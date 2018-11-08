@@ -1,7 +1,12 @@
+#!/usr/bin/env python3
+
 import json
 import base64
 import uuid
 import configparser
+import os
+from tempfile import mkstemp
+from shutil import move
 from pprint import pprint
 from flask import Flask, jsonify, request
 from flask_jwt_simple import (
@@ -46,6 +51,9 @@ def login():
     if not request.is_json:
         return jsonify({"msg": "Missing JSON in request"}), 400
 
+    with open('omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+
     params = request.get_json()
     username = params.get('username', None)
     password = params.get('password', None)
@@ -55,7 +63,7 @@ def login():
     if not password:
         return jsonify({"msg": "Missing password parameter"}), 400
 
-    if username != 'test' or password != 'test':
+    if username != omr_config_data["user"] or password != omr_config_data["pass"]:
         return jsonify({"msg": "Bad username or password"}), 401
 
     # Identity can be any data that is json serializable
@@ -116,6 +124,8 @@ def shadowsocks():
     no_delay = params.get('no_delay', None)
     mptcp = params.get('mptcp', None)
     obfs = params.get('obfs', None)
+    if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp or not obfs:
+        raise BadRequestError("Invalid parameters")
     if obfs:
         shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
     else:
@@ -124,9 +134,39 @@ def shadowsocks():
     if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
         with open('/etc/shadowsocks-libev/config.json.new','w') as outfile:
             json.dump(shadowsocks_config,outfile)
+        os.system("systemctl restart shadowsocks-libev-server@config.service")
+        for x in range (1,os.cpu_count()):
+            os.system("systemctl restart shadowsocks-libev-server@config" + x + ".service")
         return jsonify(**shadowsocks_config)
     else:
         return jsonify({'result': 'done'})
+
+# Set shorewall config
+@app.route('/shorewall', methods=['POST'])
+@jwt_required
+def shorewall():
+    params = request.get_json()
+    state = params.get('redirect_ports', None)
+    if not state:
+        raise BadRequestError('Invalid parameter')
+    fd, tmpfile = mkstemp()
+    with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if state == 'enable' and '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
+                n.write(line.replace(line[:1], ''))
+            elif state == 'enable' and '#DNAT		net		vpn:$OMR_ADDR	udp	1-64999' in line:
+                n.write(line.replace(line[:1], ''))
+            elif state == 'disable' and 'DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
+                n.write('#' + line)
+            elif state == 'disable' and 'DNAT		net		vpn:$OMR_ADDR	udp	1-64999' in line:
+                n.write('#' + line)
+            else:
+                n.write(line)
+    os.close(fd)
+    move(tmpfile,'/etc/shorewall/rules.new')
+    # Need to do the same for IPv6...
+    return jsonify({'result': 'done'})
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=65500,ssl_context=('cert.pem','key.pem'))
