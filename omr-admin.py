@@ -104,7 +104,13 @@ def config():
     mlvpn_config.readfp(open(r'/etc/mlvpn/mlvpn0.conf'))
     mlvpn_key = mlvpn_config.get('general','password')
 
-    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key}}), 200
+    shorewall_redirect = False
+    with open('/etc/shorewall/rules','r') as f:
+        for line in f:
+            if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
+                shorewall_redirect = True
+
+    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'shorewall': {'redirect_ports': shorewall_redirect}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
