@@ -4,6 +4,7 @@ import json
 import base64
 import uuid
 import configparser
+import subprocess
 import os
 from tempfile import mkstemp
 from shutil import move
@@ -102,7 +103,14 @@ def config():
         openvpn_key = base64.b64encode(ovpnkey_file.read())
     mlvpn_config = configparser.ConfigParser()
     mlvpn_config.readfp(open(r'/etc/mlvpn/mlvpn0.conf'))
-    mlvpn_key = mlvpn_config.get('general','password')
+    mlvpn_key = mlvpn_config.get('general','password').strip('"')
+
+    mptcp_checksum = os.popen('sysctl -n net.mptcp.mptcp_checksum').read().rstrip()
+    mptcp_path_manager = os.popen('sysctl -n  net.mptcp.mptcp_path_manager').read().rstrip()
+    mptcp_scheduler = os.popen('sysctl -n net.mptcp.mptcp_scheduler').read().rstrip()
+    mptcp_syn_retries = os.popen('sysctl -n net.mptcp.mptcp_syn_retries').read().rstrip()
+
+    congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
@@ -110,7 +118,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect}}), 200
+    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
@@ -173,6 +181,24 @@ def shorewall():
     #os.system("systemctl reload shorewall")
     # Need to do the same for IPv6...
     return jsonify({'result': 'done'})
+
+# Set MPTCP config
+@app.route('/mptcp', methods=['POST'])
+@jwt_required
+def mptcp():
+    params = request.get_json()
+    checksum = params.get('checksum', None)
+    path_manager = params.get('path_manager', None)
+    scheduler = params.get('scheduler', None)
+    syn_retries = params.get('syn_retries', None)
+    congestion_control = params.get('congestion_control', None)
+    os.system('sysctl -w net.mptcp.mptcp_checksum='+checksum)
+    os.system('sysctl -w  net.mptcp.mptcp_path_manager='+path_manager)
+    os.system('sysctl -w net.mptcp.mptcp_scheduler='+scheduler)
+    os.system('sysctl -w net.mptcp.mptcp_syn_retries='+syn_retries)
+    os.system('sysctl -w net.ipv4.tcp_congestion_control='+congestion_control)
+    return jsonify({'result': 'done'})
+
 
 # Set VPN config
 #@app.route('/vpn', methods=['POST'])
