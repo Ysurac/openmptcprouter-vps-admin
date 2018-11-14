@@ -104,19 +104,19 @@ def config():
     mlvpn_config.readfp(open(r'/etc/mlvpn/mlvpn0.conf'))
     mlvpn_key = mlvpn_config.get('general','password')
 
-    shorewall_redirect = False
+    shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
         for line in f:
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
-                shorewall_redirect = True
+                shorewall_redirect = "disable"
 
-    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'shorewall': {'redirect_ports': shorewall_redirect}}), 200
+    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
 @jwt_required
 def shadowsocks():
-    with open('/etc/shadowsocks-libev/config.json.new') as f:
+    with open('/etc/shadowsocks-libev/config.json') as f:
         data = json.load(f)
     key = data["key"]
     timeout = data["timeout"]
@@ -130,19 +130,19 @@ def shadowsocks():
     no_delay = params.get('no_delay', None)
     mptcp = params.get('mptcp', None)
     obfs = params.get('obfs', None)
-    if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp or not obfs:
-        raise BadRequestError("Invalid parameters")
+    if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp:
+        return jsonify({'result': 'error','reason': 'Invalid parameters'})
     if obfs:
         shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
     else:
         shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp}
 
     if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
-        with open('/etc/shadowsocks-libev/config.json.new','w') as outfile:
-            json.dump(shadowsocks_config,outfile)
+        with open('/etc/shadowsocks-libev/config.json','w') as outfile:
+            json.dump(shadowsocks_config,outfile,ident=4)
         os.system("systemctl restart shadowsocks-libev-server@config.service")
         for x in range (1,os.cpu_count()):
-            os.system("systemctl restart shadowsocks-libev-server@config" + x + ".service")
+            os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
         return jsonify(**shadowsocks_config)
     else:
         return jsonify({'result': 'done'})
@@ -154,7 +154,7 @@ def shorewall():
     params = request.get_json()
     state = params.get('redirect_ports', None)
     if not state:
-        raise BadRequestError('Invalid parameter')
+        return jsonify({'result': 'error','reason': 'Invalid parameters'})
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
@@ -170,8 +170,18 @@ def shorewall():
                 n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules.new')
+    #os.system("systemctl reload shorewall")
     # Need to do the same for IPv6...
     return jsonify({'result': 'done'})
+
+# Set VPN config
+#@app.route('/vpn', methods=['POST'])
+#@jwt_required
+#def vpn():
+#    params = request.get_json()
+#    type = params.get('type', None)
+#    mtu = params.get('mtu', None)
+#    return jsonify({'result': 'done'})
 
 
 if __name__ == '__main__':
