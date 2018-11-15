@@ -192,11 +192,13 @@ def mptcp():
     scheduler = params.get('scheduler', None)
     syn_retries = params.get('syn_retries', None)
     congestion_control = params.get('congestion_control', None)
-    os.system('sysctl -w net.mptcp.mptcp_checksum='+checksum)
-    os.system('sysctl -w  net.mptcp.mptcp_path_manager='+path_manager)
-    os.system('sysctl -w net.mptcp.mptcp_scheduler='+scheduler)
-    os.system('sysctl -w net.mptcp.mptcp_syn_retries='+syn_retries)
-    os.system('sysctl -w net.ipv4.tcp_congestion_control='+congestion_control)
+    if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
+        return jsonify({'result': 'error','reason': 'Invalid parameters'})
+    os.system('sysctl -w net.mptcp.mptcp_checksum=' + checksum)
+    os.system('sysctl -w net.mptcp.mptcp_path_manager=' + path_manager)
+    os.system('sysctl -w net.mptcp.mptcp_scheduler=' + scheduler)
+    os.system('sysctl -w net.mptcp.mptcp_syn_retries=' + syn_retries)
+    os.system('sysctl -w net.ipv4.tcp_congestion_control=' + congestion_control)
     return jsonify({'result': 'done'})
 
 
