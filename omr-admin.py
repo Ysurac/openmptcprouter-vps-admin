@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (C) 2018 Ycarus (Yannick Chabanois) <ycarus@zugaina.org>
+#
+# This is free software, licensed under the GNU General Public License v3.0.
+# See /LICENSE for more information.
+#
 
 import json
 import base64
@@ -112,13 +117,15 @@ def config():
 
     congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
 
+    ipv6_addr = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
         for line in f:
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control}}), 200
+    return jsonify({'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6': ipv6_addr}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
@@ -151,9 +158,9 @@ def shadowsocks():
         os.system("systemctl restart shadowsocks-libev-server@config.service")
         for x in range (1,os.cpu_count()):
             os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
-        return jsonify(**shadowsocks_config)
+        return jsonify({'result': 'done','reason': 'changes applied'})
     else:
-        return jsonify({'result': 'done'})
+        return jsonify({'result': 'done','reason': 'no changes'})
 
 # Set shorewall config
 @app.route('/shorewall', methods=['POST'])
@@ -177,10 +184,10 @@ def shorewall():
             else:
                 n.write(line)
     os.close(fd)
-    move(tmpfile,'/etc/shorewall/rules.new')
-    #os.system("systemctl reload shorewall")
+    move(tmpfile,'/etc/shorewall/rules')
+    os.system("systemctl reload shorewall")
     # Need to do the same for IPv6...
-    return jsonify({'result': 'done'})
+    return jsonify({'result': 'done','reason': 'changes applied'})
 
 # Set MPTCP config
 @app.route('/mptcp', methods=['POST'])
@@ -199,7 +206,7 @@ def mptcp():
     os.system('sysctl -w net.mptcp.mptcp_scheduler=' + scheduler)
     os.system('sysctl -w net.mptcp.mptcp_syn_retries=' + syn_retries)
     os.system('sysctl -w net.ipv4.tcp_congestion_control=' + congestion_control)
-    return jsonify({'result': 'done'})
+    return jsonify({'result': 'done','reason': 'changes applied'})
 
 
 # Set VPN config
