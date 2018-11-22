@@ -57,7 +57,7 @@ def login():
     if not request.is_json:
         return jsonify({"msg": "Missing JSON in request"}), 400
 
-    with open('omr-admin-config.json') as f:
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
 
     params = request.get_json()
@@ -226,4 +226,4 @@ def mptcp():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0',port=65500,ssl_context=('cert.pem','key.pem'))
+    app.run(host='0.0.0.0',port=65500,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'))
