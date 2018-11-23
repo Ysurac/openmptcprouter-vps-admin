@@ -104,11 +104,19 @@ def config():
     else:
         shadowsocks_obfs = False
     glorytun_key = open('/etc/glorytun-tcp/tun0.key').readline().rstrip()
-    with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
-        openvpn_key = base64.b64encode(ovpnkey_file.read())
-    mlvpn_config = configparser.ConfigParser()
-    mlvpn_config.readfp(open(r'/etc/mlvpn/mlvpn0.conf'))
-    mlvpn_key = mlvpn_config.get('general','password').strip('"')
+
+    if os.path.isfile('/etc/openvpn/server/static.key'):
+        with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
+            openvpn_key = base64.b64encode(ovpnkey_file.read())
+    else:
+        openvpn_key = ''
+
+    if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
+        mlvpn_config = configparser.ConfigParser()
+        mlvpn_config.readfp(open(r'/etc/mlvpn/mlvpn0.conf'))
+        mlvpn_key = mlvpn_config.get('general','password').strip('"')
+    else:
+        mlvpn_key = ''
 
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
     mptcp_checksum = os.popen('sysctl -n net.mptcp.mptcp_checksum').read().rstrip()
