@@ -11,6 +11,7 @@ import uuid
 import configparser
 import subprocess
 import os
+import re
 from tempfile import mkstemp
 from shutil import move
 from pprint import pprint
@@ -94,7 +95,9 @@ def status():
 @jwt_required
 def config():
     with open('/etc/shadowsocks-libev/config.json') as f:
-        data = json.load(f)
+        content = f.read()
+    content = re.sub(",\s*}","}",content)
+    data = json.loads(content)
     shadowsocks_key = data["key"]
     shadowsocks_port = data["server_port"]
     shadowsocks_method = data["method"]
@@ -151,8 +154,10 @@ def config():
 @jwt_required
 def shadowsocks():
     with open('/etc/shadowsocks-libev/config.json') as f:
-        data = json.load(f)
-    key = data["key"]
+        content = f.read()
+    content = re.sub(",\s*}","}",content)
+    data = json.loads(content)
+    #key = data["key"]
     timeout = data["timeout"]
     verbose = data["verbose"]
     prefer_ipv6 = data["prefer_ipv6"]
@@ -164,6 +169,9 @@ def shadowsocks():
     no_delay = params.get('no_delay', None)
     mptcp = params.get('mptcp', None)
     obfs = params.get('obfs', None)
+    key = params.get('key', None)
+    if not key:
+        key = data["key"]
     if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp:
         return jsonify({'result': 'error','reason': 'Invalid parameters'})
     if obfs:
@@ -229,13 +237,23 @@ def mptcp():
 
 
 # Set VPN config
-#@app.route('/vpn', methods=['POST'])
-#@jwt_required
-#def vpn():
-#    params = request.get_json()
-#    type = params.get('type', None)
-#    mtu = params.get('mtu', None)
-#    return jsonify({'result': 'done'})
+@app.route('/vpn', methods=['POST'])
+@jwt_required
+def vpn():
+    params = request.get_json()
+    vpn_type = params.get('type', None)
+    key = params.get('key', None)
+    if not key:
+        return jsonify({'result': 'error','reason': 'Invalid parameters'})
+    if vpn_type == "glorytun":
+        with open('/etc/glorytun-tcp/tun0.key','w') as outfile:
+            outfile.write(key)
+        with open('/etc/glorytun-udp/tun0.key','w') as outfile:
+            outfile.write(key)
+    if vpn_type == "openvpn":
+        with open('/etc/openvpn/server/static.key','w') as outfile:
+            outfile.write(base64.b64decode(key))
+    return jsonify({'result': 'done'})
 
 
 if __name__ == '__main__':
