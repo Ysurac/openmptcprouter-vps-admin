@@ -101,10 +101,22 @@ def config():
     shadowsocks_key = data["key"]
     shadowsocks_port = data["server_port"]
     shadowsocks_method = data["method"]
-    shadowsocks_fast_open = data["fast_open"]
-    shadowsocks_reuse_port = data["reuse_port"]
-    shadowsocks_no_delay = data["no_delay"]
-    shadowsocks_mptcp = data["mptcp"]
+    if 'fast_open' in data:
+        shadowsocks_fast_open = data["fast_open"]
+    else:
+        shadowsocks_fast_open = False
+    if 'fast_open' in data:
+        shadowsocks_reuse_port = data["reuse_port"]
+    else:
+        shadowsocks_reuse_port = False
+    if 'no_delay' in data:
+        shadowsocks_no_delay = data["no_delay"]
+    else:
+        shadowsocks_no_delay = False
+    if 'mptcp' in data:
+        shadowsocks_mptcp = data["mptcp"]
+    else:
+        shadowsocks_mptcp = False
     if "plugin" in data:
         shadowsocks_obfs = True
     else:
@@ -159,7 +171,10 @@ def shadowsocks():
     data = json.loads(content)
     #key = data["key"]
     timeout = data["timeout"]
-    verbose = data["verbose"]
+    if 'verbose' in data:
+        verbose = data["verbose"]
+    else:
+        verbose = 0
     prefer_ipv6 = data["prefer_ipv6"]
     params = request.get_json()
     port = params.get('port', None)
