@@ -81,8 +81,11 @@ def login():
 @app.route('/status', methods=['GET'])
 @jwt_required
 def status():
+    vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
+    vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
+
     if iface:
-        return jsonify({'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}), 200
+        return jsonify({'vps': {'loadavg': vps_loadavg,'uptime': vps_uptime}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}), 200
     else:
         return jsonify({'error': 'No iface defined'}), 200
 
@@ -132,6 +135,8 @@ def config():
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_machine = os.popen('uname -m').read().rstrip()
     vps_omr_version = os.popen("grep -s OpenMPTCProuter /etc/* | awk '{print $4}'").read().rstrip()
+    vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
+    vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
@@ -139,7 +144,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr}}), 200
+    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
