@@ -122,19 +122,31 @@ def config():
     else:
         shadowsocks_obfs = False
     glorytun_key = open('/etc/glorytun-tcp/tun0.key').readline().rstrip()
+    glorytun_tcp_host_ip = '10.255.255.1'
+    glorytun_tcp_client_ip = '10.255.255.2'
+    glorytun_udp_host_ip = '10.255.254.1'
+    glorytun_udp_client_ip = '10.255.254.2'
+    available_vpn = ["glorytun-tcp", "glorytun-udp"]
 
     if os.path.isfile('/etc/openvpn/server/static.key'):
         with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
             openvpn_key = base64.b64encode(ovpnkey_file.read())
+            available_vpn.append("openvpn")
     else:
         openvpn_key = ''
+    openvpn_host_ip = '10.255.253.1'
+    openvpn_client_ip = '10.255.253.2'
 
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
         mlvpn_config.readfp(open(r'/etc/mlvpn/mlvpn0.conf'))
         mlvpn_key = mlvpn_config.get('general','password').strip('"')
+        available_vpn.append("mlvpn")
     else:
         mlvpn_key = ''
+    mlvpn_host_ip = ''
+    mlvpn_client_ip = ''
+
 
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
     mptcp_checksum = os.popen('sysctl -n net.mptcp.mptcp_checksum').read().rstrip()
@@ -159,7 +171,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key},'openvpn': {'key': openvpn_key},'mlvpn': {'key': mlvpn_key},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr}}), 200
+    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key,'udp_host_ip': glorytun_udp_host_ip,'udp_client_ip': glorytun_udp_client_ip,'tcp_host_ip': glorytun_tcp_host_ip,'tcp_client_ip': glorytun_tcp_client_ip},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
@@ -215,13 +227,13 @@ def shorewall():
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if state == 'enable' and '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
+            if state == 'enable' and line == '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999\n':
                 n.write(line.replace(line[:1], ''))
-            elif state == 'enable' and '#DNAT		net		vpn:$OMR_ADDR	udp	1-64999' in line:
+            elif state == 'enable' and line == '#DNAT		net		vpn:$OMR_ADDR	udp	1-64999\n':
                 n.write(line.replace(line[:1], ''))
-            elif state == 'disable' and 'DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
+            elif state == 'disable' and line == 'DNAT		net		vpn:$OMR_ADDR	tcp	1-64999\n':
                 n.write('#' + line)
-            elif state == 'disable' and 'DNAT		net		vpn:$OMR_ADDR	udp	1-64999' in line:
+            elif state == 'disable' and line == 'DNAT		net		vpn:$OMR_ADDR	udp	1-64999\n':
                 n.write('#' + line)
             else:
                 n.write(line)
