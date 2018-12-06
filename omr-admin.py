@@ -84,11 +84,12 @@ def login():
 def status():
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
+    mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
 
     if iface:
-        return jsonify({'vps': {'loadavg': vps_loadavg,'uptime': vps_uptime}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}), 200
+        return jsonify({'vps': {'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}), 200
     else:
-        return jsonify({'error': 'No iface defined'}), 200
+        return jsonify({'error': 'No iface defined','route': 'status'}), 200
 
 # Get VPS config
 @app.route('/config', methods=['GET'])
@@ -97,7 +98,10 @@ def config():
     with open('/etc/shadowsocks-libev/config.json') as f:
         content = f.read()
     content = re.sub(",\s*}","}",content)
-    data = json.loads(content)
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        data = {'key': '', 'server_port': 65101, 'method': 'chacha20'}
     shadowsocks_key = data["key"]
     shadowsocks_port = data["server_port"]
     shadowsocks_method = data["method"]
@@ -121,7 +125,16 @@ def config():
         shadowsocks_obfs = True
     else:
         shadowsocks_obfs = False
-    glorytun_key = open('/etc/glorytun-tcp/tun0.key').readline().rstrip()
+    if os.path.isfile('/etc/glorytun-tcp/tun0.key'):
+        glorytun_key = open('/etc/glorytun-tcp/tun0.key').readline().rstrip()
+    else:
+        glorytun_key = ''
+    glorytun_port = '65001'
+    if os.path.isfile('/etc/glorytun-tcp/tun0'):
+        with open('/etc/glorytun-tcp/tun0',"r") as glorytun_file:
+            for line in glorytun_file:
+                if 'PORT=' in line:
+                    glorytun_port = line.replace(line[:5], '').rstrip()
     glorytun_tcp_host_ip = '10.255.255.1'
     glorytun_tcp_client_ip = '10.255.255.2'
     glorytun_udp_host_ip = '10.255.254.1'
@@ -134,6 +147,12 @@ def config():
             available_vpn.append("openvpn")
     else:
         openvpn_key = ''
+    openvpn_port = '65301'
+    if os.path.isfile('/etc/openvpn/openvpn-tun0.conf'):
+        with open('/etc/openvpn/openvpn-tun0.conf',"r") as openvpn_file:
+            for line in openvpn_file:
+                if 'port ' in line:
+                    openvpn_port = line.replace(line[:5], '').rstrip()
     openvpn_host_ip = '10.255.253.1'
     openvpn_client_ip = '10.255.253.2'
 
@@ -171,7 +190,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key,'udp_host_ip': glorytun_udp_host_ip,'udp_client_ip': glorytun_udp_client_ip,'tcp_host_ip': glorytun_tcp_host_ip,'tcp_client_ip': glorytun_tcp_client_ip},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn}}), 200
+    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
@@ -180,9 +199,13 @@ def shadowsocks():
     with open('/etc/shadowsocks-libev/config.json') as f:
         content = f.read()
     content = re.sub(",\s*}","}",content)
-    data = json.loads(content)
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        data = {'timeout': 600, 'verbose': 0, 'prefer_ipv6': False}
     #key = data["key"]
-    timeout = data["timeout"]
+    if 'timeout' in data:
+        timeout = data["timeout"]
     if 'verbose' in data:
         verbose = data["verbose"]
     else:
@@ -198,9 +221,10 @@ def shadowsocks():
     obfs = params.get('obfs', None)
     key = params.get('key', None)
     if not key:
-        key = data["key"]
-    if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp:
-        return jsonify({'result': 'error','reason': 'Invalid parameters'})
+        if 'key' in data:
+            key = data["key"]
+    if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp or not key:
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'})
     if obfs:
         shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
     else:
@@ -208,13 +232,13 @@ def shadowsocks():
 
     if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
         with open('/etc/shadowsocks-libev/config.json','w') as outfile:
-            json.dump(shadowsocks_config,outfile,ident=4)
+            json.dump(shadowsocks_config,outfile,indent=4)
         os.system("systemctl restart shadowsocks-libev-server@config.service")
         for x in range (1,os.cpu_count()):
             os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
-        return jsonify({'result': 'done','reason': 'changes applied'})
+        return jsonify({'result': 'done','reason': 'changes applied','route': 'shadowsocks'})
     else:
-        return jsonify({'result': 'done','reason': 'no changes'})
+        return jsonify({'result': 'done','reason': 'no changes','route': 'shadowsocks'})
 
 # Set shorewall config
 @app.route('/shorewall', methods=['POST'])
@@ -223,7 +247,7 @@ def shorewall():
     params = request.get_json()
     state = params.get('redirect_ports', None)
     if not state:
-        return jsonify({'result': 'error','reason': 'Invalid parameters'})
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shorewall'})
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
@@ -239,7 +263,7 @@ def shorewall():
                 n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
-    os.system("systemctl reload shorewall")
+    os.system("systemctl -q reload shorewall")
     # Need to do the same for IPv6...
     return jsonify({'result': 'done','reason': 'changes applied'})
 
@@ -254,7 +278,7 @@ def mptcp():
     syn_retries = params.get('syn_retries', None)
     congestion_control = params.get('congestion_control', None)
     if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
-        return jsonify({'result': 'error','reason': 'Invalid parameters'})
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'mptcp'})
     os.system('sysctl -w net.mptcp.mptcp_checksum=' + checksum)
     os.system('sysctl -w net.mptcp.mptcp_path_manager=' + path_manager)
     os.system('sysctl -w net.mptcp.mptcp_scheduler=' + scheduler)
@@ -263,25 +287,61 @@ def mptcp():
     return jsonify({'result': 'done','reason': 'changes applied'})
 
 
-# Set VPN config
-@app.route('/vpn', methods=['POST'])
+# Set Glorytun config
+@app.route('/glorytun', methods=['POST'])
 @jwt_required
-def vpn():
+def glorytun():
     params = request.get_json()
-    vpn_type = params.get('type', None)
     key = params.get('key', None)
-    if not key:
-        return jsonify({'result': 'error','reason': 'Invalid parameters'})
-    if vpn_type == "glorytun":
-        with open('/etc/glorytun-tcp/tun0.key','w') as outfile:
-            outfile.write(key)
-        with open('/etc/glorytun-udp/tun0.key','w') as outfile:
-            outfile.write(key)
-    if vpn_type == "openvpn":
-        with open('/etc/openvpn/server/static.key','w') as outfile:
-            outfile.write(base64.b64decode(key))
+    port = params.get('port', None)
+    if not key or not port:
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'glorytun'})
+    with open('/etc/glorytun-tcp/tun0.key','w') as outfile:
+        outfile.write(key)
+    with open('/etc/glorytun-udp/tun0.key','w') as outfile:
+        outfile.write(key)
+    fd, tmpfile = mkstemp()
+    with open('/etc/glorytun-tcp/tun0','r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if 'PORT=' in line:
+                n.write('PORT=' + str(port) + '\n')
+            else:
+                n.write(line)
+    os.close(fd)
+    move(tmpfile,'/etc/glorytun-tcp/tun0')
+    os.system("systemctl -q restart glorytun-tcp@tun0")
+    fd, tmpfile = mkstemp()
+    with open('/etc/glorytun-udp/tun0','r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if 'BIND_PORT=' in line:
+                n.write('BIND_PORT=' + str(port) + '\n')
+            else:
+                n.write(line)
+    os.close(fd)
+    move(tmpfile,'/etc/glorytun-udp/tun0')
+    os.system("systemctl -q restart glorytun-udp@tun0")
     return jsonify({'result': 'done'})
 
+# Set OpenVPN config
+@app.route('/openvpn', methods=['POST'])
+@jwt_required
+def openvpn():
+    params = request.get_json()
+    key = params.get('key', None)
+    if not key:
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'openvpn'})
+    with open('/etc/openvpn/server/static.key','w') as outfile:
+        outfile.write(base64.b64decode(key))
+    os.system("systemctl -q restart openvpn@tun0")
+    return jsonify({'result': 'done'})
+
+# Update VPS
+@app.route('/update', methods=['GET'])
+@jwt_required
+def update():
+    os.system("wget -O - http://www.openmptcprouter.com/server/debian9-x86_64.sh | sh")
+    # Need to reboot if kernel change
+    return jsonify({'result': 'done'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=65500,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'))
