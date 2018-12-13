@@ -1,4 +1,5 @@
 {
     "user":"openmptcprouter",
-    "pass":"MySecretKey"
+    "pass":"MySecretKey",
+    "port":65500
 }

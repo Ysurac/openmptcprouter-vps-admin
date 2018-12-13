@@ -344,4 +344,9 @@ def update():
     return jsonify({'result': 'done'})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0',port=65500,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'))
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    omrport=65500
+    if 'port' in omr_config_data:
+        omrport = omr_config_data["port"]
+    app.run(host='0.0.0.0',port=omrport,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'))
