@@ -22,6 +22,9 @@ from flask_jwt_simple import (
 
 app = Flask(__name__)
 
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 # Setup the Flask-JWT-Simple extension
 
 # Generate a random secret key
@@ -279,11 +282,11 @@ def mptcp():
     congestion_control = params.get('congestion_control', None)
     if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'mptcp'})
-    os.system('sysctl -w net.mptcp.mptcp_checksum=' + checksum)
-    os.system('sysctl -w net.mptcp.mptcp_path_manager=' + path_manager)
-    os.system('sysctl -w net.mptcp.mptcp_scheduler=' + scheduler)
-    os.system('sysctl -w net.mptcp.mptcp_syn_retries=' + syn_retries)
-    os.system('sysctl -w net.ipv4.tcp_congestion_control=' + congestion_control)
+    os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
+    os.system('sysctl -qw net.mptcp.mptcp_path_manager=' + path_manager)
+    os.system('sysctl -qw net.mptcp.mptcp_scheduler=' + scheduler)
+    os.system('sysctl -qw net.mptcp.mptcp_syn_retries=' + syn_retries)
+    os.system('sysctl -qw net.ipv4.tcp_congestion_control=' + congestion_control)
     return jsonify({'result': 'done','reason': 'changes applied'})
 
 
