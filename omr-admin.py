@@ -222,6 +222,12 @@ def shadowsocks():
     no_delay = params.get('no_delay', None)
     mptcp = params.get('mptcp', None)
     obfs = params.get('obfs', None)
+    ebpf = params.get('ebpf', None)
+    if not ebpf:
+        if 'ebpf' in data:
+            ebpf = data["ebpf"]
+        else:
+            ebpf = 0
     key = params.get('key', None)
     if not key:
         if 'key' in data:
@@ -229,9 +235,9 @@ def shadowsocks():
     if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp or not key:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'})
     if obfs:
-        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
     else:
-        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp}
+        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf}
 
     if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
         with open('/etc/shadowsocks-libev/config.json','w') as outfile:
