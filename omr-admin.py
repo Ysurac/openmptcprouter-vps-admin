@@ -286,7 +286,7 @@ def mptcp():
     scheduler = params.get('scheduler', None)
     syn_retries = params.get('syn_retries', None)
     congestion_control = params.get('congestion_control', None)
-    if checksum is None or path_manager is None or scheduler is None or syn_retries is None or congestion_control is None:
+    if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'mptcp'})
     os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
     os.system('sysctl -qw net.mptcp.mptcp_path_manager=' + path_manager)
