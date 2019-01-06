@@ -150,8 +150,9 @@ def config():
 
     if os.path.isfile('/etc/openvpn/server/static.key'):
         with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
-            openvpn_key = base64.b64encode(ovpnkey_file.read())
-            available_vpn.append("openvpn")
+            openvpn_keyb = base64.b64encode(ovpnkey_file.read())
+            openvpn_key = openvpn_keyb.decode('utf-8')
+        available_vpn.append("openvpn")
     else:
         openvpn_key = ''
     openvpn_port = '65301'
@@ -226,17 +227,12 @@ def shadowsocks():
     no_delay = params.get('no_delay', None)
     mptcp = params.get('mptcp', None)
     obfs = params.get('obfs', None)
-    ebpf = params.get('ebpf', None)
-    if not ebpf:
-        if 'ebpf' in data:
-            ebpf = data["ebpf"]
-        else:
-            ebpf = 0
+    ebpf = params.get('ebpf', False)
     key = params.get('key', None)
     if not key:
         if 'key' in data:
             key = data["key"]
-    if not port or not method or not fast_open or not reuse_port or not no_delay or not mptcp or not key:
+    if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'})
     if obfs:
         shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
@@ -259,7 +255,7 @@ def shadowsocks():
 def shorewall():
     params = request.get_json()
     state = params.get('redirect_ports', None)
-    if not state:
+    if state is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shorewall'})
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
@@ -290,7 +286,7 @@ def mptcp():
     scheduler = params.get('scheduler', None)
     syn_retries = params.get('syn_retries', None)
     congestion_control = params.get('congestion_control', None)
-    if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
+    if checksum is None or path_manager is None or scheduler is None or syn_retries is None or congestion_control is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'mptcp'})
     os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
     os.system('sysctl -qw net.mptcp.mptcp_path_manager=' + path_manager)
@@ -307,7 +303,7 @@ def glorytun():
     params = request.get_json()
     key = params.get('key', None)
     port = params.get('port', None)
-    if not key or not port:
+    if not key or port is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'glorytun'})
     with open('/etc/glorytun-tcp/tun0.key','w') as outfile:
         outfile.write(key)
