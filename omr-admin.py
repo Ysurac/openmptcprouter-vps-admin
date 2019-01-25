@@ -130,8 +130,18 @@ def config():
         shadowsocks_ebpf = False
     if "plugin" in data:
         shadowsocks_obfs = True
+        if 'v2ray' in data["plugin"]:
+            shadowsocks_obfs_plugin = 'v2ray'
+        else:
+            shadowsocks_obfs_plugin = 'obfs'
+        if 'tls' in data["plugin_opts"]:
+            shadowsocks_obfs_type = 'tls'
+        else:
+            shadowsocks_obfs_plugin = 'http'
     else:
         shadowsocks_obfs = False
+        shadowsocks_obfs_plugin = ''
+        shadowsocks_obfs_type = ''
     if os.path.isfile('/etc/glorytun-tcp/tun0.key'):
         glorytun_key = open('/etc/glorytun-tcp/tun0.key').readline().rstrip()
     else:
@@ -198,7 +208,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn}}), 200
+    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
@@ -226,7 +236,9 @@ def shadowsocks():
     reuse_port = params.get('reuse_port', None)
     no_delay = params.get('no_delay', None)
     mptcp = params.get('mptcp', None)
-    obfs = params.get('obfs', None)
+    obfs = params.get('obfs', False)
+    obfs_plugin = params.get('obfs_plugin', False)
+    obfs_type = params.get('obfs_type', None)
     ebpf = params.get('ebpf', False)
     key = params.get('key', None)
     if not key:
@@ -235,7 +247,16 @@ def shadowsocks():
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'})
     if obfs:
-        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+        if obfs_plugin = 'v2ray':
+            if obfs_type = 'tls':
+                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
+            else:
+                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server'}
+        else:
+            if obfs_type = 'tls':
+                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+            else:
+                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
     else:
         shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf}
 
