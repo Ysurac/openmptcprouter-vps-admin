@@ -137,7 +137,7 @@ def config():
         if 'tls' in data["plugin_opts"]:
             shadowsocks_obfs_type = 'tls'
         else:
-            shadowsocks_obfs_plugin = 'http'
+            shadowsocks_obfs_type = 'http'
     else:
         shadowsocks_obfs = False
         shadowsocks_obfs_plugin = ''
