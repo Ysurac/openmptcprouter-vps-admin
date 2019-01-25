@@ -247,13 +247,13 @@ def shadowsocks():
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'})
     if obfs:
-        if obfs_plugin = 'v2ray':
-            if obfs_type = 'tls':
+        if obfs_plugin == 'v2ray':
+            if obfs_type == 'tls':
                 shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
             else:
                 shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server'}
         else:
-            if obfs_type = 'tls':
+            if obfs_type == 'tls':
                 shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
             else:
                 shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
