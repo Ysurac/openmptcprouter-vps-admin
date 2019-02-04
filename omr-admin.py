@@ -175,6 +175,7 @@ def config():
                     openvpn_port = line.replace(line[:5], '').rstrip()
     openvpn_host_ip = '10.255.253.1'
     #openvpn_client_ip = '10.255.253.2'
+    openvpn_client_ip = 'dhcp'
 
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
