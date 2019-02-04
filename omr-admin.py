@@ -153,9 +153,11 @@ def config():
                 if 'PORT=' in line:
                     glorytun_port = line.replace(line[:5], '').rstrip()
     glorytun_tcp_host_ip = '10.255.255.1'
-    glorytun_tcp_client_ip = '10.255.255.2'
+    #glorytun_tcp_client_ip = '10.255.255.2'
+    glorytun_tcp_client_ip = 'dhcp'
     glorytun_udp_host_ip = '10.255.254.1'
-    glorytun_udp_client_ip = '10.255.254.2'
+    #glorytun_udp_client_ip = '10.255.254.2'
+    glorytun_udp_client_ip = 'dhcp'
     available_vpn = ["glorytun-tcp", "glorytun-udp"]
 
     if os.path.isfile('/etc/openvpn/server/static.key'):
@@ -172,7 +174,7 @@ def config():
                 if 'port ' in line:
                     openvpn_port = line.replace(line[:5], '').rstrip()
     openvpn_host_ip = '10.255.253.1'
-    openvpn_client_ip = '10.255.253.2'
+    #openvpn_client_ip = '10.255.253.2'
 
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
