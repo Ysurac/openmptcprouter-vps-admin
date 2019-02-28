@@ -12,6 +12,7 @@ import configparser
 import subprocess
 import os
 import re
+from datetime import timedelta
 from tempfile import mkstemp
 from shutil import move
 from pprint import pprint
@@ -29,6 +30,7 @@ log.setLevel(logging.ERROR)
 
 # Generate a random secret key
 app.config['JWT_SECRET_KEY'] = uuid.uuid4().hex
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 
 jwt = JWTManager(app)
 
@@ -61,6 +63,7 @@ def login():
     if not request.is_json:
         return jsonify({"msg": "Missing JSON in request"}), 400
 
+    session.permanent = True
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
 
@@ -197,7 +200,8 @@ def config():
     congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
 
     ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
-    ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
+    #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
+    ipv6_addr = ''
 
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_machine = os.popen('uname -m').read().rstrip()
@@ -382,4 +386,4 @@ if __name__ == '__main__':
     omrport=65500
     if 'port' in omr_config_data:
         omrport = omr_config_data["port"]
-    app.run(host='0.0.0.0',port=omrport,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'))
+    app.run(host='0.0.0.0',port=omrport,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'),threaded=True)
