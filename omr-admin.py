@@ -16,7 +16,7 @@ from datetime import timedelta
 from tempfile import mkstemp
 from shutil import move
 from pprint import pprint
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, session
 from flask_jwt_simple import (
     JWTManager, jwt_required, create_jwt, get_jwt_identity
 )
@@ -29,6 +29,7 @@ log.setLevel(logging.ERROR)
 # Setup the Flask-JWT-Simple extension
 
 # Generate a random secret key
+app.config['SECRET_KEY'] = uuid.uuid4().hex
 app.config['JWT_SECRET_KEY'] = uuid.uuid4().hex
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 
