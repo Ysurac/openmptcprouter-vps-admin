@@ -202,7 +202,7 @@ def config():
 
     ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
-    ipv6_addr = ''
+    ipv6_addr = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
 
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_machine = os.popen('uname -m').read().rstrip()
