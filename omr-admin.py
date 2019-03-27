@@ -102,6 +102,11 @@ def status():
 @app.route('/config', methods=['GET'])
 @jwt_required
 def config():
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
     with open('/etc/shadowsocks-libev/config.json') as f:
         content = f.read()
     content = re.sub(",\s*}","}",content)
@@ -156,13 +161,35 @@ def config():
             for line in glorytun_file:
                 if 'PORT=' in line:
                     glorytun_port = line.replace(line[:5], '').rstrip()
-    glorytun_tcp_host_ip = '10.255.255.1'
-    glorytun_tcp_client_ip = '10.255.255.2'
-    #glorytun_tcp_client_ip = 'dhcp'
-    glorytun_udp_host_ip = '10.255.254.1'
-    glorytun_udp_client_ip = '10.255.254.2'
-    #glorytun_udp_client_ip = 'dhcp'
+    if 'glorytun_tcp_type' in omr_config_data:
+        if omr_config_data['glorytun_tcp_type'] == 'static':
+            glorytun_tcp_host_ip = '10.255.255.1'
+            glorytun_tcp_client_ip = '10.255.255.2'
+        else:
+            glorytun_tcp_host_ip = 'dhcp'
+            glorytun_tcp_client_ip = 'dhcp'
+    else:
+        glorytun_tcp_host_ip = '10.255.255.1'
+        glorytun_tcp_client_ip = '10.255.255.2'
+    if 'glorytun_udp_type' in omr_config_data:
+        if omr_config_data['glorytun_udp_type'] == 'static':
+            glorytun_udp_host_ip = '10.255.255.1'
+            glorytun_udp_client_ip = '10.255.255.2'
+        else:
+            glorytun_udp_host_ip = 'dhcp'
+            glorytun_udp_client_ip = 'dhcp'
+    else:
+        glorytun_udp_host_ip = '10.255.255.1'
+        glorytun_udp_client_ip = '10.255.255.2'
     available_vpn = ["glorytun-tcp", "glorytun-udp"]
+
+    if os.path.isfile('/etc/iperf3/public.key'):
+        with open('/etc/iperf3/public.key',"rb") as iperfkey_file:
+            iperf_keyb = base64.b64encode(iperfkey_file.read())
+            iperf3_key = iperf_keyb.decode('utf-8')
+    else:
+        iperf3_key = ''
+
 
     if os.path.isfile('/etc/openvpn/server/static.key'):
         with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
@@ -216,7 +243,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn}}), 200
+    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
