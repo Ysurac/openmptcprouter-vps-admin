@@ -183,8 +183,8 @@ def config():
         glorytun_udp_client_ip = '10.255.255.2'
     available_vpn = ["glorytun-tcp", "glorytun-udp"]
 
-    if os.path.isfile('/etc/iperf3/public.key'):
-        with open('/etc/iperf3/public.key',"rb") as iperfkey_file:
+    if os.path.isfile('/etc/iperf3/public.pem'):
+        with open('/etc/iperf3/public.pem',"rb") as iperfkey_file:
             iperf_keyb = base64.b64encode(iperfkey_file.read())
             iperf3_key = iperf_keyb.decode('utf-8')
     else:
