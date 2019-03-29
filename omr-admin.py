@@ -233,7 +233,7 @@ def config():
 
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_machine = os.popen('uname -m').read().rstrip()
-    vps_omr_version = os.popen("grep -s OpenMPTCProuter /etc/* | awk '{print $4}'").read().rstrip()
+    vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
 
