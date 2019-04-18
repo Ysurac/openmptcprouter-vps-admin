@@ -57,6 +57,19 @@ def ordered(obj):
     else:
         return obj
 
+def shorewall_port(port,proto,name):
+    fd, tmpfile = mkstemp()
+    with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if not '# OMR open ' + name + ' port ' + proto in line:
+                n.write(line)
+        n.write('ACCEPT		net		$FW	' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto)
+    os.close(fd)
+    move(tmpfile,'/etc/shorewall/rules')
+    os.system("systemctl -q reload shorewall")
+
+
+
 # Provide a method to create access tokens. The create_jwt()
 # function is used to actually generate the token
 @app.route('/login', methods=['POST'])
@@ -190,6 +203,10 @@ def config():
     else:
         iperf3_key = ''
 
+    if os.path.isfile('/etc/pihole/setupVars.conf'):
+        pihole = True
+    else:
+        pihole = False
 
     if os.path.isfile('/etc/openvpn/server/static.key'):
         with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
@@ -230,12 +247,17 @@ def config():
     ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
     ipv6_addr = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
+    ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
 
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_machine = os.popen('uname -m').read().rstrip()
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
+    vps_domain = os.popen('dig +noall +answer -x ' + ipv4_addr + " | awk '{print substr($5,1,length($5)-1)}'").read().rstrip()
+    vps_domain_test = os.popen('dig +noall +answer ' + vps_domain).read().rstrip()
+    if not vps_domain_test:
+        vps_domain = ''
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
@@ -243,7 +265,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr},'vpn': {'available': available_vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key}}), 200
+    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
@@ -279,17 +301,29 @@ def shadowsocks():
     if not key:
         if 'key' in data:
             key = data["key"]
+    ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
+    vps_domain = os.popen('dig +noall +answer -x ' + ipv4_addr + " | awk '{print substr($5,1,length($5)-1)}'").read().rstrip()
+    vps_domain_test = os.popen('dig +noall +answer ' + vps_domain).read().rstrip()
+    if not vps_domain_test:
+        vps_domain = ''
+
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'})
     if obfs:
         if obfs_plugin == 'v2ray':
             if obfs_type == 'tls':
-                shadowsocks_config = {'server': '::0','server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
+                if vps_domain == '':
+                    shadowsocks_config = {'server': '::0','server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
+                else:
+                    shadowsocks_config = {'server': '::0','server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls;host=' + vps_domain}
             else:
                 shadowsocks_config = {'server': '::0','server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server'}
         else:
             if obfs_type == 'tls':
-                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                if vps_domain == '':
+                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                else:
+                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
             else:
                 shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
     else:
@@ -301,6 +335,8 @@ def shadowsocks():
         os.system("systemctl restart shadowsocks-libev-server@config.service")
         for x in range (1,os.cpu_count()):
             os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
+        shorewall_port(str(port),'tcp','shadowsocks')
+        shorewall_port(str(port),'udp','shadowsocks')
         return jsonify({'result': 'done','reason': 'changes applied','route': 'shadowsocks'})
     else:
         return jsonify({'result': 'done','reason': 'no changes','route': 'shadowsocks'})
@@ -385,6 +421,7 @@ def glorytun():
     os.close(fd)
     move(tmpfile,'/etc/glorytun-udp/tun0')
     os.system("systemctl -q restart glorytun-udp@tun0")
+    shorewall_port(port,str(port),'glorytun')
     return jsonify({'result': 'done'})
 
 # Set OpenVPN config
