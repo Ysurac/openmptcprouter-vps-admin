@@ -299,10 +299,7 @@ def shadowsocks():
         if 'key' in data:
             key = data["key"]
     ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
-    vps_domain = os.popen('dig +noall +answer -x ' + ipv4_addr + " | awk '{print substr($5,1,length($5)-1)}'").read().rstrip()
-    vps_domain_test = os.popen('dig +noall +answer ' + vps_domain).read().rstrip()
-    if not vps_domain_test:
-        vps_domain = ''
+    vps_domain = os.popen('wget -4 -qO- -T 2 http://hostname.openmptcprouter.com').read().rstrip()
 
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'})
