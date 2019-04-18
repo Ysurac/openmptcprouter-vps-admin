@@ -254,10 +254,7 @@ def config():
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
-    vps_domain = os.popen('dig +noall +answer -x ' + ipv4_addr + " | awk '{print substr($5,1,length($5)-1)}'").read().rstrip()
-    vps_domain_test = os.popen('dig +noall +answer ' + vps_domain).read().rstrip()
-    if not vps_domain_test:
-        vps_domain = ''
+    vps_domain = os.popen('wget -4 -qO- -T 2 http://hostname.openmptcprouter.com').read().rstrip()
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
