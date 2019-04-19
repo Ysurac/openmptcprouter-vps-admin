@@ -63,7 +63,7 @@ def shorewall_port(port,proto,name):
         for line in f:
             if not '# OMR open ' + name + ' port ' + proto in line:
                 n.write(line)
-        n.write('ACCEPT		net		$FW	' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto)
+        n.write('ACCEPT		net		$FW	' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
     os.system("systemctl -q reload shorewall")
