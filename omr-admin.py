@@ -63,7 +63,7 @@ def shorewall_port(port,proto,name):
         for line in f:
             if not '# OMR open ' + name + ' port ' + proto in line:
                 n.write(line)
-        n.write('ACCEPT		net		$FW	' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
+        n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
     os.system("systemctl -q reload shorewall")
@@ -221,8 +221,8 @@ def config():
             for line in openvpn_file:
                 if 'port ' in line:
                     openvpn_port = line.replace(line[:5], '').rstrip()
-    openvpn_host_ip = '10.255.253.1'
-    openvpn_client_ip = '10.255.253.2'
+    openvpn_host_ip = '10.255.252.1'
+    openvpn_client_ip = '10.255.252.2'
     #openvpn_client_ip = 'dhcp'
 
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
@@ -232,8 +232,8 @@ def config():
         available_vpn.append("mlvpn")
     else:
         mlvpn_key = ''
-    mlvpn_host_ip = ''
-    mlvpn_client_ip = ''
+    mlvpn_host_ip = '10.255.253.1'
+    mlvpn_client_ip = '10.255.253.2'
 
 
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
