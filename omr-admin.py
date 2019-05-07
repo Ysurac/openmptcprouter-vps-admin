@@ -186,14 +186,14 @@ def config():
         glorytun_tcp_client_ip = '10.255.255.2'
     if 'glorytun_udp_type' in omr_config_data:
         if omr_config_data['glorytun_udp_type'] == 'static':
-            glorytun_udp_host_ip = '10.255.255.1'
-            glorytun_udp_client_ip = '10.255.255.2'
+            glorytun_udp_host_ip = '10.255.254.1'
+            glorytun_udp_client_ip = '10.255.254.2'
         else:
             glorytun_udp_host_ip = 'dhcp'
             glorytun_udp_client_ip = 'dhcp'
     else:
-        glorytun_udp_host_ip = '10.255.255.1'
-        glorytun_udp_client_ip = '10.255.255.2'
+        glorytun_udp_host_ip = '10.255.254.1'
+        glorytun_udp_client_ip = '10.255.254.2'
     available_vpn = ["glorytun-tcp", "glorytun-udp"]
 
     if os.path.isfile('/etc/iperf3/public.pem'):
