@@ -169,11 +169,14 @@ def config():
     else:
         glorytun_key = ''
     glorytun_port = '65001'
+    glorytun_chacha = False
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
         with open('/etc/glorytun-tcp/tun0',"r") as glorytun_file:
             for line in glorytun_file:
                 if 'PORT=' in line:
                     glorytun_port = line.replace(line[:5], '').rstrip()
+                if 'chacha' in line:
+                    glorytun_chacha = True
     if 'glorytun_tcp_type' in omr_config_data:
         if omr_config_data['glorytun_tcp_type'] == 'static':
             glorytun_tcp_host_ip = '10.255.255.1'
@@ -247,14 +250,14 @@ def config():
     ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
     ipv6_addr = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
-    ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
+    ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ip.openmptcprouter.com').read().rstrip()
 
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_machine = os.popen('uname -m').read().rstrip()
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
-    vps_domain = os.popen('wget -4 -qO- -T 2 http://hostname.openmptcprouter.com').read().rstrip()
+    vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
@@ -262,7 +265,7 @@ def config():
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole}}), 200
+    return jsonify({'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'openvpn': {'key': openvpn_key, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole}}), 200
 
 # Set shadowsocks config
 @app.route('/shadowsocks', methods=['POST'])
@@ -389,6 +392,7 @@ def glorytun():
     params = request.get_json()
     key = params.get('key', None)
     port = params.get('port', None)
+    chacha = params.get('chacha', True)
     if not key or port is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'glorytun'})
     with open('/etc/glorytun-tcp/tun0.key','w') as outfile:
@@ -400,6 +404,11 @@ def glorytun():
         for line in f:
             if 'PORT=' in line:
                 n.write('PORT=' + str(port) + '\n')
+            elif 'OPTIONS=' in line:
+                if chacha:
+                    n.write('OPTIONS="chacha20 retry count -1 const 5000000 timeout 90000 keepalive count 5 idle 10 interval 2 buffer-size 65536 multiqueue"\n')
+                else:
+                    n.write('OPTIONS="retry count -1 const 5000000 timeout 90000 keepalive count 5 idle 10 interval 2 buffer-size 65536 multiqueue"\n')
             else:
                 n.write(line)
     os.close(fd)
@@ -410,6 +419,11 @@ def glorytun():
         for line in f:
             if 'BIND_PORT=' in line:
                 n.write('BIND_PORT=' + str(port) + '\n')
+            elif 'OPTIONS=' in line:
+                if chacha:
+                    n.write('OPTIONS="chacha persist"\n')
+                else:
+                    n.write('OPTIONS="persist"\n')
             else:
                 n.write(line)
     os.close(fd)
