@@ -429,7 +429,7 @@ def glorytun():
     os.close(fd)
     move(tmpfile,'/etc/glorytun-udp/tun0')
     os.system("systemctl -q restart glorytun-udp@tun0")
-    shorewall_port(port,str(port),'glorytun')
+    shorewall_port(str(port),'tcp','glorytun')
     return jsonify({'result': 'done'})
 
 # Set OpenVPN config
