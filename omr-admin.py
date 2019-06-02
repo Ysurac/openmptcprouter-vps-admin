@@ -12,6 +12,7 @@ import configparser
 import subprocess
 import os
 import re
+import hashlib
 from datetime import timedelta
 from tempfile import mkstemp
 from shutil import move
@@ -57,7 +58,12 @@ def ordered(obj):
     else:
         return obj
 
+def file_as_bytes(file):
+    with file:
+        return file.read()
+
 def shorewall_port(port,proto,name):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
@@ -66,7 +72,9 @@ def shorewall_port(port,proto,name):
         n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
-    os.system("systemctl -q reload shorewall")
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q reload shorewall")
 
 
 
@@ -346,6 +354,7 @@ def shorewall():
     state = params.get('redirect_ports', None)
     if state is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shorewall'})
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
@@ -361,7 +370,9 @@ def shorewall():
                 n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
-    os.system("systemctl -q reload shorewall")
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q reload shorewall")
     # Need to do the same for IPv6...
     return jsonify({'result': 'done','reason': 'changes applied'})
 
@@ -395,6 +406,7 @@ def glorytun():
     chacha = params.get('chacha', True)
     if not key or port is None:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'glorytun'})
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-tcp/tun0', 'rb'))).hexdigest()
     with open('/etc/glorytun-tcp/tun0.key','w') as outfile:
         outfile.write(key)
     with open('/etc/glorytun-udp/tun0.key','w') as outfile:
@@ -413,7 +425,10 @@ def glorytun():
                 n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/glorytun-tcp/tun0')
-    os.system("systemctl -q restart glorytun-tcp@tun0")
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-tcp/tun0', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q restart glorytun-tcp@tun0")
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun0', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/glorytun-udp/tun0','r') as f, open(tmpfile,'a+') as n:
         for line in f:
@@ -428,7 +443,9 @@ def glorytun():
                 n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/glorytun-udp/tun0')
-    os.system("systemctl -q restart glorytun-udp@tun0")
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun0', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q restart glorytun-udp@tun0")
     shorewall_port(str(port),'tcp','glorytun')
     return jsonify({'result': 'done'})
 
@@ -440,9 +457,12 @@ def openvpn():
     key = params.get('key', None)
     if not key:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'openvpn'})
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/server/static.key', 'rb'))).hexdigest()
     with open('/etc/openvpn/server/static.key','w') as outfile:
         outfile.write(base64.b64decode(key))
-    os.system("systemctl -q restart openvpn@tun0")
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/server/static.key', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q restart openvpn@tun0")
     return jsonify({'result': 'done'})
 
 # Update VPS
