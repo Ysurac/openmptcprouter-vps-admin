@@ -11,6 +11,7 @@ import uuid
 import configparser
 import subprocess
 import os
+import socket
 import re
 import hashlib
 from datetime import timedelta
@@ -112,10 +113,11 @@ def login():
 def status():
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
+    vps_hostname = socket.gethostname()
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
 
     if iface:
-        return jsonify({'vps': {'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}), 200
+        return jsonify({'vps': {'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}), 200
     else:
         return jsonify({'error': 'No iface defined','route': 'status'}), 200
 
