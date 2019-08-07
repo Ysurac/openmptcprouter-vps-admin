@@ -214,8 +214,8 @@ def config():
     else:
         dsvpn_key = ''
     dsvpn_port = '65011'
-    dsvpn_tcp_host_ip = '10.255.251.1'
-    dsvpn_tcp_client_ip = '10.255.251.2'
+    dsvpn_host_ip = '10.255.251.1'
+    dsvpn_client_ip = '10.255.251.2'
 
     if os.path.isfile('/etc/iperf3/public.pem'):
         with open('/etc/iperf3/public.pem',"rb") as iperfkey_file:
@@ -269,7 +269,7 @@ def config():
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
     ipv6_addr = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
-    ipv4_addr = os.popen("dig -4 TXT +times=3 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
+    ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
     if ipv4_addr == '':
         ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.co').read().rstrip()
     #ipv4_addr = ""
