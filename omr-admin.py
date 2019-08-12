@@ -77,6 +77,17 @@ def shorewall_port(port,proto,name):
     if not initial_md5 == final_md5:
         os.system("systemctl -q reload shorewall")
 
+def set_lastchange():
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}","}",content)
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        return jsonify({'error': 'Config file not readable','route': 'lastchange'}), 200
+    content.lastchange = time.time()
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as outfile:
+        json.dump(data,outfile,indent=4)
 
 
 # Provide a method to create access tokens. The create_jwt()
@@ -368,6 +379,7 @@ def shadowsocks():
             os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
         shorewall_port(str(port),'tcp','shadowsocks')
         shorewall_port(str(port),'udp','shadowsocks')
+        set_lastchange()
         return jsonify({'result': 'done','reason': 'changes applied','route': 'shadowsocks'})
     else:
         return jsonify({'result': 'done','reason': 'no changes','route': 'shadowsocks'})
@@ -419,6 +431,7 @@ def mptcp():
     os.system('sysctl -qw net.mptcp.mptcp_scheduler=' + scheduler)
     os.system('sysctl -qw net.mptcp.mptcp_syn_retries=' + syn_retries)
     os.system('sysctl -qw net.ipv4.tcp_congestion_control=' + congestion_control)
+    set_lastchange()
     return jsonify({'result': 'done','reason': 'changes applied'})
 
 # Set global VPN config
@@ -430,6 +443,7 @@ def vpn():
     if not vpn:
         return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'vpn'})
     os.system('echo ' + vpn + ' > /etc/openmptcprouter-vps-admin/current-vpn')
+    set_lastchange()
     return jsonify({'result': 'done','reason': 'changes applied'})
 
 
@@ -484,6 +498,7 @@ def glorytun():
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart glorytun-udp@tun0")
     shorewall_port(str(port),'tcp','glorytun')
+    set_lastchange()
     return jsonify({'result': 'done'})
 
 # Set A Dead Simple VPN config
@@ -502,6 +517,7 @@ def dsvpn():
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart dsvpn-server")
     shorewall_port(str(port),'tcp','dsvpn')
+    set_lastchange()
     return jsonify({'result': 'done'})
 
 # Set OpenVPN config
@@ -518,6 +534,7 @@ def openvpn():
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/server/static.key', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart openvpn@tun0")
+    set_lastchange()
     return jsonify({'result': 'done'})
 
 # Update VPS
