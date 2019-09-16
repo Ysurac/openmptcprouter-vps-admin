@@ -86,7 +86,7 @@ def set_lastchange():
         data = json.loads(content)
     except ValueError as e:
         return jsonify({'error': 'Config file not readable','route': 'lastchange'}), 200
-    content.lastchange = time.time()
+    data["lastchange"] = time.time()
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as outfile:
         json.dump(data,outfile,indent=4)
 
@@ -551,10 +551,10 @@ def wan():
         outfile.write('[white_list]\n')
         outfile.write(ips)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/local.acl', 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
-        os.system("systemctl restart shadowsocks-libev-server@config.service")
-        for x in range (1,os.cpu_count()):
-            os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
+    #if not initial_md5 == final_md5:
+        #os.system("systemctl restart shadowsocks-libev-server@config.service")
+        #for x in range (1,os.cpu_count()):
+            #os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
 
     return jsonify({'result': 'done'})
 
