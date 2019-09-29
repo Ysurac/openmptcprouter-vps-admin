@@ -64,14 +64,34 @@ def file_as_bytes(file):
     with file:
         return file.read()
 
-def shorewall_port(port,proto,name):
+def shorewall_add_port(port,proto,name,fwtype='ACCEPT'):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if not '# OMR open ' + name + ' port ' + proto in line:
+            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line:
                 n.write(line)
-        n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line:
+                n.write(line)
+        if fwtype == 'ACCEPT':
+            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
+        elif fwtype == 'DNAT':
+            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR redirect ' + name + ' port ' + proto + "\n")
+    os.close(fd)
+    move(tmpfile,'/etc/shorewall/rules')
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q reload shorewall")
+
+def shorewall_del_port(port,proto,name,fwtype='ACCEPT'):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
+    fd, tmpfile = mkstemp()
+    with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line:
+                n.write(line)
+            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line:
+                n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
@@ -378,8 +398,8 @@ def shadowsocks():
         os.system("systemctl restart shadowsocks-libev-server@config.service")
         for x in range (1,os.cpu_count()):
             os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
-        shorewall_port(str(port),'tcp','shadowsocks')
-        shorewall_port(str(port),'udp','shadowsocks')
+        shorewall_add_port(str(port),'tcp','shadowsocks')
+        shorewall_add_port(str(port),'udp','shadowsocks')
         set_lastchange()
         return jsonify({'result': 'done','reason': 'changes applied','route': 'shadowsocks'})
     else:
@@ -413,6 +433,46 @@ def shorewall():
     if not initial_md5 == final_md5:
         os.system("systemctl -q reload shorewall")
     # Need to do the same for IPv6...
+    return jsonify({'result': 'done','reason': 'changes applied'})
+
+@app.route('/shorewalllist', methods=['POST'])
+@jwt_required
+def shorewall_list():
+    params = request.get_json()
+    name = params.get('name', None)
+    if name is None:
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'})
+    fwlist = []
+    with open('/etc/shorewall/rules','r') as f:
+        for line in f:
+            if '# OMR ' + name in line:
+                fwlist.append(line)
+    return jsonify({'list': fwlist})
+
+@app.route('/shorewallopen', methods=['POST'])
+@jwt_required
+def shorewall_open():
+    params = request.get_json()
+    name = params.get('name', None)
+    port = params.get('port', None)
+    proto = params.get('proto', None)
+    fwtype = params.get('fwtype', None)
+    if name is None:
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'})
+    shorewall_add_port(str(port),proto,name,fwtype)
+    return jsonify({'result': 'done','reason': 'changes applied'})
+
+@app.route('/shorewallclose', methods=['POST'])
+@jwt_required
+def shorewall_close():
+    params = request.get_json()
+    name = params.get('name', None)
+    port = params.get('port', None)
+    proto = params.get('proto', None)
+    fwtype = params.get('fwtype', None)
+    if name is None:
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'})
+    shorewall_del_port(str(port),proto,name,fwtype)
     return jsonify({'result': 'done','reason': 'changes applied'})
 
 # Set MPTCP config
@@ -498,7 +558,7 @@ def glorytun():
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun0', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart glorytun-udp@tun0")
-    shorewall_port(str(port),'tcp','glorytun')
+    shorewall_add_port(str(port),'tcp','glorytun')
     set_lastchange()
     return jsonify({'result': 'done'})
 
@@ -517,7 +577,7 @@ def dsvpn():
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn.key', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart dsvpn-server")
-    shorewall_port(str(port),'tcp','dsvpn')
+    shorewall_add_port(str(port),'tcp','dsvpn')
     set_lastchange()
     return jsonify({'result': 'done'})
 
@@ -565,6 +625,27 @@ def update():
     os.system("wget -O - http://www.openmptcprouter.com/server/debian9-x86_64.sh | sh")
     # Need to reboot if kernel change
     return jsonify({'result': 'done'})
+
+# Backup
+@app.route('/backuppost', methods=['POST'])
+@jwt_required
+def backuppost():
+    params = request.get_json()
+    backup_file = params.get('data', None)
+    if not backup_file:
+        return jsonify({'result': 'error','reason': 'Invalid parameters','route': 'backuppost'})
+    with open('/var/opt/openmptcprouter/backup.tar.gz','wb') as f:
+        f.write(base64.b64decode(backup_file))
+    return jsonify({'result': 'done'})
+
+@app.route('/backup', methods=['GET'])
+@jwt_required
+def send_backup():
+    with open('/var/opt/openmptcprouter/backup.tar.gz',"rb") as backup_file:
+        file_base64 = base64.b64encode(backup_file.read())
+        file_base64utf = file_base64.decode('utf-8')
+    return jsonify({'data': file_base64utf})
+
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
