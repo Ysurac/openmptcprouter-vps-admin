@@ -19,6 +19,7 @@ from datetime import timedelta
 from tempfile import mkstemp
 from shutil import move
 from pprint import pprint
+from netjsonconfig import OpenWrt
 from flask import Flask, jsonify, request, session
 from flask_jwt_simple import (
     JWTManager, jwt_required, create_jwt, get_jwt_identity
@@ -638,13 +639,39 @@ def backuppost():
         f.write(base64.b64decode(backup_file))
     return jsonify({'result': 'done'})
 
-@app.route('/backup', methods=['GET'])
+@app.route('/backupget', methods=['GET'])
 @jwt_required
 def send_backup():
     with open('/var/opt/openmptcprouter/backup.tar.gz',"rb") as backup_file:
         file_base64 = base64.b64encode(backup_file.read())
         file_base64utf = file_base64.decode('utf-8')
     return jsonify({'data': file_base64utf})
+
+@app.route('/backuplist', methods=['GET'])
+@jwt_required
+def list_backup():
+    if os.path.isfile('/var/opt/openmptcprouter/backup.tar.gz'):
+        modiftime = os.path.getmtime('/var/opt/openmptcprouter/backup.tar.gz')
+        return jsonify({'backup': True, 'modif': modiftime})
+    else:
+        return jsonify({'backup': False})
+
+@app.route('/backupshow', methods=['GET'])
+@jwt_required
+def show_backup():
+    if os.path.isfile('/var/opt/openmptcprouter/backup.tar.gz'):
+        router = OpenWrt(native=open('/var/opt/openmptcprouter/backup.tar.gz'))
+        return jsonify({'backup': True,'data': router})
+    else:
+        return jsonify({'backup': False})
+
+@app.route('/backupedit', methods=['POST'])
+@jwt_required
+def edit_backup():
+    params = request.get_data()
+    o = OpenWrt(params)
+    o.write('backup',path='/var/opt/openmptcprouter/'):
+    return jsonify({'result': 'done'})
 
 
 if __name__ == '__main__':
