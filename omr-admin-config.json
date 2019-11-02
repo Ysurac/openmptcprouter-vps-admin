@@ -1,5 +1,12 @@
 {
-    "user":"openmptcprouter",
-    "pass":"MySecretKey",
-    "port":65500
+    "port": 65500,
+    "users": [
+        {
+            "openmptcprouter": {
+                "username": "openmptcprouter",
+                "hashed_password": "MySecretKey",
+                "disabled": false
+            }
+        }
+    ]
 }
