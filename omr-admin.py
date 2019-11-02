@@ -438,8 +438,21 @@ def config(current_user: User = Depends(get_current_user)):
     return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole}}
 
 # Set shadowsocks config
+class ShadowsocksConfigparams(BaseModel):
+    port: int
+    method: str
+    fast_open: str
+    reuse_port: bool
+    no_delay: bool
+    mptcp: bool
+    obfs: bool
+    obfs_plugin: bool
+    obfs_type: str
+    ebpf: bool
+    key: str
+
 @app.get('/shadowsocks')
-def shadowsocks(current_user: User = Depends(get_current_user)):
+def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(get_current_user)):
     with open('/etc/shadowsocks-libev/config.json') as f:
         content = f.read()
     content = re.sub(",\s*}","}",content)
@@ -455,18 +468,17 @@ def shadowsocks(current_user: User = Depends(get_current_user)):
     else:
         verbose = 0
     prefer_ipv6 = data["prefer_ipv6"]
-    params = request.get_json()
-    port = params.get('port', None)
-    method = params.get('method', None)
-    fast_open = params.get('fast_open', None)
-    reuse_port = params.get('reuse_port', None)
-    no_delay = params.get('no_delay', None)
-    mptcp = params.get('mptcp', None)
-    obfs = params.get('obfs', False)
-    obfs_plugin = params.get('obfs_plugin', False)
-    obfs_type = params.get('obfs_type', None)
-    ebpf = params.get('ebpf', False)
-    key = params.get('key', None)
+    port = params.port
+    method = params.method
+    fast_open = params.fast_open
+    reuse_port = params.reuse_port
+    no_delay = params.no_delay
+    mptcp = params.mptcp
+    obfs = params.obfs
+    obfs_plugin = params.obfs_plugin
+    obfs_type = params.obfs_type
+    ebpf = params.ebpf
+    key = params.key
     if not key:
         if 'key' in data:
             key = data["key"]
@@ -509,10 +521,12 @@ def shadowsocks(current_user: User = Depends(get_current_user)):
         return {'result': 'done','reason': 'no changes','route': 'shadowsocks'}
 
 # Set shorewall config
+class ShorewallAllparams(BaseModel):
+    redirect_ports: str
+
 @app.post('/shorewall')
-def shorewall(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    state = params.get('redirect_ports', None)
+def shorewall(*, params: ShorewallAllparams,current_user: User = Depends(get_current_user)):
+    state = params.redirect_ports
     if state is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewall'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
@@ -537,10 +551,12 @@ def shorewall(current_user: User = Depends(get_current_user)):
     # Need to do the same for IPv6...
     return {'result': 'done','reason': 'changes applied'}
 
+class ShorewallListparams(BaseModel):
+    name: str
+
 @app.post('/shorewalllist')
-def shorewall_list(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    name = params.get('name', None)
+def shorewall_list(*,params: ShorewallListparams, current_user: User = Depends(get_current_user)):
+    name = params.name
     if name is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'}
     fwlist = []
@@ -550,39 +566,49 @@ def shorewall_list(current_user: User = Depends(get_current_user)):
                 fwlist.append(line)
     return {'list': fwlist}
 
+class Shorewallparams(BaseModel):
+    name: str
+    port: int
+    proto: str
+    fwtype: str
+
 @app.post('/shorewallopen')
-def shorewall_open(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    name = params.get('name', None)
-    port = params.get('port', None)
-    proto = params.get('proto', None)
-    fwtype = params.get('fwtype', None)
+def shorewall_open(*,params: Shorewallparams, current_user: User = Depends(get_current_user)):
+    name = params.name
+    port = params.port
+    proto = params.proto
+    fwtype = params.fwtype
     if name is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'}
     shorewall_add_port(str(port),proto,name,fwtype)
     return {'result': 'done','reason': 'changes applied'}
 
 @app.post('/shorewallclose')
-def shorewall_close(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    name = params.get('name', None)
-    port = params.get('port', None)
-    proto = params.get('proto', None)
-    fwtype = params.get('fwtype', None)
+def shorewall_close(*,params: Shorewallparams,current_user: User = Depends(get_current_user)):
+    name = params.name
+    port = params.port
+    proto = params.proto
+    fwtype = params.fwtype
     if name is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'}
     shorewall_del_port(str(port),proto,name,fwtype)
     return {'result': 'done','reason': 'changes applied'}
 
 # Set MPTCP config
+class MPTCPparams(BaseModel):
+    checksum: str
+    path_manager: str
+    scheduler: str
+    syn_retries: int
+    congestion_control: str
+
 @app.post('/mptcp')
-def mptcp(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    checksum = params.get('checksum', None)
-    path_manager = params.get('path_manager', None)
-    scheduler = params.get('scheduler', None)
-    syn_retries = params.get('syn_retries', None)
-    congestion_control = params.get('congestion_control', None)
+def mptcp(*, params: MPTCPparams,current_user: User = Depends(get_current_user)):
+    checksum = params.checksum
+    path_manager = params.path_manager
+    scheduler = params.scheduler
+    syn_retries = params.syn_retries
+    congestion_control = params.congestion_control
     if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
         return {'result': 'error','reason': 'Invalid parameters','route': 'mptcp'}
     os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
@@ -600,7 +626,6 @@ class Vpn(BaseModel):
 @app.post('/vpn')
 def vpn(*,vpnconfig: Vpn,current_user: User = Depends(get_current_user)):
     vpn = vpnconfig.vpn
-    log.debug("VPN !")
     if not vpn:
         return {'result': 'error','reason': 'Invalid parameters','route': 'vpn'}
     os.system('echo ' + vpn + ' > /etc/openmptcprouter-vps-admin/current-vpn')
@@ -664,11 +689,14 @@ def glorytun(*, glorytunconfig: GlorytunConfig,current_user: User = Depends(get_
     return {'result': 'done'}
 
 # Set A Dead Simple VPN config
+class DSVPN(BaseModel):
+    key: str
+    port: int
+
 @app.post('/dsvpn')
-def dsvpn(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    key = params.get('key', None)
-    port = params.get('port', None)
+def dsvpn(*,params: DSVPN,current_user: User = Depends(get_current_user)):
+    key = params.key
+    port = params.port
     if not key or port is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'dsvpn'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn.key', 'rb'))).hexdigest()
@@ -682,10 +710,12 @@ def dsvpn(current_user: User = Depends(get_current_user)):
     return {'result': 'done'}
 
 # Set OpenVPN config
+class OpenVPN(BaseModel):
+    key: str
+
 @app.post('/openvpn')
-def openvpn(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    key = params.get('key', None)
+def openvpn(*,ovpn: OpenVPN,current_user: User = Depends(get_current_user)):
+    key = ovpn.key
     if not key:
         return {'result': 'error','reason': 'Invalid parameters','route': 'openvpn'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/server/static.key', 'rb'))).hexdigest()
@@ -726,10 +756,12 @@ def update(current_user: User = Depends(get_current_user)):
     return {'result': 'done'}
 
 # Backup
+class Backupfile(BaseModel):
+    data: str
+
 @app.post('/backuppost')
-def backuppost(current_user: User = Depends(get_current_user)):
-    params = request.get_json()
-    backup_file = params.get('data', None)
+def backuppost(*,backupfile: Backupfile ,current_user: User = Depends(get_current_user)):
+    backup_file = backupfile.data
     if not backup_file:
         return {'result': 'error','reason': 'Invalid parameters','route': 'backuppost'}
     with open('/var/opt/openmptcprouter/backup.tar.gz','wb') as f:
@@ -760,8 +792,7 @@ def show_backup(current_user: User = Depends(get_current_user)):
         return {'backup': False}
 
 @app.post('/backupedit')
-def edit_backup(current_user: User = Depends(get_current_user)):
-    params = request.get_data()
+def edit_backup(params,current_user: User = Depends(get_current_user)):
     o = OpenWrt(params)
     o.write('backup',path='/var/opt/openmptcprouter/')
     return {'result': 'done'}
