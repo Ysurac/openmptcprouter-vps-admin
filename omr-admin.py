@@ -453,7 +453,7 @@ class ShadowsocksConfigparams(BaseModel):
     ebpf: bool
     key: str
 
-@app.get('/shadowsocks')
+@app.post('/shadowsocks')
 def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(get_current_user)):
     with open('/etc/shadowsocks-libev/config.json') as f:
         content = f.read()
