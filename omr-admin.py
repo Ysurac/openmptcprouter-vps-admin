@@ -45,7 +45,7 @@ log.setLevel(logging.DEBUG)
 SECRET_KEY = uuid.uuid4().hex
 JWT_SECRET_KEY = uuid.uuid4().hex
 PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
 
 # Get main net interface
@@ -127,7 +127,6 @@ fake_users_db = omr_config_data['users'][0]
 
 def verify_password(plain_password, hashed_password):
     #return pwd_context.verify(plain_password, hashed_password)
-    log.debug("plain_password: " + plain_password + " - hashed_password: " + hashed_password)
     if plain_password == hashed_password:
         log.debug("password true")
         return True
@@ -164,7 +163,7 @@ class TokenData(BaseModel):
 class User(BaseModel):
     username: str
 #    email: str = None
-#    full_name: str = None
+    shadowsocks_port: int = None
     disabled: bool = None
 
 
@@ -229,14 +228,15 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
 # Get VPS status
 @app.get('/status')
-def status():
+def status(current_user: User = Depends(get_current_user)):
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_hostname = socket.gethostname()
+    vps_current_time = time.time()
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
 
     if iface:
-        return {'vps': {'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}
+        return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}
     else:
         return {'error': 'No iface defined','route': 'status'}
 
@@ -347,13 +347,14 @@ def config(current_user: User = Depends(get_current_user)):
     else:
         pihole = False
 
-    if os.path.isfile('/etc/openvpn/server/static.key'):
-        with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
-            openvpn_keyb = base64.b64encode(ovpnkey_file.read())
-            openvpn_key = openvpn_keyb.decode('utf-8')
-        available_vpn.append("openvpn")
-    else:
-        openvpn_key = ''
+    #if os.path.isfile('/etc/openvpn/server/static.key'):
+    #    with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
+    #        openvpn_keyb = base64.b64encode(ovpnkey_file.read())
+    #        openvpn_key = openvpn_keyb.decode('utf-8')
+    #    available_vpn.append("openvpn")
+    #else:
+    #    openvpn_key = ''
+    openvpn_key = ''
     if os.path.isfile('/etc/openvpn/client/client.key'):
         with open('/etc/openvpn/client/client.key',"rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
@@ -364,6 +365,7 @@ def config(current_user: User = Depends(get_current_user)):
         with open('/etc/openvpn/client/client.crt',"rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
             openvpn_client_crt = openvpn_keyb.decode('utf-8')
+        available_vpn.append("openvpn")
     else:
         openvpn_client_crt = ''
     if os.path.isfile('/etc/openvpn/server/ca.crt'):
@@ -379,12 +381,12 @@ def config(current_user: User = Depends(get_current_user)):
                 if 'port ' in line:
                     openvpn_port = line.replace(line[:5], '').rstrip()
     openvpn_host_ip = '10.255.252.1'
-    openvpn_client_ip = '10.255.252.2'
-    #openvpn_client_ip = 'dhcp'
+    #openvpn_client_ip = '10.255.252.2'
+    openvpn_client_ip = 'dhcp'
 
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
-        mlvpn_config.readfp(open(r'/etc/mlvpn/mlvpn0.conf'))
+        mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
         mlvpn_key = mlvpn_config.get('general','password').strip('"')
         available_vpn.append("mlvpn")
     else:
