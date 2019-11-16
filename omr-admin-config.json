@@ -4,7 +4,8 @@
         {
             "openmptcprouter": {
                 "username": "openmptcprouter",
-                "hashed_password": "MySecretKey",
+                "user_password": "MySecretKey",
+                "shadowsocks_port": 65101,
                 "disabled": false
             }
         }
