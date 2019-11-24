@@ -444,14 +444,13 @@ def config(current_user: User = Depends(get_current_user)):
 class ShadowsocksConfigparams(BaseModel):
     port: int
     method: str
-    fast_open: str
+    fast_open: bool
     reuse_port: bool
     no_delay: bool
     mptcp: bool
     obfs: bool
-    obfs_plugin: bool
+    obfs_plugin: str
     obfs_type: str
-    ebpf: bool
     key: str
 
 #@app.post('/shadowsocks')
@@ -547,6 +546,7 @@ def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(g
     obfs = params.obfs
     obfs_plugin = params.obfs_plugin
     obfs_type = params.obfs_type
+    ebpf = 0
     key = params.key
     portkey = data["port_key"]
     portkey[str(port)] = key
@@ -556,8 +556,8 @@ def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(g
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'}
     if obfs:
-        if obfs_plugin == 'v2ray':
-            if obfs_type == 'tls':
+        if obfs_plugin == "v2ray":
+            if obfs_type == "tls":
                 if vps_domain == '':
                     shadowsocks_config = {'server': '::0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
                 else:
