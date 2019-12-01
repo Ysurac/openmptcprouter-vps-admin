@@ -26,7 +26,6 @@ from pprint import pprint
 from netjsonconfig import OpenWrt
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes
-from jwt import PyJWTError
 from passlib.context import CryptContext
 from pydantic import BaseModel, ValidationError
 from starlette.status import HTTP_401_UNAUTHORIZED
