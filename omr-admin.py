@@ -521,6 +521,7 @@ class ShadowsocksConfigparams(BaseModel):
 
 @app.post('/shadowsocks')
 def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(get_current_user)):
+    ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
     content = re.sub(",\s*}","}",content)
@@ -554,25 +555,46 @@ def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(g
 
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'}
-    if obfs:
-        if obfs_plugin == "v2ray":
-            if obfs_type == "tls":
-                if vps_domain == '':
-                    shadowsocks_config = {'server': '::0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
+    if ipv6_network == '':
+        if obfs:
+            if obfs_plugin == "v2ray":
+                if obfs_type == "tls":
+                    if vps_domain == '':
+                        shadowsocks_config = {'server': '0.0.0.0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
+                    else:
+                        shadowsocks_config = {'server': '0.0.0.0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls;host=' + vps_domain}
                 else:
-                    shadowsocks_config = {'server': '::0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls;host=' + vps_domain}
+                    shadowsocks_config = {'server': '0.0.0.0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server'}
             else:
-                shadowsocks_config = {'server': '::0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server'}
+                if obfs_type == 'tls':
+                    if vps_domain == '':
+                        shadowsocks_config = {'server': '0.0.0.0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                    else:
+                        shadowsocks_config = {'server': '0.0.0.0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
+                else:
+                    shadowsocks_config = {'server': '0.0.0.0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
         else:
-            if obfs_type == 'tls':
-                if vps_domain == '':
-                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
-                else:
-                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
-            else:
-                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+            shadowsocks_config = {'server': '0.0.0.0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl'}
     else:
-        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl'}
+        if obfs:
+            if obfs_plugin == "v2ray":
+                if obfs_type == "tls":
+                    if vps_domain == '':
+                        shadowsocks_config = {'server': '::0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
+                    else:
+                        shadowsocks_config = {'server': '::0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls;host=' + vps_domain}
+                else:
+                    shadowsocks_config = {'server': '::0','port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server'}
+            else:
+                if obfs_type == 'tls':
+                    if vps_domain == '':
+                        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                    else:
+                        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
+                else:
+                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+        else:
+            shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'port_key': portkey,'local_port': 1081,'mode': 'tcp_and_udp','timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl'}
 
     if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
         with open('/etc/shadowsocks-libev/manager.json','w') as outfile:
@@ -635,7 +657,7 @@ def shorewall_list(*,params: ShorewallListparams, current_user: User = Depends(g
 
 class Shorewallparams(BaseModel):
     name: str
-    port: int
+    port: str
     proto: str
     fwtype: str
 
