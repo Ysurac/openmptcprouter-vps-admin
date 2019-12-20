@@ -17,6 +17,7 @@ import hashlib
 import time
 import uvicorn
 import jwt
+from jwt import PyJWTError
 from pprint import pprint
 from datetime import datetime,timedelta
 from tempfile import mkstemp
