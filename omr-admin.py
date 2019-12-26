@@ -30,16 +30,11 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, Se
 from passlib.context import CryptContext
 from pydantic import BaseModel, ValidationError
 from starlette.status import HTTP_401_UNAUTHORIZED
-#from flask import Flask, jsonify, request, session
-#from flask_jwt_simple import (
-#    JWTManager, jwt_required, create_jwt, get_jwt_identity
-#)
-
 
 import logging
 log = logging.getLogger('api')
-#log.setLevel(logging.ERROR)
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.ERROR)
+#log.setLevel(logging.DEBUG)
 
 # Generate a random secret key
 SECRET_KEY = uuid.uuid4().hex
@@ -61,6 +56,22 @@ def get_bytes(t, iface='eth0'):
     with open('/sys/class/net/' + iface + '/statistics/' + t + '_bytes', 'r') as f:
         data = f.read();
     return int(data)
+
+def get_bytes_ss(port):
+    ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
+    ss_socket.sendto('ping'.encode(), ("127.0.0.1",8839));
+    ss_recv = ss_socket.recv(1024);
+    json_txt = ss_recv.decode("utf-8").replace('stat: ','');
+    result = json.loads(json_txt);
+    return result[str(port)]
+
+def add_ss_user(port,key):
+    ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
+    ss_socket.sendto('add: {"server_port": ' + port + ',"key": "' + key + '"}'.encode(), ("127.0.0.1",8839));
+
+def remove_ss_user(port,key):
+    ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
+    ss_socket.sendto('remove: {"server_port": ' + port + '}'.encode(), ("127.0.0.1",8839));
 
 def ordered(obj):
     if isinstance(obj, dict):
@@ -108,7 +119,7 @@ def shorewall_del_port(port,proto,name,fwtype='ACCEPT'):
     if not initial_md5 == final_md5:
         os.system("systemctl -q reload shorewall")
 
-def set_lastchange():
+def set_lastchange(sync = 0):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
     content = re.sub(",\s*}","}",content)
@@ -116,9 +127,16 @@ def set_lastchange():
         data = json.loads(content)
     except ValueError as e:
         return jsonify({'error': 'Config file not readable','route': 'lastchange'}), 200
-    data["lastchange"] = time.time()
+    data["lastchange"] = time.time() + sync
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as outfile:
         json.dump(data,outfile,indent=4)
+
+def modif_config_user(user,changes):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = json.load(f)
+    content['users'][0][user.username].update(changes)
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as f:
+        json.dump(content,f)
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
     omr_config_data = json.load(f)
@@ -126,16 +144,13 @@ with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
 fake_users_db = omr_config_data['users'][0]
 
 def verify_password(plain_password, user_password):
-    #return pwd_context.verify(plain_password, user_password)
     if plain_password == user_password:
         log.debug("password true")
         return True
     return False
 
 def get_password_hash(password):
-    #return pwd_context.hash(password)
     return password
-
 
 def get_user(db, username: str):
     if username in db:
@@ -162,7 +177,10 @@ class TokenData(BaseModel):
 
 class User(BaseModel):
     username: str
-#    email: str = None
+    vpn: str = None
+    vpn_port: int = None
+    vpn_client_ip: str = None
+    permissions: str = None
     shadowsocks_port: int = None
     disabled: bool = None
 
@@ -225,7 +243,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-
 # Get VPS status
 @app.get('/status')
 def status(current_user: User = Depends(get_current_user)):
@@ -233,10 +250,12 @@ def status(current_user: User = Depends(get_current_user)):
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_hostname = socket.gethostname()
     vps_current_time = time.time()
+    vps_kernel = os.popen('uname -r').read().rstrip()
+    vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
 
     if iface:
-        return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}}
+        return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname,'kernel': vps_kernel, 'vps_omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}, 'shadowsocks': {'traffic': get_bytes_ss(current_user.shadowsocks_port)}}
     else:
         return {'error': 'No iface defined','route': 'status'}
 
@@ -453,75 +472,11 @@ class ShadowsocksConfigparams(BaseModel):
     obfs_type: str
     key: str
 
-#@app.post('/shadowsocks')
-#def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(get_current_user)):
-#    with open('/etc/shadowsocks-libev/config.json') as f:
-#        content = f.read()
-#    content = re.sub(",\s*}","}",content)
-#    try:
-#        data = json.loads(content)
-#    except ValueError as e:
-#        data = {'timeout': 600, 'verbose': 0, 'prefer_ipv6': False}
-#    if 'timeout' in data:
-#        timeout = data["timeout"]
-#    if 'verbose' in data:
-#        verbose = data["verbose"]
-#    else:
-#        verbose = 0
-#    prefer_ipv6 = data["prefer_ipv6"]
-#    port = params.port
-#    method = params.method
-#    fast_open = params.fast_open
-#    reuse_port = params.reuse_port
-#    no_delay = params.no_delay
-#    mptcp = params.mptcp
-#    obfs = params.obfs
-#    obfs_plugin = params.obfs_plugin
-#    obfs_type = params.obfs_type
-#    ebpf = params.ebpf
-#    key = params.key
-#    if not key:
-#        if 'key' in data:
-#            key = data["key"]
-#    vps_domain = os.popen('wget -4 -qO- -T 2 http://hostname.openmptcprouter.com').read().rstrip()
-#
-#    if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
-#        return {'result': 'error','reason': 'Invalid parameters','route': 'shadowsocks'}
-#    if obfs:
-#        if obfs_plugin == 'v2ray':
-#            if obfs_type == 'tls':
-#                if vps_domain == '':
-#                    shadowsocks_config = {'server': '::0','server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls'}
-#                else:
-#                    shadowsocks_config = {'server': '::0','server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server;tls;host=' + vps_domain}
-#            else:
-#                shadowsocks_config = {'server': '::0','server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin','plugin_opts': 'server'}
-#        else:
-#            if obfs_type == 'tls':
-#                if vps_domain == '':
-#                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
-#                else:
-#                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
-#            else:
-#                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server','plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
-#    else:
-#        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'),'server_port': port,'local_port': 1081,'mode': 'tcp_and_udp','key': key,'timeout': timeout,'method': method,'verbose': verbose,'ipv6_first': True, 'prefer_ipv6': prefer_ipv6,'fast_open': fast_open,'no_delay': no_delay,'reuse_port': reuse_port,'mptcp': mptcp,'ebpf': ebpf,'acl': '/etc/shadowsocks-libev/local.acl'}
-#
-#    if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
-#        with open('/etc/shadowsocks-libev/config.json','w') as outfile:
-#            json.dump(shadowsocks_config,outfile,indent=4)
-#        os.system("systemctl restart shadowsocks-libev-server@config.service")
-#        for x in range (1,os.cpu_count()):
-#            os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
-#        shorewall_add_port(str(port),'tcp','shadowsocks')
-#        shorewall_add_port(str(port),'udp','shadowsocks')
-#        set_lastchange()
-#        return {'result': 'done','reason': 'changes applied','route': 'shadowsocks'}
-#    else:
-#        return {'result': 'done','reason': 'no changes','route': 'shadowsocks'}
-
 @app.post('/shadowsocks')
 def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
@@ -550,6 +505,7 @@ def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(g
     ebpf = 0
     key = params.key
     portkey = data["port_key"]
+    modif_config_user(current_user,{'shadowsocks_port': port})
     portkey[str(port)] = key
     #ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
     vps_domain = os.popen('wget -4 -qO- -T 2 http://hostname.openmptcprouter.com').read().rstrip()
@@ -616,6 +572,8 @@ class ShorewallAllparams(BaseModel):
 
 @app.post('/shorewall')
 def shorewall(*, params: ShorewallAllparams,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     state = params.redirect_ports
     if state is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewall'}
@@ -664,6 +622,8 @@ class Shorewallparams(BaseModel):
 
 @app.post('/shorewallopen')
 def shorewall_open(*,params: Shorewallparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     name = params.name
     port = params.port
     proto = params.proto
@@ -675,6 +635,8 @@ def shorewall_open(*,params: Shorewallparams, current_user: User = Depends(get_c
 
 @app.post('/shorewallclose')
 def shorewall_close(*,params: Shorewallparams,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     name = params.name
     port = params.port
     proto = params.proto
@@ -694,6 +656,9 @@ class MPTCPparams(BaseModel):
 
 @app.post('/mptcp')
 def mptcp(*, params: MPTCPparams,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     checksum = params.checksum
     path_manager = params.path_manager
     scheduler = params.scheduler
@@ -715,10 +680,15 @@ class Vpn(BaseModel):
 # Set global VPN config
 @app.post('/vpn')
 def vpn(*,vpnconfig: Vpn,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     vpn = vpnconfig.vpn
     if not vpn:
         return {'result': 'error','reason': 'Invalid parameters','route': 'vpn'}
     os.system('echo ' + vpn + ' > /etc/openmptcprouter-vps-admin/current-vpn')
+    modif_config_user(current_user,{'vpn': vpn})
+    current_user.vpn = vpn
     set_lastchange()
     return {'result': 'done','reason': 'changes applied'}
 
@@ -731,6 +701,9 @@ class GlorytunConfig(BaseModel):
 # Set Glorytun config
 @app.post('/glorytun')
 def glorytun(*, glorytunconfig: GlorytunConfig,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     key = glorytunconfig.key
     port = glorytunconfig.port
     chacha = glorytunconfig.chacha
@@ -785,6 +758,9 @@ class DSVPN(BaseModel):
 
 @app.post('/dsvpn')
 def dsvpn(*,params: DSVPN,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     key = params.key
     port = params.port
     if not key or port is None:
@@ -805,6 +781,9 @@ class OpenVPN(BaseModel):
 
 @app.post('/openvpn')
 def openvpn(*,ovpn: OpenVPN,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     key = ovpn.key
     if not key:
         return {'result': 'error','reason': 'Invalid parameters','route': 'openvpn'}
@@ -841,6 +820,8 @@ def wan(*, wanips: Wanips,current_user: User = Depends(get_current_user)):
 # Update VPS
 @app.get('/update')
 def update(current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     os.system("wget -O - http://www.openmptcprouter.com/server/debian9-x86_64.sh | sh")
     # Need to reboot if kernel change
     return {'result': 'done'}
@@ -851,41 +832,62 @@ class Backupfile(BaseModel):
 
 @app.post('/backuppost')
 def backuppost(*,backupfile: Backupfile ,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     backup_file = backupfile.data
     if not backup_file:
         return {'result': 'error','reason': 'Invalid parameters','route': 'backuppost'}
-    with open('/var/opt/openmptcprouter/backup.tar.gz','wb') as f:
+    with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz','wb') as f:
         f.write(base64.b64decode(backup_file))
     return {'result': 'done'}
 
 @app.get('/backupget')
 def send_backup(current_user: User = Depends(get_current_user)):
-    with open('/var/opt/openmptcprouter/backup.tar.gz',"rb") as backup_file:
+    with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz',"rb") as backup_file:
         file_base64 = base64.b64encode(backup_file.read())
         file_base64utf = file_base64.decode('utf-8')
     return {'data': file_base64utf}
 
 @app.get('/backuplist')
 def list_backup(current_user: User = Depends(get_current_user)):
-    if os.path.isfile('/var/opt/openmptcprouter/backup.tar.gz'):
-        modiftime = os.path.getmtime('/var/opt/openmptcprouter/backup.tar.gz')
+    if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
+        modiftime = os.path.getmtime('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz')
         return {'backup': True, 'modif': modiftime}
     else:
         return {'backup': False}
 
 @app.get('/backupshow')
 def show_backup(current_user: User = Depends(get_current_user)):
-    if os.path.isfile('/var/opt/openmptcprouter/backup.tar.gz'):
-        router = OpenWrt(native=open('/var/opt/openmptcprouter/backup.tar.gz'))
+    if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
+        router = OpenWrt(native=open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'))
         return {'backup': True,'data': router}
     else:
         return {'backup': False}
 
 @app.post('/backupedit')
 def edit_backup(params,current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     o = OpenWrt(params)
-    o.write('backup',path='/var/opt/openmptcprouter/')
+    o.write(current_user.username + '-backup',path='/var/opt/openmptcprouter/')
     return {'result': 'done'}
+
+
+class NewUser(BaseModel):
+    username: str
+    permission: str
+
+
+@app.post('/add_user')
+def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission','reason': 'Need admin user','route': 'shadowsocks'}
+    user_json = json.loads('"'+ params.username + '": {"username":"'+ params.username +'","permission":"'+params.permission+'","disabled":"false"}')
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = json.load(f)
+    content['users'][0].update(changes)
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as f:
+        json.dump(content,f)
 
 
 if __name__ == '__main__':
@@ -894,5 +896,6 @@ if __name__ == '__main__':
     omrport=65500
     if 'port' in omr_config_data:
         omrport = omr_config_data["port"]
-    uvicorn.run(app,host='0.0.0.0',port=omrport,log_level='debug',ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
+#    uvicorn.run(app,host='0.0.0.0',port=omrport,log_level='debug',ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
+    uvicorn.run(app,host='0.0.0.0',port=omrport,log_level='error',ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
 #    uvicorn.run(app,host='0.0.0.0',port=omrport,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'),threaded=True)
