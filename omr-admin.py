@@ -7,6 +7,7 @@
 
 import json
 import base64
+import secrets
 import uuid
 import configparser
 import subprocess
@@ -67,11 +68,28 @@ def get_bytes_ss(port):
 
 def add_ss_user(port,key):
     ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
-    ss_socket.sendto('add: {"server_port": ' + port + ',"key": "' + key + '"}'.encode(), ("127.0.0.1",8839));
+    data = 'add: {"server_port": ' + port + ',"key": "' + key + '"}'
+    ss_socket.sendto(data.encode(), ("127.0.0.1",8839));
+    with open('/etc/shadowsocks-libev/manager.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}","}",content)
+    data = json.loads(content)
+    data['port_key'][port] = key
+    with open('/etc/shadowsocks-libev/manager.json','w') as f:
+        json.dump(data,f, indent=4)
 
-def remove_ss_user(port,key):
+
+def remove_ss_user(port):
     ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
-    ss_socket.sendto('remove: {"server_port": ' + port + '}'.encode(), ("127.0.0.1",8839));
+    data = 'remove: {"server_port": ' + port + '}'
+    ss_socket.sendto(data.encode(), ("127.0.0.1",8839));
+    with open('/etc/shadowsocks-libev/manager.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}","}",content)
+    data = json.loads(content)
+    del data['port_key'][port]
+    with open('/etc/shadowsocks-libev/manager.json','w') as f:
+        json.dump(data,f, indent=4)
 
 def ordered(obj):
     if isinstance(obj, dict):
@@ -253,9 +271,14 @@ def status(current_user: User = Depends(get_current_user)):
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
+    shadowsocks_port = current_user.shadowsocks_port
+    if not shadowsocks_port == None:
+        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    else:
+        ss_traffic = 0
 
     if iface:
-        return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname,'kernel': vps_kernel, 'vps_omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}, 'shadowsocks': {'traffic': get_bytes_ss(current_user.shadowsocks_port)}}
+        return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname,'kernel': vps_kernel, 'vps_omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}, 'shadowsocks': {'traffic': ss_traffic}}
     else:
         return {'error': 'No iface defined','route': 'status'}
 
@@ -276,7 +299,10 @@ def config(current_user: User = Depends(get_current_user)):
         data = {'key': '', 'server_port': 65101, 'method': 'chacha20'}
     #shadowsocks_port = data["server_port"]
     shadowsocks_port = current_user.shadowsocks_port
-    shadowsocks_key = data["port_key"][str(shadowsocks_port)]
+    if not shadowsocks_port == None:
+        shadowsocks_key = data["port_key"][str(shadowsocks_port)]
+    else:
+        shadowsocks_key = ''
     shadowsocks_method = data["method"]
     if 'fast_open' in data:
         shadowsocks_fast_open = data["fast_open"]
@@ -375,21 +401,21 @@ def config(current_user: User = Depends(get_current_user)):
     #else:
     #    openvpn_key = ''
     openvpn_key = ''
-    if os.path.isfile('/etc/openvpn/client/client.key'):
-        with open('/etc/openvpn/client/client.key',"rb") as ovpnkey_file:
+    if os.path.isfile('/etc/openvpn/ca/pki/private/' + current_user.username + '.key'):
+        with open('/etc/openvpn/ca/pki/private/' + current_user.username + '.key',"rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
             openvpn_client_key = openvpn_keyb.decode('utf-8')
     else:
         openvpn_client_key = ''
-    if os.path.isfile('/etc/openvpn/client/client.crt'):
-        with open('/etc/openvpn/client/client.crt',"rb") as ovpnkey_file:
+    if os.path.isfile('/etc/openvpn/ca/issued/' + current_user.username + '.crt'):
+        with open('/etc/openvpn/ca/issued/' + current_user.username + '.crt',"rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
             openvpn_client_crt = openvpn_keyb.decode('utf-8')
         available_vpn.append("openvpn")
     else:
         openvpn_client_crt = ''
-    if os.path.isfile('/etc/openvpn/server/ca.crt'):
-        with open('/etc/openvpn/server/ca.crt',"rb") as ovpnkey_file:
+    if os.path.isfile('/etc/openvpn/ca/pki/ca.crt'):
+        with open('/etc/openvpn/ca/pki/ca.crt',"rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
             openvpn_client_ca = openvpn_keyb.decode('utf-8')
     else:
@@ -875,20 +901,53 @@ def edit_backup(params,current_user: User = Depends(get_current_user)):
 
 class NewUser(BaseModel):
     username: str
-    permission: str
-
+    permission: str = None
+    shadowsocks_port: int = None
+    vpn: str = None
 
 @app.post('/add_user')
 def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission','reason': 'Need admin user','route': 'shadowsocks'}
-    user_json = json.loads('"'+ params.username + '": {"username":"'+ params.username +'","permission":"'+params.permission+'","disabled":"false"}')
+    user_key = secrets.token_hex(32)
+    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permission":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false"}}')
+    if params.shadowsocks_port is not None:
+        shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
+        add_ss_user(str(params.shadowsocks_port),shadowsocks_key.decode('utf-8'))
+        user_json[params.username].update({"shadowsocks_port": params.shadowsocks_port})
+    if params.vpn is not None:
+        user_json[params.username].update({"vpn": params.vpn})
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
-    content['users'][0].update(changes)
+    content['users'][0].update(user_json)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as f:
-        json.dump(content,f)
+        json.dump(content,f,indent=4)
+    os.popen('EASYRSA_CERT_EXPIRE=3650 /etc/openvpn/ca/easyrsa build-client-full "' + params.username + '" nopass')
 
+class RemoveUser(BaseModel):
+    username: str
+
+@app.post('/remove_user')
+def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission','reason': 'Need admin user','route': 'shadowsocks'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = json.load(f)
+    shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
+    del content['users'][0][params.username]
+    remove_ss_user(str(shadowsocks_port))
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as f:
+        json.dump(content,f,indent=4)
+    os.remove('/etc/openvpn/ca/pki/issued/' + params.username + '.crt')
+    os.remove('/etc/openvpn/ca/pki/private/' + params.username + '.key')
+
+@app.post('/list_users')
+def list_users(current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission','reason': 'Need admin user','route': 'shadowsocks'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = json.load(f)
+    return json.dumps(content)
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -896,6 +955,9 @@ if __name__ == '__main__':
     omrport=65500
     if 'port' in omr_config_data:
         omrport = omr_config_data["port"]
+    omrhost='0.0.0.0'
+    if 'host' in omr_config_data:
+        omrhost = omr_config_data["host"]
 #    uvicorn.run(app,host='0.0.0.0',port=omrport,log_level='debug',ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
-    uvicorn.run(app,host='0.0.0.0',port=omrport,log_level='error',ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
+    uvicorn.run(app,host=omrhost,port=omrport,log_level='error',ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
 #    uvicorn.run(app,host='0.0.0.0',port=omrport,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem','/etc/openmptcprouter-vps-admin/key.pem'),threaded=True)
