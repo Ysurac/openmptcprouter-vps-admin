@@ -2,6 +2,11 @@
     "port": 65500,
     "users": [
         {
+            "admin": {
+                "username": "admin",
+                "user_password": "AdminMySecretKey",
+                "disabled": false
+            },
             "openmptcprouter": {
                 "username": "openmptcprouter",
                 "user_password": "MySecretKey",
