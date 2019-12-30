@@ -31,6 +31,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, Se
 from passlib.context import CryptContext
 from pydantic import BaseModel, ValidationError
 from starlette.status import HTTP_401_UNAUTHORIZED
+from enum import Enum
 
 import logging
 log = logging.getLogger('api')
@@ -207,7 +208,7 @@ class UserInDB(User):
     user_password: str
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-app = FastAPI()
+app = FastAPI(redoc_url=None)
 
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -338,6 +339,11 @@ def config(current_user: User = Depends(get_current_user)):
         shadowsocks_obfs = False
         shadowsocks_obfs_plugin = ''
         shadowsocks_obfs_type = ''
+    shadowsocks_port = current_user.shadowsocks_port
+    if not shadowsocks_port == None:
+        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    else:
+        ss_traffic = 0
     if os.path.isfile('/etc/glorytun-tcp/tun0.key'):
         glorytun_key = open('/etc/glorytun-tcp/tun0.key').readline().rstrip()
     else:
@@ -483,7 +489,7 @@ def config(current_user: User = Depends(get_current_user)):
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole}}
+    return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'traffic': ss_traffic,'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
@@ -898,12 +904,19 @@ def edit_backup(params,current_user: User = Depends(get_current_user)):
     o.write(current_user.username + '-backup',path='/var/opt/openmptcprouter/')
     return {'result': 'done'}
 
+class VPN(str, Enum):
+    openvpn = "openvpn"
+
+class Permissions(str, Enum):
+    ro = "ro"
+    rw = "rw"
+    admin = "admin"
 
 class NewUser(BaseModel):
     username: str
-    permission: str = None
+    permission: Permissions
     shadowsocks_port: int = None
-    vpn: str = None
+    vpn: VPN
 
 @app.post('/add_user')
 def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
