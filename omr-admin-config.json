@@ -5,6 +5,7 @@
             "admin": {
                 "username": "admin",
                 "user_password": "AdminMySecretKey",
+                "permissions": "admin",
                 "disabled": false
             },
             "openmptcprouter": {
