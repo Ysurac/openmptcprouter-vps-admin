@@ -413,8 +413,8 @@ def config(current_user: User = Depends(get_current_user)):
             openvpn_client_key = openvpn_keyb.decode('utf-8')
     else:
         openvpn_client_key = ''
-    if os.path.isfile('/etc/openvpn/ca/issued/' + current_user.username + '.crt'):
-        with open('/etc/openvpn/ca/issued/' + current_user.username + '.crt',"rb") as ovpnkey_file:
+    if os.path.isfile('/etc/openvpn/ca/pki/issued/' + current_user.username + '.crt'):
+        with open('/etc/openvpn/ca/pki/issued/' + current_user.username + '.crt',"rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
             openvpn_client_crt = openvpn_keyb.decode('utf-8')
         available_vpn.append("openvpn")
@@ -605,7 +605,7 @@ class ShorewallAllparams(BaseModel):
 @app.post('/shorewall')
 def shorewall(*, params: ShorewallAllparams,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'shorewall'}
     state = params.redirect_ports
     if state is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewall'}
@@ -655,28 +655,28 @@ class Shorewallparams(BaseModel):
 @app.post('/shorewallopen')
 def shorewall_open(*,params: Shorewallparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'shorewallopen'}
     name = params.name
     port = params.port
     proto = params.proto
     fwtype = params.fwtype
     if name is None:
-        return {'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'}
+        return {'result': 'error','reason': 'Invalid parameters','route': 'shorewallopen'}
     shorewall_add_port(str(port),proto,name,fwtype)
     return {'result': 'done','reason': 'changes applied'}
 
 @app.post('/shorewallclose')
 def shorewall_close(*,params: Shorewallparams,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'shorewallclose'}
     name = params.name
     port = params.port
     proto = params.proto
     fwtype = params.fwtype
     if name is None:
-        return {'result': 'error','reason': 'Invalid parameters','route': 'shorewalllist'}
+        return {'result': 'error','reason': 'Invalid parameters','route': 'shorewallclose'}
     shorewall_del_port(str(port),proto,name,fwtype)
-    return {'result': 'done','reason': 'changes applied'}
+    return {'result': 'done','reason': 'changes applied','route': 'shorewallclose'}
 
 # Set MPTCP config
 class MPTCPparams(BaseModel):
@@ -690,7 +690,7 @@ class MPTCPparams(BaseModel):
 def mptcp(*, params: MPTCPparams,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'mptcp'}
     checksum = params.checksum
     path_manager = params.path_manager
     scheduler = params.scheduler
@@ -714,7 +714,7 @@ class Vpn(BaseModel):
 def vpn(*,vpnconfig: Vpn,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'vpn'}
     vpn = vpnconfig.vpn
     if not vpn:
         return {'result': 'error','reason': 'Invalid parameters','route': 'vpn'}
@@ -735,7 +735,7 @@ class GlorytunConfig(BaseModel):
 def glorytun(*, glorytunconfig: GlorytunConfig,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'glorytun'}
     key = glorytunconfig.key
     port = glorytunconfig.port
     chacha = glorytunconfig.chacha
@@ -792,7 +792,7 @@ class DSVPN(BaseModel):
 def dsvpn(*,params: DSVPN,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'dsvpn'}
     key = params.key
     port = params.port
     if not key or port is None:
@@ -815,7 +815,7 @@ class OpenVPN(BaseModel):
 def openvpn(*,ovpn: OpenVPN,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'openvpn'}
     key = ovpn.key
     if not key:
         return {'result': 'error','reason': 'Invalid parameters','route': 'openvpn'}
@@ -853,7 +853,7 @@ def wan(*, wanips: Wanips,current_user: User = Depends(get_current_user)):
 @app.get('/update')
 def update(current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'update'}
     os.system("wget -O - http://www.openmptcprouter.com/server/debian9-x86_64.sh | sh")
     # Need to reboot if kernel change
     return {'result': 'done'}
@@ -865,7 +865,7 @@ class Backupfile(BaseModel):
 @app.post('/backuppost')
 def backuppost(*,backupfile: Backupfile ,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'backuppost'}
     backup_file = backupfile.data
     if not backup_file:
         return {'result': 'error','reason': 'Invalid parameters','route': 'backuppost'}
@@ -899,7 +899,7 @@ def show_backup(current_user: User = Depends(get_current_user)):
 @app.post('/backupedit')
 def edit_backup(params,current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Read only user','route': 'backupedit'}
     o = OpenWrt(params)
     o.write(current_user.username + '-backup',path='/var/opt/openmptcprouter/')
     return {'result': 'done'}
@@ -921,7 +921,7 @@ class NewUser(BaseModel):
 @app.post('/add_user')
 def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
-        return {'result': 'permission','reason': 'Need admin user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Need admin user','route': 'add_user'}
     user_key = secrets.token_hex(32)
     user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permission":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false"}}')
     if params.shadowsocks_port is not None:
@@ -943,7 +943,7 @@ class RemoveUser(BaseModel):
 @app.post('/remove_user')
 def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
-        return {'result': 'permission','reason': 'Need admin user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Need admin user','route': 'remove_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
@@ -957,7 +957,7 @@ def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_u
 @app.post('/list_users')
 def list_users(current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
-        return {'result': 'permission','reason': 'Need admin user','route': 'shadowsocks'}
+        return {'result': 'permission','reason': 'Need admin user','route': 'list_users'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     return json.dumps(content)
