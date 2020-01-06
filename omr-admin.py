@@ -12,6 +12,7 @@ import uuid
 import configparser
 import subprocess
 import os
+import sys
 import socket
 import re
 import hashlib
@@ -477,11 +478,7 @@ def config(current_user: User = Depends(get_current_user)):
     vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
 
-    vpn = ''
-    if os.path.isfile('/etc/openmptcprouter-vps-admin/current-vpn'):
-        vpn = os.popen('cat /etc/openmptcprouter-vps-admin/current-vpn').read().rstrip()
-    if vpn == '':
-        vpn = 'glorytun-tcp'
+    vpn = current_user.vpn
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
@@ -935,7 +932,8 @@ def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
     content['users'][0].update(user_json)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as f:
         json.dump(content,f,indent=4)
-    os.popen('EASYRSA_CERT_EXPIRE=3650 /etc/openvpn/ca/easyrsa build-client-full "' + params.username + '" nopass')
+    os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full "' + params.username + '" nopass')
+    os.execv(__file__, sys.argv)
 
 class RemoveUser(BaseModel):
     username: str
@@ -953,6 +951,7 @@ def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_u
         json.dump(content,f,indent=4)
     os.remove('/etc/openvpn/ca/pki/issued/' + params.username + '.crt')
     os.remove('/etc/openvpn/ca/pki/private/' + params.username + '.key')
+    os.execv(__file__, sys.argv)
 
 @app.post('/list_users')
 def list_users(current_user: User = Depends(get_current_user)):
