@@ -135,33 +135,33 @@ def file_as_bytes(file):
     with file:
         return file.read()
 
-def shorewall_add_port(port,proto,name,fwtype='ACCEPT'):
+def shorewall_add_port(username,port,proto,name,fwtype='ACCEPT'):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line:
+            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
                 n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line:
+            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
                 n.write(line)
         if fwtype == 'ACCEPT':
-            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
+            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + "\n")
         elif fwtype == 'DNAT':
-            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR redirect ' + name + ' port ' + proto + "\n")
+            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + "\n")
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall_del_port(port,proto,name,fwtype='ACCEPT'):
+def shorewall_del_port(username,port,proto,name,fwtype='ACCEPT'):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line:
+            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
                 n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line:
+            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
                 n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/shorewall/rules')
@@ -169,33 +169,33 @@ def shorewall_del_port(port,proto,name,fwtype='ACCEPT'):
     if not initial_md5 == final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall6_add_port(port,proto,name,fwtype='ACCEPT'):
+def shorewall6_add_port(username,port,proto,name,fwtype='ACCEPT'):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line:
+            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
                 n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line:
+            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
                 n.write(line)
         if fwtype == 'ACCEPT':
-            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR open ' + name + ' port ' + proto + "\n")
+            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + "\n")
         elif fwtype == 'DNAT':
-            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR redirect ' + name + ' port ' + proto + "\n")
+            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + "\n")
     os.close(fd)
     move(tmpfile,'/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q reload shorewall6")
 
-def shorewall6_del_port(port,proto,name,fwtype='ACCEPT'):
+def shorewall6_del_port(username,port,proto,name,fwtype='ACCEPT'):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line:
+            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
                 n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line:
+            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
                 n.write(line)
     os.close(fd)
     move(tmpfile,'/etc/shorewall6/rules')
@@ -774,9 +774,9 @@ def shorewall_open(*,params: Shorewallparams, current_user: User = Depends(get_c
     if name is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewallopen'}
     if params.ipproto == 'ipv4':
-        shorewall_add_port(str(port),proto,name,fwtype)
+        shorewall_add_port(current_user.username,str(port),proto,name,fwtype)
     else:
-        shorewall6_add_port(str(port),proto,name,fwtype)
+        shorewall6_add_port(current_user.username,str(port),proto,name,fwtype)
     return {'result': 'done','reason': 'changes applied'}
 
 @app.post('/shorewallclose')
@@ -790,9 +790,9 @@ def shorewall_close(*,params: Shorewallparams,current_user: User = Depends(get_c
     if name is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'shorewallclose'}
     if params.ipproto == 'ipv4':
-        shorewall_del_port(str(port),proto,name,fwtype)
+        shorewall_del_port(current_user.username,str(port),proto,name,fwtype)
     else:
-        shorewall6_del_port(str(port),proto,name,fwtype)
+        shorewall6_del_port(current_user.username,str(port),proto,name,fwtype)
     return {'result': 'done','reason': 'changes applied','route': 'shorewallclose'}
 
 # Set MPTCP config
@@ -959,12 +959,21 @@ def wan(*, wanips: Wanips,current_user: User = Depends(get_current_user)):
         outfile.write('[white_list]\n')
         outfile.write(ips)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/local.acl', 'rb'))).hexdigest()
-    #if not initial_md5 == final_md5:
-        #os.system("systemctl restart shadowsocks-libev-server@config.service")
-        #for x in range (1,os.cpu_count()):
-            #os.system("systemctl restart shadowsocks-libev-server@config" + str(x) + ".service")
-
+    #modif_config_user(current_user,{'wanips': wanip})
     return {'result': 'done'}
+
+class Lanips(BaseModel):
+    lanips: List[str] = []
+
+# Set user lan config
+@app.post('/lan')
+def router(*,lanconfig: Lanips,current_user: User = Depends(get_current_user)):
+    lanips = lanconfig.lanips
+    if not lanips:
+        return {'result': 'error','reason': 'Invalid parameters','route': 'lan'}
+    modif_config_user(current_user,{'lanips': lanips})
+    return {'result': 'done','reason': 'changes applied'}
+
 
 # Update VPS
 @app.get('/update')
