@@ -672,8 +672,8 @@ def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(g
         os.system("systemctl restart shadowsocks-libev-manager@manager.service")
         for x in range (1,os.cpu_count()):
             os.system("systemctl restart shadowsocks-libev-manager@manager" + str(x) + ".service")
-        shorewall_add_port(str(port),'tcp','shadowsocks')
-        shorewall_add_port(str(port),'udp','shadowsocks')
+        shorewall_add_port(current_user.username,str(port),'tcp','shadowsocks')
+        shorewall_add_port(current_user.username,str(port),'udp','shadowsocks')
         set_lastchange()
         return {'result': 'done','reason': 'changes applied','route': 'shadowsocks'}
     else:
@@ -853,16 +853,19 @@ def glorytun(*, glorytunconfig: GlorytunConfig,current_user: User = Depends(get_
     if current_user.permission == "ro":
         set_lastchange(10)
         return {'result': 'permission','reason': 'Read only user','route': 'glorytun'}
+    userid = current_user.userid
+    if userid == None:
+        userid = 0
     key = glorytunconfig.key
     port = glorytunconfig.port
     chacha = glorytunconfig.chacha
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-tcp/tun0', 'rb'))).hexdigest()
-    with open('/etc/glorytun-tcp/tun0.key','w') as outfile:
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-tcp/tun' + str(userid), 'rb'))).hexdigest()
+    with open('/etc/glorytun-tcp/tun' + str(userid) + '.key','w') as outfile:
         outfile.write(key)
-    with open('/etc/glorytun-udp/tun0.key','w') as outfile:
+    with open('/etc/glorytun-udp/tun' + str(userid) + '.key','w') as outfile:
         outfile.write(key)
     fd, tmpfile = mkstemp()
-    with open('/etc/glorytun-tcp/tun0','r') as f, open(tmpfile,'a+') as n:
+    with open('/etc/glorytun-tcp/tun' + str(userid),'r') as f, open(tmpfile,'a+') as n:
         for line in f:
             if 'PORT=' in line:
                 n.write('PORT=' + str(port) + '\n')
@@ -874,13 +877,13 @@ def glorytun(*, glorytunconfig: GlorytunConfig,current_user: User = Depends(get_
             else:
                 n.write(line)
     os.close(fd)
-    move(tmpfile,'/etc/glorytun-tcp/tun0')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-tcp/tun0', 'rb'))).hexdigest()
+    move(tmpfile,'/etc/glorytun-tcp/tun' + str(userid))
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-tcp/tun' + str(userid), 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
-        os.system("systemctl -q restart glorytun-tcp@tun0")
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun0', 'rb'))).hexdigest()
+        os.system("systemctl -q restart glorytun-tcp@tun" + str(userid))
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun' + str(userid), 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
-    with open('/etc/glorytun-udp/tun0','r') as f, open(tmpfile,'a+') as n:
+    with open('/etc/glorytun-udp/tun' + str(userid),'r') as f, open(tmpfile,'a+') as n:
         for line in f:
             if 'BIND_PORT=' in line:
                 n.write('BIND_PORT=' + str(port) + '\n')
@@ -892,11 +895,11 @@ def glorytun(*, glorytunconfig: GlorytunConfig,current_user: User = Depends(get_
             else:
                 n.write(line)
     os.close(fd)
-    move(tmpfile,'/etc/glorytun-udp/tun0')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun0', 'rb'))).hexdigest()
+    move(tmpfile,'/etc/glorytun-udp/tun' + str(userid))
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun' + str(userid), 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
-        os.system("systemctl -q restart glorytun-udp@tun0")
-    shorewall_add_port(str(port),'tcp','glorytun')
+        os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
+    shorewall_add_port(current_user.username,str(port),'tcp','glorytun')
     set_lastchange()
     return {'result': 'done'}
 
@@ -920,7 +923,7 @@ def dsvpn(*,params: DSVPN,current_user: User = Depends(get_current_user)):
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn.key', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart dsvpn-server")
-    shorewall_add_port(str(port),'tcp','dsvpn')
+    shorewall_add_port(current_user.username,str(port),'tcp','dsvpn')
     set_lastchange()
     return {'result': 'done'}
 
