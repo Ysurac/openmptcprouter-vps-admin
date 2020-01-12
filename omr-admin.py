@@ -123,6 +123,25 @@ def add_glorytun_udp(userid):
         f.write(glorytun_udp_key)
     os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
 
+def add_dsvpn(userid):
+    port = '654{:02d}'.format(userid)
+    with open('/etc/dsvpn/dsvpn0','r') as f, open('/etc/dsvpn/dsvpn' + str(userid),'a+') as n:
+        for line in f:
+            if 'PORT' in line:
+                n.write('PORT=' + port + "\n")
+            elif 'DEV' in line:
+                n.write('DEV=dsvpn' + str(userid) + "\n")
+            elif 'LOCALTUNIP' in line:
+                n.write('LOCALTUNIP=10.255.251.' + str(userid) + '1' + "\n")
+            elif 'LOCALTUNIP' in line:
+                n.write('REMOTETUNIP=10.255.251.' + str(userid) + '2' + "\n")
+            else:
+                n.write(line)
+    dsvpn_key = secrets.token_hex(32)
+    with open('/etc/dsvpn/dsvpn' + str(userid) + '.key','w') as f:
+        f.write(glorytun_tcp_key)
+    os.system("systemctl -q restart dsvpn@dsvpn" + str(userid))
+
 def ordered(obj):
     if isinstance(obj, dict):
         return sorted((k, ordered(v)) for k, v in obj.items())
@@ -459,14 +478,24 @@ def config(current_user: User = Depends(get_current_user)):
         glorytun_udp_host_ip = '10.255.254.' + str(userid) + '1'
         glorytun_udp_client_ip = '10.255.254.' + str(userid) + '2'
     available_vpn = ["glorytun-tcp", "glorytun-udp"]
-    if os.path.isfile('/etc/dsvpn/dsvpn.key'):
-        dsvpn_key = open('/etc/dsvpn/dsvpn.key').readline().rstrip()
+    if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid) + '.key'):
+        dsvpn_key = open('/etc/dsvpn/dsvpn' + str(userid) + '.key').readline().rstrip()
         available_vpn.append("dsvpn")
     else:
         dsvpn_key = ''
-    dsvpn_port = '65011'
-    dsvpn_host_ip = '10.255.251.1'
-    dsvpn_client_ip = '10.255.251.2'
+    dsvpn_port = '65401'
+    if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid)):
+        with open('/etc/dsvpn/dsvpn' + str(userid),"r") as dsvpn_file:
+            for line in dsvpn_file:
+                if 'PORT=' in line:
+                    dsvpn_port = line.replace(line[:5], '').rstrip()
+
+    if userid == 0:
+        dsvpn_host_ip = '10.255.251.1'
+        dsvpn_client_ip = '10.255.251.2'
+    else:
+        dsvpn_host_ip = '10.255.251.' + str(userid) + '1'
+        dsvpn_client_ip = '10.255.251.' + str(userid) + '2'
 
     if os.path.isfile('/etc/iperf3/public.pem'):
         with open('/etc/iperf3/public.pem',"rb") as iperfkey_file:
@@ -913,16 +942,30 @@ def dsvpn(*,params: DSVPN,current_user: User = Depends(get_current_user)):
     if current_user.permission == "ro":
         set_lastchange(10)
         return {'result': 'permission','reason': 'Read only user','route': 'dsvpn'}
+    userid = current_user.userid
+    if userid == None:
+        userid = 0
     key = params.key
     port = params.port
     if not key or port is None:
         return {'result': 'error','reason': 'Invalid parameters','route': 'dsvpn'}
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn.key', 'rb'))).hexdigest()
+
+    fd, tmpfile = mkstemp()
+    with open('/etc/dsvpn/dsvpn' + str(userid),'r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if 'PORT=' in line:
+                n.write('PORT=' + str(port) + '\n')
+            else:
+                n.write(line)
+    os.close(fd)
+    move(tmpfile,'/etc/dsvpn/dsvpn' + str(userid))
+
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn' + str(userid) + '.key', 'rb'))).hexdigest()
     with open('/etc/dsvpn/dsvpn.key','w') as outfile:
         outfile.write(key)
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn.key', 'rb'))).hexdigest()
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn' + str(userid) + '.key', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
-        os.system("systemctl -q restart dsvpn-server")
+        os.system("systemctl -q restart dsvpn-server@dsvpn" + str(userid))
     shorewall_add_port(current_user.username,str(port),'tcp','dsvpn')
     set_lastchange()
     return {'result': 'done'}
@@ -975,6 +1018,12 @@ def router(*,lanconfig: Lanips,current_user: User = Depends(get_current_user)):
     if not lanips:
         return {'result': 'error','reason': 'Invalid parameters','route': 'lan'}
     modif_config_user(current_user,{'lanips': lanips})
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    client2client = false
+    if 'client2client' in omr_config_data:
+        client2client = omr_config_data["client2client"]
+
     return {'result': 'done','reason': 'changes applied'}
 
 
