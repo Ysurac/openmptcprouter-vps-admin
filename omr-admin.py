@@ -20,6 +20,7 @@ import time
 import uvicorn
 import jwt
 from jwt import PyJWTError
+from netaddr import *
 from pprint import pprint
 from datetime import datetime,timedelta
 from tempfile import mkstemp
@@ -234,12 +235,24 @@ def set_lastchange(sync = 0):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as outfile:
         json.dump(data,outfile,indent=4)
 
+def set_global_param(key,value):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}","}",content)
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        return jsonify({'error': 'Config file not readable','route': 'global_param'}), 200
+    data[key] = value
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as outfile:
+        json.dump(data,outfile,indent=4)
+
 def modif_config_user(user,changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     content['users'][0][user.username].update(changes)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as f:
-        json.dump(content,f)
+        json.dump(content,f,indent=4)
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
     omr_config_data = json.load(f)
@@ -283,7 +296,7 @@ class User(BaseModel):
     vpn: str = None
     vpn_port: int = None
     vpn_client_ip: str = None
-    permission: str = 'rw'
+    permissions: str = 'rw'
     shadowsocks_port: int = None
     disabled: bool = 'false'
     userid: int = None
@@ -586,10 +599,10 @@ def config(current_user: User = Depends(get_current_user)):
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
-    user_permission = current_user.permission
+    user_permissions = current_user.permissions
 
     vpn = current_user.vpn
-    if current_user.permission == 'ro':
+    if current_user.permissions == 'ro':
         del available_vpn
         available_vpn = [vpn]
 
@@ -599,7 +612,7 @@ def config(current_user: User = Depends(get_current_user)):
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'traffic': ss_traffic,'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole},'user': {'name': current_user.username,'permission': user_permission}}
+    return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'traffic': ss_traffic,'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole},'user': {'name': current_user.username,'permission': user_permissions}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
@@ -616,7 +629,7 @@ class ShadowsocksConfigparams(BaseModel):
 
 @app.post('/shadowsocks')
 def shadowsocks(*,params: ShadowsocksConfigparams,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission','reason': 'Read only user','route': 'shadowsocks'}
     ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
@@ -715,7 +728,7 @@ class ShorewallAllparams(BaseModel):
 
 @app.post('/shorewall')
 def shorewall(*, params: ShorewallAllparams,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         return {'result': 'permission','reason': 'Read only user','route': 'shorewall'}
     state = params.redirect_ports
     if state is None:
@@ -794,7 +807,7 @@ class Shorewallparams(BaseModel):
 
 @app.post('/shorewallopen')
 def shorewall_open(*,params: Shorewallparams, current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         return {'result': 'permission','reason': 'Read only user','route': 'shorewallopen'}
     name = params.name
     port = params.port
@@ -810,7 +823,7 @@ def shorewall_open(*,params: Shorewallparams, current_user: User = Depends(get_c
 
 @app.post('/shorewallclose')
 def shorewall_close(*,params: Shorewallparams,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         return {'result': 'permission','reason': 'Read only user','route': 'shorewallclose'}
     name = params.name
     port = params.port
@@ -858,7 +871,7 @@ class Vpn(BaseModel):
 # Set global VPN config
 @app.post('/vpn')
 def vpn(*,vpnconfig: Vpn,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission','reason': 'Read only user','route': 'vpn'}
     vpn = vpnconfig.vpn
@@ -879,7 +892,7 @@ class GlorytunConfig(BaseModel):
 # Set Glorytun config
 @app.post('/glorytun')
 def glorytun(*, glorytunconfig: GlorytunConfig,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission','reason': 'Read only user','route': 'glorytun'}
     userid = current_user.userid
@@ -939,7 +952,7 @@ class DSVPN(BaseModel):
 
 @app.post('/dsvpn')
 def dsvpn(*,params: DSVPN,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission','reason': 'Read only user','route': 'dsvpn'}
     userid = current_user.userid
@@ -976,7 +989,7 @@ class OpenVPN(BaseModel):
 
 @app.post('/openvpn')
 def openvpn(*,ovpn: OpenVPN,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission','reason': 'Read only user','route': 'openvpn'}
     key = ovpn.key
@@ -1020,17 +1033,35 @@ def router(*,lanconfig: Lanips,current_user: User = Depends(get_current_user)):
     modif_config_user(current_user,{'lanips': lanips})
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
-    client2client = false
+    client2client = False
     if 'client2client' in omr_config_data:
         client2client = omr_config_data["client2client"]
-
+    if 'client2client' == True:
+        with open('/etc/openvpn/ccd/' + current_user.username,'w') as outfile:
+            for lan in lanips:
+                ip = IPNetwork(lan)
+                outfile.write('iroute ' + str(ip.network) + ' ' + str(ip.netmask) + "\n")
+                #outfile.write('route ' + str(ip.network) + ' ' + str(ip.netmask) + "\n")
+        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
+        fd, tmpfile = mkstemp()
+        with open('/etc/openvpn/tun0.conf','r') as f, open(tmpfile,'a+') as n:
+            for line in f:
+                if not 'push "route ' + str(ip.network) + ' ' + str(ip.netmask) + '"' in line:
+                    n.write(line)
+            n.write('push "route ' + str(ip.network) + ' ' + str(ip.netmask) + '"' + "\n")
+        os.close(fd)
+        move(tmpfile,'/etc/openvpn/tun0.conf')
+        final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
+        if not initial_md5 == final_md5:
+            os.system("systemctl -q restart openvpn@tun0")
+            set_lastchange()
     return {'result': 'done','reason': 'changes applied'}
 
 
 # Update VPS
 @app.get('/update')
 def update(current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         return {'result': 'permission','reason': 'Read only user','route': 'update'}
     os.system("wget -O - http://www.openmptcprouter.com/server/debian9-x86_64.sh | sh")
     # Need to reboot if kernel change
@@ -1042,7 +1073,7 @@ class Backupfile(BaseModel):
 
 @app.post('/backuppost')
 def backuppost(*,backupfile: Backupfile ,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         return {'result': 'permission','reason': 'Read only user','route': 'backuppost'}
     backup_file = backupfile.data
     if not backup_file:
@@ -1076,7 +1107,7 @@ def show_backup(current_user: User = Depends(get_current_user)):
 
 @app.post('/backupedit')
 def edit_backup(params,current_user: User = Depends(get_current_user)):
-    if current_user.permission == "ro":
+    if current_user.permissions == "ro":
         return {'result': 'permission','reason': 'Read only user','route': 'backupedit'}
     o = OpenWrt(params)
     o.write(current_user.username + '-backup',path='/var/opt/openmptcprouter/')
@@ -1102,7 +1133,7 @@ class NewUser(BaseModel):
 
 @app.post('/add_user')
 def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
-    if not current_user.permission == "admin":
+    if not current_user.permissions == "admin":
         return {'result': 'permission','reason': 'Need admin user','route': 'add_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
@@ -1114,7 +1145,7 @@ def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
                 if usercontent['userid'] > userid:
                     userid = usercontent['userid']
     user_key = secrets.token_hex(32)
-    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permission":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false"}}')
+    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false"}}')
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
     shadowsocks_port = '651{:02d}'.format(userid)
@@ -1140,7 +1171,7 @@ class RemoveUser(BaseModel):
 
 @app.post('/remove_user')
 def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_user)):
-    if not current_user.permission == "admin":
+    if not current_user.permissions == "admin":
         return {'result': 'permission','reason': 'Need admin user','route': 'remove_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
@@ -1154,9 +1185,31 @@ def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_u
     set_lastchange(30)
     os.execv(__file__, sys.argv)
 
+class ClienttoClient(BaseModel):
+    enable: bool = False
+
+@app.post('/client2client')
+def client2client(*, params: ClienttoClient,current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission','reason': 'Need admin user','route': 'client2client'}
+    set_global_param('client2client',params.enable)
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
+    fd, tmpfile = mkstemp()
+    with open('/etc/openvpn/tun0.conf','r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if not 'client-to-client' in line:
+                n.write(line)
+        n.write('client-to-client' + "\n")
+    os.close(fd)
+    move(tmpfile,'/etc/openvpn/tun0.conf')
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q restart openvpn@tun0")
+    return {'result': 'done'}
+
 @app.get('/list_users')
 def list_users(current_user: User = Depends(get_current_user)):
-    if not current_user.permission == "admin":
+    if not current_user.permissions == "admin":
         return {'result': 'permission','reason': 'Need admin user','route': 'list_users'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
