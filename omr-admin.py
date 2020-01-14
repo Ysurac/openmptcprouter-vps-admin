@@ -1180,8 +1180,9 @@ def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_u
     remove_ss_user(str(shadowsocks_port))
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json','w') as f:
         json.dump(content,f,indent=4)
-    os.remove('/etc/openvpn/ca/pki/issued/' + params.username + '.crt')
-    os.remove('/etc/openvpn/ca/pki/private/' + params.username + '.key')
+    os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username)
+    os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl')
+    os.system("systemctl -q restart openvpn@tun0")
     set_lastchange(30)
     os.execv(__file__, sys.argv)
 
