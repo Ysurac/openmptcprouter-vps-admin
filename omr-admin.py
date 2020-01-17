@@ -96,7 +96,7 @@ def remove_ss_user(port):
 
 def add_glorytun_tcp(userid):
     port = '650{:02d}'.format(userid)
-    with open('/etc/glorytun-tcp/tun0','r') as f, open('/etc/glorytun-tcp/tun' + str(userid),'a+') as n:
+    with open('/etc/glorytun-tcp/tun0','r') as f, open('/etc/glorytun-tcp/tun' + str(userid),'w') as n:
         for line in f:
             if 'PORT' in line:
                 n.write('PORT=' + port + "\n")
@@ -111,7 +111,7 @@ def add_glorytun_tcp(userid):
 
 def add_glorytun_udp(userid):
     port = '650{:02d}'.format(userid)
-    with open('/etc/glorytun-udp/tun0','r') as f, open('/etc/glorytun-udp/tun' + str(userid),'a+') as n:
+    with open('/etc/glorytun-udp/tun0','r') as f, open('/etc/glorytun-udp/tun' + str(userid),'w') as n:
         for line in f:
             if 'BIND_PORT' in line:
                 n.write('BIND_PORT=' + port + "\n")
@@ -126,7 +126,7 @@ def add_glorytun_udp(userid):
 
 def add_dsvpn(userid):
     port = '654{:02d}'.format(userid)
-    with open('/etc/dsvpn/dsvpn0','r') as f, open('/etc/dsvpn/dsvpn' + str(userid),'a+') as n:
+    with open('/etc/dsvpn/dsvpn0','r') as f, open('/etc/dsvpn/dsvpn' + str(userid),'w') as n:
         for line in f:
             if 'PORT' in line:
                 n.write('PORT=' + port + "\n")
@@ -1026,7 +1026,7 @@ class Lanips(BaseModel):
 
 # Set user lan config
 @app.post('/lan')
-def router(*,lanconfig: Lanips,current_user: User = Depends(get_current_user)):
+def lan(*,lanconfig: Lanips,current_user: User = Depends(get_current_user)):
     lanips = lanconfig.lanips
     if not lanips:
         return {'result': 'error','reason': 'Invalid parameters','route': 'lan'}
@@ -1055,6 +1055,34 @@ def router(*,lanconfig: Lanips,current_user: User = Depends(get_current_user)):
         if not initial_md5 == final_md5:
             os.system("systemctl -q restart openvpn@tun0")
             set_lastchange()
+    return {'result': 'done','reason': 'changes applied'}
+
+class VPNips(BaseModel):
+    remoteip: str
+    localip: str
+
+# Set user vpn IPs
+@app.post('/vpnips')
+def vpnips(*,vpnconfig: VPNips,current_user: User = Depends(get_current_user)):
+    remoteip = vpnconfig.remoteip
+    localip = vpnconfig.localip
+    if not remoteip or not localip:
+        return {'result': 'error','reason': 'Invalid parameters','route': 'vpnips'}
+    modif_config_user(current_user,{'vpnremoteip': remoteip})
+    modif_config_user(current_user,{'vpnlocalip': localip})
+    userid = current_user.userid
+    if userid == None:
+        userid = 0
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr6in4/user' + str(userid), 'rb'))).hexdigest()
+    with open('/etc/openvpn/tun0.conf','r') as f:
+        n.write('LOCALIP=' + localip + "\n")
+        n.write('REMOTEIP=' + remoteip + "\n")
+        n.write('LOCALIP6=fe80::a0' + hex(userid) + ':1/64' + "\n")
+        n.write('REMOTEIP6=fe80::a0' + hex(userid) + ':2/64' + "\n")
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr6in4/user' + str(userid), 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q restart omr6in4@user" + str(userid))
+        set_lastchange()
     return {'result': 'done','reason': 'changes applied'}
 
 
@@ -1144,8 +1172,9 @@ def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
             if 'userid' in usercontent:
                 if usercontent['userid'] > userid:
                     userid = usercontent['userid']
+    userid = userid + 1
     user_key = secrets.token_hex(32)
-    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false"}}')
+    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '"}}')
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
     shadowsocks_port = '651{:02d}'.format(userid)
