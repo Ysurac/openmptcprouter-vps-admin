@@ -1167,11 +1167,9 @@ def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
         content = json.load(f)
     userid = 2
     for users in content['users'][0]:
-        #usercontent = content['users'][0][users]
-        for usercontent in users:
-            if 'userid' in usercontent:
-                if usercontent['userid'] > userid:
-                    userid = usercontent['userid']
+        if 'userid' in content['users'][0][users]:
+            if int(content['users'][0][users]['userid']) > userid:
+                userid = int(content['users'][0][users]['userid'])
     userid = userid + 1
     user_key = secrets.token_hex(32)
     user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '"}}')
