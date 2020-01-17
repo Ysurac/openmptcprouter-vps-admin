@@ -67,7 +67,10 @@ def get_bytes_ss(port):
     ss_recv = ss_socket.recv(1024);
     json_txt = ss_recv.decode("utf-8").replace('stat: ','');
     result = json.loads(json_txt);
-    return result[str(port)]
+    if str(port) in result:
+        return result[str(port)]
+    else:
+        return 0
 
 def add_ss_user(port,key):
     ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
@@ -1036,7 +1039,7 @@ def lan(*,lanconfig: Lanips,current_user: User = Depends(get_current_user)):
     client2client = False
     if 'client2client' in omr_config_data:
         client2client = omr_config_data["client2client"]
-    if 'client2client' == True:
+    if client2client == True:
         with open('/etc/openvpn/ccd/' + current_user.username,'w') as outfile:
             for lan in lanips:
                 ip = IPNetwork(lan)
