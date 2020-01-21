@@ -1099,13 +1099,16 @@ def vpnips(*,vpnconfig: VPNips,current_user: User = Depends(get_current_user)):
     userid = current_user.userid
     if userid == None:
         userid = 0
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr6in4/user' + str(userid), 'rb'))).hexdigest()
-    with open('/etc/openvpn/tun0.conf','r') as f:
+    if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
+        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
+    else:
+        initial_md5 = ''
+    with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid),'w+') as n:
         n.write('LOCALIP=' + localip + "\n")
         n.write('REMOTEIP=' + remoteip + "\n")
-        n.write('LOCALIP6=fe80::a0' + hex(userid) + ':1/64' + "\n")
-        n.write('REMOTEIP6=fe80::a0' + hex(userid) + ':2/64' + "\n")
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr6in4/user' + str(userid), 'rb'))).hexdigest()
+        n.write('LOCALIP6=fe80::a0' + hex(userid)[2:] + ':1/126' + "\n")
+        n.write('REMOTEIP6=fe80::a0' + hex(userid)[2:] + ':2/126' + "\n")
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart omr6in4@user" + str(userid))
         set_lastchange()
@@ -1114,12 +1117,12 @@ def vpnips(*,vpnconfig: VPNips,current_user: User = Depends(get_current_user)):
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/params.vpn','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if 'OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0:
-                n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
-            elif 'OMR_ADDR=' in line and userid == 0:
-                n.write('OMR_ADDR=' + remoteip + '\n')
-            else:
+            if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
                 n.write(line)
+        if not userid == 0:
+            n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
+        elif userid == 0:
+            n.write('OMR_ADDR=' + remoteip + '\n')
     os.close(fd)
     move(tmpfile,'/etc/shorewall/params.vpn')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
@@ -1131,12 +1134,13 @@ def vpnips(*,vpnconfig: VPNips,current_user: User = Depends(get_current_user)):
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/params.vpn','r') as f, open(tmpfile,'a+') as n:
         for line in f:
-            if 'OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0:
-                n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
-            elif 'OMR_ADDR=' in line and userid == 0:
-                n.write('OMR_ADDR=' + remoteip + '\n')
-            else:
+            if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
                 n.write(line)
+        if  not userid == 0:
+            n.write('OMR_ADDR_USER' + str(userid) + '=fe80::a0' + hex(userid)[2:] + ':2/126' + '\n')
+        elif userid == 0:
+            n.write('OMR_ADDR=fe80::a0' + hex(userid)[2:] + ':2/126' + '\n')
+
     os.close(fd)
     move(tmpfile,'/etc/shorewall6/params.vpn')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
