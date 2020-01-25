@@ -480,14 +480,22 @@ def config(current_user: User = Depends(get_current_user)):
         glorytun_key = ''
     glorytun_port = '65001'
     glorytun_chacha = False
+    glorytun_tcp_host_ip = ''
+    glorytun_tcp_client_ip = ''
+    glorytun_udp_host_ip = ''
+    glorytun_udp_client_ip = ''
     if os.path.isfile('/etc/glorytun-tcp/tun' + str(userid)):
         with open('/etc/glorytun-tcp/tun' + str(userid),"r") as glorytun_file:
             for line in glorytun_file:
                 if 'PORT=' in line:
                     glorytun_port = line.replace(line[:5], '').rstrip()
+                if 'LOCALIP=' in line:
+                    glorytun_tcp_host_ip = line.replace(line[:8], '').rstrip()
+                if 'REMOTEIP=' in line:
+                    glorytun_tcp_client_ip = line.replace(line[:9], '').rstrip()
                 if 'chacha' in line:
                     glorytun_chacha = True
-    if userid == 0:
+    if userid == 0 and glorytun_tcp_host_ip == '':
         if 'glorytun_tcp_type' in omr_config_data:
             if omr_config_data['glorytun_tcp_type'] == 'static':
                 glorytun_tcp_host_ip = '10.255.255.1'
@@ -498,12 +506,15 @@ def config(current_user: User = Depends(get_current_user)):
         else:
             glorytun_tcp_host_ip = '10.255.255.1'
             glorytun_tcp_client_ip = '10.255.255.2'
-    else:
-        #glorytun_tcp_host_ip = '10.255.255.' + '{:02d}'.format(userid) + '1'
-        #glorytun_tcp_client_ip = '10.255.255.' + '{:02d}'.format(userid) + '2'
-        glorytun_tcp_host_ip = '10.255.255.' + str(userid) + '1'
-        glorytun_tcp_client_ip = '10.255.255.' + str(userid) + '2'
-    if userid == 0:
+    if os.path.isfile('/etc/glorytun-udp/tun' + str(userid)):
+        with open('/etc/glorytun-udp/tun' + str(userid),"r") as glorytun_file:
+            for line in glorytun_file:
+                if 'LOCALIP=' in line:
+                    glorytun_udp_host_ip = line.replace(line[:8], '').rstrip()
+                if 'REMOTEIP=' in line:
+                    glorytun_udp_client_ip = line.replace(line[:9], '').rstrip()
+
+    if userid == 0 and glorytun_udp_host_ip == '':
         if 'glorytun_udp_type' in omr_config_data:
             if omr_config_data['glorytun_udp_type'] == 'static':
                 glorytun_udp_host_ip = '10.255.254.1'
@@ -514,11 +525,6 @@ def config(current_user: User = Depends(get_current_user)):
         else:
             glorytun_udp_host_ip = '10.255.254.1'
             glorytun_udp_client_ip = '10.255.254.2'
-    else:
-        #glorytun_udp_host_ip = '10.255.254.' + '{:02d}'.format(userid) + '1'
-        #glorytun_udp_client_ip = '10.255.254.' + '{:02d}'.format(userid) + '2'
-        glorytun_udp_host_ip = '10.255.254.' + str(userid) + '1'
-        glorytun_udp_client_ip = '10.255.254.' + str(userid) + '2'
     available_vpn = ["glorytun-tcp", "glorytun-udp"]
     if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid) + '.key'):
         dsvpn_key = open('/etc/dsvpn/dsvpn' + str(userid) + '.key').readline().rstrip()
@@ -526,18 +532,21 @@ def config(current_user: User = Depends(get_current_user)):
     else:
         dsvpn_key = ''
     dsvpn_port = '65401'
+    dsvpn_host_ip = ''
+    dsvpn_client_ip = ''
     if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid)):
         with open('/etc/dsvpn/dsvpn' + str(userid),"r") as dsvpn_file:
             for line in dsvpn_file:
                 if 'PORT=' in line:
                     dsvpn_port = line.replace(line[:5], '').rstrip()
+                if 'LOCALTUNIP=' in line:
+                    dsvpn_host_ip = line.replace(line[:11], '').rstrip()
+                if 'REMOTETUNIP=' in line:
+                    dsvpn_client_ip = line.replace(line[:12], '').rstrip()
 
-    if userid == 0:
+    if userid == 0 and dsvpn_host_ip == '':
         dsvpn_host_ip = '10.255.251.1'
         dsvpn_client_ip = '10.255.251.2'
-    else:
-        dsvpn_host_ip = '10.255.251.' + str(userid) + '1'
-        dsvpn_client_ip = '10.255.251.' + str(userid) + '2'
 
     if os.path.isfile('/etc/iperf3/public.pem'):
         with open('/etc/iperf3/public.pem',"rb") as iperfkey_file:
