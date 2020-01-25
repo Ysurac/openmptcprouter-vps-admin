@@ -99,36 +99,52 @@ def remove_ss_user(port):
 
 def add_glorytun_tcp(userid):
     port = '650{:02d}'.format(userid)
+    ip = IPNetwork('10.255.255.0/24')
+    subnets = ip.subnet(30)
+    network = list(subnets)[userid]
     with open('/etc/glorytun-tcp/tun0','r') as f, open('/etc/glorytun-tcp/tun' + str(userid),'w') as n:
         for line in f:
             if 'PORT' in line:
                 n.write('PORT=' + port + "\n")
             elif 'DEV' in line:
                 n.write('DEV=tun' + str(userid) + "\n")
-            else:
+            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line:
                 n.write(line)
+        n.write('LOCALIP=' + str(list(network)[1]))
+        n.write('REMOTEIP=' + str(list(network)[2]))
+        n.write('BROADCASTIP=' + str(network.broadcast))
     glorytun_tcp_key = secrets.token_hex(32)
     with open('/etc/glorytun-tcp/tun' + str(userid) + '.key','w') as f:
-        f.write(glorytun_tcp_key)
+        f.write(glorytun_tcp_key.upper())
     os.system("systemctl -q restart glorytun-tcp@tun" + str(userid))
 
 def add_glorytun_udp(userid):
     port = '650{:02d}'.format(userid)
+    ip = IPNetwork('10.255.254.0/24')
+    subnets = ip.subnet(30)
+    network = list(subnets)[userid]
     with open('/etc/glorytun-udp/tun0','r') as f, open('/etc/glorytun-udp/tun' + str(userid),'w') as n:
         for line in f:
             if 'BIND_PORT' in line:
                 n.write('BIND_PORT=' + port + "\n")
             elif 'DEV' in line:
                 n.write('DEV=tun' + str(userid) + "\n")
-            else:
+            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line:
                 n.write(line)
+        n.write('LOCALIP=' + str(list(network)[1]))
+        n.write('REMOTEIP=' + str(list(network)[2]))
+        n.write('BROADCASTIP=' + str(network.broadcast))
     glorytun_udp_key = secrets.token_hex(32)
-    with open('/etc/glorytun-udp/tun' + str(userid) + '.key','w') as f:
-        f.write(glorytun_udp_key)
+    with open('/etc/glorytun-tcp/tun' + str(userid) + '.key','r') as f, open('/etc/glorytun-udp/tun' + str(userid) + '.key','w') as n:
+        for line in f:
+            n.write(line)
     os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
 
 def add_dsvpn(userid):
     port = '654{:02d}'.format(userid)
+    ip = IPNetwork('10.255.251.0/24')
+    subnets = ip.subnet(30)
+    network = list(subnets)[userid]
     with open('/etc/dsvpn/dsvpn0','r') as f, open('/etc/dsvpn/dsvpn' + str(userid),'w') as n:
         for line in f:
             if 'PORT' in line:
@@ -136,14 +152,14 @@ def add_dsvpn(userid):
             elif 'DEV' in line:
                 n.write('DEV=dsvpn' + str(userid) + "\n")
             elif 'LOCALTUNIP' in line:
-                n.write('LOCALTUNIP=10.255.251.' + str(userid) + '1' + "\n")
-            elif 'LOCALTUNIP' in line:
-                n.write('REMOTETUNIP=10.255.251.' + str(userid) + '2' + "\n")
+                n.write('LOCALTUNIP=' + str(list(network)[1]) + "\n")
+            elif 'REMOTETUNIP' in line:
+                n.write('REMOTETUNIP=' + str(list(network)[2]) + "\n")
             else:
                 n.write(line)
     dsvpn_key = secrets.token_hex(32)
     with open('/etc/dsvpn/dsvpn' + str(userid) + '.key','w') as f:
-        f.write(glorytun_tcp_key)
+        f.write(dsvpn_key.upper())
     os.system("systemctl -q restart dsvpn@dsvpn" + str(userid))
 
 def ordered(obj):
@@ -1208,8 +1224,8 @@ def edit_backup(params,current_user: User = Depends(get_current_user)):
 
 class VPN(str, Enum):
     openvpn = "openvpn"
-    glorytuntcp = "glorytun-tcp"
-    glorytunudp = "glorytun-udp"
+    glorytuntcp = "glorytun_tcp"
+    glorytunudp = "glorytun_udp"
 
 class permissions(str, Enum):
     ro = "ro"
