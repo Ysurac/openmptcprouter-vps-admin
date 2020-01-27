@@ -108,11 +108,11 @@ def add_glorytun_tcp(userid):
                 n.write('PORT=' + port + "\n")
             elif 'DEV' in line:
                 n.write('DEV=tun' + str(userid) + "\n")
-            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line:
+            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line and not line == "\n":
                 n.write(line)
-        n.write('LOCALIP=' + str(list(network)[1]))
-        n.write('REMOTEIP=' + str(list(network)[2]))
-        n.write('BROADCASTIP=' + str(network.broadcast))
+        n.write("\n" + 'LOCALIP=' + str(list(network)[1]) + "\n")
+        n.write('REMOTEIP=' + str(list(network)[2]) + "\n")
+        n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
     glorytun_tcp_key = secrets.token_hex(32)
     with open('/etc/glorytun-tcp/tun' + str(userid) + '.key','w') as f:
         f.write(glorytun_tcp_key.upper())
@@ -129,11 +129,11 @@ def add_glorytun_udp(userid):
                 n.write('BIND_PORT=' + port + "\n")
             elif 'DEV' in line:
                 n.write('DEV=tun' + str(userid) + "\n")
-            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line:
+            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line and not line == "\n":
                 n.write(line)
-        n.write('LOCALIP=' + str(list(network)[1]))
-        n.write('REMOTEIP=' + str(list(network)[2]))
-        n.write('BROADCASTIP=' + str(network.broadcast))
+        n.write("\n" + 'LOCALIP=' + str(list(network)[1]) + "\n")
+        n.write('REMOTEIP=' + str(list(network)[2]) + "\n")
+        n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
     glorytun_udp_key = secrets.token_hex(32)
     with open('/etc/glorytun-tcp/tun' + str(userid) + '.key','r') as f, open('/etc/glorytun-udp/tun' + str(userid) + '.key','w') as n:
         for line in f:
