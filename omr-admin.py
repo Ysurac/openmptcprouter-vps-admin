@@ -642,20 +642,30 @@ def config(current_user: User = Depends(get_current_user)):
     localip6=''
     remoteip6=''
     if userid == 0:
-        with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid),"r") as omr6in4_file:
-            for line in omr6in4_file:
-                if 'LOCALIP6=' in line:
-                    localip6 = line.replace(line[:9], '').rstrip()
-                if 'REMOTEIP6=' in line:
-                    remoteip6 = line.replace(line[:10], '').rstrip()
+        if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
+            with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid),"r") as omr6in4_file:
+                for line in omr6in4_file:
+                    if 'LOCALIP6=' in line:
+                        localip6 = line.replace(line[:9], '').rstrip()
+                    if 'REMOTEIP6=' in line:
+                        remoteip6 = line.replace(line[:10], '').rstrip()
     else:
         locaip6='fe80::a00:1'
         remoteip6='fe80::a00:2'
 
-    vpn = current_user.vpn
+    vpn = omr_config_data['users'][0][current_user.username]['vpn']
+    #vpn = current_user.vpn
     if current_user.permissions == 'ro':
         del available_vpn
         available_vpn = [vpn]
+
+    alllanips = []
+    client2client = False
+    if 'client2client' in omr_config_data and omr_config_data['client2client'] == True:
+        client2client = True
+        for users in omr_config_data['users'][0]:
+            if 'lanips' in omr_config_data['users'][0][users]:
+                alllanips.append(omr_config_data['users'][0][users]['lanips'])
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules','r') as f:
@@ -663,7 +673,7 @@ def config(current_user: User = Depends(get_current_user)):
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
 
-    return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'traffic': ss_traffic,'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole},'user': {'name': current_user.username,'permission': user_permissions},'6in4': {'localip': localip6,'remoteip': remoteip6}}
+    return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'traffic': ss_traffic,'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole},'user': {'name': current_user.username,'permission': user_permissions},'6in4': {'localip': localip6,'remoteip': remoteip6},'client2client': {'enabled': client2client,'lanips': alllanips}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
