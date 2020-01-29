@@ -664,7 +664,7 @@ def config(current_user: User = Depends(get_current_user)):
     if 'client2client' in omr_config_data and omr_config_data['client2client'] == True:
         client2client = True
         for users in omr_config_data['users'][0]:
-            if 'lanips' in omr_config_data['users'][0][users]:
+            if 'lanips' in omr_config_data['users'][0][users] and users != current_user.username:
                 alllanips.append(omr_config_data['users'][0][users]['lanips'])
 
     shorewall_redirect = "enable"
@@ -1333,6 +1333,21 @@ def client2client(*, params: ClienttoClient,current_user: User = Depends(get_cur
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart openvpn@tun0")
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
+    fd, tmpfile = mkstemp()
+    with open('/etc/shorewall/policy','r') as f, open(tmpfile,'a+') as n:
+        for line in f:
+            if not line == 'vpn		vpn		DROP\n' and not line == '# THE FOLLOWING POLICY MUST BE LAST\n' and not line == 'all		all		REJECT		info\n':
+                n.write(line)
+        if params.enable == True:
+            n.write('vpn		vpn		DROP\n')
+        n.write('# THE FOLLOWING POLICY MUST BE LAST\n')
+        n.write('all		all		REJECT		info\n')
+    os.close(fd)
+    move(tmpfile,'/etc/shorewall/policy')
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
+    if not initial_md5 == final_md5:
+        os.system("systemctl -q reload shorewall")
     return {'result': 'done'}
 
 @app.get('/list_users')
