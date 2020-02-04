@@ -406,7 +406,7 @@ def status(current_user: User = Depends(get_current_user)):
         ss_traffic = 0
 
     if iface:
-        return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname,'kernel': vps_kernel, 'vps_omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}, 'shadowsocks': {'traffic': ss_traffic}}
+        return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname,'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}, 'shadowsocks': {'traffic': ss_traffic}}
     else:
         return {'error': 'No iface defined','route': 'status'}
 
