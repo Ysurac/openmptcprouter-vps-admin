@@ -118,6 +118,11 @@ def add_glorytun_tcp(userid):
         f.write(glorytun_tcp_key.upper())
     os.system("systemctl -q restart glorytun-tcp@tun" + str(userid))
 
+def remove_glorytun_tcp(userid):
+    os.system("systemctl -q stop glorytun-tcp@tun" + str(userid))
+    os.remove('/etc/glorytun-tcp/tun' + str(userid) + '.key')
+    os.remove('/etc/glorytun-tcp/tun' + str(userid))
+
 def add_glorytun_udp(userid):
     port = '650{:02d}'.format(userid)
     ip = IPNetwork('10.255.254.0/24')
@@ -140,6 +145,12 @@ def add_glorytun_udp(userid):
             n.write(line)
     os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
 
+def remove_glorytun_udp(userid):
+    os.system("systemctl -q stop glorytun-udp@tun" + str(userid))
+    os.remove('/etc/glorytun-udp/tun' + str(userid) + '.key')
+    os.remove('/etc/glorytun-udp/tun' + str(userid))
+
+
 def add_dsvpn(userid):
     port = '654{:02d}'.format(userid)
     ip = IPNetwork('10.255.251.0/24')
@@ -161,6 +172,12 @@ def add_dsvpn(userid):
     with open('/etc/dsvpn/dsvpn' + str(userid) + '.key','w') as f:
         f.write(dsvpn_key.upper())
     os.system("systemctl -q restart dsvpn@dsvpn" + str(userid))
+
+def remove_dsvpn(userid):
+    os.system("systemctl -q stop dsvpn@dsvpn" + str(userid))
+    os.remove('/etc/dsvpn/dsvpn' + str(userid))
+    os.remove('/etc/dsvpn/dsvpn' + str(userid) + '.key')
+
 
 def ordered(obj):
     if isinstance(obj, dict):
@@ -1289,6 +1306,7 @@ def add_user(*, params: NewUser,current_user: User = Depends(get_current_user)):
     os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full "' + params.username + '" nopass')
     add_glorytun_tcp(userid)
     add_glorytun_udp(userid)
+    add_dsvpn(userid)
 
     set_lastchange(30)
     os.execv(__file__, sys.argv)
@@ -1310,6 +1328,10 @@ def remove_user(*, params: RemoveUser,current_user: User = Depends(get_current_u
     os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username)
     os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl')
     os.system("systemctl -q restart openvpn@tun0")
+    remove_glorytun_tcp(userid)
+    remove_glorytun_udp(userid)
+    remove_dsvpn(userid)
+
     set_lastchange(30)
     os.execv(__file__, sys.argv)
 
