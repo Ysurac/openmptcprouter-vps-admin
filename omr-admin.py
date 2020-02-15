@@ -367,7 +367,7 @@ def create_access_token(*, data: dict, expires_delta: timedelta = None):
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.utcnow() + timedelta(minutes=60)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -382,6 +382,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
+            log.debug("get_current_user: Username not found")
             raise credentials_exception
         token_data = TokenData(username=username)
     except PyJWTError:
@@ -397,6 +398,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(fake_users_db, form_data.username, form_data.password)
     if not user:
+        log.debug("Incorrect username or password")
         raise HTTPException(status_code=400, detail="Incorrect username or password")
 
     # Identity can be any data that is json serializable
@@ -408,7 +410,8 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
 # Get VPS status
 @app.get('/status')
-def status(current_user: User = Depends(get_current_user)):
+async def status(current_user: User = Depends(get_current_user)):
+    log.debug('Get status...')
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_hostname = socket.gethostname()
@@ -422,6 +425,7 @@ def status(current_user: User = Depends(get_current_user)):
     else:
         ss_traffic = 0
 
+    log.debug('Get status: done')
     if iface:
         return {'vps': {'time': vps_current_time,'loadavg': vps_loadavg,'uptime': vps_uptime,'mptcp': mptcp_enabled,'hostname': vps_hostname,'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx',iface),'rx': get_bytes('rx',iface)}, 'shadowsocks': {'traffic': ss_traffic}}
     else:
@@ -429,7 +433,8 @@ def status(current_user: User = Depends(get_current_user)):
 
 # Get VPS config
 @app.get('/config')
-def config(current_user: User = Depends(get_current_user)):
+async def config(current_user: User = Depends(get_current_user)):
+    log.debug('Get config...')
     userid = current_user.userid
     if userid == None:
         userid = 0
@@ -438,6 +443,7 @@ def config(current_user: User = Depends(get_current_user)):
             omr_config_data = json.load(f)
         except ValueError as e:
             omr_config_data = {}
+    log.debug('Get config... shadowsocks')
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
     content = re.sub(",\s*}","}",content)
@@ -487,10 +493,12 @@ def config(current_user: User = Depends(get_current_user)):
         shadowsocks_obfs_plugin = ''
         shadowsocks_obfs_type = ''
     shadowsocks_port = current_user.shadowsocks_port
-    if not shadowsocks_port == None:
-        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
-    else:
-        ss_traffic = 0
+    #if not shadowsocks_port == None:
+    #    ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    #else:
+    ss_traffic = 0
+
+    log.debug('Get config... glorytun')
     if os.path.isfile('/etc/glorytun-tcp/tun' + str(userid) +'.key'):
         glorytun_key = open('/etc/glorytun-tcp/tun' + str(userid) + '.key').readline().rstrip()
     else:
@@ -543,6 +551,7 @@ def config(current_user: User = Depends(get_current_user)):
             glorytun_udp_host_ip = '10.255.254.1'
             glorytun_udp_client_ip = '10.255.254.2'
     available_vpn = ["glorytun-tcp", "glorytun-udp"]
+    log.debug('Get config... dsvpn')
     if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid) + '.key'):
         dsvpn_key = open('/etc/dsvpn/dsvpn' + str(userid) + '.key').readline().rstrip()
         available_vpn.append("dsvpn")
@@ -565,6 +574,7 @@ def config(current_user: User = Depends(get_current_user)):
         dsvpn_host_ip = '10.255.251.1'
         dsvpn_client_ip = '10.255.251.2'
 
+    log.debug('Get config... iperf3')
     if os.path.isfile('/etc/iperf3/public.pem'):
         with open('/etc/iperf3/public.pem',"rb") as iperfkey_file:
             iperf_keyb = base64.b64encode(iperfkey_file.read())
@@ -577,6 +587,7 @@ def config(current_user: User = Depends(get_current_user)):
     else:
         pihole = False
 
+    log.debug('Get config... openvpn')
     #if os.path.isfile('/etc/openvpn/server/static.key'):
     #    with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
     #        openvpn_keyb = base64.b64encode(ovpnkey_file.read())
@@ -614,6 +625,7 @@ def config(current_user: User = Depends(get_current_user)):
     #openvpn_client_ip = '10.255.252.2'
     openvpn_client_ip = 'dhcp'
 
+    log.debug('Get config... mlvpn')
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
         mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
@@ -625,6 +637,7 @@ def config(current_user: User = Depends(get_current_user)):
     mlvpn_client_ip = '10.255.253.2'
 
 
+    log.debug('Get config... mptcp')
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
     mptcp_checksum = os.popen('sysctl -n net.mptcp.mptcp_checksum').read().rstrip()
     mptcp_path_manager = os.popen('sysctl -n  net.mptcp.mptcp_path_manager').read().rstrip()
@@ -633,10 +646,12 @@ def config(current_user: User = Depends(get_current_user)):
 
     congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
 
+    log.debug('Get config... ipv6')
     ipv6_network = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
     ipv6_addr = os.popen('ip -6 addr show ' + iface +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
+    log.debug('get server IPv4')
     ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
     if ipv4_addr == '':
         ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.co').read().rstrip()
@@ -652,6 +667,7 @@ def config(current_user: User = Depends(get_current_user)):
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
+    log.debug('get hostname')
     vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
     user_permissions = current_user.permissions
@@ -689,7 +705,7 @@ def config(current_user: User = Depends(get_current_user)):
         for line in f:
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
-
+    log.debug('Get config: done')
     return {'vps': {'kernel': vps_kernel,'machine': vps_machine,'omr_version': vps_omr_version,'loadavg': vps_loadavg,'uptime': vps_uptime,'aes': vps_aes},'shadowsocks': {'traffic': ss_traffic,'key': shadowsocks_key,'port': shadowsocks_port,'method': shadowsocks_method,'fast_open': shadowsocks_fast_open,'reuse_port': shadowsocks_reuse_port,'no_delay': shadowsocks_no_delay,'mptcp': shadowsocks_mptcp,'ebpf': shadowsocks_ebpf,'obfs': shadowsocks_obfs,'obfs_plugin': shadowsocks_obfs_plugin,'obfs_type': shadowsocks_obfs_type},'glorytun': {'key': glorytun_key,'udp': {'host_ip': glorytun_udp_host_ip,'client_ip': glorytun_udp_client_ip},'tcp': {'host_ip': glorytun_tcp_host_ip,'client_ip': glorytun_tcp_client_ip},'port': glorytun_port,'chacha': glorytun_chacha},'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port},'openvpn': {'key': openvpn_key,'client_key': openvpn_client_key,'client_crt': openvpn_client_crt,'client_ca': openvpn_client_ca,'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port},'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip},'shorewall': {'redirect_ports': shorewall_redirect},'mptcp': {'enabled': mptcp_enabled,'checksum': mptcp_checksum,'path_manager': mptcp_path_manager,'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries},'network': {'congestion_control': congestion_control,'ipv6_network': ipv6_network,'ipv6': ipv6_addr,'ipv4': ipv4_addr,'domain': vps_domain},'vpn': {'available': available_vpn,'current': vpn},'iperf': {'user': 'openmptcprouter','password': 'openmptcprouter', 'key': iperf3_key},'pihole': {'state': pihole},'user': {'name': current_user.username,'permission': user_permissions},'6in4': {'localip': localip6,'remoteip': remoteip6},'client2client': {'enabled': client2client,'lanips': alllanips}}
 
 # Set shadowsocks config
@@ -1373,7 +1389,7 @@ def client2client(*, params: ClienttoClient,current_user: User = Depends(get_cur
     return {'result': 'done'}
 
 @app.get('/list_users')
-def list_users(current_user: User = Depends(get_current_user)):
+async def list_users(current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission','reason': 'Need admin user','route': 'list_users'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
