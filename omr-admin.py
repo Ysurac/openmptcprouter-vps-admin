@@ -420,10 +420,10 @@ async def status(current_user: User = Depends(get_current_user)):
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
     shadowsocks_port = current_user.shadowsocks_port
-    if not shadowsocks_port == None:
-        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
-    else:
-        ss_traffic = 0
+    #if not shadowsocks_port == None:
+    #    ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    #else:
+    ss_traffic = 0
 
     log.debug('Get status: done')
     if iface:
