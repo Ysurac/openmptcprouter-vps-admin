@@ -63,6 +63,7 @@ def get_bytes(t, iface='eth0'):
 
 def get_bytes_ss(port):
     ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
+    ss_socket.settimeout(3)
     ss_socket.sendto('ping'.encode(), ("127.0.0.1",8839));
     ss_recv = ss_socket.recv(1024);
     json_txt = ss_recv.decode("utf-8").replace('stat: ','');
@@ -954,7 +955,7 @@ def mptcp(*, params: MPTCPparams,current_user: User = Depends(get_current_user))
     os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
     os.system('sysctl -qw net.mptcp.mptcp_path_manager=' + path_manager)
     os.system('sysctl -qw net.mptcp.mptcp_scheduler=' + scheduler)
-    os.system('sysctl -qw net.mptcp.mptcp_syn_retries=' + syn_retries)
+    os.system('sysctl -qw net.mptcp.mptcp_syn_retries=' + str(syn_retries))
     os.system('sysctl -qw net.ipv4.tcp_congestion_control=' + congestion_control)
     set_lastchange()
     return {'result': 'done','reason': 'changes applied'}
