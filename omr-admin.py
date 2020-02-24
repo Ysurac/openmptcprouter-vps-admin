@@ -37,8 +37,8 @@ from enum import Enum
 
 import logging
 log = logging.getLogger('api')
-log.setLevel(logging.ERROR)
-#log.setLevel(logging.DEBUG)
+#log.setLevel(logging.ERROR)
+log.setLevel(logging.DEBUG)
 
 # Generate a random secret key
 SECRET_KEY = uuid.uuid4().hex
@@ -688,7 +688,7 @@ async def config(current_user: User = Depends(get_current_user)):
         remoteip6='fe80::a00:2'
 
     vpn = 'glorytun_tcp'
-    if 'vpn' in omr_config_data['users'][0][current_user.username]
+    if 'vpn' in omr_config_data['users'][0][current_user.username]:
         vpn = omr_config_data['users'][0][current_user.username]['vpn']
     #vpn = current_user.vpn
     if current_user.permissions == 'ro':
