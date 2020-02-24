@@ -37,8 +37,8 @@ from enum import Enum
 
 import logging
 log = logging.getLogger('api')
-#log.setLevel(logging.ERROR)
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.ERROR)
+#log.setLevel(logging.DEBUG)
 
 # Generate a random secret key
 SECRET_KEY = uuid.uuid4().hex
