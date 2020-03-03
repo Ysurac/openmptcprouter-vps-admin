@@ -39,7 +39,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.models import SecurityBase as SecurityBaseModel
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError # pylint: disable=E0611 
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse
 from starlette.requests import Request
@@ -87,7 +87,7 @@ def add_ss_user(port, key):
     ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content)
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     data['port_key'][port] = key
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
@@ -100,7 +100,7 @@ def remove_ss_user(port):
     ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content)
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     del data['port_key'][port]
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
@@ -286,7 +286,7 @@ def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT'):
 def set_lastchange(sync=0):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content)
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -298,7 +298,7 @@ def set_lastchange(sync=0):
 def set_global_param(key, value):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content)
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -368,11 +368,11 @@ class UserInDB(User):
 # Add support for auth before seeing doc
 class OAuth2PasswordBearerCookie(OAuth2):
     def __init__(
-        self,
-        tokenUrl: str,
-        scheme_name: str = None,
-        scopes: dict = None,
-        auto_error: bool = True,
+            self,
+            tokenUrl: str,
+            scheme_name: str = None,
+            scopes: dict = None,
+            auto_error: bool = True,
     ):
         if not scopes:
             scopes = {}
@@ -491,7 +491,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     # Identity can be any data that is json serializable
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
+        data={"sub": form_data.username}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -586,7 +586,7 @@ async def config(current_user: User = Depends(get_current_user)):
     LOG.debug('Get config... shadowsocks')
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content)
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -765,7 +765,7 @@ async def config(current_user: User = Depends(get_current_user)):
     #openvpn_client_ip = '10.255.252.2'
     openvpn_client_ip = 'dhcp'
 
-    log.debug('Get config... mlvpn')
+    LOG.debug('Get config... mlvpn')
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
         mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
@@ -871,7 +871,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     ipv6_network = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content)
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -1479,6 +1479,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
+    userid = int(content['users'][0][params.username]['userid'])
     del content['users'][0][params.username]
     remove_ss_user(str(shadowsocks_port))
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
