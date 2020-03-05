@@ -1519,7 +1519,8 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
         for line in f:
             if not 'client-to-client' in line:
                 n.write(line)
-        n.write('client-to-client' + "\n")
+        if params.enable == True:
+            n.write('client-to-client' + "\n")
     os.close(fd)
     move(tmpfile, '/etc/openvpn/tun0.conf')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
