@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#
 # Copyright (C) 2018-2019 Ycarus (Yannick Chabanois) <ycarus@zugaina.org>
 #
 # This is free software, licensed under the GNU General Public License v3.0.
@@ -39,7 +40,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.models import SecurityBase as SecurityBaseModel
-from pydantic import BaseModel, ValidationError # pylint: disable=E0611 
+from pydantic import BaseModel, ValidationError # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse
 from starlette.requests import Request
@@ -111,13 +112,17 @@ def add_glorytun_tcp(userid):
     ip = IPNetwork('10.255.255.0/24')
     subnets = ip.subnet(30)
     network = list(subnets)[userid]
-    with open('/etc/glorytun-tcp/tun0', 'r') as f, open('/etc/glorytun-tcp/tun' + str(userid), 'w') as n:
+    with open('/etc/glorytun-tcp/tun0', 'r') as f, \
+          open('/etc/glorytun-tcp/tun' + str(userid), 'w') as n:
         for line in f:
             if 'PORT' in line:
                 n.write('PORT=' + port + "\n")
             elif 'DEV' in line:
                 n.write('DEV=tun' + str(userid) + "\n")
-            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line and not line == "\n":
+            elif (not 'LOCALIP' in line
+                  and not 'REMOTEIP' in line
+                  and not 'BROADCASTIP' in line
+                  and not line == "\n"):
                 n.write(line)
         n.write("\n" + 'LOCALIP=' + str(list(network)[1]) + "\n")
         n.write('REMOTEIP=' + str(list(network)[2]) + "\n")
@@ -139,18 +144,23 @@ def add_glorytun_udp(userid):
     ip = IPNetwork('10.255.254.0/24')
     subnets = ip.subnet(30)
     network = list(subnets)[userid]
-    with open('/etc/glorytun-udp/tun0', 'r') as f, open('/etc/glorytun-udp/tun' + str(userid), 'w') as n:
+    with open('/etc/glorytun-udp/tun0', 'r') as f, \
+          open('/etc/glorytun-udp/tun' + str(userid), 'w') as n:
         for line in f:
             if 'BIND_PORT' in line:
                 n.write('BIND_PORT=' + port + "\n")
             elif 'DEV' in line:
                 n.write('DEV=tun' + str(userid) + "\n")
-            elif not 'LOCALIP' in line and not 'REMOTEIP' in line and not 'BROADCASTIP' in line and not line == "\n":
+            elif (not 'LOCALIP' in line
+                  and not 'REMOTEIP' in line
+                  and not 'BROADCASTIP' in line
+                  and not line == "\n"):
                 n.write(line)
         n.write("\n" + 'LOCALIP=' + str(list(network)[1]) + "\n")
         n.write('REMOTEIP=' + str(list(network)[2]) + "\n")
         n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
-    with open('/etc/glorytun-tcp/tun' + str(userid) + '.key', 'r') as f, open('/etc/glorytun-udp/tun' + str(userid) + '.key', 'w') as n:
+    with open('/etc/glorytun-tcp/tun' + str(userid) + '.key', 'r') as f, \
+          open('/etc/glorytun-udp/tun' + str(userid) + '.key', 'w') as n:
         for line in f:
             n.write(line)
     os.system("systemctl -q enable glorytun-udp@tun" + str(userid))
@@ -211,9 +221,10 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT'):
         userid = 0
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
-    with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
+    with open('/etc/shorewall/rules', 'r') as f, \
+          open(tmpfile, 'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line:
+            if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line):
                 n.write(line)
             elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
                 n.write(line)
@@ -246,7 +257,7 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT'):
 
 def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT'):
     userid = user.userid
-    if userid == None:
+    if userid is None:
         userid = 0
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
@@ -830,7 +841,7 @@ async def config(current_user: User = Depends(get_current_user)):
     if 'vpn' in omr_config_data['users'][0][current_user.username]:
         vpn = omr_config_data['users'][0][current_user.username]['vpn']
     #vpn = current_user.vpn
-    if current_user.permissions == 'ro':
+    if user_permissions == 'ro':
         del available_vpn
         available_vpn = [vpn]
 
@@ -839,8 +850,8 @@ async def config(current_user: User = Depends(get_current_user)):
     if 'client2client' in omr_config_data and omr_config_data['client2client']:
         client2client = True
         for users in omr_config_data['users'][0]:
-            if 'lanips' in omr_config_data['users'][0][users] and users != current_user.username:
-                alllanips.append(omr_config_data['users'][0][users]['lanips'])
+            if 'lanips' in omr_config_data['users'][0][users] and users != current_user.username and omr_config_data['users'][0][users]['lanips'][0] not in alllanips:
+                alllanips.append(omr_config_data['users'][0][users]['lanips'][0])
 
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules', 'r') as f:
@@ -1527,7 +1538,7 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
     os.close(fd)
     move(tmpfile, '/etc/shorewall/policy')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
     return {'result': 'done'}
 
