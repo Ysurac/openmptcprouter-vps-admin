@@ -1532,7 +1532,7 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
         for line in f:
             if not line == 'vpn		vpn		DROP\n' and not line == '# THE FOLLOWING POLICY MUST BE LAST\n' and not line == 'all		all		REJECT		info\n':
                 n.write(line)
-        if params.enable == True:
+        if params.enable == False:
             n.write('vpn		vpn		DROP\n')
         n.write('# THE FOLLOWING POLICY MUST BE LAST\n')
         n.write('all		all		REJECT		info\n')
