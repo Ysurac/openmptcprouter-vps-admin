@@ -787,11 +787,11 @@ async def config(current_user: User = Depends(get_current_user)):
     mlvpn_host_ip = '10.255.253.1'
     mlvpn_client_ip = '10.255.253.2'
 
-    if 'vpnremoteip' in omr_config_data['users'][0][current_user.username]
+    if 'vpnremoteip' in omr_config_data['users'][0][current_user.username]:
         vpn_remote_ip = omr_config_data['users'][0][current_user.username]['vpnremoteip']
     else:
         vpn_remote_ip = ''
-    if 'vpnlocalip' in omr_config_data['users'][0][current_user.username]
+    if 'vpnlocalip' in omr_config_data['users'][0][current_user.username]:
         vpn_local_ip = content['users'][0][current_user.username]['vpnlocalip']
     else:
         vpn_local_ip = ''
