@@ -967,8 +967,8 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         with open('/etc/shadowsocks-libev/manager.json', 'w') as outfile:
             json.dump(shadowsocks_config, outfile, indent=4)
         os.system("systemctl restart shadowsocks-libev-manager@manager.service")
-        for x in range(1, os.cpu_count()):
-            os.system("systemctl restart shadowsocks-libev-manager@manager" + str(x) + ".service")
+        #for x in range(1, os.cpu_count()):
+        #    os.system("systemctl restart shadowsocks-libev-manager@manager" + str(x) + ".service")
         shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks')
         shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks')
         set_lastchange()
