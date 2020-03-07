@@ -792,7 +792,7 @@ async def config(current_user: User = Depends(get_current_user)):
     else:
         vpn_remote_ip = ''
     if 'vpnlocalip' in omr_config_data['users'][0][current_user.username]:
-        vpn_local_ip = content['users'][0][current_user.username]['vpnlocalip']
+        vpn_local_ip = omr_config_data['users'][0][current_user.username]['vpnlocalip']
     else:
         vpn_local_ip = ''
 
