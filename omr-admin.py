@@ -1439,6 +1439,7 @@ class VPN(str, Enum):
     openvpn = "openvpn"
     glorytuntcp = "glorytun_tcp"
     glorytunudp = "glorytun_udp"
+    dsvpn = "dsvpn"
 
 class permissions(str, Enum):
     ro = "ro"
