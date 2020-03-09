@@ -701,7 +701,7 @@ async def config(current_user: User = Depends(get_current_user)):
         else:
             glorytun_udp_host_ip = '10.255.254.1'
             glorytun_udp_client_ip = '10.255.254.2'
-    available_vpn = ["glorytun-tcp", "glorytun-udp"]
+    available_vpn = ["glorytun_tcp", "glorytun_udp"]
     LOG.debug('Get config... dsvpn')
     if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid) + '.key'):
         dsvpn_key = open('/etc/dsvpn/dsvpn' + str(userid) + '.key').readline().rstrip()
