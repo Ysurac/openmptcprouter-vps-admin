@@ -1044,12 +1044,12 @@ def shorewall_list(*, params: ShorewallListparams, current_user: User = Depends(
     if params.ipproto == 'ipv4':
         with open('/etc/shorewall/rules', 'r') as f:
             for line in f:
-                if '# OMR ' + name in line:
+                if '# OMR ' + current_user.username + ' ' + name in line:
                     fwlist.append(line)
     else:
         with open('/etc/shorewall6/rules', 'r') as f:
             for line in f:
-                if '# OMR ' + name in line:
+                if '# OMR ' + current_user.username + ' ' + name in line:
                     fwlist.append(line)
     return {'list': fwlist}
 
