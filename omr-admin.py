@@ -811,9 +811,14 @@ async def config(current_user: User = Depends(get_current_user)):
     ipv6_addr = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
-    ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
-    if ipv4_addr == '':
-        ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.co').read().rstrip()
+    if 'ipv4' in omr_config_data:
+        ipv4_addr = omr_config['ipv4']
+    else:
+        ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
+        if ipv4_addr == '':
+            ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.co').read().rstrip()
+        if ipv4_addr != '':
+            set_global_param('ipv4', ipv4_addr)
     #ipv4_addr = ""
 
     test_aes = os.popen('cat /proc/cpuinfo | grep aes').read().rstrip()
@@ -827,7 +832,12 @@ async def config(current_user: User = Depends(get_current_user)):
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     LOG.debug('get hostname')
-    vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
+    if 'hostname' in omr_config_data:
+        vps_domain = omr_config['hostname']
+    else:
+        vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
+        if vps_domain != '':
+            set_global_param('hostname', vps_domain)
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
     user_permissions = current_user.permissions
 
@@ -1197,6 +1207,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
     shorewall_add_port(current_user, str(port), 'tcp', 'glorytun')
+    shorewall_add_port(current_user, str(port), 'udp', 'glorytun')
     set_lastchange()
     return {'result': 'done'}
 
