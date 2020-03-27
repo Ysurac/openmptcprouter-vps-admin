@@ -833,7 +833,7 @@ async def config(current_user: User = Depends(get_current_user)):
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     LOG.debug('get hostname')
     if 'hostname' in omr_config_data:
-        vps_domain = omr_config['hostname']
+        vps_domain = omr_config_data['hostname']
     else:
         vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
         if vps_domain != '':
