@@ -812,7 +812,7 @@ async def config(current_user: User = Depends(get_current_user)):
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
     if 'ipv4' in omr_config_data:
-        ipv4_addr = omr_config['ipv4']
+        ipv4_addr = omr_config_data['ipv4']
     else:
         ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
         if ipv4_addr == '':
