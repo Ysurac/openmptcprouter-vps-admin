@@ -927,8 +927,22 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     portkey = data["port_key"]
     modif_config_user(current_user, {'shadowsocks_port': port})
     portkey[str(port)] = key
+    userid = current_user.userid
+    if userid is None:
+        userid = 0
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
+
     #ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
-    vps_domain = os.popen('wget -4 -qO- -T 2 http://hostname.openmptcprouter.com').read().rstrip()
+    if 'hostname' in omr_config_data:
+        vps_domain = omr_config_data['hostname']
+    else:
+        vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
+        if vps_domain != '':
+            set_global_param('hostname', vps_domain)
 
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shadowsocks'}
