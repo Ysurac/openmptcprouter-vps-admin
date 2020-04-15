@@ -1340,16 +1340,19 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
 class VPNips(BaseModel):
     remoteip: str
     localip: str
+    ula: str
 
 # Set user vpn IPs
 @app.post('/vpnips')
 def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user)):
     remoteip = vpnconfig.remoteip
     localip = vpnconfig.localip
-    if not remoteip or not localip:
+    ula = vpnconfig.ula
+    if not remoteip or not localip or not ula:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
     modif_config_user(current_user, {'vpnremoteip': remoteip})
     modif_config_user(current_user, {'vpnlocalip': localip})
+    modif_config_user(current_user, {'ula': ula})
     userid = current_user.userid
     if userid == None:
         userid = 0
@@ -1362,6 +1365,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         n.write('REMOTEIP=' + remoteip + "\n")
         n.write('LOCALIP6=fe80::a0' + hex(userid)[2:] + ':1/126' + "\n")
         n.write('REMOTEIP6=fe80::a0' + hex(userid)[2:] + ':2/126' + "\n")
+        n.write('ULA=' + ula + "\n")
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart omr6in4@user" + str(userid))
@@ -1403,7 +1407,6 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         set_lastchange()
 
     return {'result': 'done', 'reason': 'changes applied'}
-
 
 # Update VPS
 @app.get('/update')
