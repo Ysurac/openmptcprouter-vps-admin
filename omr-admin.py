@@ -604,7 +604,7 @@ async def config(current_user: User = Depends(get_current_user)):
         data = {'key': '', 'server_port': 65101, 'method': 'chacha20'}
     #shadowsocks_port = data["server_port"]
     shadowsocks_port = current_user.shadowsocks_port
-    if not shadowsocks_port == None:
+    if shadowsocks_port is not None:
         shadowsocks_key = data["port_key"][str(shadowsocks_port)]
     else:
         shadowsocks_key = ''
@@ -813,6 +813,8 @@ async def config(current_user: User = Depends(get_current_user)):
     LOG.debug('get server IPv4')
     if 'ipv4' in omr_config_data:
         ipv4_addr = omr_config_data['ipv4']
+    elif 'internet' in omr_config_data and not omr_config_data['internet']:
+        ipv4_addr = os.popen('ip -4 addr show ' + IFACE +' | grep -oP "(?<=inet ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     else:
         ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
         if ipv4_addr == '':
@@ -834,6 +836,8 @@ async def config(current_user: User = Depends(get_current_user)):
     LOG.debug('get hostname')
     if 'hostname' in omr_config_data:
         vps_domain = omr_config_data['hostname']
+    elif 'internet' in omr_config_data and not omr_config_data['internet']:
+        vps_domain = ''
     else:
         vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
         if vps_domain != '':
@@ -1175,7 +1179,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
         set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'glorytun'}
     userid = current_user.userid
-    if userid == None:
+    if userid is None:
         userid = 0
     key = glorytunconfig.key
     port = glorytunconfig.port
@@ -1236,7 +1240,7 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
         set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'dsvpn'}
     userid = current_user.userid
-    if userid == None:
+    if userid is None:
         userid = 0
     key = params.key
     port = params.port
@@ -1354,7 +1358,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     modif_config_user(current_user, {'vpnlocalip': localip})
     modif_config_user(current_user, {'ula': ula})
     userid = current_user.userid
-    if userid == None:
+    if userid is None:
         userid = 0
     if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
         initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
