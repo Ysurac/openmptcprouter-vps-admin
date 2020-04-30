@@ -865,8 +865,8 @@ async def config(current_user: User = Depends(get_current_user)):
                     if 'REMOTEIP6=' in line:
                         remoteip6 = line.replace(line[:10], '').rstrip()
     else:
-        locaip6 = 'fe80::a00:1'
-        remoteip6 = 'fe80::a00:2'
+        locaip6 = 'fd80::a00:1'
+        remoteip6 = 'fd80::a00:2'
 
     vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][current_user.username]:
@@ -1376,8 +1376,8 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'w+') as n:
         n.write('LOCALIP=' + localip + "\n")
         n.write('REMOTEIP=' + remoteip + "\n")
-        n.write('LOCALIP6=fe80::a0' + hex(userid)[2:] + ':1/126' + "\n")
-        n.write('REMOTEIP6=fe80::a0' + hex(userid)[2:] + ':2/126' + "\n")
+        n.write('LOCALIP6=fd80::a0' + hex(userid)[2:] + ':1/126' + "\n")
+        n.write('REMOTEIP6=fd80::a0' + hex(userid)[2:] + ':2/126' + "\n")
         n.write('ULA=' + ula + "\n")
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
@@ -1408,9 +1408,9 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
             if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
                 n.write(line)
         if  not userid == 0:
-            n.write('OMR_ADDR_USER' + str(userid) + '=fe80::a0' + hex(userid)[2:] + ':2/126' + '\n')
+            n.write('OMR_ADDR_USER' + str(userid) + '=fd80::a0' + hex(userid)[2:] + ':2/126' + '\n')
         elif userid == 0:
-            n.write('OMR_ADDR=fe80::a0' + hex(userid)[2:] + ':2/126' + '\n')
+            n.write('OMR_ADDR=fd80::a0' + hex(userid)[2:] + ':2/126' + '\n')
 
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/params.vpn')
