@@ -606,7 +606,7 @@ async def config(current_user: User = Depends(get_current_user)):
     try:
         data = json.loads(content)
     except ValueError as e:
-        data = {'key': '', 'server_port': 65101, 'method': 'chacha20'}
+        data = {'port_key': '', 'server_port': 65101, 'method': 'chacha20'}
     #shadowsocks_port = data["server_port"]
     shadowsocks_port = current_user.shadowsocks_port
     if shadowsocks_port is not None:
@@ -811,9 +811,15 @@ async def config(current_user: User = Depends(get_current_user)):
     congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
 
     LOG.debug('Get config... ipv6')
-    ipv6_network = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+    if 'ipv6_network' in omr_config_data:
+        ipv6_network = omr_config_data['ipv6_network']
+    else:
+        ipv6_network = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
-    ipv6_addr = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
+    if 'ipv6_addr' in omr_config_data:
+        ipv6_addr = omr_config_data['ipv6_addr']
+    else:
+        ipv6_addr = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
     if 'ipv4' in omr_config_data:
