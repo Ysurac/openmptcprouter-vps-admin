@@ -81,10 +81,17 @@ def get_bytes(t, iface='eth0'):
     return int(data)
 
 def get_bytes_ss(port):
-    ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ss_socket.settimeout(3)
-    ss_socket.sendto('ping'.encode(), ("127.0.0.1", 8839))
-    ss_recv = ss_socket.recv(1024)
+    try:
+        ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ss_socket.settimeout(3)
+        ss_socket.sendto('ping'.encode(), ("127.0.0.1", 8839))
+        ss_recv = ss_socket.recv(1024)
+    except socket.timeout as err:
+        LOG.debug("Shadowsocks stats timeout (" + err + ")")
+        return 0
+    except socket.error as err:
+        LOG.debug("Shadowsocks stats error (" + err + ")")
+        return 0
     json_txt = ss_recv.decode("utf-8").replace('stat: ', '')
     result = json.loads(json_txt)
     if str(port) in result:
@@ -585,11 +592,11 @@ async def status(current_user: User = Depends(get_current_user)):
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
-    #shadowsocks_port = current_user.shadowsocks_port
-    #if not shadowsocks_port == None:
-    #    ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
-    #else:
-    ss_traffic = 0
+    shadowsocks_port = current_user.shadowsocks_port
+    if not shadowsocks_port == None:
+        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    else:
+        ss_traffic = 0
 
     LOG.debug('Get status: done')
     if IFACE:
@@ -659,10 +666,10 @@ async def config(current_user: User = Depends(get_current_user)):
         shadowsocks_obfs_plugin = ''
         shadowsocks_obfs_type = ''
     shadowsocks_port = current_user.shadowsocks_port
-    #if not shadowsocks_port == None:
-    #    ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
-    #else:
-    ss_traffic = 0
+    if not shadowsocks_port == None:
+        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    else:
+        ss_traffic = 0
 
     LOG.debug('Get config... glorytun')
     if os.path.isfile('/etc/glorytun-tcp/tun' + str(userid) +'.key'):
@@ -890,6 +897,21 @@ async def config(current_user: User = Depends(get_current_user)):
     vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][current_user.username]:
         vpn = omr_config_data['users'][0][current_user.username]['vpn']
+
+    vpn_traffic = 0
+    if vpn == 'glorytun_tcp':
+        vpn_traffic_rx = get_bytes('rx','gt-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','gt-tun' + str(userid))
+    elif vpn == 'glorytun_udp':
+        vpn_traffic_rx = get_bytes('rx','gt-udp-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','gt-udp-tun' + str(userid))
+    elif vpn == 'mlvpn':
+        vpn_traffic_rx = get_bytes('rx','mlvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','mlvpn' + str(userid))
+    elif vpn == 'dsvpn':
+        vpn_traffic_rx = get_bytes('rx','dsvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','dsvpn' + str(userid))
+
     #vpn = current_user.vpn
     if user_permissions == 'ro':
         del available_vpn
@@ -909,7 +931,7 @@ async def config(current_user: User = Depends(get_current_user)):
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, '6in4': {'localip': localip6, 'remoteip': remoteip6,'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip,'rx': vpn_traffic_rx,'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, '6in4': {'localip': localip6, 'remoteip': remoteip6,'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
@@ -1383,6 +1405,8 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'vpnips'}
     remoteip = vpnconfig.remoteip
     localip = vpnconfig.localip
+    remoteip6 = vpnconfig.remoteip6
+    localip6 = vpnconfig.localip6
     ula = vpnconfig.ula
     if not remoteip or not localip:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
