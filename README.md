@@ -1,3 +1,3 @@
-# OpenMPTCProuter VPS admin rest API
+# OpenMPTCProuter Server admin rest API
 
-Script to get and set config from OpenMPTCProuter to the VPS part
+The OpenMPTCProuter API is based on [FastAPI](https://fastapi.tiangolo.com/).
