@@ -1394,9 +1394,9 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
 class VPNips(BaseModel):
     remoteip: str
     localip: str
-    remoteip6: str
-    localip6: str
-    ula: str
+    remoteip6: str = ""
+    localip6: str = ""
+    ula: str = ""
 
 # Set user vpn IPs
 @app.post('/vpnips')

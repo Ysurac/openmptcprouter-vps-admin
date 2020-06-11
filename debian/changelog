@@ -1,3 +1,9 @@
+omr-vps-admin (0.2+20200611) unstable; urgency=medium
+
+    * Fix on VPN IPs settings
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 11 Jun 2020 20:27:08 +0200
+
 omr-vps-admin (0.1+20200608.git.e1e3bfa) unstable; urgency=medium
 
     * initial package
