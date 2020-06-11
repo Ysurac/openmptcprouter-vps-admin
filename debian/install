@@ -1,0 +1,3 @@
+omr-admin-config.json usr/share/omr-admin
+omr-admin.py usr/bin
+debian/omr-admin.service lib/systemd/system

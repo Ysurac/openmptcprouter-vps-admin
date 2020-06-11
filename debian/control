@@ -1,0 +1,14 @@
+Source: omr-vps-admin
+Section: net
+Priority: optional
+Maintainer: OpenMPTCProuter <contact@openmptcprouter.com>
+Build-Depends:
+X-Python-Version: >= 3.2
+Standards-Version: 0.0.1
+Homepage: https://github.com/ysurac/openmptcprouter-vps-admin
+
+Package: omr-vps-admin
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}, ${python3:Depends}, python3-uvicorn, python3-netaddr, python3-pip
+Description: OpenMPTCProuter VPS admin rest api

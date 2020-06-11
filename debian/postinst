@@ -1,0 +1,30 @@
+#!/bin/sh -e
+
+test $DEBIAN_SCRIPT_DEBUG && set -v -x
+
+action="$1"
+oldversion="$2"
+
+umask 022
+OMR_ADMIN_PASS=$(od -vN "32" -An -tx1 /dev/urandom | tr '[:lower:]' '[:upper:]' | tr -d " \n")
+# use debconf
+. /usr/share/debconf/confmodule
+
+pip3 -q install fastapi netjsonconfig python-multipart -U
+
+if [ ! -f "/etc/openmptcprouter-vps-admin/omr-admin-config.json" ]; then
+	mkdir -p /etc/openmptcprouter-vps-admin
+	cp /usr/share/omr-admin/omr-admin-config.json /etc/openmptcprouter-vps-admin/omr-admin-config.json
+	sed -i "s:MySecretKey:$OMR_ADMIN_PASS:g" /etc/openmptcprouter-vps-admin/omr-admin-config.json
+	openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -keyout /etc/openmptcprouter-vps-admin/key.pem -out /etc/openmptcprouter-vps-admin/cert.pem -subj "/C=US/ST=Oregon/L=Portland/O=OpenMPTCProuterVPS/OU=Org/CN=www.openmptcprouter.vps"
+fi
+
+systemctl enable omr-admin.service
+systemctl restart omr-admin.service
+
+
+db_stop
+
+#DEBHELPER#
+exit 0
+# vim:set ai et sts=2 sw=2 tw=0:
