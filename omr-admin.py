@@ -232,7 +232,7 @@ def file_as_bytes(file):
     with file:
         return file.read()
 
-def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT'):
+def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip = ''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -241,38 +241,58 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT'):
     with open('/etc/shorewall/rules', 'r') as f, \
           open(tmpfile, 'a+') as n:
         for line in f:
-            if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line):
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
-        if fwtype == 'ACCEPT':
-            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid == 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid != 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            if source_dip == '':
+                if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line):
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line):
+                    n.write(line)
+                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+        if source_dip == '':
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+        else:
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT'):
+def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
+            if source_dip == '':
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if fwtype == 'ACCEPT' and not port + '# OMR ' + username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT'):
+def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip=''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -280,31 +300,51 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT'):
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line:
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
-        if fwtype == 'ACCEPT':
-            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid == 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid != 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            if source_dip == '':
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+        if source_dip == '':
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+        else:
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip +  "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip +  "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall6")
 
-def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT'):
+def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
+            if source_dip == '':
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
@@ -1137,6 +1177,7 @@ class Shorewallparams(BaseModel):
     proto: str
     fwtype: str
     ipproto: str = "ipv4"
+    source_dip: str = ""
 
 @app.post('/shorewallopen')
 def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
@@ -1146,12 +1187,13 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
     port = params.port
     proto = params.proto
     fwtype = params.fwtype
+    source_dip = params.source_dip
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallopen'}
     if params.ipproto == 'ipv4':
-        shorewall_add_port(current_user, str(port), proto, name, fwtype)
+        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip)
     else:
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype)
+        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/shorewallclose')
@@ -1162,12 +1204,13 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     port = params.port
     proto = params.proto
     fwtype = params.fwtype
+    source_dip = params.source_dip
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallclose'}
     if params.ipproto == 'ipv4':
-        shorewall_del_port(current_user.username, str(port), proto, name, fwtype)
+        shorewall_del_port(current_user.username, str(port), proto, name, fwtype, source_dip)
     else:
-        shorewall6_del_port(current_user.username, str(port), proto, name, fwtype)
+        shorewall6_del_port(current_user.username, str(port), proto, name, fwtype, source_dip)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
 
 # Set MPTCP config
