@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2019 Ycarus (Yannick Chabanois) <ycarus@zugaina.org>
+# Copyright (C) 2018-2020 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
 #
 # This is free software, licensed under the GNU General Public License v3.0.
 # See /LICENSE for more information.
@@ -17,6 +17,8 @@ import sys
 import socket
 import re
 import hashlib
+import netifaces
+import pathlib
 import time
 from pprint import pprint
 from datetime import datetime, timedelta
@@ -74,6 +76,8 @@ for line in READ.splitlines():
         IFACE6 = line.split('=', 1)[1]
 FILE.close()
 
+LOG.debug("Launching OMR-Admin")
+
 # Get interface rx/tx
 def get_bytes(t, iface='eth0'):
     with open('/sys/class/net/' + iface + '/statistics/' + t + '_bytes', 'r') as f:
@@ -99,7 +103,102 @@ def get_bytes_ss(port):
     else:
         return 0
 
-def add_ss_user(port, key):
+def file_as_bytes(file):
+    with file:
+        return file.read()
+
+def set_global_param(key, value):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        return {'error': 'Config file not readable', 'route': 'global_param'}
+    data[key] = value
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
+        json.dump(data, outfile, indent=4)
+
+def modif_config_user(user, changes):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = json.load(f)
+    content['users'][0][user.username].update(changes)
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
+        json.dump(content, f, indent=4)
+
+
+def add_gre_tunnels():
+    nbip = 0
+    allips = []
+    for intf in netifaces.interfaces():
+        addrs = netifaces.ifaddresses(intf)
+        try:
+            ipv4_addr_list = addrs[netifaces.AF_INET]
+            for ip_info in ipv4_addr_list:
+                addr = ip_info['addr']
+                if not IPAddress(addr).is_private() and not IPAddress(addr).is_reserved():
+                    allips.append(addr)
+                    nbip = nbip + 1
+        except Exception as exception:
+            pass
+
+    if nbip > 1:
+        nbgre = 0
+        nbip = 0
+        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
+        for intf in netifaces.interfaces():
+            addrs = netifaces.ifaddresses(intf)
+            try:
+                ipv4_addr_list = addrs[netifaces.AF_INET]
+                for ip_info in ipv4_addr_list:
+                    addr = ip_info['addr']
+                    if not IPAddress(addr).is_private() and not IPAddress(addr).is_reserved():
+                        netmask = ip_info['netmask']
+                        ip = IPNetwork('10.255.249.0/24')
+                        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+                            content = json.load(f)
+                        for user in content['users'][0]:
+                            if user != "admin":
+                                subnets = ip.subnet(30)
+                                network = list(subnets)[nbgre]
+                                nbgre = nbgre + 1
+                                userid = 0
+                                username = user
+                                if 'userid' in content['users'][0][user]:
+                                    userid = content['users'][0][user]['userid']
+                                if 'username' in content['users'][0][user]:
+                                    username = content['users'][0][user]['username']
+                                with open('/etc/openmptcprouter-vps-admin/intf/gre-user' + str(userid) + '-ip' + str(nbip), 'w') as n:
+                                    n.write('INTF=' + str(intf.split(':')[0]) + "\n")
+                                    n.write('INTFADDR=' + str(addr) + "\n")
+                                    n.write('INTFNETMASK=' + str(netmask) + "\n")
+                                    n.write('NETWORK=' + str(network) + "\n")
+                                    n.write('LOCALIP=' + str(list(network)[1]) + "\n")
+                                    n.write('REMOTEIP=' + str(list(network)[2]) + "\n")
+                                    n.write('NETMASK=255.255.255.252' + "\n")
+                                    n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
+                                    n.write('USERNAME=' + str(username) + "\n")
+                                    n.write('USERID=' + str(userid) + "\n")
+                                initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
+                                fd, tmpfile = mkstemp()
+                                with open('/etc/shorewall/snat', 'r') as f, open(tmpfile, 'a+') as n:
+                                    for line in f:
+                                        if not '# OMR GRE for ' + str(addr) + ' for user ' + str(user) in f:
+                                            n.write(line)
+                                    n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
+                                os.close(fd)
+                                move(tmpfile, '/etc/shorewall/snat')
+                        nbip = nbip + 1
+            except Exception as exception:
+                pass
+        final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
+        if initial_md5 != final_md5:
+            os.system("systemctl -q reload shorewall")
+    set_global_param('allips',allips)
+
+add_gre_tunnels()
+
+def add_ss_user(port, key, ip=''):
     ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     data = 'add: {"server_port": ' + port + ', "key": "' + key + '"}'
     ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
@@ -107,10 +206,19 @@ def add_ss_user(port, key):
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
-    data['port_key'][port] = key
+    if ip == '' and 'port_key' in data:
+        data['port_key'][port] = key
+    else:
+        if 'port_key' in data:
+            for old_port in data['port_key']:
+                data['port_conf'][old_port] = {'key': data['port_key'][old_port]}
+            del data['port_key']
+        if ip != '':
+            data['port_conf'][port] = {'key': key, 'ip': ip}
+        else:
+            data['port_conf'][port] = {'key': key}
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
         json.dump(data, f, indent=4)
-
 
 def remove_ss_user(port):
     ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -120,7 +228,10 @@ def remove_ss_user(port):
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
-    del data['port_key'][port]
+    if 'port_key' in data:
+        del data['port_key'][port]
+    else:
+        del data['port_conf'][port]
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
         json.dump(data, f, indent=4)
 
@@ -228,11 +339,8 @@ def ordered(obj):
     else:
         return obj
 
-def file_as_bytes(file):
-    with file:
-        return file.read()
 
-def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip = ''):
+def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -241,17 +349,22 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip = ''
     with open('/etc/shorewall/rules', 'r') as f, \
           open(tmpfile, 'a+') as n:
         for line in f:
-            if source_dip == '':
+            if source_dip == '' and dest_ip == '':
                 if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line):
                     n.write(line)
                 elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
                     n.write(line)
             else:
-                if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line):
+                comment = ''
+                if source_dip == '':
+                    comment = ' to ' + source_dip
+                if dest_ip == '':
+                    comment = comment + ' from ' + dest_ip
+                if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment in line):
                     n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment in line:
                     n.write(line)
-        if source_dip == '':
+        if source_dip == '' and dest_ip == '':
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
             elif fwtype == 'DNAT' and userid == 0:
@@ -259,19 +372,26 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip = ''
             elif fwtype == 'DNAT' and userid != 0:
                 n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
         else:
+            net = 'net'
+            comment = ''
+            if source_dip != '':
+                comment = ' to ' + source_dip
+            if dest_ip != '':
+                comment = comment + ' from ' + dest_ip
+                net = 'net:' + dest_ip
             if fwtype == 'ACCEPT':
-                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=''):
+def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
@@ -282,9 +402,9 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=
                 elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
                     n.write(line)
             else:
-                if fwtype == 'ACCEPT' and not port + '# OMR ' + username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                if fwtype == 'ACCEPT' and not port + '# OMR ' + username + ' open ' + name + ' port ' + proto + ' to ' + source_dip in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                elif fwtype == 'DNAT' and not port + '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' to ' + source_dip in line:
                     n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
@@ -292,7 +412,7 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip=''):
+def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -306,9 +426,14 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='')
                 elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
                     n.write(line)
             else:
-                if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                comment = ''
+                if source_dip == '':
+                    comment = ' to ' + source_dip
+                if dest_ip == '':
+                    comment = comment + ' from ' + dest_ip
+                if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                elif fwtype == 'DNAT' and not port + '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment in line:
                     n.write(line)
         if source_dip == '':
             if fwtype == 'ACCEPT':
@@ -318,19 +443,26 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='')
             elif fwtype == 'DNAT' and userid != 0:
                 n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
         else:
+            net = 'net'
+            comment = ''
+            if source_dip == '':
+                comment = ' to ' + source_dip
+            if dest_ip == '':
+                comment = comment + ' from ' + dest_ip
+                net = 'net:' + dest_ip
             if fwtype == 'ACCEPT':
-                n.write('ACCEPT		net		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip +  "\n")
+                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment+  "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip +  "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall6")
 
-def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=''):
+def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
@@ -341,9 +473,9 @@ def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip
                 elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
                     n.write(line)
             else:
-                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + ' to ' + source_dip in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' to ' + source_dip in line:
                     n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
@@ -363,24 +495,6 @@ def set_lastchange(sync=0):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
         json.dump(data, outfile, indent=4)
 
-def set_global_param(key, value):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        data = json.loads(content)
-    except ValueError as e:
-        return {'error': 'Config file not readable', 'route': 'global_param'}
-    data[key] = value
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-        json.dump(data, outfile, indent=4)
-
-def modif_config_user(user, changes):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
-    content['users'][0][user.username].update(changes)
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-        json.dump(content, f, indent=4)
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
     omr_config_data = json.load(f)
@@ -667,7 +781,10 @@ async def config(current_user: User = Depends(get_current_user)):
     #shadowsocks_port = data["server_port"]
     shadowsocks_port = current_user.shadowsocks_port
     if shadowsocks_port is not None:
-        shadowsocks_key = data["port_key"][str(shadowsocks_port)]
+        if 'port_key' in data:
+            shadowsocks_key = data["port_key"][str(shadowsocks_port)]
+        else:
+            shadowsocks_key = data["port_conf"][str(shadowsocks_port)]["key"]
     else:
         shadowsocks_key = ''
     shadowsocks_method = data["method"]
@@ -849,6 +966,20 @@ async def config(current_user: User = Depends(get_current_user)):
     mlvpn_host_ip = '10.255.253.1'
     mlvpn_client_ip = '10.255.253.2'
 
+    gre_tunnel = False
+    gre_tunnel_conf = []
+    for tunnel in pathlib.Path('/etc/openmptcprouter-vps-admin/intf').glob('gre-user' + str(userid) + '-ip*'):
+        gre_tunnel = True
+        with open(tunnel, "r") as tunnel_conf:
+            for line in tunnel_conf:
+                if 'LOCALIP=' in line:
+                    gre_tunnel_localip = line.replace(line[:8], '').rstrip()
+                if 'REMOTEIP=' in line:
+                    gre_tunnel_remoteip = line.replace(line[:9], '').rstrip()
+                if 'NETMASK=' in line:
+                    gre_tunnel_netmask = line.replace(line[:8], '').rstrip()
+        gre_tunnel_conf.append("{'local_ip': '" + gre_tunnel_localip + "', 'remote_ip': '" + gre_tunnel_remoteip + "', 'netmask': '" + gre_tunnel_netmask + "'}")
+
     if 'vpnremoteip' in omr_config_data['users'][0][current_user.username]:
         vpn_remote_ip = omr_config_data['users'][0][current_user.username]['vpnremoteip']
     else:
@@ -940,17 +1071,17 @@ async def config(current_user: User = Depends(get_current_user)):
 
     vpn_traffic = 0
     if vpn == 'glorytun_tcp':
-        vpn_traffic_rx = get_bytes('rx','gt-tun' + str(userid))
-        vpn_traffic_tx = get_bytes('tx','gt-tun' + str(userid))
+        vpn_traffic_rx = get_bytes('rx', 'gt-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'gt-tun' + str(userid))
     elif vpn == 'glorytun_udp':
-        vpn_traffic_rx = get_bytes('rx','gt-udp-tun' + str(userid))
-        vpn_traffic_tx = get_bytes('tx','gt-udp-tun' + str(userid))
+        vpn_traffic_rx = get_bytes('rx', 'gt-udp-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'gt-udp-tun' + str(userid))
     elif vpn == 'mlvpn':
-        vpn_traffic_rx = get_bytes('rx','mlvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx','mlvpn' + str(userid))
+        vpn_traffic_rx = get_bytes('rx', 'mlvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'mlvpn' + str(userid))
     elif vpn == 'dsvpn':
-        vpn_traffic_rx = get_bytes('rx','dsvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx','dsvpn' + str(userid))
+        vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
 
     #vpn = current_user.vpn
     if user_permissions == 'ro':
@@ -971,7 +1102,7 @@ async def config(current_user: User = Depends(get_current_user)):
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip,'rx': vpn_traffic_rx,'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6,'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6,'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
@@ -1018,7 +1149,10 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     obfs_type = params.obfs_type
     ebpf = 0
     key = params.key
-    portkey = data["port_key"]
+    if 'port_key' in data:
+        portkey = data["port_key"]
+    if 'port_conf' in data:
+        portconf = data["port_conf"]
     modif_config_user(current_user, {'shadowsocks_port': port})
     portkey[str(port)] = key
     userid = current_user.userid
@@ -1040,46 +1174,88 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
 
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shadowsocks'}
-    if ipv6_network == '':
-        if obfs:
-            if obfs_plugin == "v2ray":
-                if obfs_type == "tls":
-                    if vps_domain == '':
-                        shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls'}
+    if 'port_key' in data:
+        if ipv6_network == '':
+            if obfs:
+                if obfs_plugin == "v2ray":
+                    if obfs_type == "tls":
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls'}
+                        else:
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls;host=' + vps_domain}
                     else:
-                        shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls;host=' + vps_domain}
+                        shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server'}
                 else:
-                    shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server'}
+                    if obfs_type == 'tls':
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                        else:
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
+                    else:
+                        shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
             else:
-                if obfs_type == 'tls':
-                    if vps_domain == '':
-                        shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
-                    else:
-                        shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
-                else:
-                    shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+                shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl'}
         else:
-            shadowsocks_config = {'server': '0.0.0.0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl'}
+            if obfs:
+                if obfs_plugin == "v2ray":
+                    if obfs_type == "tls":
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': '::0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls'}
+                        else:
+                            shadowsocks_config = {'server': '::0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls;host=' + vps_domain}
+                    else:
+                        shadowsocks_config = {'server': '::0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server'}
+                else:
+                    if obfs_type == 'tls':
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                        else:
+                            shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
+                    else:
+                        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+            else:
+                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl'}
     else:
-        if obfs:
-            if obfs_plugin == "v2ray":
-                if obfs_type == "tls":
-                    if vps_domain == '':
-                        shadowsocks_config = {'server': '::0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls'}
+        if ipv6_network == '':
+            if obfs:
+                if obfs_plugin == "v2ray":
+                    if obfs_type == "tls":
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls'}
+                        else:
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls;host=' + vps_domain}
                     else:
-                        shadowsocks_config = {'server': '::0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls;host=' + vps_domain}
+                        shadowsocks_config = {'server': '0.0.0.0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server'}
                 else:
-                    shadowsocks_config = {'server': '::0', 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server'}
+                    if obfs_type == 'tls':
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                        else:
+                            shadowsocks_config = {'server': '0.0.0.0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
+                    else:
+                        shadowsocks_config = {'server': '0.0.0.0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
             else:
-                if obfs_type == 'tls':
-                    if vps_domain == '':
-                        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
-                    else:
-                        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
-                else:
-                    shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+                shadowsocks_config = {'server': '0.0.0.0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl'}
         else:
-            shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_key': portkey, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl'}
+            if obfs:
+                if obfs_plugin == "v2ray":
+                    if obfs_type == "tls":
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': '::0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls'}
+                        else:
+                            shadowsocks_config = {'server': '::0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server;tls;host=' + vps_domain}
+                    else:
+                        shadowsocks_config = {'server': '::0', 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/v2ray-plugin', 'plugin_opts': 'server'}
+                else:
+                    if obfs_type == 'tls':
+                        if vps_domain == '':
+                            shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400'}
+                        else:
+                            shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=tls;mptcp;fast-open;t=400;host=' + vps_domain}
+                    else:
+                        shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl', 'plugin': '/usr/local/bin/obfs-server', 'plugin_opts': 'obfs=http;mptcp;fast-open;t=400'}
+            else:
+                shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl'}
 
     if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
         with open('/etc/shadowsocks-libev/manager.json', 'w') as outfile:
@@ -1590,6 +1766,7 @@ class NewUser(BaseModel):
     permission: permissions = Query("ro", title="permission of the user")
 #    shadowsocks_port: int = Query(None, title="Shadowsocks port")
     vpn: VPN = Query("openvpn", title="default VPN for the user")
+    ips: List[str] = Query([], title="Public exit IP")
 #    vpn_port: int = None
 #    userid: int = Query(0, title="User ID",description="User ID is used to create port of each VPN and shadowsocks",gt=0,le=99)
 
@@ -1606,13 +1783,13 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
                 userid = int(content['users'][0][users]['userid'])
     userid = userid + 1
     user_key = secrets.token_hex(32)
-    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '"}}')
+    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ params.ips +'}}')
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
     shadowsocks_port = '651{:02d}'.format(userid)
 
     shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
-    add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'))
+    add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), params.ips[0])
     user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
@@ -1700,6 +1877,7 @@ async def list_users(current_user: User = Depends(get_current_user)):
     return content['users'][0]
 
 if __name__ == '__main__':
+    LOG.debug("Main OMR-Admin launch")
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
     omrport = 65500
