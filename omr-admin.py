@@ -978,7 +978,9 @@ async def config(current_user: User = Depends(get_current_user)):
                     gre_tunnel_remoteip = line.replace(line[:9], '').rstrip()
                 if 'NETMASK=' in line:
                     gre_tunnel_netmask = line.replace(line[:8], '').rstrip()
-        gre_tunnel_conf.append("{'local_ip': '" + gre_tunnel_localip + "', 'remote_ip': '" + gre_tunnel_remoteip + "', 'netmask': '" + gre_tunnel_netmask + "'}")
+                if 'INTFADDR=' in line:
+                    gre_tunnel_intfaddr = line.replace(line[:9], '').rstrip()
+        gre_tunnel_conf.append("{'local_ip': '" + gre_tunnel_localip + "', 'remote_ip': '" + gre_tunnel_remoteip + "', 'netmask': '" + gre_tunnel_netmask + "', 'public_ip': '" + gre_tunnel_intfaddr + "'}")
 
     if 'vpnremoteip' in omr_config_data['users'][0][current_user.username]:
         vpn_remote_ip = omr_config_data['users'][0][current_user.username]['vpnremoteip']
