@@ -17,7 +17,6 @@ import sys
 import socket
 import re
 import hashlib
-import netifaces
 import pathlib
 import time
 from pprint import pprint
@@ -45,7 +44,8 @@ from fastapi.openapi.models import SecurityBase as SecurityBaseModel
 from pydantic import BaseModel, ValidationError # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse
-from starlette.requests import Request
+#from starlette.requests import Request
+import netifaces
 
 LOG = logging.getLogger('api')
 #LOG.setLevel(logging.ERROR)
@@ -76,8 +76,6 @@ for line in READ.splitlines():
         IFACE6 = line.split('=', 1)[1]
 FILE.close()
 
-LOG.debug("Launching OMR-Admin")
-
 # Get interface rx/tx
 def get_bytes(t, iface='eth0'):
     with open('/sys/class/net/' + iface + '/statistics/' + t + '_bytes', 'r') as f:
@@ -100,8 +98,7 @@ def get_bytes_ss(port):
     result = json.loads(json_txt)
     if str(port) in result:
         return result[str(port)]
-    else:
-        return 0
+    return 0
 
 def file_as_bytes(file):
     with file:
@@ -122,9 +119,61 @@ def set_global_param(key, value):
 def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
-    content['users'][0][user.username].update(changes)
+    content['users'][0][user].update(changes)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
         json.dump(content, f, indent=4)
+
+def add_ss_user(port, key, ip=''):
+    with open('/etc/shadowsocks-libev/manager.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    data = json.loads(content)
+    if ip == '' and 'port_key' in data:
+        if port == '':
+            port = max(data['port_key'], key=int) + 1
+        data['port_key'][str(port)] = key
+    else:
+        if 'port_key' in data:
+            for old_port in data['port_key']:
+                data['port_conf'][old_port] = {'key': data['port_key'][old_port]}
+            del data['port_key']
+        if port == '':
+            port = max(data['port_conf'], key=int) + 1
+        if ip != '':
+            data['port_conf'][str(port)] = {'key': key, 'ip': ip}
+        else:
+            data['port_conf'][str(port)] = {'key': key}
+    with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    try:
+        ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        data = 'add: {"server_port": ' + port + ', "key": "' + key + '"}'
+        ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
+    except socket.timeout as err:
+        LOG.debug("Shadowsocks add timeout (" + err + ")")
+    except socket.error as err:
+        LOG.debug("Shadowsocks add error (" + err + ")")
+    return port
+
+def remove_ss_user(port):
+    try:
+        ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        data = 'remove: {"server_port": ' + port + '}'
+        ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
+    except socket.timeout as err:
+        LOG.debug("Shadowsocks remove timeout (" + err + ")")
+    except socket.error as err:
+        LOG.debug("Shadowsocks remove error (" + err + ")")
+    with open('/etc/shadowsocks-libev/manager.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    data = json.loads(content)
+    if 'port_key' in data:
+        del data['port_key'][port]
+    else:
+        del data['port_conf'][port]
+    with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
+        json.dump(data, f, indent=4)
 
 
 def add_gre_tunnels():
@@ -181,13 +230,28 @@ def add_gre_tunnels():
                                     n.write('USERID=' + str(userid) + "\n")
                                 initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
                                 fd, tmpfile = mkstemp()
-                                with open('/etc/shorewall/snat', 'r') as f, open(tmpfile, 'a+') as n:
-                                    for line in f:
-                                        if not '# OMR GRE for ' + str(addr) + ' for user ' + str(user) in f:
+                                with open('/etc/shorewall/snat', 'r') as h, open(tmpfile, 'a+') as n:
+                                    for line in h:
+                                        if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in h:
                                             n.write(line)
                                     n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                 os.close(fd)
                                 move(tmpfile, '/etc/shorewall/snat')
+                                user_gre_tunnels = []
+                                if 'gre_tunnels' in content['users'][0]:
+                                    user_gre_tunnels = content['users'][0]['gre_tunnels']
+                                if not str(addr) in user_gre_tunnels:
+                                    with open('/etc/shadowsocks-libev/manager.json') as g:
+                                        contentss = g.read()
+                                    contentss = re.sub(",\s*}", "}", contentss) # pylint: disable=W1401
+                                    datass = json.loads(contentss)
+                                    ss_port = content['users'][0][user]['shadowsocks_port']
+                                    if 'port_key' in datass:
+                                        ss_key = datass['port_key'][str(ss_port)]
+                                    if 'port_conf' in datass:
+                                        ss_key = datass['port_conf'][str(ss_port)]['key']
+                                    user_gre_tunnels[str(addr)].append({str(addr): {'shadowsocks_port': str(add_ss_user('',ss_key,str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}})
+                                    modif_config_user(user,{'gre_tunnels': user_gre_tunnels})
                         nbip = nbip + 1
             except Exception as exception:
                 pass
@@ -198,42 +262,6 @@ def add_gre_tunnels():
 
 add_gre_tunnels()
 
-def add_ss_user(port, key, ip=''):
-    ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    data = 'add: {"server_port": ' + port + ', "key": "' + key + '"}'
-    ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
-    with open('/etc/shadowsocks-libev/manager.json') as f:
-        content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
-    data = json.loads(content)
-    if ip == '' and 'port_key' in data:
-        data['port_key'][port] = key
-    else:
-        if 'port_key' in data:
-            for old_port in data['port_key']:
-                data['port_conf'][old_port] = {'key': data['port_key'][old_port]}
-            del data['port_key']
-        if ip != '':
-            data['port_conf'][port] = {'key': key, 'ip': ip}
-        else:
-            data['port_conf'][port] = {'key': key}
-    with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
-        json.dump(data, f, indent=4)
-
-def remove_ss_user(port):
-    ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    data = 'remove: {"server_port": ' + port + '}'
-    ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
-    with open('/etc/shadowsocks-libev/manager.json') as f:
-        content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
-    data = json.loads(content)
-    if 'port_key' in data:
-        del data['port_key'][port]
-    else:
-        del data['port_conf'][port]
-    with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
-        json.dump(data, f, indent=4)
 
 def add_glorytun_tcp(userid):
     port = '650{:02d}'.format(userid)
@@ -968,19 +996,23 @@ async def config(current_user: User = Depends(get_current_user)):
 
     gre_tunnel = False
     gre_tunnel_conf = []
-    for tunnel in pathlib.Path('/etc/openmptcprouter-vps-admin/intf').glob('gre-user' + str(userid) + '-ip*'):
+#    for tunnel in pathlib.Path('/etc/openmptcprouter-vps-admin/intf').glob('gre-user' + str(userid) + '-ip*'):
+#        gre_tunnel = True
+#        with open(tunnel, "r") as tunnel_conf:
+#            for line in tunnel_conf:
+#                if 'LOCALIP=' in line:
+#                    gre_tunnel_localip = line.replace(line[:8], '').rstrip()
+#                if 'REMOTEIP=' in line:
+#                    gre_tunnel_remoteip = line.replace(line[:9], '').rstrip()
+#                if 'NETMASK=' in line:
+#                    gre_tunnel_netmask = line.replace(line[:8], '').rstrip()
+#                if 'INTFADDR=' in line:
+#                    gre_tunnel_intfaddr = line.replace(line[:9], '').rstrip()
+#        gre_tunnel_conf.append("{'local_ip': '" + gre_tunnel_localip + "', 'remote_ip': '" + gre_tunnel_remoteip + "', 'netmask': '" + gre_tunnel_netmask + "', 'public_ip': '" + gre_tunnel_intfaddr + "'}")
+
+    if 'gre_tunnels' in omr_config_data['users'][0][current_user.username]:
         gre_tunnel = True
-        with open(tunnel, "r") as tunnel_conf:
-            for line in tunnel_conf:
-                if 'LOCALIP=' in line:
-                    gre_tunnel_localip = line.replace(line[:8], '').rstrip()
-                if 'REMOTEIP=' in line:
-                    gre_tunnel_remoteip = line.replace(line[:9], '').rstrip()
-                if 'NETMASK=' in line:
-                    gre_tunnel_netmask = line.replace(line[:8], '').rstrip()
-                if 'INTFADDR=' in line:
-                    gre_tunnel_intfaddr = line.replace(line[:9], '').rstrip()
-        gre_tunnel_conf.append("{'local_ip': '" + gre_tunnel_localip + "', 'remote_ip': '" + gre_tunnel_remoteip + "', 'netmask': '" + gre_tunnel_netmask + "', 'public_ip': '" + gre_tunnel_intfaddr + "'}")
+        gre_tunnel_conf = omr_config_data['users'][0][current_user.username]['gre_tunnels']
 
     if 'vpnremoteip' in omr_config_data['users'][0][current_user.username]:
         vpn_remote_ip = omr_config_data['users'][0][current_user.username]['vpnremoteip']
@@ -1104,7 +1136,7 @@ async def config(current_user: User = Depends(get_current_user)):
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6,'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
@@ -1155,7 +1187,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         portkey = data["port_key"]
     if 'port_conf' in data:
         portconf = data["port_conf"]
-    modif_config_user(current_user, {'shadowsocks_port': port})
+    modif_config_user(current_user.username, {'shadowsocks_port': port})
     portkey[str(port)] = key
     userid = current_user.userid
     if userid is None:
@@ -1432,7 +1464,7 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
     if not vpn:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpn'}
     os.system('echo ' + vpn + ' > /etc/openmptcprouter-vps-admin/current-vpn')
-    modif_config_user(current_user, {'vpn': vpn})
+    modif_config_user(current_user.username, {'vpn': vpn})
     current_user.vpn = vpn
     set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
@@ -1573,7 +1605,7 @@ def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
         outfile.write('[white_list]\n')
         outfile.write(ips)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/local.acl', 'rb'))).hexdigest()
-    #modif_config_user(current_user,{'wanips': wanip})
+    #modif_config_user(current_user.username,{'wanips': wanip})
     return {'result': 'done'}
 
 class Lanips(BaseModel):
@@ -1585,7 +1617,7 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     lanips = lanconfig.lanips
     if not lanips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'lan'}
-    modif_config_user(current_user, {'lanips': lanips})
+    modif_config_user(current_user.username, {'lanips': lanips})
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
     client2client = False
@@ -1631,10 +1663,10 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     ula = vpnconfig.ula
     if not remoteip or not localip:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
-    modif_config_user(current_user, {'vpnremoteip': remoteip})
-    modif_config_user(current_user, {'vpnlocalip': localip})
+    modif_config_user(current_user.username, {'vpnremoteip': remoteip})
+    modif_config_user(current_user.username, {'vpnlocalip': localip})
     if ula:
-        modif_config_user(current_user, {'ula': ula})
+        modif_config_user(current_user.username, {'ula': ula})
     userid = current_user.userid
     if userid is None:
         userid = 0
@@ -1766,10 +1798,10 @@ class permissions(str, Enum):
 class NewUser(BaseModel):
     username: str = Query(None, title="Username")
     permission: permissions = Query("ro", title="permission of the user")
-#    shadowsocks_port: int = Query(None, title="Shadowsocks port")
     vpn: VPN = Query("openvpn", title="default VPN for the user")
+    shadowsocks_port: int = Query("", title="Shadowsocks port")
+    userid: int = Query(None, title="User ID")
     ips: List[str] = Query([], title="Public exit IP")
-#    vpn_port: int = None
 #    userid: int = Query(0, title="User ID",description="User ID is used to create port of each VPN and shadowsocks",gt=0,le=99)
 
 @app.post('/add_user')
@@ -1778,20 +1810,23 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
-    userid = 2
-    for users in content['users'][0]:
-        if 'userid' in content['users'][0][users]:
-            if int(content['users'][0][users]['userid']) > userid:
-                userid = int(content['users'][0][users]['userid'])
-    userid = userid + 1
+    userid = params.userid
+    if userid is None:
+        userid = 2
+        for users in content['users'][0]:
+            if 'userid' in content['users'][0][users]:
+                if int(content['users'][0][users]['userid']) > userid:
+                    userid = int(content['users'][0][users]['userid'])
+        userid = userid + 1
     user_key = secrets.token_hex(32)
     user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ params.ips +'}}')
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
-    shadowsocks_port = '651{:02d}'.format(userid)
+#    shadowsocks_port = '651{:02d}'.format(userid)
+    shadowsocks_port = ''
 
     shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
-    add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), params.ips[0])
+    shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), params.ips[0])
     user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
