@@ -89,10 +89,10 @@ def get_bytes_ss(port):
         ss_socket.sendto('ping'.encode(), ("127.0.0.1", 8839))
         ss_recv = ss_socket.recv(1024)
     except socket.timeout as err:
-        LOG.debug("Shadowsocks stats timeout (" + err + ")")
+        LOG.debug("Shadowsocks stats timeout (" + str(err) + ")")
         return 0
     except socket.error as err:
-        LOG.debug("Shadowsocks stats error (" + err + ")")
+        LOG.debug("Shadowsocks stats error (" + str(err) + ")")
         return 0
     json_txt = ss_recv.decode("utf-8").replace('stat: ', '')
     result = json.loads(json_txt)
@@ -130,7 +130,7 @@ def add_ss_user(port, key, ip=''):
     data = json.loads(content)
     if ip == '' and 'port_key' in data:
         if port == '':
-            port = max(data['port_key'], key=int) + 1
+            port = int(max(data['port_key'], key=int)) + 1
         data['port_key'][str(port)] = key
     else:
         if 'port_key' in data:
@@ -138,7 +138,7 @@ def add_ss_user(port, key, ip=''):
                 data['port_conf'][old_port] = {'key': data['port_key'][old_port]}
             del data['port_key']
         if port == '':
-            port = max(data['port_conf'], key=int) + 1
+            port = int(max(data['port_conf'], key=int)) + 1
         if ip != '':
             data['port_conf'][str(port)] = {'key': key, 'ip': ip}
         else:
@@ -147,23 +147,19 @@ def add_ss_user(port, key, ip=''):
         json.dump(data, f, indent=4)
     try:
         ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        data = 'add: {"server_port": ' + port + ', "key": "' + key + '"}'
+        if ip != '':
+            data = 'add: {"server_port": ' + port + ', "key": "' + key + '", "local_addr": "' + ip + '"}'
+        else:
+            data = 'add: {"server_port": ' + port + ', "key": "' + key + '"}'
+        ss_socket.settimeout(3)
         ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
     except socket.timeout as err:
-        LOG.debug("Shadowsocks add timeout (" + err + ")")
+        LOG.debug("Shadowsocks add timeout (" + str(err) + ")")
     except socket.error as err:
-        LOG.debug("Shadowsocks add error (" + err + ")")
+        LOG.debug("Shadowsocks add error (" + str(err) + ")")
     return port
 
 def remove_ss_user(port):
-    try:
-        ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        data = 'remove: {"server_port": ' + port + '}'
-        ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
-    except socket.timeout as err:
-        LOG.debug("Shadowsocks remove timeout (" + err + ")")
-    except socket.error as err:
-        LOG.debug("Shadowsocks remove error (" + err + ")")
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
@@ -174,6 +170,15 @@ def remove_ss_user(port):
         del data['port_conf'][port]
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
         json.dump(data, f, indent=4)
+    try:
+        ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        data = 'remove: {"server_port": ' + port + '}'
+        ss_socket.settimeout(3)
+        ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
+    except socket.timeout as err:
+        LOG.debug("Shadowsocks remove timeout (" + str(err) + ")")
+    except socket.error as err:
+        LOG.debug("Shadowsocks remove error (" + str(err) + ")")
 
 
 def add_gre_tunnels():
@@ -217,7 +222,8 @@ def add_gre_tunnels():
                                     userid = content['users'][0][user]['userid']
                                 if 'username' in content['users'][0][user]:
                                     username = content['users'][0][user]['username']
-                                with open('/etc/openmptcprouter-vps-admin/intf/gre-user' + str(userid) + '-ip' + str(nbip), 'w') as n:
+                                gre_intf = 'gre-user' + str(userid) + '-ip' + str(nbip)
+                                with open('/etc/openmptcprouter-vps-admin/intf/' + gre_intf, 'w') as n:
                                     n.write('INTF=' + str(intf.split(':')[0]) + "\n")
                                     n.write('INTFADDR=' + str(addr) + "\n")
                                     n.write('INTFNETMASK=' + str(netmask) + "\n")
@@ -240,7 +246,7 @@ def add_gre_tunnels():
                                 user_gre_tunnels = []
                                 if 'gre_tunnels' in content['users'][0]:
                                     user_gre_tunnels = content['users'][0]['gre_tunnels']
-                                if not str(addr) in user_gre_tunnels:
+                                if not gre_intf in user_gre_tunnels or user_gre_tunnels[gre_intf]['public_ip'] != str(addr):
                                     with open('/etc/shadowsocks-libev/manager.json') as g:
                                         contentss = g.read()
                                     contentss = re.sub(",\s*}", "}", contentss) # pylint: disable=W1401
@@ -250,7 +256,7 @@ def add_gre_tunnels():
                                         ss_key = datass['port_key'][str(ss_port)]
                                     if 'port_conf' in datass:
                                         ss_key = datass['port_conf'][str(ss_port)]['key']
-                                    user_gre_tunnels[str(addr)].append({str(addr): {'shadowsocks_port': str(add_ss_user('',ss_key,str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}})
+                                    user_gre_tunnels.append({gre_intf: {'shadowsocks_port': str(add_ss_user('',ss_key,str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}})
                                     modif_config_user(user,{'gre_tunnels': user_gre_tunnels})
                         nbip = nbip + 1
             except Exception as exception:
@@ -1185,10 +1191,11 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     key = params.key
     if 'port_key' in data:
         portkey = data["port_key"]
+        portkey[str(port)] = key
     if 'port_conf' in data:
         portconf = data["port_conf"]
+        portconf[str(port)]['key'] = key
     modif_config_user(current_user.username, {'shadowsocks_port': port})
-    portkey[str(port)] = key
     userid = current_user.userid
     if userid is None:
         userid = 0
