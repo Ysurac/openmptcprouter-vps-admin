@@ -123,7 +123,7 @@ def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
         json.dump(content, f, indent=4)
 
-def add_ss_user(port, key, ip=''):
+def add_ss_user(port, key, userid=0, ip=''):
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
@@ -148,7 +148,7 @@ def add_ss_user(port, key, ip=''):
     try:
         ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if ip != '':
-            data = 'add: {"server_port": ' + port + ', "key": "' + key + '", "local_addr": "' + ip + '"}'
+            data = 'add: {"server_port": ' + port + ', "key": "' + key + '", "local_addr": "' + ip + '", "userid": ' + userid + '}'
         else:
             data = 'add: {"server_port": ' + port + ', "key": "' + key + '"}'
         ss_socket.settimeout(3)
@@ -234,7 +234,6 @@ def add_gre_tunnels():
                                     n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
                                     n.write('USERNAME=' + str(username) + "\n")
                                     n.write('USERID=' + str(userid) + "\n")
-                                initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
                                 fd, tmpfile = mkstemp()
                                 with open('/etc/shorewall/snat', 'r') as h, open(tmpfile, 'a+') as n:
                                     for line in h:
@@ -243,9 +242,9 @@ def add_gre_tunnels():
                                     n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                 os.close(fd)
                                 move(tmpfile, '/etc/shorewall/snat')
-                                user_gre_tunnels = []
-                                if 'gre_tunnels' in content['users'][0]:
-                                    user_gre_tunnels = content['users'][0]['gre_tunnels']
+                                user_gre_tunnels = { }
+                                if 'gre_tunnels' in content['users'][0][user]:
+                                    user_gre_tunnels = content['users'][0][user]['gre_tunnels']
                                 if not gre_intf in user_gre_tunnels or user_gre_tunnels[gre_intf]['public_ip'] != str(addr):
                                     with open('/etc/shadowsocks-libev/manager.json') as g:
                                         contentss = g.read()
@@ -256,7 +255,10 @@ def add_gre_tunnels():
                                         ss_key = datass['port_key'][str(ss_port)]
                                     if 'port_conf' in datass:
                                         ss_key = datass['port_conf'][str(ss_port)]['key']
-                                    user_gre_tunnels.append({gre_intf: {'shadowsocks_port': str(add_ss_user('',ss_key,str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}})
+                                    if gre_intf not in user_gre_tunnels:
+                                        user_gre_tunnels[gre_intf] = {}
+                                    user_gre_tunnels[gre_intf] = {'shadowsocks_port': str(add_ss_user('',ss_key,userid,str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
+                                    #user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
                                     modif_config_user(user,{'gre_tunnels': user_gre_tunnels})
                         nbip = nbip + 1
             except Exception as exception:
@@ -652,7 +654,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearerCookie(tokenUrl="/token")
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, title="OpenMPTCProuter Server API")
 
 
 def create_access_token(*, data: dict, expires_delta: timedelta = None):
@@ -770,7 +772,7 @@ async def status(request: Request):
     return {"client_host": client_host}
 
 # Get VPS status
-@app.get('/status')
+@app.get('/status', summary="Get current server load average, uptime and release")
 async def status(current_user: User = Depends(get_current_user)):
     LOG.debug('Get status...')
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
@@ -793,7 +795,7 @@ async def status(current_user: User = Depends(get_current_user)):
         return {'error': 'No iface defined', 'route': 'status'}
 
 # Get VPS config
-@app.get('/config')
+@app.get('/config', summary="Get full server configuration for current user")
 async def config(current_user: User = Depends(get_current_user)):
     LOG.debug('Get config...')
     userid = current_user.userid
@@ -1157,7 +1159,7 @@ class ShadowsocksConfigparams(BaseModel):
     obfs_type: str
     key: str
 
-@app.post('/shadowsocks')
+@app.post('/shadowsocks', summary="Modify Shadowsocks-libev configuration")
 def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
@@ -1316,7 +1318,7 @@ class ShorewallAllparams(BaseModel):
     redirect_ports: str
     ipproto: str = "ipv4"
 
-@app.post('/shorewall')
+@app.post('/shorewall', summary="Redirect all ports from Server to router")
 def shorewall(*, params: ShorewallAllparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shorewall'}
@@ -1370,7 +1372,7 @@ class ShorewallListparams(BaseModel):
     name: str
     ipproto: str = "ipv4"
 
-@app.post('/shorewalllist')
+@app.post('/shorewalllist', summary="Display all OpenMPTCProuter rules in Shorewall config")
 def shorewall_list(*, params: ShorewallListparams, current_user: User = Depends(get_current_user)):
     name = params.name
     if name is None:
@@ -1396,7 +1398,7 @@ class Shorewallparams(BaseModel):
     ipproto: str = "ipv4"
     source_dip: str = ""
 
-@app.post('/shorewallopen')
+@app.post('/shorewallopen', summary="Redirect a port from Server to Router")
 def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shorewallopen'}
@@ -1413,7 +1415,7 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
         shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip)
     return {'result': 'done', 'reason': 'changes applied'}
 
-@app.post('/shorewallclose')
+@app.post('/shorewallclose', summary="Remove a redirected port")
 def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shorewallclose'}
@@ -1438,7 +1440,7 @@ class MPTCPparams(BaseModel):
     syn_retries: int
     congestion_control: str
 
-@app.post('/mptcp')
+@app.post('/mptcp', summary="Modify MPTCP configuration of the server")
 def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
@@ -1462,7 +1464,7 @@ class Vpn(BaseModel):
     vpn: str
 
 # Set global VPN config
-@app.post('/vpn')
+@app.post('/vpn', summary="Set VPN used by the current user")
 def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
@@ -1483,7 +1485,7 @@ class GlorytunConfig(BaseModel):
     chacha: bool
 
 # Set Glorytun config
-@app.post('/glorytun')
+@app.post('/glorytun', summary="Modify Glorytun configuration")
 def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
@@ -1544,7 +1546,7 @@ class DSVPN(BaseModel):
     key: str
     port: int
 
-@app.post('/dsvpn')
+@app.post('/dsvpn', summary="Modify DSVPN configuration")
 def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
@@ -1581,7 +1583,7 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
 class OpenVPN(BaseModel):
     key: str
 
-@app.post('/openvpn')
+@app.post('/openvpn', summary="Modify OpenVPN TCP configuration")
 def openvpn(*, ovpn: OpenVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
@@ -1602,7 +1604,7 @@ class Wanips(BaseModel):
     ips: str
 
 # Set WANIP
-@app.post('/wan')
+@app.post('/wan', summary="Set WAN IPs")
 def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
     ips = wanips.ips
     if not ips:
@@ -1619,7 +1621,7 @@ class Lanips(BaseModel):
     lanips: List[str] = []
 
 # Set user lan config
-@app.post('/lan')
+@app.post('/lan', summary="Set current user LAN IPs")
 def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     lanips = lanconfig.lanips
     if not lanips:
@@ -1659,7 +1661,7 @@ class VPNips(BaseModel):
     ula: str = ""
 
 # Set user vpn IPs
-@app.post('/vpnips')
+@app.post('/vpnips', summary="Set current user VPN IPs")
 def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'vpnips'}
@@ -1737,7 +1739,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     return {'result': 'done', 'reason': 'changes applied'}
 
 # Update VPS
-@app.get('/update')
+@app.get('/update', summary="Update VPS script")
 def update(current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'update'}
@@ -1749,7 +1751,7 @@ def update(current_user: User = Depends(get_current_user)):
 class Backupfile(BaseModel):
     data: str
 
-@app.post('/backuppost')
+@app.post('/backuppost', summary="Send current user router backup file")
 def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'backuppost'}
@@ -1760,14 +1762,14 @@ def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_curre
         f.write(base64.b64decode(backup_file))
     return {'result': 'done'}
 
-@app.get('/backupget')
+@app.get('/backupget', summary="Get current user router backup file")
 def send_backup(current_user: User = Depends(get_current_user)):
     with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', "rb") as backup_file:
         file_base64 = base64.b64encode(backup_file.read())
         file_base64utf = file_base64.decode('utf-8')
     return {'data': file_base64utf}
 
-@app.get('/backuplist')
+@app.get('/backuplist', summary="List available current user backup")
 def list_backup(current_user: User = Depends(get_current_user)):
     if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
         modiftime = os.path.getmtime('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz')
@@ -1775,7 +1777,7 @@ def list_backup(current_user: User = Depends(get_current_user)):
     else:
         return {'backup': False}
 
-@app.get('/backupshow')
+@app.get('/backupshow', summary="Show current user backup")
 def show_backup(current_user: User = Depends(get_current_user)):
     if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
         router = OpenWrt(native=open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'))
@@ -1783,7 +1785,7 @@ def show_backup(current_user: User = Depends(get_current_user)):
     else:
         return {'backup': False}
 
-@app.post('/backupedit')
+@app.post('/backupedit', summary="Modify current user backup")
 def edit_backup(params, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'backupedit'}
@@ -1811,7 +1813,7 @@ class NewUser(BaseModel):
     ips: List[str] = Query([], title="Public exit IP")
 #    userid: int = Query(0, title="User ID",description="User ID is used to create port of each VPN and shadowsocks",gt=0,le=99)
 
-@app.post('/add_user')
+@app.post('/add_user', summary="Add a new user")
 def add_user(*, params: NewUser, current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
@@ -1833,7 +1835,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     shadowsocks_port = ''
 
     shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
-    shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), params.ips[0])
+    shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, params.ips[0])
     user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
@@ -1852,7 +1854,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
 class RemoveUser(BaseModel):
     username: str
 
-@app.post('/remove_user')
+@app.post('/remove_user', summary="Remove an user")
 def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
@@ -1877,7 +1879,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
 class ClienttoClient(BaseModel):
     enable: bool = False
 
-@app.post('/client2client')
+@app.post('/client2client', summary="Enable client 2 client communications")
 def client2client(*, params: ClienttoClient, current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'client2client'}
@@ -1912,7 +1914,7 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
         os.system("systemctl -q reload shorewall")
     return {'result': 'done'}
 
-@app.get('/list_users')
+@app.get('/list_users', summary="List all users")
 async def list_users(current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'list_users'}
