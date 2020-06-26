@@ -85,7 +85,7 @@ def get_bytes(t, iface='eth0'):
 def get_bytes_ss(port):
     try:
         ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        ss_socket.settimeout(3)
+        ss_socket.settimeout(1)
         ss_socket.sendto('ping'.encode(), ("127.0.0.1", 8839))
         ss_recv = ss_socket.recv(1024)
     except socket.timeout as err:
@@ -140,18 +140,18 @@ def add_ss_user(port, key, userid=0, ip=''):
         if port == '':
             port = int(max(data['port_conf'], key=int)) + 1
         if ip != '':
-            data['port_conf'][str(port)] = {'key': key, 'ip': ip}
+            data['port_conf'][str(port)] = {'key': key, 'local_address': ip, 'userid': userid}
         else:
-            data['port_conf'][str(port)] = {'key': key}
+            data['port_conf'][str(port)] = {'key': key, 'userid': userid}
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
         json.dump(data, f, indent=4)
     try:
         ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if ip != '':
-            data = 'add: {"server_port": ' + port + ', "key": "' + key + '", "local_addr": "' + ip + '", "userid": ' + userid + '}'
+            data = 'add: {"server_port": ' + str(port) + ', "key": "' + key + '", "local_addr": "' + ip + '"}'
         else:
-            data = 'add: {"server_port": ' + port + ', "key": "' + key + '"}'
-        ss_socket.settimeout(3)
+            data = 'add: {"server_port": ' + str(port) + ', "key": "' + key + '"}'
+        ss_socket.settimeout(1)
         ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
     except socket.timeout as err:
         LOG.debug("Shadowsocks add timeout (" + str(err) + ")")
@@ -165,15 +165,15 @@ def remove_ss_user(port):
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     if 'port_key' in data:
-        del data['port_key'][port]
+        del data['port_key'][str(port)]
     else:
-        del data['port_conf'][port]
+        del data['port_conf'][str(port)]
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
         json.dump(data, f, indent=4)
     try:
         ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        data = 'remove: {"server_port": ' + port + '}'
-        ss_socket.settimeout(3)
+        data = 'remove: {"server_port": ' + str(port) + '}'
+        ss_socket.settimeout(1)
         ss_socket.sendto(data.encode(), ("127.0.0.1", 8839))
     except socket.timeout as err:
         LOG.debug("Shadowsocks remove timeout (" + str(err) + ")")
@@ -237,9 +237,9 @@ def add_gre_tunnels():
                                 fd, tmpfile = mkstemp()
                                 with open('/etc/shorewall/snat', 'r') as h, open(tmpfile, 'a+') as n:
                                     for line in h:
-                                        if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in h:
+                                        if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in line:
                                             n.write(line)
-                                    n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
+                                    n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf.split(':')[0]) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                 os.close(fd)
                                 move(tmpfile, '/etc/shorewall/snat')
                                 user_gre_tunnels = { }
