@@ -114,7 +114,7 @@ def get_username_from_userid(userid):
         data = json.loads(content)
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'get_username'}
-    for user as content['users'][0]:
+    for user in content['users'][0]:
         if 'userid' in content['users'][0][user] and content['users'][0][user]['userid'] == userid:
             return user
     return ''
