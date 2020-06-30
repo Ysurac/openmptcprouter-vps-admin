@@ -104,6 +104,21 @@ def file_as_bytes(file):
     with file:
         return file.read()
 
+def get_username_from_userid(userid):
+    if userid == 0:
+        return 'openmptcprouter'
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        return {'error': 'Config file not readable', 'route': 'get_username'}
+    for user as content['users'][0]:
+        if 'userid' in content['users'][0][user] and content['users'][0][user]['userid'] == userid:
+            return user
+    return ''
+
 def set_global_param(key, value):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
@@ -772,13 +787,14 @@ async def status(request: Request):
     return {"client_host": client_host}
 
 # Get VPS status
-@app.get('/status',userid: Optional[int] = Query(None), summary="Get current server load average, uptime and release")
-async def status(current_user: User = Depends(get_current_user)):
+@app.get('/status', summary="Get current server load average, uptime and release")
+async def status(userid: Optional[int] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get status...')
     if not current_user.permissions == "admin":
         userid = current_user.userid
     if userid is None:
         userid = 0
+    username = get_username_from_userid(userid)
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_hostname = socket.gethostname()
@@ -791,6 +807,9 @@ async def status(current_user: User = Depends(get_current_user)):
         ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
     else:
         ss_traffic = 0
+    vpn = 'glorytun_tcp'
+    if 'vpn' in omr_config_data['users'][0][username]:
+        vpn = omr_config_data['users'][0][username]['vpn']
     vpn_traffic_rx = 0
     vpn_traffic_tx = 0
     if vpn == 'glorytun_tcp':
@@ -819,6 +838,7 @@ async def config(userid: Optional[int] = Query(None),current_user: User = Depend
         userid = current_user.userid
     if userid is None:
         userid = 0
+    username = get_username_from_userid(userid)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
@@ -980,14 +1000,14 @@ async def config(userid: Optional[int] = Query(None),current_user: User = Depend
     #else:
     #    openvpn_key = ''
     openvpn_key = ''
-    if os.path.isfile('/etc/openvpn/ca/pki/private/' + current_user.username + '.key'):
-        with open('/etc/openvpn/ca/pki/private/' + current_user.username + '.key', "rb") as ovpnkey_file:
+    if os.path.isfile('/etc/openvpn/ca/pki/private/' + username + '.key'):
+        with open('/etc/openvpn/ca/pki/private/' + username + '.key', "rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
             openvpn_client_key = openvpn_keyb.decode('utf-8')
     else:
         openvpn_client_key = ''
-    if os.path.isfile('/etc/openvpn/ca/pki/issued/' + current_user.username + '.crt'):
-        with open('/etc/openvpn/ca/pki/issued/' + current_user.username + '.crt', "rb") as ovpnkey_file:
+    if os.path.isfile('/etc/openvpn/ca/pki/issued/' + username + '.crt'):
+        with open('/etc/openvpn/ca/pki/issued/' + username + '.crt', "rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
             openvpn_client_crt = openvpn_keyb.decode('utf-8')
         available_vpn.append("openvpn")
@@ -1036,16 +1056,16 @@ async def config(userid: Optional[int] = Query(None),current_user: User = Depend
 #                    gre_tunnel_intfaddr = line.replace(line[:9], '').rstrip()
 #        gre_tunnel_conf.append("{'local_ip': '" + gre_tunnel_localip + "', 'remote_ip': '" + gre_tunnel_remoteip + "', 'netmask': '" + gre_tunnel_netmask + "', 'public_ip': '" + gre_tunnel_intfaddr + "'}")
 
-    if 'gre_tunnels' in omr_config_data['users'][0][current_user.username]:
+    if 'gre_tunnels' in omr_config_data['users'][0][username]:
         gre_tunnel = True
-        gre_tunnel_conf = omr_config_data['users'][0][current_user.username]['gre_tunnels']
+        gre_tunnel_conf = omr_config_data['users'][0][username]['gre_tunnels']
 
-    if 'vpnremoteip' in omr_config_data['users'][0][current_user.username]:
-        vpn_remote_ip = omr_config_data['users'][0][current_user.username]['vpnremoteip']
+    if 'vpnremoteip' in omr_config_data['users'][0][username]:
+        vpn_remote_ip = omr_config_data['users'][0][username]['vpnremoteip']
     else:
         vpn_remote_ip = ''
-    if 'vpnlocalip' in omr_config_data['users'][0][current_user.username]:
-        vpn_local_ip = omr_config_data['users'][0][current_user.username]['vpnlocalip']
+    if 'vpnlocalip' in omr_config_data['users'][0][username]:
+        vpn_local_ip = omr_config_data['users'][0][username]['vpnlocalip']
     else:
         vpn_local_ip = ''
 
@@ -1126,8 +1146,8 @@ async def config(userid: Optional[int] = Query(None),current_user: User = Depend
         remoteip6 = 'fe80::a00:2'
 
     vpn = 'glorytun_tcp'
-    if 'vpn' in omr_config_data['users'][0][current_user.username]:
-        vpn = omr_config_data['users'][0][current_user.username]['vpn']
+    if 'vpn' in omr_config_data['users'][0][username]:
+        vpn = omr_config_data['users'][0][username]['vpn']
 
     vpn_traffic_rx = 0
     vpn_traffic_tx = 0
@@ -1154,7 +1174,7 @@ async def config(userid: Optional[int] = Query(None),current_user: User = Depend
     if 'client2client' in omr_config_data and omr_config_data['client2client']:
         client2client = True
         for users in omr_config_data['users'][0]:
-            if 'lanips' in omr_config_data['users'][0][users] and users != current_user.username and omr_config_data['users'][0][users]['lanips'][0] not in alllanips:
+            if 'lanips' in omr_config_data['users'][0][users] and users != username and omr_config_data['users'][0][users]['lanips'][0] not in alllanips:
                 alllanips.append(omr_config_data['users'][0][users]['lanips'][0])
 
     shorewall_redirect = "enable"
@@ -1163,7 +1183,7 @@ async def config(userid: Optional[int] = Query(None),current_user: User = Depend
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
