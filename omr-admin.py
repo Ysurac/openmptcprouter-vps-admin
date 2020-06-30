@@ -772,9 +772,13 @@ async def status(request: Request):
     return {"client_host": client_host}
 
 # Get VPS status
-@app.get('/status', summary="Get current server load average, uptime and release")
+@app.get('/status',userid: Optional[int] = Query(None), summary="Get current server load average, uptime and release")
 async def status(current_user: User = Depends(get_current_user)):
     LOG.debug('Get status...')
+    if not current_user.permissions == "admin":
+        userid = current_user.userid
+    if userid is None:
+        userid = 0
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_hostname = socket.gethostname()
@@ -787,18 +791,32 @@ async def status(current_user: User = Depends(get_current_user)):
         ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
     else:
         ss_traffic = 0
-
+    vpn_traffic_rx = 0
+    vpn_traffic_tx = 0
+    if vpn == 'glorytun_tcp':
+        vpn_traffic_rx = get_bytes('rx', 'gt-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'gt-tun' + str(userid))
+    elif vpn == 'glorytun_udp':
+        vpn_traffic_rx = get_bytes('rx', 'gt-udp-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'gt-udp-tun' + str(userid))
+    elif vpn == 'mlvpn':
+        vpn_traffic_rx = get_bytes('rx', 'mlvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'mlvpn' + str(userid))
+    elif vpn == 'dsvpn':
+        vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
     LOG.debug('Get status: done')
     if IFACE:
-        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}}
+        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}}
     else:
         return {'error': 'No iface defined', 'route': 'status'}
 
 # Get VPS config
 @app.get('/config', summary="Get full server configuration for current user")
-async def config(current_user: User = Depends(get_current_user)):
+async def config(userid: Optional[int] = Query(None),current_user: User = Depends(get_current_user)):
     LOG.debug('Get config...')
-    userid = current_user.userid
+    if not current_user.permissions == "admin":
+        userid = current_user.userid
     if userid is None:
         userid = 0
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -1111,7 +1129,8 @@ async def config(current_user: User = Depends(get_current_user)):
     if 'vpn' in omr_config_data['users'][0][current_user.username]:
         vpn = omr_config_data['users'][0][current_user.username]['vpn']
 
-    vpn_traffic = 0
+    vpn_traffic_rx = 0
+    vpn_traffic_tx = 0
     if vpn == 'glorytun_tcp':
         vpn_traffic_rx = get_bytes('rx', 'gt-tun' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'gt-tun' + str(userid))
