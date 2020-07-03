@@ -48,8 +48,8 @@ from starlette.responses import RedirectResponse, Response, JSONResponse
 import netifaces
 
 LOG = logging.getLogger('api')
-#LOG.setLevel(logging.ERROR)
-LOG.setLevel(logging.DEBUG)
+LOG.setLevel(logging.ERROR)
+#LOG.setLevel(logging.DEBUG)
 
 # Generate a random secret key
 SECRET_KEY = uuid.uuid4().hex
@@ -257,7 +257,7 @@ def add_gre_tunnels():
                                     n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf.split(':')[0]) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                 os.close(fd)
                                 move(tmpfile, '/etc/shorewall/snat')
-                                user_gre_tunnels = { }
+                                user_gre_tunnels = {}
                                 if 'gre_tunnels' in content['users'][0][user]:
                                     user_gre_tunnels = content['users'][0][user]['gre_tunnels']
                                 if not gre_intf in user_gre_tunnels or user_gre_tunnels[gre_intf]['public_ip'] != str(addr):
@@ -272,16 +272,16 @@ def add_gre_tunnels():
                                         ss_key = datass['port_conf'][str(ss_port)]['key']
                                     if gre_intf not in user_gre_tunnels:
                                         user_gre_tunnels[gre_intf] = {}
-                                    user_gre_tunnels[gre_intf] = {'shadowsocks_port': str(add_ss_user('',ss_key,userid,str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
+                                    user_gre_tunnels[gre_intf] = {'shadowsocks_port': str(add_ss_user('', ss_key, userid, str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
                                     #user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
-                                    modif_config_user(user,{'gre_tunnels': user_gre_tunnels})
+                                    modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
                         nbip = nbip + 1
             except Exception as exception:
                 pass
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
         if initial_md5 != final_md5:
             os.system("systemctl -q reload shorewall")
-    set_global_param('allips',allips)
+    set_global_param('allips', allips)
 
 add_gre_tunnels()
 
@@ -549,6 +549,8 @@ def set_lastchange(sync=0):
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
     omr_config_data = json.load(f)
+    if 'debug' in omr_config_data and omr_config_data['debug']:
+        LOG.setLevel(logging.DEBUG)
 
 fake_users_db = omr_config_data['users'][0]
 
@@ -832,7 +834,7 @@ async def status(userid: Optional[int] = Query(None), current_user: User = Depen
 
 # Get VPS config
 @app.get('/config', summary="Get full server configuration for current user")
-async def config(userid: Optional[int] = Query(None),current_user: User = Depends(get_current_user)):
+async def config(userid: Optional[int] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get config...')
     if not current_user.permissions == "admin":
         userid = current_user.userid
@@ -1189,16 +1191,25 @@ async def config(userid: Optional[int] = Query(None),current_user: User = Depend
     return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}}
 
 # Set shadowsocks config
+class OBFSPLUGIN(str, Enum):
+    v2ray = "v2ray"
+    obfs = "obfs"
+
+class OBFSTYPE(str, Enum):
+    tls = "tls"
+    http = "http"
+
+
 class ShadowsocksConfigparams(BaseModel):
-    port: int
+    port: int = Query(..., gt=0, lt=65535)
     method: str
     fast_open: bool
     reuse_port: bool
     no_delay: bool
-    mptcp: bool
-    obfs: bool
-    obfs_plugin: str
-    obfs_type: str
+    mptcp: bool = Query(True, title="Enable/Disable MPTCP support")
+    obfs: bool = Query(False, title="Enable/Disable obfuscation support")
+    obfs_plugin: OBFSPLUGIN = Query("v2ray", title="Choose obfuscation plugin")
+    obfs_type: OBFSTYPE = Query("tls", title="Choose obfuscation method")
     key: str
 
 @app.post('/shadowsocks', summary="Modify Shadowsocks-libev configuration")
@@ -1356,9 +1367,13 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         return {'result': 'done', 'reason': 'no changes', 'route': 'shadowsocks'}
 
 # Set shorewall config
+class IPPROTO(str, Enum):
+    ipv4 = "ipv4"
+    ipv6 = "ipv6"
+
 class ShorewallAllparams(BaseModel):
-    redirect_ports: str
-    ipproto: str = "ipv4"
+    redirect_ports: str = Query(..., title="Port or ports range")
+    ipproto: IPPROTO = Query("ipv4", title="Protocol IP to apply changes")
 
 @app.post('/shorewall', summary="Redirect all ports from Server to router")
 def shorewall(*, params: ShorewallAllparams, current_user: User = Depends(get_current_user)):
@@ -1385,7 +1400,7 @@ def shorewall(*, params: ShorewallAllparams, current_user: User = Depends(get_cu
         os.close(fd)
         move(tmpfile, '/etc/shorewall/rules')
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
-        if not initial_md5 == final_md5:
+        if initial_md5 != final_md5:
             os.system("systemctl -q reload shorewall")
     else:
         initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
@@ -1405,14 +1420,14 @@ def shorewall(*, params: ShorewallAllparams, current_user: User = Depends(get_cu
         os.close(fd)
         move(tmpfile, '/etc/shorewall6/rules')
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
-        if not initial_md5 == final_md5:
+        if initial_md5 != final_md5:
             os.system("systemctl -q reload shorewall6")
     # Need to do the same for IPv6...
     return {'result': 'done', 'reason': 'changes applied'}
 
 class ShorewallListparams(BaseModel):
     name: str
-    ipproto: str = "ipv4"
+    ipproto: IPPROTO = Query("ipv4", title="Protocol IP to list")
 
 @app.post('/shorewalllist', summary="Display all OpenMPTCProuter rules in Shorewall config")
 def shorewall_list(*, params: ShorewallListparams, current_user: User = Depends(get_current_user)):
@@ -1437,7 +1452,7 @@ class Shorewallparams(BaseModel):
     port: str
     proto: str
     fwtype: str
-    ipproto: str = "ipv4"
+    ipproto: IPPROTO = Query("ipv4", title="Protocol IP for changes")
     source_dip: str = ""
 
 @app.post('/shorewallopen', summary="Redirect a port from Server to Router")
@@ -1502,8 +1517,14 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
+class VPN(str, Enum):
+    openvpn = "openvpn"
+    glorytuntcp = "glorytun_tcp"
+    glorytunudp = "glorytun_udp"
+    dsvpn = "dsvpn"
+
 class Vpn(BaseModel):
-    vpn: str
+    vpn: VPN
 
 # Set global VPN config
 @app.post('/vpn', summary="Set VPN used by the current user")
@@ -1523,8 +1544,8 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
 
 class GlorytunConfig(BaseModel):
     key: str
-    port: int
-    chacha: bool
+    port: int = Query(..., gt=0, lt=65535, title="Glorytun TCP and UDP port")
+    chacha: bool = Query(True, title="Enable of disable chacha20, if disable AEGIS is used")
 
 # Set Glorytun config
 @app.post('/glorytun', summary="Modify Glorytun configuration")
@@ -1558,7 +1579,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     os.close(fd)
     move(tmpfile, '/etc/glorytun-tcp/tun' + str(userid))
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-tcp/tun' + str(userid), 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q restart glorytun-tcp@tun" + str(userid))
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun' + str(userid), 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
@@ -1576,7 +1597,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     os.close(fd)
     move(tmpfile, '/etc/glorytun-udp/tun' + str(userid))
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun' + str(userid), 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
     shorewall_add_port(current_user, str(port), 'tcp', 'glorytun')
     shorewall_add_port(current_user, str(port), 'udp', 'glorytun')
@@ -1586,7 +1607,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
 # Set A Dead Simple VPN config
 class DSVPN(BaseModel):
     key: str
-    port: int
+    port: int = Query(..., gt=0, lt=65535)
 
 @app.post('/dsvpn', summary="Modify DSVPN configuration")
 def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
@@ -1615,7 +1636,7 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     with open('/etc/dsvpn/dsvpn.key', 'w') as outfile:
         outfile.write(key)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn' + str(userid) + '.key', 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q restart dsvpn-server@dsvpn" + str(userid))
     shorewall_add_port(current_user, str(port), 'tcp', 'dsvpn')
     set_lastchange()
@@ -1623,7 +1644,7 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
 
 # Set OpenVPN config
 class OpenVPN(BaseModel):
-    port: int = 65301
+    port: int = Query(..., gt=0, lt=65535)
     cipher: str = "AES-256-CBC"
 
 @app.post('/openvpn', summary="Modify OpenVPN TCP configuration")
@@ -1645,7 +1666,7 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     move(tmpfile, '/etc/openvpn/tun0')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0', 'rb'))).hexdigest()
 
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q restart openvpn@tun0")
         shorewall_add_port(current_user, str(port), 'tcp', 'openvpn')
         set_lastchange()
@@ -1699,17 +1720,17 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
         os.close(fd)
         move(tmpfile, '/etc/openvpn/tun0.conf')
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-        if not initial_md5 == final_md5:
+        if initial_md5 != final_md5:
             os.system("systemctl -q restart openvpn@tun0")
             set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
 class VPNips(BaseModel):
-    remoteip: str
-    localip: str
-    remoteip6: str = ""
-    localip6: str = ""
-    ula: str = ""
+    remoteip: str = Query(..., regex='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
+    localip: str = Query(..., regex='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
+    remoteip6: Optional[str] = Query(None, regex='(?:^|(?<=\s))(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))(?=\s|$)')
+    localip6: Optional[str] = Query(None, regex='(?:^|(?<=\s))(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))(?=\s|$)')
+    ula: Optional[str] = None
 
 # Set user vpn IPs
 @app.post('/vpnips', summary="Set current user VPN IPs")
@@ -1748,7 +1769,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         if ula:
             n.write('ULA=' + ula + "\n")
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q restart omr6in4@user" + str(userid))
         set_lastchange()
 
@@ -1765,7 +1786,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     os.close(fd)
     move(tmpfile, '/etc/shorewall/params.vpn')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
         set_lastchange()
 
@@ -1783,7 +1804,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/params.vpn')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall6")
         set_lastchange()
 
@@ -1800,7 +1821,7 @@ def update(current_user: User = Depends(get_current_user)):
 
 # Backup
 class Backupfile(BaseModel):
-    data: str
+    data: str = Query(..., title="OpenMPTCProuter backup file in tar.gz encoded in base64")
 
 @app.post('/backuppost', summary="Send current user router backup file")
 def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_current_user)):
@@ -1844,11 +1865,11 @@ def edit_backup(params, current_user: User = Depends(get_current_user)):
     o.write(current_user.username + '-backup', path='/var/opt/openmptcprouter/')
     return {'result': 'done'}
 
-class VPN(str, Enum):
-    openvpn = "openvpn"
-    glorytuntcp = "glorytun_tcp"
-    glorytunudp = "glorytun_udp"
-    dsvpn = "dsvpn"
+#class VPN(str, Enum):
+#    openvpn = "openvpn"
+#    glorytuntcp = "glorytun_tcp"
+#    glorytunudp = "glorytun_udp"
+#    dsvpn = "dsvpn"
 
 class permissions(str, Enum):
     ro = "ro"
@@ -1856,12 +1877,12 @@ class permissions(str, Enum):
     admin = "admin"
 
 class NewUser(BaseModel):
-    username: str = Query(None, title="Username")
+    username: str = Query(..., title="Username")
     permission: permissions = Query("ro", title="permission of the user")
     vpn: VPN = Query("openvpn", title="default VPN for the user")
-    shadowsocks_port: int = Query("", title="Shadowsocks port")
-    userid: int = Query(None, title="User ID")
-    ips: List[str] = Query([], title="Public exit IP")
+    shadowsocks_port: Optional[int] = Query(None, gt=0, lt=65535, title="Shadowsocks port")
+    userid: Optional[int] = Query(None, title="User ID")
+    ips: Optional[List[str]] = Query(None, title="Public exit IP")
 #    userid: int = Query(0, title="User ID",description="User ID is used to create port of each VPN and shadowsocks",gt=0,le=99)
 
 @app.post('/add_user', summary="Add a new user")
@@ -1878,15 +1899,23 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
                 if int(content['users'][0][users]['userid']) > userid:
                     userid = int(content['users'][0][users]['userid'])
         userid = userid + 1
+    if params.ips is None:
+        publicips = []
+    else:
+        publicips = params.ips
     user_key = secrets.token_hex(32)
-    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ params.ips +'}}')
+    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ publicips +'}}')
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
 #    shadowsocks_port = '651{:02d}'.format(userid)
-    shadowsocks_port = ''
-
+    shadowsocks_port = params.port
     shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
-    shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, params.ips[0])
+    if not publicips:
+        shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid)
+    else:
+        for publicip in publicips:
+            shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, publicip)
+            shadowsocks_port = shadowsocks_port + 1
     user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
@@ -1946,7 +1975,7 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
     os.close(fd)
     move(tmpfile, '/etc/openvpn/tun0.conf')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-    if not initial_md5 == final_md5:
+    if initial_md5 != final_md5:
         os.system("systemctl -q restart openvpn@tun0")
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
