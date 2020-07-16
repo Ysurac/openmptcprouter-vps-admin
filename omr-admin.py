@@ -41,6 +41,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.models import SecurityBase as SecurityBaseModel
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse
@@ -277,6 +278,7 @@ def add_gre_tunnels():
                                     modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
                         nbip = nbip + 1
             except Exception as exception:
+                LOG.error("Gre-tunnel exception (" + exception.message + " - " + exception.args + ")")
                 pass
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
         if initial_md5 != final_md5:
@@ -2001,6 +2003,16 @@ async def list_users(current_user: User = Depends(get_current_user)):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     return content['users'][0]
+
+async def fake_data():
+    for i in range(100):
+        yield b"fake data speedtest"
+
+@app.get('/speedtest', summary="Test speed from the server")
+async def list_users(current_user: User = Depends(get_current_user)):
+    return StreamingResponse(fake_data())
+
+
 
 if __name__ == '__main__':
     LOG.debug("Main OMR-Admin launch")

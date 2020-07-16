@@ -15,5 +15,6 @@
                 "disabled": false
             }
         }
-    ]
+    ],
+    "debug": false
 }
