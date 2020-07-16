@@ -149,6 +149,8 @@ def add_ss_user(port, key, userid=0, ip=''):
             port = int(max(data['port_key'], key=int)) + 1
         data['port_key'][str(port)] = key
     else:
+        if 'port_conf' not in data:
+            data['port_conf'] = {}
         if 'port_key' in data:
             for old_port in data['port_key']:
                 data['port_conf'][old_port] = {'key': data['port_key'][old_port]}
@@ -278,7 +280,6 @@ def add_gre_tunnels():
                                     modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
                         nbip = nbip + 1
             except Exception as exception:
-                LOG.error("Gre-tunnel exception (" + exception.message + " - " + exception.args + ")")
                 pass
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
         if initial_md5 != final_md5:
