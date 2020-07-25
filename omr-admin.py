@@ -260,6 +260,14 @@ def add_gre_tunnels():
                                     n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf.split(':')[0]) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                 os.close(fd)
                                 move(tmpfile, '/etc/shorewall/snat')
+                                #fd, tmpfile = mkstemp()
+                                #with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
+                                #    for line in h:
+                                #        if not 'gre-user' + str(userid) + '-ip' + str(nbip) in line:
+                                #            n.write(line)
+                                #    n.write('vpn	gre-user' + str(userid) + '-ip' + str(nbip) + '	nosmurfs,tcpflags' + "\n")
+                                #os.close(fd)
+                                #move(tmpfile, '/etc/shorewall/interfaces')
                                 user_gre_tunnels = {}
                                 if 'gre_tunnels' in content['users'][0][user]:
                                     user_gre_tunnels = content['users'][0][user]['gre_tunnels']
@@ -450,15 +458,19 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if source_dip == '':
+            if source_dip == '' and dest_ip == '':
                 if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
                     n.write(line)
                 elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
                     n.write(line)
             else:
-                if fwtype == 'ACCEPT' and not port + '# OMR ' + username + ' open ' + name + ' port ' + proto + ' to ' + source_dip in line:
+                if source_dip != '':
+                    comment = ' to ' + source_dip
+                if dest_ip != '':
+                    comment = comment + ' from ' + dest_ip
+                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + comment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' to ' + source_dip in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + comment in line:
                     n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
@@ -1457,6 +1469,7 @@ class Shorewallparams(BaseModel):
     fwtype: str
     ipproto: IPPROTO = Query("ipv4", title="Protocol IP for changes")
     source_dip: str = ""
+    source_ip: str = ""
 
 @app.post('/shorewallopen', summary="Redirect a port from Server to Router")
 def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
@@ -1467,12 +1480,13 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
     proto = params.proto
     fwtype = params.fwtype
     source_dip = params.source_dip
+    source_ip = params.source_ip
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallopen'}
     if params.ipproto == 'ipv4':
-        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip)
+        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip)
     else:
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip)
+        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/shorewallclose', summary="Remove a redirected port")
@@ -1484,12 +1498,13 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     proto = params.proto
     fwtype = params.fwtype
     source_dip = params.source_dip
+    source_ip = params.source_ip
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallclose'}
     if params.ipproto == 'ipv4':
-        shorewall_del_port(current_user.username, str(port), proto, name, fwtype, source_dip)
+        shorewall_del_port(current_user.username, str(port), proto, name, fwtype, source_dip, source_ip)
     else:
-        shorewall6_del_port(current_user.username, str(port), proto, name, fwtype, source_dip)
+        shorewall6_del_port(current_user.username, str(port), proto, name, fwtype, source_dip, source_ip)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
 
 # Set MPTCP config
