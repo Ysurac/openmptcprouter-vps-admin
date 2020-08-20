@@ -109,8 +109,11 @@ def get_bytes_v2ray(t,user):
         side="downlink"
     else:
         side="uplink"
-    data = subprocess.check_output('/bin/v2ray/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' | grep value | cut -d: -f2 | tr -d " "')
-    return int(data.decode("utf-8"))
+    data = subprocess.check_output('/bin/v2ray/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' | grep value | cut -d: -f2 | tr -d " "', shell = True)
+    if data != '':
+        return int(data.decode("utf-8"))
+    else:
+        return 0
 
 def file_as_bytes(file):
     with file:
@@ -835,6 +838,12 @@ async def status(userid: Optional[int] = Query(None), current_user: User = Depen
         ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
     else:
         ss_traffic = 0
+    v2ray_tx = 0
+    v2ray_rx = 0
+    if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+            v2ray_conf = omr_config_data['users'][0][username]['v2ray']
+        v2ray_tx = get_bytes_v2ray('tx',username)
+        v2ray_rx = get_bytes_v2ray('rx',username)
     vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][username]:
         vpn = omr_config_data['users'][0][username]['vpn']
@@ -854,7 +863,7 @@ async def status(userid: Optional[int] = Query(None), current_user: User = Depen
         vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
     LOG.debug('Get status: done')
     if IFACE:
-        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}}
+        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx}}
     else:
         return {'error': 'No iface defined', 'route': 'status'}
 
@@ -1574,6 +1583,8 @@ class VPN(str, Enum):
     glorytuntcp = "glorytun_tcp"
     glorytunudp = "glorytun_udp"
     dsvpn = "dsvpn"
+    mlvpn = "mlvpn"
+    none = "none"
 
 class Vpn(BaseModel):
     vpn: VPN
@@ -1607,7 +1618,7 @@ def proxy(*, proxyconfig: Proxy, current_user: User = Depends(get_current_user))
     if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'proxy'}
-    proxy = vpnconfig.proxy
+    proxy = proxyconfig.proxy
     if not proxy:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'proxy'}
     os.system('echo ' + proxy + ' > /etc/openmptcprouter-vps-admin/current-proxy')
