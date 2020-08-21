@@ -159,7 +159,7 @@ def add_ss_user(port, key, userid=0, ip=''):
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     if ip == '' and 'port_key' in data:
-        if port is None or port == '' or port == 0:
+        if port is None or port == '' or port == 0 or port == 'None':
             port = int(max(data['port_key'], key=int)) + 1
         data['port_key'][str(port)] = key
     else:
@@ -169,7 +169,7 @@ def add_ss_user(port, key, userid=0, ip=''):
             for old_port in data['port_key']:
                 data['port_conf'][old_port] = {'key': data['port_key'][old_port]}
             del data['port_key']
-        if port == '':
+        if port == '' or port == "None" or port is None or port == 0:
             port = int(max(data['port_conf'], key=int)) + 1
         if ip != '':
             data['port_conf'][str(port)] = {'key': key, 'local_address': ip, 'userid': userid}
@@ -1989,11 +1989,11 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     else:
         publicips = params.ips
     user_key = secrets.token_hex(32)
-    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ publicips +'}}')
+    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ json.dumps(publicips) +'}}')
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
 #    shadowsocks_port = '651{:02d}'.format(userid)
-    shadowsocks_port = params.port
+    shadowsocks_port = params.shadowsocks_port
     shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
     if not publicips:
         shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid)
