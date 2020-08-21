@@ -841,7 +841,6 @@ async def status(userid: Optional[int] = Query(None), current_user: User = Depen
     v2ray_tx = 0
     v2ray_rx = 0
     if os.path.isfile('/etc/v2ray/v2ray-server.json'):
-            v2ray_conf = omr_config_data['users'][0][username]['v2ray']
         v2ray_tx = get_bytes_v2ray('tx',username)
         v2ray_rx = get_bytes_v2ray('rx',username)
     vpn = 'glorytun_tcp'
