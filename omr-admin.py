@@ -159,7 +159,7 @@ def add_ss_user(port, key, userid=0, ip=''):
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     if ip == '' and 'port_key' in data:
-        if port == '':
+        if port is None or port == '' or port == 0:
             port = int(max(data['port_key'], key=int)) + 1
         data['port_key'][str(port)] = key
     else:
@@ -1978,7 +1978,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     userid = params.userid
-    if userid is None:
+    if userid is None or userid == 0:
         userid = 2
         for users in content['users'][0]:
             if 'userid' in content['users'][0][users]:
