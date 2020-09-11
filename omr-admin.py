@@ -18,6 +18,7 @@ import socket
 import re
 import hashlib
 import pathlib
+import psutil
 import time
 from pprint import pprint
 from datetime import datetime, timedelta
@@ -109,11 +110,23 @@ def get_bytes_v2ray(t,user):
         side="downlink"
     else:
         side="uplink"
-    data = subprocess.check_output('/bin/v2ray/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' | grep value | cut -d: -f2 | tr -d " "', shell = True)
-    if data != '':
+    try:
+        data = subprocess.check_output('/bin/v2ray/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' | grep value | cut -d: -f2 | tr -d " "', shell = True)
+    except:
+        return 0
+    if data.decode("utf-8") != '':
         return int(data.decode("utf-8"))
     else:
         return 0
+
+def checkIfProcessRunning(processName):
+    for proc in psutil.process_iter():
+        try:
+            if processName.lower() in proc.name().lower():
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return False;
 
 def file_as_bytes(file):
     with file:
@@ -840,7 +853,7 @@ async def status(userid: Optional[int] = Query(None), current_user: User = Depen
         ss_traffic = 0
     v2ray_tx = 0
     v2ray_rx = 0
-    if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+    if os.path.isfile('/etc/v2ray/v2ray-server.json') and checkIfProcessRunning(v2ray):
         v2ray_tx = get_bytes_v2ray('tx',username)
         v2ray_rx = get_bytes_v2ray('rx',username)
     vpn = 'glorytun_tcp'
@@ -1121,8 +1134,9 @@ async def config(userid: Optional[int] = Query(None), current_user: User = Depen
             modif_config_user(username, {'v2ray': v2ray_conf})
         else:
             v2ray_conf = omr_config_data['users'][0][username]['v2ray']
-        v2ray_tx = get_bytes_v2ray('tx',username)
-        v2ray_rx = get_bytes_v2ray('rx',username)
+        if checkIfProcessRunning('v2ray'):
+            v2ray_tx = get_bytes_v2ray('tx',username)
+            v2ray_rx = get_bytes_v2ray('rx',username)
 
     LOG.debug('Get config... mptcp')
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
@@ -1622,7 +1636,7 @@ def proxy(*, proxyconfig: Proxy, current_user: User = Depends(get_current_user))
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'proxy'}
     os.system('echo ' + proxy + ' > /etc/openmptcprouter-vps-admin/current-proxy')
     modif_config_user(current_user.username, {'proxy': proxy})
-    current_user.proxy = proxy
+    #current_user.proxy = proxy
     set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
