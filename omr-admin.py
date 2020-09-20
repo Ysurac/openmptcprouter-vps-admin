@@ -263,6 +263,7 @@ def add_gre_tunnels():
                                 nbgre = nbgre + 1
                                 userid = 0
                                 username = user
+                                iface = intf.split(':')[0]
                                 if 'userid' in content['users'][0][user]:
                                     userid = content['users'][0][user]['userid']
                                 if 'username' in content['users'][0][user]:
@@ -284,7 +285,7 @@ def add_gre_tunnels():
                                     for line in h:
                                         if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in line:
                                             n.write(line)
-                                    n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(intf.split(':')[0]) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
+                                    n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(iface) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                 os.close(fd)
                                 move(tmpfile, '/etc/shorewall/snat')
                                 #fd, tmpfile = mkstemp()
@@ -295,6 +296,15 @@ def add_gre_tunnels():
                                 #    n.write('vpn	gre-user' + str(userid) + '-ip' + str(nbip) + '	nosmurfs,tcpflags' + "\n")
                                 #os.close(fd)
                                 #move(tmpfile, '/etc/shorewall/interfaces')
+                                if str(iface) != IFACE:
+                                    fd, tmpfile = mkstemp()
+                                    with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
+                                        for line in h:
+                                            if not str(iface) in line:
+                                                n.write(line)
+                                        n.write('net	' + str(iface) + '	dhcp,nosmurfs,tcpflags,routefilter,sourceroute=0' + "\n")
+                                    os.close(fd)
+                                    move(tmpfile, '/etc/shorewall/interfaces')
                                 user_gre_tunnels = {}
                                 if 'gre_tunnels' in content['users'][0][user]:
                                     user_gre_tunnels = content['users'][0][user]['gre_tunnels']
