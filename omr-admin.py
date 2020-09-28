@@ -867,6 +867,11 @@ async def status(userid: Optional[int] = Query(None), current_user: User = Depen
         v2ray_tx = get_bytes_v2ray('tx',username)
         v2ray_rx = get_bytes_v2ray('rx',username)
     vpn = 'glorytun_tcp'
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
     if 'vpn' in omr_config_data['users'][0][username]:
         vpn = omr_config_data['users'][0][username]['vpn']
     vpn_traffic_rx = 0
