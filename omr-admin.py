@@ -439,7 +439,7 @@ def ordered(obj):
         return obj
 
 
-def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
+def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default'):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -480,6 +480,8 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
                 net = 'net:' + dest_ip
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + "\n")
+            elif fwtype == 'DNAT' and vpn != 'default':
+                n.write('DNAT		net		vpn:' + vpn + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
             elif fwtype == 'DNAT' and userid == 0:
                 n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
@@ -1546,16 +1548,26 @@ class Shorewallparams(BaseModel):
 def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shorewallopen'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
     name = params.name
     port = params.port
     proto = params.proto
     fwtype = params.fwtype
     source_dip = params.source_dip
     source_ip = params.source_ip
+    vpn = "default"
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallopen'}
     if params.ipproto == 'ipv4':
-        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip)
+        if 'gre_tunnels' in omr_config_data['users'][0][current_user.username]:
+            for tunnel in omr_config_data['users'][0][current_user.username]['gre_tunnels']:
+                if omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['public_ip'] == source_dip:
+                    vpn = omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['remote_ip']
+        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn)
     else:
         shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip)
     return {'result': 'done', 'reason': 'changes applied'}
