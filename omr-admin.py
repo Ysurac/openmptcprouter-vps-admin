@@ -166,6 +166,7 @@ def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
         json.dump(content, f, indent=4)
 
+
 def add_ss_user(port, key, userid=0, ip=''):
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
@@ -438,6 +439,48 @@ def ordered(obj):
     else:
         return obj
 
+def v2ray_add_port(user, port, proto, name, destip):
+    userid = user.userid
+    if userid is None:
+        userid = 0
+    tag = user.username + '_redir_' + proto + '_' + str(port)
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        exist = 0
+        for inbounds in data['inbounds']:
+            LOG.debug(inbounds)
+            if inbounds['tag'] == tag:
+                exist = 1
+        if exist == 0:
+            inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': port, 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': port, 'address': destip}}
+            data['inbounds'].append(inbounds)
+            routing = {'type': 'field','inboundTag': [user.username + '_redir_' + proto + '_' + str(port)], 'outboundTag': 'OMRLan'}
+            data['routing']['rules'].append(routing)
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl -q restart v2ray")
+
+
+def v2ray_del_port(username, port, proto, name):
+    userid = user.userid
+    if userid is None:
+        userid = 0
+    tag = user.username + '_redir_' + proto + '_' + str(port)
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        exist = 0
+        for inbounds in data['inbounds'][0]:
+            if data['inbounds'][0][inbounds]['tag'] == tag:
+                data['inbounds'][0].remove(inbounds)
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl -q restart v2ray")
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default'):
     userid = user.userid
@@ -1560,8 +1603,15 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
     source_dip = params.source_dip
     source_ip = params.source_ip
     vpn = "default"
+    username = current_user.username
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallopen'}
+    #proxy = 'shadowsocks'
+    #if 'proxy' in omr_config_data['users'][0][username]:
+    #    proxy = omr_config_data['users'][0][username]['proxy']
+    #if proxy == 'v2ray':
+    #    v2ray_add_port(current_user, str(port), proto, name)
+    #    fwtype = 'ACCEPT'
     if params.ipproto == 'ipv4':
         if 'gre_tunnels' in omr_config_data['users'][0][current_user.username]:
             for tunnel in omr_config_data['users'][0][current_user.username]['gre_tunnels']:
@@ -1584,11 +1634,57 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     source_ip = params.source_ip
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallclose'}
+    #v2ray_del_port(current_user.username, str(port), proto, name)
     if params.ipproto == 'ipv4':
-        shorewall_del_port(current_user.username, str(port), proto, name, fwtype, source_dip, source_ip)
+        shorewall_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip)
+        shorewall_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip)
     else:
-        shorewall6_del_port(current_user.username, str(port), proto, name, fwtype, source_dip, source_ip)
+        shorewall6_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip)
+        shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
+
+class V2rayparams(BaseModel):
+    name: str
+    port: str
+    proto: str
+    destip: str
+
+@app.post('/v2rayredirect', summary="Redirect a port from Server to Router with V2Ray")
+def v2ray_redirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayredirect'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
+    name = params.name
+    port = params.port
+    proto = params.proto
+    destip = params.destip
+    username = current_user.username
+    if name is None:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayredirect'}
+    v2ray_add_port(current_user, port, proto, name, destip)
+    return {'result': 'done', 'reason': 'changes applied'}
+
+@app.post('/v2rayunredirect', summary="Remove a redirected port from Server to Router with V2Ray")
+def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayredirect'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
+    name = params.name
+    port = params.port
+    proto = params.proto
+    username = curent_user.username
+    if name is None:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayunredirect'}
+    v2ray_del_port(current_user, port, proto, name)
+    return {'result': 'done', 'reason': 'changes applied'}
 
 # Set MPTCP config
 class MPTCPparams(BaseModel):
