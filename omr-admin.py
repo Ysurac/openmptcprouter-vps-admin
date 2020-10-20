@@ -439,7 +439,7 @@ def ordered(obj):
     else:
         return obj
 
-def v2ray_add_port(user, port, proto, name, destip):
+def v2ray_add_port(user, port, proto, name, destip, destport):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -453,7 +453,7 @@ def v2ray_add_port(user, port, proto, name, destip):
             if inbounds['tag'] == tag:
                 exist = 1
         if exist == 0:
-            inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(port), 'address': destip}}
+            inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(destport), 'address': destip}}
             data['inbounds'].append(inbounds)
             routing = {'type': 'field','inboundTag': [user.username + '_redir_' + proto + '_' + str(port)], 'outboundTag': 'OMRLan'}
             data['routing']['rules'].append(routing)
@@ -1648,6 +1648,7 @@ class V2rayparams(BaseModel):
     port: str
     proto: str
     destip: str
+    destport: str
 
 @app.post('/v2rayredirect', summary="Redirect a port from Server to Router with V2Ray")
 def v2ray_redirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
@@ -1662,10 +1663,11 @@ def v2ray_redirect(*, params: V2rayparams, current_user: User = Depends(get_curr
     port = params.port
     proto = params.proto
     destip = params.destip
+    destport = params.destport
     username = current_user.username
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayredirect'}
-    v2ray_add_port(current_user, port, proto, name, destip)
+    v2ray_add_port(current_user, port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/v2rayunredirect', summary="Remove a redirected port from Server to Router with V2Ray")
