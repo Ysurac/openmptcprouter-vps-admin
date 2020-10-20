@@ -453,7 +453,7 @@ def v2ray_add_port(user, port, proto, name, destip):
             if inbounds['tag'] == tag:
                 exist = 1
         if exist == 0:
-            inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': port, 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': port, 'address': destip}}
+            inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(port), 'address': destip}}
             data['inbounds'].append(inbounds)
             routing = {'type': 'field','inboundTag': [user.username + '_redir_' + proto + '_' + str(port)], 'outboundTag': 'OMRLan'}
             data['routing']['rules'].append(routing)
