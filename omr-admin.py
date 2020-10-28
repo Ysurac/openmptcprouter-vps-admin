@@ -1349,6 +1349,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks'}
     ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
@@ -1484,9 +1485,10 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
             else:
                 shadowsocks_config = {'server': ('[::0]', '0.0.0.0'), 'port_conf': portconf, 'local_port': 1081, 'mode': 'tcp_and_udp', 'timeout': timeout, 'method': method, 'verbose': verbose, 'ipv6_first': True, 'prefer_ipv6': prefer_ipv6, 'fast_open': fast_open, 'no_delay': no_delay, 'reuse_port': reuse_port, 'mptcp': mptcp, 'ebpf': ebpf, 'acl': '/etc/shadowsocks-libev/local.acl'}
 
-    if ordered(data) != ordered(json.loads(json.dumps(shadowsocks_config))):
-        with open('/etc/shadowsocks-libev/manager.json', 'w') as outfile:
-            json.dump(shadowsocks_config, outfile, indent=4)
+    with open('/etc/shadowsocks-libev/manager.json', 'w') as outfile:
+        json.dump(shadowsocks_config, outfile, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
         os.system("systemctl restart shadowsocks-libev-manager@manager.service")
         #for x in range(1, os.cpu_count()):
         #    os.system("systemctl restart shadowsocks-libev-manager@manager" + str(x) + ".service")
