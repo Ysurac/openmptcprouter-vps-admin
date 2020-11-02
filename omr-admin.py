@@ -473,9 +473,9 @@ def v2ray_del_port(username, port, proto, name):
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
         exist = 0
-        for inbounds in data['inbounds'][0]:
-            if data['inbounds'][0][inbounds]['tag'] == tag:
-                data['inbounds'][0].remove(inbounds)
+        for inbounds in data['inbounds']:
+            if inbounds['tag'] == tag:
+                data['inbounds'].remove(inbounds)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
@@ -1644,6 +1644,31 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
         shorewall6_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip)
         shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
+
+class V2rayconfig(BaseModel):
+    userid: str
+
+@app.post('/v2ray', summary="Set v2ray settings")
+def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayredirect'}
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        v2ray_config = json.load(f)
+    userid = params.userid
+    for inbounds in v2ray_config['inbounds']:
+        if inbounds['tag'] == 'omrin-tunnel':
+            inbounds['settings']['clients'][0]['id'] = userid
+    with open('/etc/v2ray/v2ray-server.json', 'w') as outfile:
+        json.dump(v2ray_config, outfile, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl restart v2ray")
+        set_lastchange()
+        return {'result': 'done', 'reason': 'changes applied', 'route': 'v2ray'}
+    else:
+        return {'result': 'done', 'reason': 'no changes', 'route': 'v2ray'}
+
 
 class V2rayparams(BaseModel):
     name: str
