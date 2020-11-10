@@ -1661,10 +1661,7 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
             inbounds['settings']['clients'][0]['id'] = v2ruserid
     with open('/etc/v2ray/v2ray-server.json', 'w') as outfile:
         json.dump(v2ray_config, outfile, indent=4)
-    userid = current_user.userid
-    if userid is None:
-        userid = 0
-    username = get_username_from_userid(userid)
+    username = current_user.username
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     v2ray_key = os.popen('jq -r .inbounds[0].settings.clients[0].id /etc/v2ray/v2ray-server.json').read().rstrip()
     v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
