@@ -20,6 +20,7 @@ import hashlib
 import pathlib
 import psutil
 import time
+import uuid
 from pprint import pprint
 from datetime import datetime, timedelta
 from tempfile import mkstemp
@@ -225,6 +226,85 @@ def remove_ss_user(port):
         LOG.debug("Shadowsocks remove timeout (" + str(err) + ")")
     except socket.error as err:
         LOG.debug("Shadowsocks remove error (" + str(err) + ")")
+
+def v2ray_add_user(user, restart=1):
+    v2rayuuid = str(uuid.uuid1())
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        exist = 0
+        for inbounds in data['inbounds']:
+            if inbounds['tag'] == 'omrin-tunnel':
+                inbounds['settings']['clients'].append({'id': v2rayuuid, 'level': 0, 'alterId': 0, 'email': user})
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart v2ray")
+
+def v2ray_del_user(user, restart=1):
+    v2rayuuid = str(uuid.uuid1())
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        for inbounds in data['inbounds']:
+            if inbounds['tag'] == 'omrin-tunnel':
+                for v2rayuser in inbounds['settings']['clients']:
+                    if v2rayuser['email'] == user:
+                        inbounds['settings']['clients'].remove(v2rayuser)
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart v2ray")
+
+def v2ray_add_outbound(tag,ip, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        data['outbounds'].append({'protocol': 'freedom', 'settings': { 'userLevel': 0 }, 'tag': tag, 'sendThrough': ip})
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart v2ray")
+
+def v2ray_del_outbound(tag, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        for outbounds in data['outbounds']:
+            if outbounds['tag'] == tag:
+                data['outbounds'].remove(outbounds)
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart v2ray")
+
+def v2ray_add_routing(tag, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        data['routing']['rules'].append({'type': 'field', 'inboundTag': ( 'omrintunnel' ), 'outboundTag': tag})
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart v2ray")
+
+def v2ray_del_routing(tag, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        data = json.load(f)
+        for rules in data['routing']['rules']:
+            if rules['outboundTag'] == tag:
+                data['routing']['rules'].remove(rules)
+    with open('/etc/v2ray/v2ray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart v2ray")
 
 
 def add_gre_tunnels():
