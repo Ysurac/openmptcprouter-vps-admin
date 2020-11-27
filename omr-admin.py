@@ -630,7 +630,7 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + "\n")
             elif fwtype == 'DNAT' and vpn != 'default':
-                n.write('DNAT		net		vpn:' + vpn + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
             elif fwtype == 'DNAT' and userid == 0:
                 n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
@@ -1338,6 +1338,8 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         ipv4_addr = os.popen('ip -4 addr show ' + IFACE +' | grep -oP "(?<=inet ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     else:
         ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
+        if ipv4_addr == '':
+            ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ip.openmptcprouter.com').read().rstrip()
         if ipv4_addr == '':
             ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.co').read().rstrip()
         if ipv4_addr != '':
