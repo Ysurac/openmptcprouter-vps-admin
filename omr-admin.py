@@ -143,8 +143,8 @@ def get_username_from_userid(userid):
         data = json.loads(content)
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'get_username'}
-    for user in content['users'][0]:
-        if 'userid' in content['users'][0][user] and content['users'][0][user]['userid'] == userid:
+    for user in data['users'][0]:
+        if 'userid' in data['users'][0][user] and data['users'][0][user]['userid'] == userid:
             return user
     return ''
 
@@ -156,21 +156,21 @@ def check_username_serial(username, serial):
         data = json.loads(content)
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'check_serial'}
-    if 'serial_enforce' not in content or content['serial_enforce'] == False:
+    if 'serial_enforce' not in data or data['serial_enforce'] == False:
         return True
-    if 'serial' not in content['users'][0][username]:
-        content['users'][0][username]['serial'] = serial
+    if 'serial' not in data['users'][0][username]:
+        data['users'][0][username]['serial'] = serial
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-            json.dump(content, outfile, indent=4)
+            json.dump(data, outfile, indent=4)
         return True
-    if content['users'][0][username]['serial'] == serial:
+    if data['users'][0][username]['serial'] == serial:
         return True
-    if 'serial_error' not in content['users'][0][username]:
-        content['users'][0][username]['serial_error'] = 0
+    if 'serial_error' not in data['users'][0][username]:
+        data['users'][0][username]['serial_error'] = 0
     else:
-        content['users'][0][username]['serial_error'] = content['users'][0][username]['serial_error'] + 1
+        data['users'][0][username]['serial_error'] = data['users'][0][username]['serial_error'] + 1
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-        json.dump(content, outfile, indent=4)
+        json.dump(data, outfile, indent=4)
     return False
 
 def set_global_param(key, value):
