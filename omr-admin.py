@@ -144,7 +144,7 @@ def get_username_from_userid(userid):
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'get_username'}
     for user in data['users'][0]:
-        if 'userid' in data['users'][0][user] and data['users'][0][user]['userid'] == userid:
+        if 'userid' in data['users'][0][user] and int(data['users'][0][user]['userid']) == userid:
             return user
     return ''
 
@@ -168,7 +168,7 @@ def check_username_serial(username, serial):
     if 'serial_error' not in data['users'][0][username]:
         data['users'][0][username]['serial_error'] = 0
     else:
-        data['users'][0][username]['serial_error'] = data['users'][0][username]['serial_error'] + 1
+        data['users'][0][username]['serial_error'] = int(data['users'][0][username]['serial_error']) + 1
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
         json.dump(data, outfile, indent=4)
     return False
