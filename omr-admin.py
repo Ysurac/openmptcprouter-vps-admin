@@ -166,7 +166,7 @@ def check_username_serial(username, serial):
     if data['users'][0][username]['serial'] == serial:
         return True
     if 'serial_error' not in data['users'][0][username]:
-        data['users'][0][username]['serial_error'] = 0
+        data['users'][0][username]['serial_error'] = 1
     else:
         data['users'][0][username]['serial_error'] = int(data['users'][0][username]['serial_error']) + 1
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
@@ -1254,6 +1254,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     #openvpn_client_ip = '10.255.252.2'
     openvpn_client_ip = 'dhcp'
 
+    if os.path.isfile('/etc/openvpn/bonding1.conf'):
+        available_vpn.append("openvpn_bonding")
+
     LOG.debug('Get config... mlvpn')
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
@@ -1865,6 +1868,7 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
 
 class VPN(str, Enum):
     openvpn = "openvpn"
+    openvpnbonding = "openvpn_bonding"
     glorytuntcp = "glorytun_tcp"
     glorytunudp = "glorytun_udp"
     dsvpn = "dsvpn"
