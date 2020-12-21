@@ -1043,6 +1043,12 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     elif vpn == 'dsvpn':
         vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
+    elif vpn == 'openvpn':
+        vpn_traffic_rx = get_bytes('rx', 'tun0')
+        vpn_traffic_tx = get_bytes('tx', 'tun0')
+    elif vpn == 'openvpn_bonding':
+        vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
+        vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
     LOG.debug('Get status: done')
     if IFACE:
         return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx}}
@@ -1414,6 +1420,12 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     elif vpn == 'dsvpn':
         vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
+    elif vpn == 'openvpn':
+        vpn_traffic_rx = get_bytes('rx', 'tun0')
+        vpn_traffic_tx = get_bytes('tx', 'tun0')
+    elif vpn == 'openvpn_bonding':
+        vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
+        vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
 
     #vpn = current_user.vpn
     available_proxy = ["shadowsocks", "v2ray"]
