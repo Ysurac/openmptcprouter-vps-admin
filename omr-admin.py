@@ -2203,8 +2203,11 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
 def update(current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'update'}
-    os.system("wget -O - http://www.openmptcprouter.com/server/debian9-x86_64.sh | sh")
-    # Need to reboot if kernel change
+    LOG.debug("Update VPS...")
+    os.system("systemctl stop omr")
+    os.system("wget -O - http://www.openmptcprouter.com/server/debian10-x86_64.sh | sh &")
+    LOG.debug("Update VPS... done")
+    os.system("reboot")
     return {'result': 'done'}
 
 # Backup
