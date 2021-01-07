@@ -112,7 +112,7 @@ def get_bytes_v2ray(t,user):
     else:
         side="uplink"
     try:
-        data = subprocess.check_output('/usr/bin/v2ray/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' 2>/dev/null | grep value | cut -d: -f2 | tr -d " "', shell = True)
+        data = subprocess.check_output('/usr/bin/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' 2>/dev/null | grep value | cut -d: -f2 | tr -d " "', shell = True)
     except:
         return 0
     if data.decode("utf-8") != '':
