@@ -436,6 +436,7 @@ def add_gre_tunnels():
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
         if initial_md5 != final_md5:
             os.system("systemctl -q reload shorewall")
+            os.system("systemctl -q restart shadowsocks-libev-manager@manager")
     set_global_param('allips', allips)
 
 add_gre_tunnels()
@@ -2207,7 +2208,7 @@ def update(current_user: User = Depends(get_current_user)):
     os.system("systemctl stop omr")
     os.system("wget -O - http://www.openmptcprouter.com/server/debian10-x86_64.sh | sh &")
     LOG.debug("Update VPS... done")
-    os.system("reboot")
+    os.system("/sbin/reboot")
     return {'result': 'done'}
 
 # Backup
