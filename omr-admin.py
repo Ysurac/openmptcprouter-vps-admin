@@ -173,6 +173,8 @@ def check_username_serial(username, serial):
     if data:
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
+    else:
+        LOG.debug("Empty data for check_username_serial")
     return False
 
 def set_global_param(key, value):
@@ -187,14 +189,18 @@ def set_global_param(key, value):
     if data:
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
+    else:
+        LOG.debug("Empty data for set_global_param")
 
 def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     content['users'][0][user].update(changes)
-    if data:
+    if content:
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
+    else:
+        LOG.debug("Empty data for modif_config_user")
 
 
 def add_ss_user(port, key, userid=0, ip=''):
@@ -756,6 +762,8 @@ def set_lastchange(sync=0):
     if data:
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
+    else:
+        LOG.debug("Empty data for set_last_change")
 
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -2320,6 +2328,8 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     if content:
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
+    else:
+        LOG.debug("Empty data for add_user")
     # Create VPNs configuration
     os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full "' + params.username + '" nopass')
     add_glorytun_tcp(userid)
@@ -2345,6 +2355,8 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     if content:
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
+    else:
+        LOG.debug("Empty data for remover_user")
     os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username)
     os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl')
     os.system("systemctl -q restart openvpn@tun0")
