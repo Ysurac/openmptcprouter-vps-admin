@@ -160,8 +160,9 @@ def check_username_serial(username, serial):
         return True
     if 'serial' not in data['users'][0][username]:
         data['users'][0][username]['serial'] = serial
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-            json.dump(data, outfile, indent=4)
+        if data:
+            with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
+                json.dump(data, outfile, indent=4)
         return True
     if data['users'][0][username]['serial'] == serial:
         return True
@@ -169,8 +170,9 @@ def check_username_serial(username, serial):
         data['users'][0][username]['serial_error'] = 1
     else:
         data['users'][0][username]['serial_error'] = int(data['users'][0][username]['serial_error']) + 1
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-        json.dump(data, outfile, indent=4)
+    if data:
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
+            json.dump(data, outfile, indent=4)
     return False
 
 def set_global_param(key, value):
@@ -182,15 +184,17 @@ def set_global_param(key, value):
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'global_param'}
     data[key] = value
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-        json.dump(data, outfile, indent=4)
+    if data:
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
+            json.dump(data, outfile, indent=4)
 
 def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     content['users'][0][user].update(changes)
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-        json.dump(content, f, indent=4)
+    if data:
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
+            json.dump(content, f, indent=4)
 
 
 def add_ss_user(port, key, userid=0, ip=''):
@@ -749,8 +753,9 @@ def set_lastchange(sync=0):
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'lastchange'}
     data["lastchange"] = time.time() + sync
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-        json.dump(data, outfile, indent=4)
+    if data:
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
+            json.dump(data, outfile, indent=4)
 
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -2312,8 +2317,9 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
     content['users'][0].update(user_json)
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-        json.dump(content, f, indent=4)
+    if content:
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
+            json.dump(content, f, indent=4)
     # Create VPNs configuration
     os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full "' + params.username + '" nopass')
     add_glorytun_tcp(userid)
@@ -2336,8 +2342,9 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     userid = int(content['users'][0][params.username]['userid'])
     del content['users'][0][params.username]
     remove_ss_user(str(shadowsocks_port))
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-        json.dump(content, f, indent=4)
+    if content:
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
+            json.dump(content, f, indent=4)
     os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username)
     os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl')
     os.system("systemctl -q restart openvpn@tun0")
