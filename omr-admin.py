@@ -2429,8 +2429,11 @@ async def list_users(current_user: User = Depends(get_current_user)):
 
 
 
-if __name__ == '__main__':
+def main(omrport: int, omrhost: str):
     LOG.debug("Main OMR-Admin launch")
+    uvicorn.run(app, host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
+
+if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
     omrport = 65500
@@ -2439,6 +2442,8 @@ if __name__ == '__main__':
     omrhost = '0.0.0.0'
     if 'host' in omr_config_data:
         omrhost = omr_config_data["host"]
-#    uvicorn.run(app,host='0.0.0.0',port=omrport,log_level='debug',ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
-    uvicorn.run(app, host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
-#    uvicorn.run(app,host='0.0.0.0',port=omrport,ssl_context=('/etc/openmptcprouter-vps-admin/cert.pem', '/etc/openmptcprouter-vps-admin/key.pem'),threaded=True)
+    parser = ArgumentParser(description="OpenMPTCProuter Server API")
+    parser.add_argument("--port", type=int, help="Listening port", default=omrport)
+    parser.add_argument("--host", type=str, help="Listening host", default=omrhost)
+    args = parser.parse_args()
+    main(args.port, args.host)
