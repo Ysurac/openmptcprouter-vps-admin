@@ -2431,7 +2431,7 @@ async def list_users(current_user: User = Depends(get_current_user)):
 
 def main(omrport: int, omrhost: str):
     LOG.debug("Main OMR-Admin launch")
-    uvicorn.run(app, host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem')
+    uvicorn.run(app, host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=2, ssl_ciphers='TLSv1.2')
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
