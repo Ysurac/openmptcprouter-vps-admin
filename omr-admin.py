@@ -11,6 +11,7 @@ import base64
 import secrets
 import uuid
 import configparser
+import argparse
 import subprocess
 import os
 import sys
@@ -2431,7 +2432,7 @@ async def list_users(current_user: User = Depends(get_current_user)):
 
 def main(omrport: int, omrhost: str):
     LOG.debug("Main OMR-Admin launch")
-    uvicorn.run(app, host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=2, ssl_ciphers='TLSv1.2')
+    uvicorn.run(app, host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5)
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -2442,7 +2443,7 @@ if __name__ == '__main__':
     omrhost = '0.0.0.0'
     if 'host' in omr_config_data:
         omrhost = omr_config_data["host"]
-    parser = ArgumentParser(description="OpenMPTCProuter Server API")
+    parser = argparse.ArgumentParser(description="OpenMPTCProuter Server API")
     parser.add_argument("--port", type=int, help="Listening port", default=omrport)
     parser.add_argument("--host", type=str, help="Listening host", default=omrhost)
     args = parser.parse_args()
