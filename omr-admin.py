@@ -1291,8 +1291,8 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     mlvpn_client_ip = '10.255.253.2'
 
     LOG.debug('Get config... wireguard')
-    if os.path.isfile('/etc/wireguard/vpn-server-private.key'):
-        with open('/etc/wireguard/vpn-server-private.key', "rb") as wgkey_file:
+    if os.path.isfile('/etc/wireguard/vpn-server-public.key'):
+        with open('/etc/wireguard/vpn-server-public.key', "rb") as wgkey_file:
             wireguard_key = wgkey_file.read()
     else:
         wireguard_key = ''
@@ -2094,11 +2094,12 @@ class WireGuard(BaseModel):
 
 @app.post('/wireguard', summary="Modify Wireguard configuration")
 def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_user)):
-    wg_config = configparser.ConfigParser()
+    wg_config = configparser.ConfigParser(strict=False)
     wg_config.read_file(open(r'/etc/wireguard/wg0.conf'))
     wg_port = wg_config.get('Interface', 'ListenPort')
     wg_key = wg_config.get('Interface', 'PrivateKey')
 
+    fd, tmpfile = mkstemp()
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/wireguard/wg0.conf', 'rb'))).hexdigest()
     with open(tmpfile, 'a+') as n:
         n.write('[Interface]\n')
@@ -2108,7 +2109,7 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
             n.write('\n')
             n.write('[Peer]')
             n.write('PublicKey  = ' + peer.key + '\n')
-            n.write('AllowedIPs  = ' + peer.ip + '\n')
+            n.write('AllowedIPs = ' + peer.ip + '\n')
     move(tmpfile, '/etc/wireguard/wg0.conf')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/wireguard/wg0.conf', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
