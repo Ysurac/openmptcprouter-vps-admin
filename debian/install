@@ -1,3 +1,4 @@
 omr-admin-config.json usr/share/omr-admin
 omr-admin.py usr/bin
 debian/omr-admin.service lib/systemd/system
+debian/omr-admin-ipv6.service lib/systemd/system

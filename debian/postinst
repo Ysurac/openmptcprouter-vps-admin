@@ -11,15 +11,15 @@ OMR_ADMIN_PASS=$(od -vN "32" -An -tx1 /dev/urandom | tr '[:lower:]' '[:upper:]' 
 # use debconf
 . /usr/share/debconf/confmodule
 
-pip3 -q install fastapi netjsonconfig python-multipart -U
+pip3 -q install fastapi jsonschema netjsonconfig python-multipart jinja2 -U
 
-if [ ! -f "/etc/openmptcprouter-vps-admin/omr-admin-config.json" ]; then
-	mkdir -p /etc/openmptcprouter-vps-admin
-	cp /usr/share/omr-admin/omr-admin-config.json /etc/openmptcprouter-vps-admin/omr-admin-config.json
-	sed -i "s:AdminMySecretKey:$OMR_API_PASS:g" /etc/openmptcprouter-vps-admin/omr-admin-config.json
-	sed -i "s:MySecretKey:$OMR_ADMIN_PASS:g" /etc/openmptcprouter-vps-admin/omr-admin-config.json
-	openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -keyout /etc/openmptcprouter-vps-admin/key.pem -out /etc/openmptcprouter-vps-admin/cert.pem -subj "/C=US/ST=Oregon/L=Portland/O=OpenMPTCProuterVPS/OU=Org/CN=www.openmptcprouter.vps"
-fi
+#if [ ! -f "/etc/openmptcprouter-vps-admin/omr-admin-config.json" ]; then
+#	mkdir -p /etc/openmptcprouter-vps-admin
+#	cp /usr/share/omr-admin/omr-admin-config.json /etc/openmptcprouter-vps-admin/omr-admin-config.json
+#	sed -i "s:AdminMySecretKey:$OMR_API_PASS:g" /etc/openmptcprouter-vps-admin/omr-admin-config.json
+#	sed -i "s:MySecretKey:$OMR_ADMIN_PASS:g" /etc/openmptcprouter-vps-admin/omr-admin-config.json
+#	openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -keyout /etc/openmptcprouter-vps-admin/key.pem -out /etc/openmptcprouter-vps-admin/cert.pem -subj "/C=US/ST=Oregon/L=Portland/O=OpenMPTCProuterVPS/OU=Org/CN=www.openmptcprouter.vps"
+#fi
 
 systemctl enable omr-admin.service
 systemctl restart omr-admin.service
