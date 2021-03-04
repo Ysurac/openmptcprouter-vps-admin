@@ -9,7 +9,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: install dependencies
-      run: sudo apt-get install debhelper
+      run: sudo apt-get install debhelper python3 python3-distutils-extra
 
     - name: Build Debian package
       run: dpkg-buildpackage -b -us -uc
