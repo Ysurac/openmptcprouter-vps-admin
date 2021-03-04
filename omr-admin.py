@@ -2116,7 +2116,7 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
         os.system("wg setconf wg0 /etc/wireguard/wg0.conf")
         shorewall_add_port(current_user, str(wg_port), 'udp', 'wireguard')
         set_lastchange()
-    return {'result': 'done'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'wireguard'}
 
 
 class Wanips(BaseModel):
@@ -2134,7 +2134,7 @@ def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
         outfile.write(ips)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/local.acl', 'rb'))).hexdigest()
     #modif_config_user(current_user.username,{'wanips': wanip})
-    return {'result': 'done'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'wan'}
 
 class Lanips(BaseModel):
     lanips: List[str] = []
@@ -2170,7 +2170,7 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
         if initial_md5 != final_md5:
             os.system("systemctl -q restart openvpn@tun0")
             set_lastchange()
-    return {'result': 'done', 'reason': 'changes applied'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'lan'}
 
 class VPNips(BaseModel):
     remoteip: str = Query(..., regex='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
@@ -2255,7 +2255,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         os.system("systemctl -q reload shorewall6")
         set_lastchange()
 
-    return {'result': 'done', 'reason': 'changes applied'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
 
 # Update VPS
 @app.get('/update', summary="Update VPS script")
@@ -2267,7 +2267,7 @@ def update(current_user: User = Depends(get_current_user)):
     os.system("wget -O - http://www.openmptcprouter.com/server/debian10-x86_64.sh | sh &")
     LOG.debug("Update VPS... done")
     os.system("/sbin/reboot")
-    return {'result': 'done'}
+    return {'result': 'done', 'route': 'update'}
 
 # Backup
 class Backupfile(BaseModel):
@@ -2282,7 +2282,7 @@ def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_curre
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'backuppost'}
     with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', 'wb') as f:
         f.write(base64.b64decode(backup_file))
-    return {'result': 'done'}
+    return {'result': 'done', 'route': 'backuppost'}
 
 @app.get('/backupget', summary="Get current user router backup file")
 def send_backup(current_user: User = Depends(get_current_user)):
