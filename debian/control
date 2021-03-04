@@ -10,5 +10,5 @@ Homepage: https://github.com/ysurac/openmptcprouter-vps-admin
 Package: omr-vps-admin
 Architecture: all
 Multi-Arch: foreign
-Depends: ${misc:Depends}, ${python3:Depends}, python3-uvicorn, python3-netaddr, python3-pip, python3-netifaces
+Depends: ${misc:Depends}, ${python3:Depends}, python3-uvicorn, python3-netaddr, python3-pip, python3-netifaces, python3-aiofiles, python3-psutil, jq, ipcacl
 Description: OpenMPTCProuter VPS admin rest api

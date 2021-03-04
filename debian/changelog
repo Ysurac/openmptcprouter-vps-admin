@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20210304) unstable; urgency=medium
+
+    * Wireguard for MPTCP over VPN support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 04 Mar 2021 14:36:12 +0200
+
 omr-vps-admin (0.2+20200611) unstable; urgency=medium
 
     * Fix on VPN IPs settings
