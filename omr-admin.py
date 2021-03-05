@@ -2094,6 +2094,8 @@ class WireGuard(BaseModel):
 
 @app.post('/wireguard', summary="Modify Wireguard configuration")
 def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_user)):
+    if not os.path.isfile('/etc/wireguard/wg0.conf'):
+        return {'result': 'error', 'reason': 'Wireguard config not found', 'route': 'wireguard'}
     wg_config = configparser.ConfigParser(strict=False)
     wg_config.read_file(open(r'/etc/wireguard/wg0.conf'))
     wg_port = wg_config.get('Interface', 'ListenPort')
@@ -2107,7 +2109,7 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
         n.write('PrivateKey = ' + wg_key + '\n')
         for peer in params.peers:
             n.write('\n')
-            n.write('[Peer]')
+            n.write('[Peer]\n')
             n.write('PublicKey  = ' + peer.key + '\n')
             n.write('AllowedIPs = ' + peer.ip + '\n')
     move(tmpfile, '/etc/wireguard/wg0.conf')
