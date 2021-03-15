@@ -1284,9 +1284,17 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         mlvpn_config = configparser.ConfigParser()
         mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
         mlvpn_key = mlvpn_config.get('general', 'password').strip('"')
+        mlvpn_timeout = mlvpn_config.get('general', 'timeout')
+        mlvpn_reorder_buffer_size = mlvpn_config.get('general', 'reorder_buffer_size')
+        mlvpn_loss_tolerence = mlvpn_config.get('general', 'loss_tolerence')
+        mlvpn_cleartext_data = mlvpn_config.get('general', 'cleartext_data')
         available_vpn.append("mlvpn")
     else:
         mlvpn_key = ''
+        mlvpn_timeout = ''
+        mlvpn_reorder_buffer_size = ''
+        mlvpn_loss_tolerence = ''
+        mlvpn_cleartext_data = ''
     mlvpn_host_ip = '10.255.253.1'
     mlvpn_client_ip = '10.255.253.2'
 
@@ -1474,7 +1482,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx}, 'proxy': {'available': available_proxy, 'current': proxy}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx}, 'proxy': {'available': available_proxy, 'current': proxy}}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -2053,6 +2061,36 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     shorewall_add_port(current_user, str(port), 'tcp', 'dsvpn')
     set_lastchange()
     return {'result': 'done'}
+
+# Set MLVPN config
+class MLVPN(BaseModel):
+    timeout: int
+    reorder_buffer_size: int
+    loss_tolerence: int
+    cleartext_data: int
+    password: str
+
+@app.post('/mlvpn', summary="Modify MLVPN configuration")
+def mlvpn(*, params: MLVPN, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mlvpn'}
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/mlvpn/mlvpn0.conf', 'rb'))).hexdigest()
+    mlvpn_config = configparser.ConfigParser()
+    mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
+    mlvpn_config.set('general', 'password', '"' + params.password + '"')
+    mlvpn_config.set('general', 'timeout',str(params.timeout))
+    mlvpn_config.set('general', 'reorder_buffer_size',str(params.reorder_buffer_size))
+    mlvpn_config.set('general', 'loss_tolerence',str(params.loss_tolerence))
+    mlvpn_config.set('general', 'cleartext_data',str(params.cleartext_data))
+    with open('/etc/mlvpn/mlvpn0.conf','w') as mlvpn_file:
+        mlvpn_config.write(mlvpn_file)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/mlvpn/mlvpn0.conf', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl -q restart mlvpn@mlvpn0")
+        set_lastchange()
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'mlvpn'}
+
 
 # Set OpenVPN config
 class OpenVPN(BaseModel):
