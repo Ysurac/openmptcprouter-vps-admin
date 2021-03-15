@@ -1287,7 +1287,10 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         mlvpn_timeout = mlvpn_config.get('general', 'timeout')
         mlvpn_reorder_buffer_size = mlvpn_config.get('general', 'reorder_buffer_size')
         mlvpn_loss_tolerence = mlvpn_config.get('general', 'loss_tolerence')
-        mlvpn_cleartext_data = mlvpn_config.get('general', 'cleartext_data')
+        if mlvpn_config.has_option('general', 'cleartext_data'):
+            mlvpn_cleartext_data = mlvpn_config.get('general', 'cleartext_data')
+        else:
+            mlvpn_cleartext_data = ''
         available_vpn.append("mlvpn")
     else:
         mlvpn_key = ''
