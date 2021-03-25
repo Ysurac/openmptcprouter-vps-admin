@@ -45,7 +45,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.models import SecurityBase as SecurityBaseModel
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, ValidationError # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse
@@ -404,6 +404,7 @@ def add_gre_tunnels():
                                         if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in line:
                                             n.write(line)
                                     n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(iface) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
+                                    n.write('SNAT(' + str(list(network)[1]) + ')	-	' + gre_intf + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                 os.close(fd)
                                 move(tmpfile, '/etc/shorewall/snat')
                                 #fd, tmpfile = mkstemp()
@@ -642,8 +643,8 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + "\n")
             elif fwtype == 'DNAT' and vpn != 'default':
-                #n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR' + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
+                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
+                #n.write('DNAT		' + net + '		vpn:$OMR_ADDR' + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
             elif fwtype == 'DNAT' and userid == 0:
                 n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
