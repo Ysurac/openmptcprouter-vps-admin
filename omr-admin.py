@@ -776,7 +776,7 @@ with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
 fake_users_db = omr_config_data['users'][0]
 
 def verify_password(plain_password, user_password):
-    if plain_password == user_password:
+    if secrets.compare_digest(plain_password,user_password):
         LOG.debug("password true")
         return True
     return False
