@@ -34,6 +34,7 @@ import uvicorn
 import jwt
 from jwt import PyJWTError
 from netaddr import *
+from ipaddress import ip_address, IPv4Address, IPv6Address
 from netjsonconfig import OpenWrt
 from fastapi import Depends, FastAPI, HTTPException, Security, Query, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes, OAuth2
@@ -1008,6 +1009,18 @@ async def get_documentation(current_user: User = Depends(get_current_active_user
 async def status(request: Request):
     client_host = request.client.host
     return {"client_host": client_host}
+
+# Check if MPTCP is enabled on this connection
+@app.get('/mptcpsupport')
+async def mptcpsupport(request: Request):
+    ip = request.client.host
+    if type(ip_address(ip)) is IPv4Address:
+        ipr = list(reversed(ip.split('.')))
+        iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, ipr))
+        with open('/proc/net/mptcp_net/mptcp') as f:
+            if iptohex in f.read():
+                return {"mptcp": "working"}
+        return {"mptcp": "not working"}
 
 # Get VPS status
 @app.get('/status', summary="Get current server load average, uptime and release")
