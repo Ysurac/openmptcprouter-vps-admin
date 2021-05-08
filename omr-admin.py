@@ -2320,10 +2320,10 @@ def update(current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'update'}
     LOG.debug("Update VPS...")
+    with open("/etc/openmptcprouter-vps-admin/update", mode='a'): pass
     os.system("systemctl stop omr")
-    os.system("wget -O - http://www.openmptcprouter.com/server/debian10-x86_64.sh | sh &")
+    os.system("systemctl -q restart omr-update")
     LOG.debug("Update VPS... done")
-    os.system("/sbin/reboot")
     return {'result': 'done', 'route': 'update'}
 
 # Backup

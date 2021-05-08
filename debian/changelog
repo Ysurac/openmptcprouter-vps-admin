@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20210508) unstable; urgency=medium
+
+    * Fix update VPS
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sat, 08 May 2021 08:40:13 +0200
+
 omr-vps-admin (0.3+20210414) unstable; urgency=medium
 
     * Add check MPTCP support
