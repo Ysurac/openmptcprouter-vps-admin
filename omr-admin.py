@@ -574,6 +574,7 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
                 exist = 1
         if exist == 0:
             inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(destport), 'address': destip}}
+            #inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': str(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': str(destport), 'address': destip}}
             data['inbounds'].append(inbounds)
             routing = {'type': 'field','inboundTag': [user.username + '_redir_' + proto + '_' + str(port)], 'outboundTag': 'OMRLan'}
             data['routing']['rules'].append(routing)
@@ -1017,9 +1018,12 @@ async def mptcpsupport(request: Request):
     if type(ip_address(ip)) is IPv4Address:
         ipr = list(reversed(ip.split('.')))
         iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, ipr))
-        with open('/proc/net/mptcp_net/mptcp') as f:
-            if iptohex in f.read():
-                return {"mptcp": "working"}
+        if path.exists('/proc/net/mptcp_net/mptcp'):
+            with open('/proc/net/mptcp_net/mptcp') as f:
+                if iptohex in f.read():
+                    return {"mptcp": "working"}
+        elif not os.popen("ss -M | grep " + ip) == '':
+            return {"mptcp": "working"}
         return {"mptcp": "not working"}
 
 # Get VPS status
@@ -1040,7 +1044,11 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     vps_current_time = time.time()
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
-    mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
+    mptcp_enabled = "0"
+    if path.exists("/proc/sys/net/mptcp/mptcp_enabled"):
+        mptcp_enabled = os.popen('sysctl -qn net.mptcp.mptcp_enabled').read().rstrip()
+    elif path.exists("/proc/sys/net/mptcp/enabled"):
+        mptcp_enabled = os.popen('sysctl -qn net.mptcp.enabled').read().rstrip()
     shadowsocks_port = current_user.shadowsocks_port
     if not shadowsocks_port == None:
         ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
@@ -1371,11 +1379,17 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             v2ray_rx = get_bytes_v2ray('rx',username)
 
     LOG.debug('Get config... mptcp')
-    mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
-    mptcp_checksum = os.popen('sysctl -n net.mptcp.mptcp_checksum').read().rstrip()
-    mptcp_path_manager = os.popen('sysctl -n  net.mptcp.mptcp_path_manager').read().rstrip()
-    mptcp_scheduler = os.popen('sysctl -n net.mptcp.mptcp_scheduler').read().rstrip()
-    mptcp_syn_retries = os.popen('sysctl -n net.mptcp.mptcp_syn_retries').read().rstrip()
+    mptcp_enabled = mptcp_checksum = '0'
+    mptcp_path_manager = mptcp_scheduler = mptcp_syn_retries = ''
+    if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
+        mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
+        mptcp_checksum = os.popen('sysctl -n net.mptcp.mptcp_checksum').read().rstrip()
+        mptcp_path_manager = os.popen('sysctl -n  net.mptcp.mptcp_path_manager').read().rstrip()
+        mptcp_scheduler = os.popen('sysctl -n net.mptcp.mptcp_scheduler').read().rstrip()
+        mptcp_syn_retries = os.popen('sysctl -n net.mptcp.mptcp_syn_retries').read().rstrip()
+    elif path.exists('/proc/sys/net/mptcp/enabled'):
+        mptcp_enabled = os.popen('sysctl -n net.mptcp.enabled').read().rstrip()
+        mptcp_checksum = os.popen('sysctl -n net.mptcp.checksum_enabled').read().rstrip()
 
     congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
 
@@ -1400,7 +1414,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         if ipv4_addr == '':
             ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ip.openmptcprouter.com').read().rstrip()
         if ipv4_addr == '':
-            ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.co').read().rstrip()
+            ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.me').read().rstrip()
         if ipv4_addr != '':
             set_global_param('ipv4', ipv4_addr)
     #ipv4_addr = ""
@@ -1920,10 +1934,13 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     congestion_control = params.congestion_control
     if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'mptcp'}
-    os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
-    os.system('sysctl -qw net.mptcp.mptcp_path_manager=' + path_manager)
-    os.system('sysctl -qw net.mptcp.mptcp_scheduler=' + scheduler)
-    os.system('sysctl -qw net.mptcp.mptcp_syn_retries=' + str(syn_retries))
+    if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
+        os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
+        os.system('sysctl -qw net.mptcp.mptcp_path_manager=' + path_manager)
+        os.system('sysctl -qw net.mptcp.mptcp_scheduler=' + scheduler)
+        os.system('sysctl -qw net.mptcp.mptcp_syn_retries=' + str(syn_retries))
+    else:
+        os.system('sysctl -qw net.mptcp.checksum_enabled=' + checksum)
     os.system('sysctl -qw net.ipv4.tcp_congestion_control=' + congestion_control)
     set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
