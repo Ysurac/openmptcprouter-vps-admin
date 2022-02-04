@@ -9,6 +9,7 @@
                 "disabled": false
             },
             "openmptcprouter": {
+                "userid": 0,
                 "username": "openmptcprouter",
                 "user_password": "MySecretKey",
                 "shadowsocks_port": 65101,

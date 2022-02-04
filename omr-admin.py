@@ -1049,22 +1049,25 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         mptcp_enabled = os.popen('sysctl -qn net.mptcp.mptcp_enabled').read().rstrip()
     elif path.exists("/proc/sys/net/mptcp/enabled"):
         mptcp_enabled = os.popen('sysctl -qn net.mptcp.enabled').read().rstrip()
-    shadowsocks_port = current_user.shadowsocks_port
-    if not shadowsocks_port == None:
-        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
-    else:
-        ss_traffic = 0
-    v2ray_tx = 0
-    v2ray_rx = 0
-    if os.path.isfile('/etc/v2ray/v2ray-server.json') and checkIfProcessRunning('v2ray'):
-        v2ray_tx = get_bytes_v2ray('tx',username)
-        v2ray_rx = get_bytes_v2ray('rx',username)
-    vpn = 'glorytun_tcp'
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
         except ValueError as e:
             omr_config_data = {}
+    proxy = 'shadowsocks'
+    if 'proxy' in omr_config_data['users'][0][username]:
+        proxy = omr_config_data['users'][0][username]['proxy']
+    shadowsocks_port = current_user.shadowsocks_port
+    if not shadowsocks_port == None and proxy == 'shadowsocks':
+        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    else:
+        ss_traffic = 0
+    v2ray_tx = 0
+    v2ray_rx = 0
+    if os.path.isfile('/etc/v2ray/v2ray-server.json') and proxy == 'v2ray' and checkIfProcessRunning('v2ray'):
+        v2ray_tx = get_bytes_v2ray('tx',username)
+        v2ray_rx = get_bytes_v2ray('rx',username)
+    vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][username]:
         vpn = omr_config_data['users'][0][username]['vpn']
     vpn_traffic_rx = 0
@@ -2566,3 +2569,4 @@ if __name__ == '__main__':
     parser.add_argument("--host", type=str, help="Listening host", default=omrhost)
     args = parser.parse_args()
     main(args.port, args.host)
+    #uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=6)
