@@ -1114,6 +1114,10 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         except ValueError as e:
             omr_config_data = {}
     LOG.debug('Get config... shadowsocks')
+    proxy = 'shadowsocks'
+    if 'proxy' in omr_config_data['users'][0][username]:
+        proxy = omr_config_data['users'][0][username]['proxy']
+
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
@@ -1166,7 +1170,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         shadowsocks_obfs_plugin = ''
         shadowsocks_obfs_type = ''
     shadowsocks_port = current_user.shadowsocks_port
-    if not shadowsocks_port == None:
+    if not shadowsocks_port == None and proxy == 'shadowsocks':
         ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
     else:
         ss_traffic = 0
@@ -1377,7 +1381,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             modif_config_user(username, {'v2ray': v2ray_conf})
         else:
             v2ray_conf = omr_config_data['users'][0][username]['v2ray']
-        if checkIfProcessRunning('v2ray'):
+        if checkIfProcessRunning('v2ray') and proxy == 'v2ray':
             v2ray_tx = get_bytes_v2ray('tx',username)
             v2ray_rx = get_bytes_v2ray('rx',username)
 
@@ -1464,10 +1468,6 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     else:
         locaip6 = 'fe80::a00:1'
         remoteip6 = 'fe80::a00:2'
-
-    proxy = 'shadowsocks'
-    if 'proxy' in omr_config_data['users'][0][username]:
-        proxy = omr_config_data['users'][0][username]['proxy']
 
     vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][username]:
