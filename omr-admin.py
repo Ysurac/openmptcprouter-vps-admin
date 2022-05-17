@@ -1843,14 +1843,13 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
 
 class SipALGparams(BaseModel):
-    enable: Bool = Query(True, title="Enable or disable SIP ALG")
+    enable: bool = Query(True, title="Enable or disable SIP ALG")
 
 @app.post('/sipalg', summary="Enable/Disable SIP ALG")
 def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'sipalg'}
     enable = params.enable
-    DONT_LOAD=nf_conntrack_sip
 
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/shorewall.conf', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
