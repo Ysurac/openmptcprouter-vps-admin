@@ -1842,6 +1842,37 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
         shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
 
+class SipALGparams(BaseModel):
+    enable: Bool = Query(True, title="Enable or disable SIP ALG")
+
+@app.post('/sipalg', summary="Enable/Disable SIP ALG")
+def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'sipalg'}
+    enable = params.enable
+    DONT_LOAD=nf_conntrack_sip
+
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/shorewall.conf', 'rb'))).hexdigest()
+    fd, tmpfile = mkstemp()
+    with open('/etc/shorewall/shorewall.conf', 'r') as f, open(tmpfile, 'a+') as n:
+        for line in f:
+            if enable and line == 'DONT_LOAD=\n':
+                n.write('DONT_LOAD=nf_conntrack_sip\n')
+            elif enable and line == 'AUTOHELPERS=Yes\n':
+                n.write('AUTOHELPERS=No\n')
+            elif not enable and line == 'DONT_LOAD=\n':
+                n.write('DONT_LOAD=\n')
+            elif not enable and line == 'AUTOHELPERS=No\n':
+                n.write('AUTOHELPERS=Yes\n')
+            else:
+                n.write(line)
+    os.close(fd)
+    move(tmpfile, '/etc/shorewall/shorewall.conf')
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/shorewall.conf', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl -q reload shorewall")
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'sipalg'}
+
 class V2rayconfig(BaseModel):
     userid: str
 
