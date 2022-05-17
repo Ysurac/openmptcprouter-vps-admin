@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20220517) unstable; urgency=medium
+
+    * Add SIP ALG support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 17 May 2022 20:50:43 +0200
+
 omr-vps-admin (0.3+20210508) unstable; urgency=medium
 
     * Fix update VPS
