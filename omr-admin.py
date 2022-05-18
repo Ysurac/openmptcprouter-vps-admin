@@ -1855,13 +1855,13 @@ def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_use
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/shorewall.conf', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if enable and line == 'DONT_LOAD=\n':
+            if not enable and line == 'DONT_LOAD=\n':
                 n.write('DONT_LOAD=nf_conntrack_sip\n')
-            elif enable and line == 'AUTOHELPERS=Yes\n':
+            elif not enable and line == 'AUTOHELPERS=Yes\n':
                 n.write('AUTOHELPERS=No\n')
-            elif not enable and line == 'DONT_LOAD=\n':
+            elif enable and line == 'DONT_LOAD=\n':
                 n.write('DONT_LOAD=\n')
-            elif not enable and line == 'AUTOHELPERS=No\n':
+            elif enable and line == 'AUTOHELPERS=No\n':
                 n.write('AUTOHELPERS=Yes\n')
             else:
                 n.write(line)
