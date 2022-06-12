@@ -619,9 +619,9 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
                     n.write(line)
             else:
                 comment = ''
-                if source_dip == '':
+                if source_dip != '':
                     comment = ' to ' + source_dip
-                if dest_ip == '':
+                if dest_ip != '':
                     comment = comment + ' from ' + dest_ip
                 if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment in line):
                     n.write(line)
@@ -698,9 +698,9 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
                     n.write(line)
             else:
                 comment = ''
-                if source_dip == '':
+                if source_dip != '':
                     comment = ' to ' + source_dip
-                if dest_ip == '':
+                if dest_ip != '':
                     comment = comment + ' from ' + dest_ip
                 if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment in line:
                     n.write(line)
