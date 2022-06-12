@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20220612) unstable; urgency=medium
+
+    * Fix multiples FW rules
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 12 Jun 2022 19:44:21 +0200
+
 omr-vps-admin (0.3+20220517) unstable; urgency=medium
 
     * Add SIP ALG support
