@@ -597,6 +597,9 @@ def v2ray_del_port(user, port, proto, name):
         for inbounds in data['inbounds']:
             if inbounds['tag'] == tag:
                 data['inbounds'].remove(inbounds)
+        for routing in data['routing']['rules']:
+            if routing['inboundTag'][0] == tag:
+                data['routing']['rules'].remove(routing)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
