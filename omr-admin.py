@@ -585,7 +585,7 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
         os.system("systemctl -q restart v2ray")
 
 
-def v2ray_del_port(username, port, proto, name):
+def v2ray_del_port(user, port, proto, name):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -1941,7 +1941,7 @@ def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_cu
     name = params.name
     port = params.port
     proto = params.proto
-    username = curent_user.username
+    username = current_user.username
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayunredirect'}
     v2ray_del_port(current_user, port, proto, name)

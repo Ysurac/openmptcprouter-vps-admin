@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20220708) unstable; urgency=medium
+
+    * Fix v2ray remove rules
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 08 Jui 2022 20:09:47 +0200
+
 omr-vps-admin (0.3+20220612) unstable; urgency=medium
 
     * Fix multiples FW rules
