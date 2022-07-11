@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2020 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
+# Copyright (C) 2018-2022 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
 #
 # This is free software, licensed under the GNU General Public License v3.0.
 # See /LICENSE for more information.
@@ -563,7 +563,7 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
     userid = user.userid
     if userid is None:
         userid = 0
-    tag = user.username + '_redir_' + proto + '_' + str(port)
+    tag = user.username + '_redir_' + proto + '_' + str(port) + '_to_' + destip + ':' + str(destport)
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -573,10 +573,10 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
             if inbounds['tag'] == tag:
                 exist = 1
         if exist == 0:
-            inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(destport), 'address': destip}}
+            inbounds = {'tag': tag, 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(destport), 'address': destip}}
             #inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': str(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': str(destport), 'address': destip}}
             data['inbounds'].append(inbounds)
-            routing = {'type': 'field','inboundTag': [user.username + '_redir_' + proto + '_' + str(port)], 'outboundTag': 'OMRLan'}
+            routing = {'type': 'field','inboundTag': [tag], 'outboundTag': 'OMRLan'}
             data['routing']['rules'].append(routing)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
@@ -585,15 +585,16 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
         os.system("systemctl -q restart v2ray")
 
 
-def v2ray_del_port(user, port, proto, name):
+def v2ray_del_port(user, port, proto, name, destip, destport):
     userid = user.userid
     if userid is None:
         userid = 0
     tag = user.username + '_redir_' + proto + '_' + str(port)
+    if destip != '':
+        tag = tag + '_to_' + destip + ':' + str(destport)
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
-        exist = 0
         for inbounds in data['inbounds']:
             if inbounds['tag'] == tag:
                 data['inbounds'].remove(inbounds)
@@ -606,7 +607,7 @@ def v2ray_del_port(user, port, proto, name):
     if initial_md5 != final_md5:
         os.system("systemctl -q restart v2ray")
 
-def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default'):
+def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -616,9 +617,9 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
           open(tmpfile, 'a+') as n:
         for line in f:
             if source_dip == '' and dest_ip == '':
-                if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line):
+                if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment in line):
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
             else:
                 comment = ''
@@ -626,17 +627,17 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
                     comment = ' to ' + source_dip
                 if dest_ip != '':
                     comment = comment + ' from ' + dest_ip
-                if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment in line):
+                if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment in line):
                     n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
         if source_dip == '' and dest_ip == '':
             if fwtype == 'ACCEPT':
-                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
         else:
             net = 'net'
             comment = ''
@@ -646,29 +647,29 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
                 comment = comment + ' from ' + dest_ip
                 net = 'net:' + dest_ip
             if fwtype == 'ACCEPT':
-                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + "\n")
+                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and vpn != 'default':
-                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
+                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
                 #n.write('DNAT		' + net + '		vpn:$OMR_ADDR' + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
+def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
             if source_dip == '' and dest_ip == '':
-                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + gencomment  in line:
                     n.write(line)
             else:
                 comment = ''
@@ -676,9 +677,9 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=
                     comment = ' to ' + source_dip
                 if dest_ip != '':
                     comment = comment + ' from ' + dest_ip
-                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + comment in line:
+                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + comment in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
@@ -686,7 +687,7 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
+def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -695,9 +696,9 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
             if source_dip == '':
-                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line:
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
             else:
                 comment = ''
@@ -705,17 +706,17 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
                     comment = ' to ' + source_dip
                 if dest_ip != '':
                     comment = comment + ' from ' + dest_ip
-                if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment in line:
+                if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment in line:
+                elif fwtype == 'DNAT' and not port + '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
         if source_dip == '':
             if fwtype == 'ACCEPT':
-                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
         else:
             net = 'net'
             comment = ''
@@ -725,11 +726,11 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
                 comment = comment + ' from ' + dest_ip
                 net = 'net:' + dest_ip
             if fwtype == 'ACCEPT':
-                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment+  "\n")
+                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
@@ -742,14 +743,14 @@ def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
             if source_dip == '':
-                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
             else:
-                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + ' to ' + source_dip in line:
+                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + ' to ' + source_dip + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' to ' + source_dip in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' to ' + source_dip + gencomment in line:
                     n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
@@ -1788,6 +1789,7 @@ class Shorewallparams(BaseModel):
     ipproto: IPPROTO = Query("ipv4", title="Protocol IP for changes")
     source_dip: str = ""
     source_ip: str = ""
+    comment: str = ""
 
 @app.post('/shorewallopen', summary="Redirect a port from Server to Router")
 def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
@@ -1804,6 +1806,9 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
     fwtype = params.fwtype
     source_dip = params.source_dip
     source_ip = params.source_ip
+    comment = params.comment
+    if comment != '':
+        comment = ' --- ' + comment
     vpn = "default"
     username = current_user.username
     if name is None:
@@ -1819,9 +1824,9 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
             for tunnel in omr_config_data['users'][0][current_user.username]['gre_tunnels']:
                 if omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['public_ip'] == source_dip:
                     vpn = omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['remote_ip']
-        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn)
+        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
     else:
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip)
+        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, comment)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/shorewallclose', summary="Remove a redirected port")
@@ -1834,15 +1839,18 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     fwtype = params.fwtype
     source_dip = params.source_dip
     source_ip = params.source_ip
+    comment = params.comment
+    if comment != '':
+        comment = ' --- ' + comment
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallclose'}
     #v2ray_del_port(current_user.username, str(port), proto, name)
     if params.ipproto == 'ipv4':
-        shorewall_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip)
-        shorewall_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip)
+        shorewall_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
+        shorewall_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
     else:
-        shorewall6_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip)
-        shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip)
+        shorewall6_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
+        shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
 
 class SipALGparams(BaseModel):
@@ -1909,8 +1917,8 @@ class V2rayparams(BaseModel):
     name: str
     port: str
     proto: str
-    destip: str
-    destport: str
+    destip: str = ""
+    destport: str = ""
 
 @app.post('/v2rayredirect', summary="Redirect a port from Server to Router with V2Ray")
 def v2ray_redirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
@@ -1944,10 +1952,12 @@ def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_cu
     name = params.name
     port = params.port
     proto = params.proto
+    destip = params.destip
+    destport = params.destport
     username = current_user.username
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayunredirect'}
-    v2ray_del_port(current_user, port, proto, name)
+    v2ray_del_port(current_user, port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
 
 # Set MPTCP config

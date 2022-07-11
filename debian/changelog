@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20220711) unstable; urgency=medium
+
+    * Add support to modify v2ray rules
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 11 Jui 2022 20:03:12 +0200
+
 omr-vps-admin (0.3+20220708) unstable; urgency=medium
 
     * Fix v2ray remove rules
