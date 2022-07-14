@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20220714) unstable; urgency=medium
+
+    * MPTCP version support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 14 Jui 2022 21:32:03 +0200
+
 omr-vps-admin (0.3+20220711) unstable; urgency=medium
 
     * Add support to modify v2ray rules
