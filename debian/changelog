@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20220715) unstable; urgency=medium
+
+    * Fix line ending for MPTCP settings
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 15 Jui 2022 04:32:00 +0200
+
 omr-vps-admin (0.3+20220714) unstable; urgency=medium
 
     * MPTCP version support
