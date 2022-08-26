@@ -1,3 +1,10 @@
+omr-vps-admin (0.3+20220827) unstable; urgency=medium
+
+    * Fix SIP ALG
+    * Add Wireguard client conf
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 27 Aug 2022 00:01:00 +0200
+
 omr-vps-admin (0.3+20220715) unstable; urgency=medium
 
     * Fix line ending for MPTCP settings
