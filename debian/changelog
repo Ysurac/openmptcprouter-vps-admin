@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20221001) unstable; urgency=medium
+
+    * Fix IPv6 firewall
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sat, 01 Oct 2022 07:26:42 +0200
+
 omr-vps-admin (0.3+20220827) unstable; urgency=medium
 
     * Fix SIP ALG

@@ -695,7 +695,7 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if source_dip == '':
+            if source_dip == '' and dest_ip == '':
                 if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
                 elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment in line:
@@ -706,11 +706,11 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
                     comment = ' to ' + source_dip
                 if dest_ip != '':
                     comment = comment + ' from ' + dest_ip
-                if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
+                if fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
-        if source_dip == '':
+        if source_dip == '' and dest_ip == '':
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
@@ -720,13 +720,15 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
         else:
             net = 'net'
             comment = ''
-            if source_dip == '':
+            if source_dip != '':
                 comment = ' to ' + source_dip
-            if dest_ip == '':
+            if dest_ip != '':
                 comment = comment + ' from ' + dest_ip
                 net = 'net:' + dest_ip
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment + "\n")
+            elif fwtype == 'DNAT' and vpn != 'default':
+                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
                 n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
