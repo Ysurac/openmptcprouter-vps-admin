@@ -1,3 +1,15 @@
+omr-vps-admin (0.3+20230709) unstable; urgency=medium
+
+    * Remove IPv6 VPN IP check
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 09 Jul 2023 20:13:12 +0200
+
+omr-vps-admin (0.3+20230217) unstable; urgency=medium
+
+    * Fix Shadowsocks config on multiple IP
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 17 Feb 2023 16:36:22 +0200
+
 omr-vps-admin (0.3+20221001) unstable; urgency=medium
 
     * Fix IPv6 firewall

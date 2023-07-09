@@ -433,14 +433,22 @@ def add_gre_tunnels():
                                         contentss = g.read()
                                     contentss = re.sub(",\s*}", "}", contentss) # pylint: disable=W1401
                                     datass = json.loads(contentss)
-                                    ss_port = content['users'][0][user]['shadowsocks_port']
-                                    if 'port_key' in datass:
-                                        ss_key = datass['port_key'][str(ss_port)]
+                                    makechange = True
                                     if 'port_conf' in datass:
-                                        ss_key = datass['port_conf'][str(ss_port)]['key']
-                                    if gre_intf not in user_gre_tunnels:
-                                        user_gre_tunnels[gre_intf] = {}
-                                    user_gre_tunnels[gre_intf] = {'shadowsocks_port': str(add_ss_user('', ss_key, userid, str(addr))), 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
+                                        for sscport in datass['port_conf']:
+                                            if 'local_address' in datass['port_conf'][sscport] and datass['port_conf'][sscport]['local_address'] == str(addr):
+                                                shadowsocks_port = sscport
+                                                makechange = False
+                                    if makechange:
+                                        ss_port = content['users'][0][user]['shadowsocks_port']
+                                        if 'port_key' in datass:
+                                            ss_key = datass['port_key'][str(ss_port)]
+                                        if 'port_conf' in datass:
+                                            ss_key = datass['port_conf'][str(ss_port)]['key']
+                                        if gre_intf not in user_gre_tunnels:
+                                            user_gre_tunnels[gre_intf] = {}
+                                        shadowsocks_port = str(add_ss_user('', ss_key, userid, str(addr)))
+                                    user_gre_tunnels[gre_intf] = {'shadowsocks_port': shadowsocks_port, 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
                                     #user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
                                     modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
                         nbip = nbip + 1
@@ -573,7 +581,7 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
             if inbounds['tag'] == tag:
                 exist = 1
         if exist == 0:
-            inbounds = {'tag': tag, 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(destport), 'address': destip}}
+            inbounds = {'tag': tag, 'port': port, 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': destport, 'address': destip}}
             #inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': str(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': str(destport), 'address': destip}}
             data['inbounds'].append(inbounds)
             routing = {'type': 'field','inboundTag': [tag], 'outboundTag': 'OMRLan'}
@@ -2332,8 +2340,8 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
 class VPNips(BaseModel):
     remoteip: str = Query(..., regex='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
     localip: str = Query(..., regex='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
-    remoteip6: Optional[str] = Query(None, regex='(?:^|(?<=\s))(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))(?=\s|$)')
-    localip6: Optional[str] = Query(None, regex='(?:^|(?<=\s))(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))(?=\s|$)')
+    remoteip6: Optional[str] = None
+    localip6: Optional[str] = None
     ula: Optional[str] = None
 
 # Set user vpn IPs
