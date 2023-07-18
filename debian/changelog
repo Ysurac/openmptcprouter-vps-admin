@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20230718) unstable; urgency=medium
+
+    * Fix FastAPI version
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 17 Jul 2023 19:08:52 +0200
+
 omr-vps-admin (0.3+20230709) unstable; urgency=medium
 
     * Remove IPv6 VPN IP check
