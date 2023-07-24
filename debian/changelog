@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20230724) unstable; urgency=medium
+
+    * Fix port redirection string to int
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 24 Jul 2023 09:24:34 +0200
+
 omr-vps-admin (0.3+20230718) unstable; urgency=medium
 
     * Fix FastAPI version
