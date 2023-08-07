@@ -36,7 +36,7 @@ from jwt import PyJWTError
 from netaddr import *
 from ipaddress import ip_address, IPv4Address, IPv6Address
 from netjsonconfig import OpenWrt
-from fastapi import Depends, FastAPI, HTTPException, Security, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Security, Query, Request, UploadFile
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes, OAuth2
 from passlib.context import CryptContext
 from fastapi.encoders import jsonable_encoder
@@ -2090,7 +2090,7 @@ def proxy(*, proxyconfig: Proxy, current_user: User = Depends(get_current_user))
 class GlorytunConfig(BaseModel):
     key: str
     port: int = Query(..., gt=0, lt=65535, title="Glorytun TCP and UDP port")
-    chacha: bool = Query(True, title="Enable of disable chacha20, if disable AEGIS is used")
+    chacha: bool = Query(True, title="Enable of disable chacha20, if disable AES is used")
 
 # Set Glorytun config
 @app.post('/glorytun', summary="Modify Glorytun configuration")
@@ -2338,8 +2338,8 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     return {'result': 'done', 'reason': 'changes applied', 'route': 'lan'}
 
 class VPNips(BaseModel):
-    remoteip: str = Query(..., regex='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
-    localip: str = Query(..., regex='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
+    remoteip: str = Query(..., pattern='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
+    localip: str = Query(..., pattern='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
     remoteip6: Optional[str] = None
     localip6: Optional[str] = None
     ula: Optional[str] = None
@@ -2634,10 +2634,15 @@ async def list_users(current_user: User = Depends(get_current_user)):
     return content['users'][0]
 
 @app.get('/speedtest', summary="Test speed from the server")
-async def list_users(current_user: User = Depends(get_current_user)):
+async def speedtest():
     return FileResponse('/usr/share/omr-server/speedtest/test.img')
 
-
+@app.post('/speedtest', summary="Test upload speed from the server")
+async def speedtestul(file: UploadFile | None = None):
+    if not file:
+        return {'result': 'No upload file sent'}
+    else:
+        return {'filename': file.filename}
 
 def main(omrport: int, omrhost: str):
     LOG.debug("Main OMR-Admin launch")
