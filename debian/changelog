@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20230823) unstable; urgency=medium
+
+    * Fix in upload speedtest
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 23 Aug 2023 19:55:20 +0200
+
 omr-vps-admin (0.3+20230807) unstable; urgency=medium
 
     * Replace regex by pattern

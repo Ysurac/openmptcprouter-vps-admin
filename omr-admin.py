@@ -2638,7 +2638,7 @@ async def speedtest():
     return FileResponse('/usr/share/omr-server/speedtest/test.img')
 
 @app.post('/speedtest', summary="Test upload speed from the server")
-async def speedtestul(file: UploadFile | None = None):
+async def speedtestul(file: UploadFile):
     if not file:
         return {'result': 'No upload file sent'}
     else:
