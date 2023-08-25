@@ -273,6 +273,10 @@ def v2ray_add_user(user, restart=1):
         for inbounds in data['inbounds']:
             if inbounds['tag'] == 'omrin-tunnel':
                 inbounds['settings']['clients'].append({'id': v2rayuuid, 'level': 0, 'alterId': 0, 'email': user})
+            if inbounds['tag'] == 'omrin-vmess-tunnel':
+                inbounds['settings']['clients'].append({'id': v2rayuuid, 'level': 0, 'alterId': 0, 'email': user})
+            if inbounds['tag'] == 'omrin-trojan-tunnel':
+                inbounds['settings']['clients'].append({'password': v2rayuuid, 'email': user})
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
@@ -280,13 +284,21 @@ def v2ray_add_user(user, restart=1):
         os.system("systemctl -q restart v2ray")
     return v2rayuuid
 
-def v2ray_del_user(user, restart=1):
+def v2ray_del_user(user, restart=1, protocol="vless"):
     v2rayuuid = str(uuid.uuid1())
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
         for inbounds in data['inbounds']:
             if inbounds['tag'] == 'omrin-tunnel':
+                for v2rayuser in inbounds['settings']['clients']:
+                    if v2rayuser['email'] == user:
+                        inbounds['settings']['clients'].remove(v2rayuser)
+            if inbounds['tag'] == 'omrin-vmess-tunnel':
+                for v2rayuser in inbounds['settings']['clients']:
+                    if v2rayuser['email'] == user:
+                        inbounds['settings']['clients'].remove(v2rayuser)
+            if inbounds['tag'] == 'omrin-trojan-tunnel':
                 for v2rayuser in inbounds['settings']['clients']:
                     if v2rayuser['email'] == user:
                         inbounds['settings']['clients'].remove(v2rayuser)

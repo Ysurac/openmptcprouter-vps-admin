@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20230825) unstable; urgency=medium
+
+    * Add V2Ray VMESS and TROJAN protocols support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 25 Aug 2023 11:14:46 +0200
+
 omr-vps-admin (0.3+20230823) unstable; urgency=medium
 
     * Fix in upload speedtest
