@@ -277,6 +277,8 @@ def v2ray_add_user(user, restart=1):
                 inbounds['settings']['clients'].append({'id': v2rayuuid, 'level': 0, 'alterId': 0, 'email': user})
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 inbounds['settings']['clients'].append({'password': v2rayuuid, 'email': user})
+            if inbounds['tag'] == 'omrin-socks-tunnel':
+                inbounds['settings']['accounts'].append({'pass': v2rayuuid, 'user': user})
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
@@ -302,6 +304,10 @@ def v2ray_del_user(user, restart=1, protocol="vless"):
                 for v2rayuser in inbounds['settings']['clients']:
                     if v2rayuser['email'] == user:
                         inbounds['settings']['clients'].remove(v2rayuser)
+            if inbounds['tag'] == 'omrin-socks-tunnel':
+                for v2rayuser in inbounds['settings']['accounts']:
+                    if v2rayuser['user'] == user:
+                        inbounds['settings']['accounts'].remove(v2rayuser)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
