@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20230828) unstable; urgency=medium
+
+    * Fix V2Ray stats
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 28 Aug 2023 10:15:54 +0200
+
 omr-vps-admin (0.3+20230825) unstable; urgency=medium
 
     * Add V2Ray VMESS, SOCKS  and TROJAN protocols support
