@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2022 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
+# Copyright (C) 2018-2023 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
 #
 # This is free software, licensed under the GNU General Public License v3.0.
 # See /LICENSE for more information.
@@ -15,10 +15,13 @@ import argparse
 import subprocess
 import os
 import sys
+import glob
 import socket
+from operator import itemgetter, attrgetter
 import re
 import hashlib
 import pathlib
+import shutil
 import psutil
 import time
 import uuid
@@ -81,6 +84,21 @@ for line in READ.splitlines():
     if 'NET_IFACE=' in line:
         IFACE6 = line.split('=', 1)[1]
 FILE.close()
+
+def delete_oldest_files(path, keep = 10):
+    files = glob.glob(path)
+    fileData = {}
+    for fname in files:
+        fileData[fname] = os.stat(fname).st_mtime
+    sorted_files = sorted(fileData.items(), key = itemgetter(1))
+    if len(sorted_files) > keep:
+        delete = len(sorted_files) - keep
+        for x in range(0, delete):
+            os.remove(sorted_files[x][0])
+
+def backup_config():
+    shutil.copy2('/etc/openmptcprouter-vps-admin/omr-admin-config.json','/etc/openmptcprouter-vps-admin/omr-admin-config.json.' + str(int(time.time())))
+    delete_oldest_files('/etc/openmptcprouter-vps-admin/omr-admin-config.json.*')
 
 # Get interface rx/tx
 def get_bytes(t, iface='eth0'):
@@ -156,7 +174,8 @@ def check_username_serial(username, serial):
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     try:
-        data = json.loads(content)
+        configdata = json.loads(content)
+        data = configdata
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'check_serial'}
     if 'serial_enforce' not in data or data['serial_enforce'] == False:
@@ -173,7 +192,8 @@ def check_username_serial(username, serial):
         data['users'][0][username]['serial_error'] = 1
     else:
         data['users'][0][username]['serial_error'] = int(data['users'][0][username]['serial_error']) + 1
-    if data:
+    if data and data != configdata:
+        backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
     else:
@@ -185,11 +205,13 @@ def set_global_param(key, value):
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     try:
-        data = json.loads(content)
+        configdata = json.loads(content)
+        data = configdata
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'global_param'}
     data[key] = value
-    if data:
+    if data and data != configdata:
+        backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
     else:
@@ -200,6 +222,7 @@ def modif_config_user(user, changes):
         content = json.load(f)
     content['users'][0][user].update(changes)
     if content:
+        backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
     else:
@@ -792,11 +815,13 @@ def set_lastchange(sync=0):
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     try:
-        data = json.loads(content)
+        configdata = json.loads(content)
+        data = configdata
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'lastchange'}
     data["lastchange"] = time.time() + sync
-    if data:
+    if data and data != configdata:
+        backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
     else:
@@ -2464,22 +2489,35 @@ def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_curre
     backup_file = backupfile.data
     if not backup_file:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'backuppost'}
-    with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', 'wb') as f:
+    with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', 'wb') as f, open('/var/opt/openmptcprouter/' + current_user.username + '-' + str(int(time.time())) + '-backup.tar.gz', 'wb') as g:
+        g.write(base64.b64decode(backup_file))
         f.write(base64.b64decode(backup_file))
+    delete_oldest_files('/var/opt/openmptcprouter/' + current_user.username + '-*-backup.tar.gz')
     return {'result': 'done', 'route': 'backuppost'}
 
 @app.get('/backupget', summary="Get current user router backup file")
-def send_backup(current_user: User = Depends(get_current_user)):
-    with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', "rb") as backup_file:
-        file_base64 = base64.b64encode(backup_file.read())
-        file_base64utf = file_base64.decode('utf-8')
+def send_backup(filename: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
+    if filename is not None and current_user.username in filename:
+        with open('/var/opt/openmptcprouter/' + filename, "rb") as backup_file:
+            file_base64 = base64.b64encode(backup_file.read())
+            file_base64utf = file_base64.decode('utf-8')
+    else:
+        with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', "rb") as backup_file:
+            file_base64 = base64.b64encode(backup_file.read())
+            file_base64utf = file_base64.decode('utf-8')
     return {'data': file_base64utf}
 
 @app.get('/backuplist', summary="List available current user backup")
 def list_backup(current_user: User = Depends(get_current_user)):
+    files = glob.glob('/var/opt/openmptcprouter/' + current_user.username + '*' + '-backup.tar.gz')
+    fileData = {}
+    for fname in files:
+        fileData[os.path.relpath(fname,'/var/opt/openmptcprouter/')] = os.stat(fname).st_mtime
+    sorted_files = sorted(fileData.items(), key = itemgetter(1))
     if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
         modiftime = os.path.getmtime('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz')
-        return {'backup': True, 'modif': modiftime}
+    if len(sorted_files) > 0:
+        return {'backup': True, 'modif': modiftime,'sorted': sorted_files}
     else:
         return {'backup': False}
 
@@ -2555,6 +2593,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
         user_json[params.username].update({"vpn": params.vpn})
     content['users'][0].update(user_json)
     if content:
+        backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
     else:
@@ -2582,6 +2621,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     del content['users'][0][params.username]
     remove_ss_user(str(shadowsocks_port))
     if content:
+        backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
     else:
