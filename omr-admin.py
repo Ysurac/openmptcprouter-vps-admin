@@ -1481,19 +1481,19 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         ipv6_addr = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
+    ipv4_addr = ''
     if 'ipv4' in omr_config_data:
         ipv4_addr = omr_config_data['ipv4']
     elif 'internet' in omr_config_data and not omr_config_data['internet']:
         ipv4_addr = os.popen('ip -4 addr show ' + IFACE +' | grep -oP "(?<=inet ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     else:
-        ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
+        #ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
         if ipv4_addr == '':
             ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ip.openmptcprouter.com').read().rstrip()
         if ipv4_addr == '':
             ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.me').read().rstrip()
         if ipv4_addr != '':
             set_global_param('ipv4', ipv4_addr)
-    #ipv4_addr = ""
 
     test_aes = os.popen('cat /proc/cpuinfo | grep aes').read().rstrip()
     if test_aes == '':

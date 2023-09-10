@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20230910) unstable; urgency=medium
+
+    * Remove dig requirement
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 10 Sep 2023 09:25:34 +0200
+
 omr-vps-admin (0.3+20230901) unstable; urgency=medium
 
     * 10 router backups on VPS support, rotated
