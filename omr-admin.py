@@ -132,12 +132,15 @@ def get_bytes_v2ray(t,user):
     else:
         side="uplink"
     try:
-        data = subprocess.check_output('/usr/bin/v2ray api stats --server=127.0.0.1:10085 -json ' + "'" + 'user>>>' + user + '>>>traffic>>>' + side + "'" + ' 2>/dev/null | jq -r .stat[0].value | tr -d " "', shell = True)
+        data = subprocess.check_output('/usr/bin/v2ray api stats --server=127.0.0.1:10085 -json ' + "'" + 'user>>>' + user + '>>>traffic>>>' + side + "'" + ' 2>/dev/null | jq -r .stat[0].value | tr -d " " | tr -d "\n"', shell = True)
         #data = subprocess.check_output('/usr/bin/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' 2>/dev/null | grep value | cut -d: -f2 | tr -d " "', shell = True)
     except:
         return 0
-    if data.decode("utf-8") != '':
-        return int(data.decode("utf-8"))
+    if data.decode("utf-8") != '' and data.decode("utf-8") != 'null':
+        try:
+            return int(data.decode("utf-8"))
+        except ValueError:
+            return 0
     else:
         return 0
 

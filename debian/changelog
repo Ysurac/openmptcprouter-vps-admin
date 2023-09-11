@@ -1,3 +1,9 @@
+omr-vps-admin (0.3+20230911) unstable; urgency=medium
+
+    * Fix V2Ray traffic stats
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 11 Sep 2023 10:52:57 +0200
+
 omr-vps-admin (0.3+20230910) unstable; urgency=medium
 
     * Remove dig requirement
