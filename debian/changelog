@@ -1,3 +1,10 @@
+omr-vps-admin (0.4+20230927) unstable; urgency=medium
+
+    * Add XRay support
+    * Add Shadowsocks-go support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 27 Sep 2023 15:08:39 +0200
+
 omr-vps-admin (0.3+20230911) unstable; urgency=medium
 
     * Fix V2Ray traffic stats

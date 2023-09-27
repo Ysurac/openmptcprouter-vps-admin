@@ -144,6 +144,23 @@ def get_bytes_v2ray(t,user):
     else:
         return 0
 
+def get_bytes_xray(t,user):
+    if t == "tx":
+        side="downlink"
+    else:
+        side="uplink"
+    try:
+        data = subprocess.check_output('/usr/bin/xray api stats --server=127.0.0.1:10086 -json ' + "'" + 'user>>>' + user + '>>>traffic>>>' + side + "'" + ' 2>/dev/null | jq -r .stat[0].value | tr -d " " | tr -d "\n"', shell = True)
+    except:
+        return 0
+    if data.decode("utf-8") != '' and data.decode("utf-8") != 'null':
+        try:
+            return int(data.decode("utf-8"))
+        except ValueError:
+            return 0
+    else:
+        return 0
+
 def checkIfProcessRunning(processName):
     for proc in psutil.process_iter():
         try:
@@ -291,8 +308,26 @@ def remove_ss_user(port):
     except socket.error as err:
         LOG.debug("Shadowsocks remove error (" + str(err) + ")")
 
-def v2ray_add_user(user, restart=1):
-    v2rayuuid = str(uuid.uuid1())
+def add_ss_go_user(user, key=''):
+    try:
+        r = requests.post(url="http://127.0.0.1:65279/v1/users", data= {'username': user,'uPSK': key})
+    except requests.exceptions.Timeout:
+        LOG.debug("Shadowsocks go add timeout")
+    except requests.exceptions.RequestException as err:
+        LOG.debug("Shadowsocks go add error (" + str(err) + ")")
+    return key
+
+def remove_ss_go_user(user):
+    try:
+        r = requests.delete(url="http://127.0.0.1:65279/v1/users/" + username)
+    except requests.exceptions.Timeout:
+        LOG.debug("Shadowsocks go remove timeout")
+    except requests.exceptions.RequestException as err:
+        LOG.debug("Shadowsocks go remove error (" + str(err) + ")")
+
+def v2ray_add_user(user, v2rayuuid='', restart=1):
+    if v2rayuuid == '': 
+        v2rayuuid = str(uuid.uuid1())
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -313,8 +348,34 @@ def v2ray_add_user(user, restart=1):
         os.system("systemctl -q restart v2ray")
     return v2rayuuid
 
+def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
+    if xrayuuid == '': 
+        xrayuuid = str(uuid.uuid1())
+    if ukeyss2022 == '': 
+        ukeyss2022 = str(base64.b64encode(os.urandom(15).encode('ascii')))
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        exist = 0
+        for inbounds in data['inbounds']:
+            if inbounds['tag'] == 'omrin-tunnel':
+                inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
+            if inbounds['tag'] == 'omrin-vmess-tunnel':
+                inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
+            if inbounds['tag'] == 'omrin-trojan-tunnel':
+                inbounds['settings']['clients'].append({'password': xrayuuid, 'email': user})
+            if inbounds['tag'] == 'omrin-socks-tunnel':
+                inbounds['settings']['accounts'].append({'pass': xrayuuid, 'user': user})
+            if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
+                inbounds['settings']['clients'].append({'password': ukeyss2022, 'email': user})
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart xray")
+    return xrayuuid
+
 def v2ray_del_user(user, restart=1, protocol="vless"):
-    v2rayuuid = str(uuid.uuid1())
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -341,6 +402,37 @@ def v2ray_del_user(user, restart=1, protocol="vless"):
     if initial_md5 != final_md5 and restart == 1:
         os.system("systemctl -q restart v2ray")
 
+def xray_del_user(user, restart=1, protocol="vless"):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        for inbounds in data['inbounds']:
+            if inbounds['tag'] == 'omrin-tunnel':
+                for xrayuser in inbounds['settings']['clients']:
+                    if xrayuser['email'] == user:
+                        inbounds['settings']['clients'].remove(xrayuser)
+            if inbounds['tag'] == 'omrin-vmess-tunnel':
+                for xrayuser in inbounds['settings']['clients']:
+                    if xrayuser['email'] == user:
+                        inbounds['settings']['clients'].remove(xrayuser)
+            if inbounds['tag'] == 'omrin-trojan-tunnel':
+                for xrayuser in inbounds['settings']['clients']:
+                    if xrayuser['email'] == user:
+                        inbounds['settings']['clients'].remove(xrayuser)
+            if inbounds['tag'] == 'omrin-socks-tunnel':
+                for xrayuser in inbounds['settings']['accounts']:
+                    if xrayuser['user'] == user:
+                        inbounds['settings']['accounts'].remove(xrayuser)
+            if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
+                for xrayuser in inbounds['settings']['clients']:
+                    if xrayuser['email'] == user:
+                        inbounds['settings']['clients'].remove(xrayuser)
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart xray")
+
 def v2ray_add_outbound(tag,ip, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
@@ -351,6 +443,17 @@ def v2ray_add_outbound(tag,ip, restart=1):
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5 and restart == 1:
         os.system("systemctl -q restart v2ray")
+
+def xray_add_outbound(tag,ip, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        data['outbounds'].append({'protocol': 'freedom', 'settings': { 'userLevel': 0 }, 'tag': tag, 'sendThrough': ip})
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart xray")
 
 def v2ray_del_outbound(tag, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
@@ -365,6 +468,19 @@ def v2ray_del_outbound(tag, restart=1):
     if initial_md5 != final_md5 and restart == 1:
         os.system("systemctl -q restart v2ray")
 
+def xray_del_outbound(tag, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        for outbounds in data['outbounds']:
+            if outbounds['tag'] == tag:
+                data['outbounds'].remove(outbounds)
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart xray")
+
 def v2ray_add_routing(tag, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
@@ -375,6 +491,17 @@ def v2ray_add_routing(tag, restart=1):
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5 and restart == 1:
         os.system("systemctl -q restart v2ray")
+
+def xray_add_routing(tag, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        data['routing']['rules'].append({'type': 'field', 'inboundTag': ( 'omrintunnel' ), 'outboundTag': tag})
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart xray")
 
 def v2ray_del_routing(tag, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
@@ -388,6 +515,19 @@ def v2ray_del_routing(tag, restart=1):
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5 and restart == 1:
         os.system("systemctl -q restart v2ray")
+
+def xray_del_routing(tag, restart=1):
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        for rules in data['routing']['rules']:
+            if rules['outboundTag'] == tag:
+                data['routing']['rules'].remove(rules)
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5 and restart == 1:
+        os.system("systemctl -q restart xray")
 
 
 def add_gre_tunnels():
@@ -637,6 +777,31 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
     if initial_md5 != final_md5:
         os.system("systemctl -q restart v2ray")
 
+def xray_add_port(user, port, proto, name, destip, destport):
+    userid = user.userid
+    if userid is None:
+        userid = 0
+    tag = user.username + '_redir_' + proto + '_' + str(port) + '_to_' + destip + ':' + str(destport)
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        exist = 0
+        for inbounds in data['inbounds']:
+            LOG.debug(inbounds)
+            if inbounds['tag'] == tag:
+                exist = 1
+        if exist == 0:
+            inbounds = {'tag': tag, 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(destport), 'address': destip}}
+            #inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': str(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': str(destport), 'address': destip}}
+            data['inbounds'].append(inbounds)
+            routing = {'type': 'field','inboundTag': [tag], 'outboundTag': 'OMRLan'}
+            data['routing']['rules'].append(routing)
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl -q restart xray")
+
 
 def v2ray_del_port(user, port, proto, name, destip, destport):
     userid = user.userid
@@ -659,6 +824,28 @@ def v2ray_del_port(user, port, proto, name, destip, destport):
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q restart v2ray")
+
+def xray_del_port(user, port, proto, name, destip, destport):
+    userid = user.userid
+    if userid is None:
+        userid = 0
+    tag = user.username + '_redir_' + proto + '_' + str(port)
+    if destip != '':
+        tag = tag + '_to_' + destip + ':' + str(destport)
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+        for inbounds in data['inbounds']:
+            if inbounds['tag'] == tag:
+                data['inbounds'].remove(inbounds)
+        for routing in data['routing']['rules']:
+            if routing['inboundTag'][0] == tag:
+                data['routing']['rules'].remove(routing)
+    with open('/etc/xray/xray-server.json', 'w') as f:
+        json.dump(data, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl -q restart xray")
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
     userid = user.userid
@@ -1128,6 +1315,11 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if os.path.isfile('/etc/v2ray/v2ray-server.json') and 'v2ray' in proxy and checkIfProcessRunning('v2ray'):
         v2ray_tx = get_bytes_v2ray('tx',username)
         v2ray_rx = get_bytes_v2ray('rx',username)
+    xray_tx = 0
+    xray_rx = 0
+    if os.path.isfile('/etc/xray/xray-server.json') and 'xray' in proxy and checkIfProcessRunning('xray'):
+        xray_tx = get_bytes_xray('tx',username)
+        xray_rx = get_bytes_xray('rx',username)
     vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][username]:
         vpn = omr_config_data['users'][0][username]['vpn']
@@ -1153,7 +1345,7 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
     LOG.debug('Get status: done')
     if IFACE:
-        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx}}
+        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'tx': xray_tx, 'rx': xray_rx}}
     else:
         return {'error': 'No iface defined', 'route': 'status'}
 
@@ -1445,7 +1637,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if os.path.isfile('/etc/v2ray/v2ray-server.json'):
         v2ray = True
         if not 'v2ray' in omr_config_data['users'][0][username]:
-            v2ray_key = os.popen('jq -r .inbounds[0].settings.clients[0].id /etc/v2ray/v2ray-server.json').read().rstrip()
+            v2ray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email=" + '"' + username + '"' + ") | .id' /etc/v2ray/v2ray-server.json").read().rstrip()
             v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
             v2ray_conf = { 'key': v2ray_key, 'port': v2ray_port}
             modif_config_user(username, {'v2ray': v2ray_conf})
@@ -1454,6 +1646,40 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         if checkIfProcessRunning('v2ray') and proxy == 'v2ray':
             v2ray_tx = get_bytes_v2ray('tx',username)
             v2ray_rx = get_bytes_v2ray('rx',username)
+
+    xray = False
+    xray_conf = []
+    xray_tx = 0
+    xray_rx = 0
+    if os.path.isfile('/etc/xray/xray-server.json'):
+        xray = True
+        if not 'xray' in omr_config_data['users'][0][username]:
+            xray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email=" + '"' + username + '"' + ") | .id' /etc/xray/xray-server.json").read().rstrip()
+            xray_ss_skey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.password' /etc/xray/xray-server.json").read().rstrip()
+            xray_ss_ukey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.clients[] | select(.email=" + '"' + username + '"' + ") | .password' /etc/xray/xray-server.json").read().rstrip()
+            xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
+            xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
+            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key}
+            modif_config_user(username, {'xray': xray_conf})
+        else:
+            xray_conf = omr_config_data['users'][0][username]['xray']
+        if checkIfProcessRunning('xray') and proxy == 'xray':
+            xray_tx = get_bytes_xray('tx',username)
+            xray_rx = get_bytes_xray('rx',username)
+
+    shadowsocks_go = False
+    shadowsocks_go_conf = []
+    if os.path.isfile('/etc/shadowsocks-go/server.json'):
+        shadowsocks_go = True
+        if not 'shadowsocks-go' in omr_config_data['users'][0][username]:
+            shadowsocks_go_psk = os.popen("jq -r '.servers[] | select(.name=" + '"ss-2022"' + ") | .psk' /etc/shadowsocks-go/server.json").read().rstrip()
+            shadowsocks_go_port = os.popen("jq -r '.servers[] | select(.name=" + '"ss-2022"' + ") | .tcpListeners[0].address' /etc/shadowsocks-go/server.json | cut -d ':' -f1").read().rstrip()
+            shadowsocks_go_protocol = os.popen("jq -r '.servers[] | select(.name=" + '"ss-2022"' + ") | .protocol' /etc/shadowsocks-go/server.json").read().rstrip()
+            shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + username + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
+            shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': shadowsocks_go_port, 'protocol': shadowsocks_go_protocol }
+            modif_config_user(username, {'shadowsocks-go': shadowsocks_go_conf})
+        else:
+            shadowsocks_go_conf = omr_config_data['users'][0][username]['shadowsocks-go']
 
     LOG.debug('Get config... mptcp')
     mptcp_version = mptcp_enabled = mptcp_checksum = '0'
@@ -1567,7 +1793,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
 
     #vpn = current_user.vpn
-    available_proxy = ["shadowsocks", "v2ray"]
+    available_proxy = ["shadowsocks", "shadowsocks-go","v2ray","v2ray-vmess","v2ray-socks","v2ray-trojan","xray","xray-vmess","xray-socks","xray-trojan","xray-shadowsocks"]
     if user_permissions == 'ro':
         del available_vpn
         available_vpn = [vpn]
@@ -1588,7 +1814,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx}, 'proxy': {'available': available_proxy, 'current': proxy}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf}, 'proxy': {'available': available_proxy, 'current': proxy}}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -1767,6 +1993,56 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks'}
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'shadowsocks'}
+
+class ShadowsocksGoConfigparams(BaseModel):
+    port: int = Query(..., gt=0, lt=65535)
+    method: str
+    fast_open: bool
+    reuse_port: bool
+    mptcp: bool = Query(True, title="Enable/Disable MPTCP support")
+    #key: str
+
+@app.post('/shadowsocks-go', summary="Modify Shadowsocks-Go configuration")
+def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        set_lastchange(10)
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks-go'}
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-go/server.json', 'rb'))).hexdigest()
+    with open('/etc/shadowsocks-go/server.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        return {'result': 'error', 'reason': 'Read only user', 'route': 'shadowsocks-go'}
+    port = params.port
+    method = params.method
+    fast_open = params.fast_open
+    reuse_port = params.reuse_port
+    mptcp = params.mptcp
+    #key = params.key
+    modif_config_user(current_user.username, {'shadowsocks-go_port': port})
+    userid = current_user.userid
+    if userid is None:
+        userid = 0
+    data["servers"][0]["tcpListeners"][0]["address"] = ":" + str(port)
+    data["servers"][0]["tcpListeners"][0]["fastOpen"] = fast_open
+    data["servers"][0]["listenerTFO"] = fast_open
+    data["servers"][0]["tcpListeners"][0]["reusePort"] = reuse_port
+    data["servers"][0]["tcpListeners"][0]["multipath"] = mptcp
+    data["servers"][0]["protocol"] = method
+    #data.servers[0].psk = key
+    with open('/etc/shadowsocks-go/server.json', 'w') as outfile:
+        json.dump(data, outfile, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-go/server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl restart shadowsocks-go.service")
+        shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks-go')
+        shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks-go')
+        set_lastchange()
+        return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks-go'}
+    else:
+        return {'result': 'done', 'reason': 'no changes', 'route': 'shadowsocks-go'}
 
 # Set shorewall config
 class IPPROTO(str, Enum):
@@ -1980,6 +2256,35 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'v2ray'}
 
+class Xrayconfig(BaseModel):
+    userid: str
+
+@app.post('/xray', summary="Set xray settings")
+def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayredirect'}
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        xray_config = json.load(f)
+    xruserid = params.userid
+    for inbounds in xray_config['inbounds']:
+        if inbounds['tag'] == 'omrin-tunnel':
+            inbounds['settings']['clients'][0]['id'] = xruserid
+    with open('/etc/xray/xray-server.json', 'w') as outfile:
+        json.dump(xray_config, outfile, indent=4)
+    username = current_user.username
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    xray_key = os.popen('jq -r .inbounds[0].settings.clients[0].id /etc/xray/xray-server.json').read().rstrip()
+    xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
+    xray_conf = { 'key': xray_key, 'port': xray_port}
+    modif_config_user(username, {'xray': xray_conf})
+    if initial_md5 != final_md5:
+        os.system("systemctl restart xray")
+        set_lastchange()
+        return {'result': 'done', 'reason': 'changes applied', 'route': 'xray'}
+    else:
+        return {'result': 'done', 'reason': 'no changes', 'route': 'xray'}
+
 
 class V2rayparams(BaseModel):
     name: str
@@ -2008,6 +2313,33 @@ def v2ray_redirect(*, params: V2rayparams, current_user: User = Depends(get_curr
     v2ray_add_port(current_user, port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
 
+class Xrayparams(BaseModel):
+    name: str
+    port: str
+    proto: str
+    destip: str = ""
+    destport: str = ""
+
+@app.post('/xrayredirect', summary="Redirect a port from Server to Router with XRay")
+def xray_redirect(*, params: Xrayparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayredirect'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
+    name = params.name
+    port = params.port
+    proto = params.proto
+    destip = params.destip
+    destport = params.destport
+    username = current_user.username
+    if name is None:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'xrayredirect'}
+    xray_add_port(current_user, port, proto, name, destip, destport)
+    return {'result': 'done', 'reason': 'changes applied'}
+
 @app.post('/v2rayunredirect', summary="Remove a redirected port from Server to Router with V2Ray")
 def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
@@ -2026,6 +2358,26 @@ def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_cu
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayunredirect'}
     v2ray_del_port(current_user, port, proto, name, destip, destport)
+    return {'result': 'done', 'reason': 'changes applied'}
+
+@app.post('/xrayunredirect', summary="Remove a redirected port from Server to Router with XRay")
+def xray_unredirect(*, params: Xrayparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayredirect'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        try:
+            omr_config_data = json.load(f)
+        except ValueError as e:
+            omr_config_data = {}
+    name = params.name
+    port = params.port
+    proto = params.proto
+    destip = params.destip
+    destport = params.destport
+    username = current_user.username
+    if name is None:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'xrayunredirect'}
+    xray_del_port(current_user, port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
 
 # Set MPTCP config
@@ -2078,6 +2430,7 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     if initial_md5 != final_md5:
         os.system("systemctl -q restart shadowsocks-libev-manager@manager")
         os.system("systemctl -q restart v2ray")
+        os.system("systemctl -q restart xray")
         os.system("systemctl -q restart glorytun-tcp@tun0")
         os.system("systemctl -q restart openvpn@tun0")
     set_lastchange()
@@ -2112,6 +2465,7 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
 
 class PROXY(str, Enum):
     v2ray = "v2ray"
+    xray = "xray"
     shadowsockslibev = "shadowsocks"
     none = "none"
 
@@ -2585,12 +2939,25 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
 #    shadowsocks_port = '651{:02d}'.format(userid)
     shadowsocks_port = params.shadowsocks_port
     shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
+    shadowsocks2022_key = base64.urlsafe_b64encode(secrets.token_hex(32).encode())
     if not publicips:
-        shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid)
+        if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+            shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid)
+        if os.path.isfile('/etc/shadowsocks-go/server.json'):
+            upsk = add_ss_go_user(params.username, shadowsocks2022_key.decode('utf-8'))
+        else:
+            upsk = ''
+        if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+            uuid = v2ray_add_user(params.username)
+        else:
+            uuid = ''
+        if os.path.isfile('/etc/xray/xray-server.json'):
+            xray_add_user(params.username,uuid,upsk)
     else:
         for publicip in publicips:
-            shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, publicip)
-            shadowsocks_port = shadowsocks_port + 1
+            if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+                shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, publicip)
+                shadowsocks_port = shadowsocks_port + 1
     user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
@@ -2602,10 +2969,14 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     else:
         LOG.debug("Empty data for add_user")
     # Create VPNs configuration
-    os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full "' + params.username + '" nopass')
-    add_glorytun_tcp(userid)
-    add_glorytun_udp(userid)
-    add_dsvpn(userid)
+    if os.path.isfile('/etc/openvpn/tun0.conf'):
+        os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full "' + params.username + '" nopass')
+    if os.path.isfile('/etc/glorytun-tcp/tun0'):
+        add_glorytun_tcp(userid)
+    if os.path.isfile('/etc/glorytun-udp/tun0'):
+        add_glorytun_udp(userid)
+    if os.path.isfile('/etc/dsvpn/dsvpn0'):
+        add_dsvpn(userid)
 
     set_lastchange(30)
     os.execv(__file__, sys.argv)
@@ -2622,20 +2993,30 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
     userid = int(content['users'][0][params.username]['userid'])
     del content['users'][0][params.username]
-    remove_ss_user(str(shadowsocks_port))
+    if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+        remove_ss_user(str(shadowsocks_port))
+    if os.path.isfile('/etc/shadowsocks-go/server.json'):
+        remove_ss_go_user(params.username)
+    if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        v2ray_remove_user(params.username)
+    if os.path.isfile('/etc/xray/xray-server.json'):
+        xray_remove_user(params.username)
     if content:
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
     else:
         LOG.debug("Empty data for remover_user")
-    os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username)
-    os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl')
-    os.system("systemctl -q restart openvpn@tun0")
-    remove_glorytun_tcp(userid)
-    remove_glorytun_udp(userid)
-    remove_dsvpn(userid)
-
+    if os.path.isfile('/etc/openvpn/tun0.conf'):
+        os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username)
+        os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl')
+        os.system("systemctl -q restart openvpn@tun0")
+    if os.path.isfile('/etc/glorytun-tcp/tun0'):
+        remove_glorytun_tcp(userid)
+    if os.path.isfile('/etc/glorytun-udp/tun0'):
+        remove_glorytun_udp(userid)
+    if os.path.isfile('/etc/dsvpn/dsvpn0'):
+        remove_dsvpn(userid)
     set_lastchange(30)
     os.execv(__file__, sys.argv)
 
