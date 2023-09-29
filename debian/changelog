@@ -1,3 +1,9 @@
+omr-vps-admin (0.4+20230929) unstable; urgency=medium
+
+    * Fix XRay  traffic stats
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 29 Sep 2023 14:23:59 +0200
+
 omr-vps-admin (0.4+20230927) unstable; urgency=medium
 
     * Add XRay support

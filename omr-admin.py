@@ -150,7 +150,7 @@ def get_bytes_xray(t,user):
     else:
         side="uplink"
     try:
-        data = subprocess.check_output('/usr/bin/xray api stats --server=127.0.0.1:10086 -json ' + "'" + 'user>>>' + user + '>>>traffic>>>' + side + "'" + ' 2>/dev/null | jq -r .stat[0].value | tr -d " " | tr -d "\n"', shell = True)
+        data = subprocess.check_output('/usr/bin/xray api stats --server=127.0.0.1:10086 -name ' + "'" + 'user>>>' + user + '>>>traffic>>>' + side + "'" + ' 2>/dev/null | jq -r .stat.value | tr -d " " | tr -d "\n"', shell = True)
     except:
         return 0
     if data.decode("utf-8") != '' and data.decode("utf-8") != 'null':
