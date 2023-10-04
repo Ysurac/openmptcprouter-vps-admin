@@ -1,3 +1,9 @@
+omr-vps-admin (0.4+20231004) unstable; urgency=medium
+
+    * Fix Proxy configuration setting
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 04 Oct 2023 15:32:25 +0200
+
 omr-vps-admin (0.4+20230929) unstable; urgency=medium
 
     * Fix XRay  traffic stats

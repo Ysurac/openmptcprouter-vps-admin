@@ -2465,8 +2465,19 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
 
 class PROXY(str, Enum):
     v2ray = "v2ray"
+    v2rayvless = "v2ray-vless"
+    v2rayvmess = "v2ray-vmess"
+    v2raysocks = "v2ray-socks"
+    v2raytrojan = "v2ray-trojan"
     xray = "xray"
+    xrayvless = "xray-vless"
+    xrayvmess = "xray-vmess"
+    xraysocks = "xray-socks"
+    xraytrojan = "xray-trojan"
+    xrayshadowsocks = "xray-shadowsocks"
     shadowsockslibev = "shadowsocks"
+    shadowsocksgo = "shadowsocks-go"
+    shadowsocksrust = "shadowsocks-rust"
     none = "none"
 
 class Proxy(BaseModel):
