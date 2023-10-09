@@ -35,6 +35,7 @@ from os import path
 import logging
 import uvicorn
 import jwt
+import requests
 from jwt import PyJWTError
 from netaddr import *
 from ipaddress import ip_address, IPv4Address, IPv6Address
@@ -125,6 +126,17 @@ def get_bytes_ss(port):
     if str(port) in result:
         return result[str(port)]
     return 0
+
+def get_bytes_ss_go(user):
+    try:
+        r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
+    except requests.exceptions.Timeout:
+        LOG.debug("Shadowsocks go stats timeout")
+        return 0
+    except requests.exceptions.RequestException as err:
+        LOG.debug("Shadowsocks go stats error (" + str(err) + ")")
+        return 0
+    return r.json()
 
 def get_bytes_v2ray(t,user):
     if t == "tx":
@@ -310,7 +322,7 @@ def remove_ss_user(port):
 
 def add_ss_go_user(user, key=''):
     try:
-        r = requests.post(url="http://127.0.0.1:65279/v1/users", data= {'username': user,'uPSK': key})
+        r = requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", data= {'username': user,'uPSK': key})
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go add timeout")
     except requests.exceptions.RequestException as err:
@@ -319,7 +331,7 @@ def add_ss_go_user(user, key=''):
 
 def remove_ss_go_user(user):
     try:
-        r = requests.delete(url="http://127.0.0.1:65279/v1/users/" + username)
+        r = requests.delete(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go remove timeout")
     except requests.exceptions.RequestException as err:
@@ -1246,7 +1258,7 @@ async def login_basic(auth: BasicAuth = Depends(basic_auth)):
 
 @app.get("/openapi.json")
 async def get_open_api_endpoint(current_user: User = Depends(get_current_active_user)):
-    return JSONResponse(get_openapi(title="FastAPI", version=1, routes=app.routes))
+    return JSONResponse(get_openapi(title="OpenMPTCProuter Server API", version="2.0.0", routes=app.routes))
 
 
 @app.get("/docs")
@@ -1310,6 +1322,12 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
     else:
         ss_traffic = 0
+    ss_go_tx = 0
+    ss_go_rx = 0
+    if os.path.isfile('/etc/shadowsocks-go/server.json') and ('shadowsocks-go' in proxy or 'shadowsocks-rust' in proxy) and checkIfProcessRunning('shadowsocks-go'):
+        ss_go_txrx = get_bytes_ss_go(username)
+        ss_go_tx = ss_go_txrx['downlinkBytes']
+        ss_go_rx = ss_go_txrx['uplinkBytes']
     v2ray_tx = 0
     v2ray_rx = 0
     if os.path.isfile('/etc/v2ray/v2ray-server.json') and 'v2ray' in proxy and checkIfProcessRunning('v2ray'):
@@ -1345,7 +1363,7 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
     LOG.debug('Get status: done')
     if IFACE:
-        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'tx': xray_tx, 'rx': xray_rx}}
+        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'tx': ss_go_tx, 'rx': ss_go_rx}}
     else:
         return {'error': 'No iface defined', 'route': 'status'}
 
@@ -1669,6 +1687,8 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
 
     shadowsocks_go = False
     shadowsocks_go_conf = []
+    ss_go_tx = 0
+    ss_go_rx = 0
     if os.path.isfile('/etc/shadowsocks-go/server.json'):
         shadowsocks_go = True
         if not 'shadowsocks-go' in omr_config_data['users'][0][username]:
@@ -1680,6 +1700,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             modif_config_user(username, {'shadowsocks-go': shadowsocks_go_conf})
         else:
             shadowsocks_go_conf = omr_config_data['users'][0][username]['shadowsocks-go']
+        ss_go_txrx = get_bytes_ss_go(username)
+        ss_go_tx = ss_go_txrx['downlinkBytes']
+        ss_go_rx = ss_go_txrx['uplinkBytes']
 
     LOG.debug('Get config... mptcp')
     mptcp_version = mptcp_enabled = mptcp_checksum = '0'
@@ -1814,7 +1837,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf}, 'proxy': {'available': available_proxy, 'current': proxy}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):

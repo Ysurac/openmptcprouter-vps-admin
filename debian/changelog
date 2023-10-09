@@ -1,3 +1,9 @@
+omr-vps-admin (0.4+20231009) unstable; urgency=medium
+
+    * Add Shadowsocks-go traffic support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 09 Oct 2023 16:45:37 +0200
+
 omr-vps-admin (0.4+20231004) unstable; urgency=medium
 
     * Fix Proxy configuration setting
