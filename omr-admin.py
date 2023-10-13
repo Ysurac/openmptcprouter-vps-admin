@@ -305,9 +305,11 @@ def remove_ss_user(port):
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     if 'port_key' in data:
-        del data['port_key'][str(port)]
+        if str(port) in data['port_key']:
+            del data['port_key'][str(port)]
     else:
-        del data['port_conf'][str(port)]
+        if str(port) in data['port_conf']:
+            del data['port_conf'][str(port)]
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
         json.dump(data, f, indent=4)
     try:

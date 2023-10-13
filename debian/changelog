@@ -1,3 +1,9 @@
+omr-vps-admin (0.4+20231013) unstable; urgency=medium
+
+    * Fix error when API try to remove a Shadowsocks port that doesn't exist
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 13 Oct 2023 11:43:24 +0200
+
 omr-vps-admin (0.4+20231009) unstable; urgency=medium
 
     * Add Shadowsocks-go traffic support
