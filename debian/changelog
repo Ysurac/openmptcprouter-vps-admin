@@ -1,3 +1,9 @@
+omr-vps-admin (0.5+20231017) unstable; urgency=medium
+
+    * Add XRay VLESS REALITY support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 17 Oct 2023 15:03:35 +0200
+
 omr-vps-admin (0.4+20231013) unstable; urgency=medium
 
     * Fix error when API try to remove a Shadowsocks port that doesn't exist

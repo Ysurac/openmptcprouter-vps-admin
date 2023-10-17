@@ -1679,7 +1679,15 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             xray_ss_ukey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.clients[] | select(.email=" + '"' + username + '"' + ") | .password' /etc/xray/xray-server.json").read().rstrip()
             xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
             xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
-            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key}
+            xray_vless_reality_public_key = ''
+            if os.path.isfile('/etc/xray/xray-vless-reality.json'):
+                xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
+            test_vless_reality = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ")' /etc/xray/xray-server.json").read().rstrip()
+            if test_vless_reality != '':
+                vless_reality = True
+            else:
+                vless_reality = False
+            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key }
             modif_config_user(username, {'xray': xray_conf})
         else:
             xray_conf = omr_config_data['users'][0][username]['xray']
@@ -1818,7 +1826,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
 
     #vpn = current_user.vpn
-    available_proxy = ["shadowsocks", "shadowsocks-go","v2ray","v2ray-vmess","v2ray-socks","v2ray-trojan","xray","xray-vmess","xray-socks","xray-trojan","xray-shadowsocks"]
+    available_proxy = ["shadowsocks", "shadowsocks-go","v2ray","v2ray-vmess","v2ray-socks","v2ray-trojan","xray","xray-vless-reality","xray-vmess","xray-socks","xray-trojan","xray-shadowsocks"]
     if user_permissions == 'ro':
         del available_vpn
         available_vpn = [vpn]
@@ -2260,17 +2268,17 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayredirect'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
-    with open('/etc/v2ray/v2ray-server.json') as f:
-        v2ray_config = json.load(f)
-    v2ruserid = params.userid
-    for inbounds in v2ray_config['inbounds']:
-        if inbounds['tag'] == 'omrin-tunnel':
-            inbounds['settings']['clients'][0]['id'] = v2ruserid
-    with open('/etc/v2ray/v2ray-server.json', 'w') as outfile:
-        json.dump(v2ray_config, outfile, indent=4)
+    #with open('/etc/v2ray/v2ray-server.json') as f:
+    #    v2ray_config = json.load(f)
+    #v2ruserid = params.userid
+    #for inbounds in v2ray_config['inbounds']:
+    #    if inbounds['tag'] == 'omrin-tunnel':
+    #        inbounds['settings']['clients'][0]['id'] = v2ruserid
+    #with open('/etc/v2ray/v2ray-server.json', 'w') as outfile:
+    #    json.dump(v2ray_config, outfile, indent=4)
     username = current_user.username
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
-    v2ray_key = os.popen('jq -r .inbounds[0].settings.clients[0].id /etc/v2ray/v2ray-server.json').read().rstrip()
+    v2ray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email=" + '"' + username + '"' + ") | .id' /etc/v2ray/v2ray-server.json").read().rstrip()
     v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
     v2ray_conf = { 'key': v2ray_key, 'port': v2ray_port}
     modif_config_user(username, {'v2ray': v2ray_conf})
@@ -2283,27 +2291,54 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
 
 class Xrayconfig(BaseModel):
     userid: str
+    vless_reality: bool = Query(False, title="Enable or disable VLESS Reality")
 
 @app.post('/xray', summary="Set xray settings")
 def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayredirect'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    test_vless_reality = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ")' /etc/xray/xray-server.json").read().rstrip()
+    if test_vless_reality != '':
+        chk_vless_reality = True
+    else:
+        chk_vless_reality = False
     with open('/etc/xray/xray-server.json') as f:
         xray_config = json.load(f)
-    xruserid = params.userid
-    for inbounds in xray_config['inbounds']:
-        if inbounds['tag'] == 'omrin-tunnel':
-            inbounds['settings']['clients'][0]['id'] = xruserid
+        if params.vless_reality and not chk_vless_reality:
+            with open('/etc/xray/xray-vless-reality.json') as f:
+                vless_reality_config = json.load(f)
+            xray_config['inbounds'].append(vless_reality_config['inbounds'][0])
+        elif not params.vless_reality and chk_vless_reality:
+            for inbounds in xray_config['inbounds']:
+                if inbounds['tag'] == 'omrin-vless-reality':
+                    xray_config['inbounds'].remove(inbounds)
     with open('/etc/xray/xray-server.json', 'w') as outfile:
         json.dump(xray_config, outfile, indent=4)
+    #with open('/etc/xray/xray-server.json') as f:
+    #    xray_config = json.load(f)
+    #xruserid = params.userid
+    #for inbounds in xray_config['inbounds']:
+    #    if inbounds['tag'] == 'omrin-tunnel':
+    #        inbounds['settings']['clients'][0]['id'] = xruserid
+    #with open('/etc/xray/xray-server.json', 'w') as outfile:
+    #    json.dump(xray_config, outfile, indent=4)
     username = current_user.username
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
-    xray_key = os.popen('jq -r .inbounds[0].settings.clients[0].id /etc/xray/xray-server.json').read().rstrip()
+    xray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email=" + '"' + username + '"' + ") | .id' /etc/xray/xray-server.json").read().rstrip()
+    xray_ss_skey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.password' /etc/xray/xray-server.json").read().rstrip()
+    xray_ss_ukey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.clients[] | select(.email=" + '"' + username + '"' + ") | .password' /etc/xray/xray-server.json").read().rstrip()
+    xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
     xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
-    xray_conf = { 'key': xray_key, 'port': xray_port}
+    if os.path.isfile('/etc/xray/xray-vless-reality.json'):
+        xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
+    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key }
     modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
+        if params.vless_reality and not chk_vless_reality:
+            shorewall_add_port(current_user, '443', 'tcp', 'xray vless-reality')
+        elif not params.vless_reality and chk_vless_reality:
+            shorewall_del_port(current_user.username, '443', 'tcp', 'xray vless-reality')
         os.system("systemctl restart xray")
         set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'xray'}
