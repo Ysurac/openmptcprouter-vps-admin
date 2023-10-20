@@ -11,8 +11,8 @@ OMR_ADMIN_PASS=$(od -vN "32" -An -tx1 /dev/urandom | tr '[:lower:]' '[:upper:]' 
 # use debconf
 . /usr/share/debconf/confmodule
 
-pip3 -q install fastapi==0.99.1 jsonschema netjsonconfig python-multipart jinja2 -U
-pip3 -q install starlette
+#pip3 -q install fastapi==0.99.1 jsonschema netjsonconfig python-multipart jinja2 -U
+#pip3 -q install starlette
 
 #if [ ! -f "/etc/openmptcprouter-vps-admin/omr-admin-config.json" ]; then
 #	mkdir -p /etc/openmptcprouter-vps-admin

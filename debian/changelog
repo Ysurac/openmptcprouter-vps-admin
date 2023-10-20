@@ -1,3 +1,9 @@
+omr-vps-admin (0.5+20231021) unstable; urgency=medium
+
+    * Remove pip from postinst
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 21 Oct 2023 23:53:14 +0200
+
 omr-vps-admin (0.5+20231017) unstable; urgency=medium
 
     * Add XRay VLESS REALITY support
