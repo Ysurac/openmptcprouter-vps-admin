@@ -2699,9 +2699,9 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'openvpn'}
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0', 'rb'))).hexdigest()
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
-    with open('/etc/openvpn/tun0', 'r') as f, open(tmpfile, 'a+') as n:
+    with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
             if 'cipher ' in line:
                 n.write('cipher ' + params.cipher + '\n')
@@ -2710,12 +2710,12 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
             else:
                 n.write(line)
     os.close(fd)
-    move(tmpfile, '/etc/openvpn/tun0')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0', 'rb'))).hexdigest()
+    move(tmpfile, '/etc/openvpn/tun0.conf')
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
 
     if initial_md5 != final_md5:
         os.system("systemctl -q restart openvpn@tun0")
-        shorewall_add_port(current_user, str(port), 'tcp', 'openvpn')
+        shorewall_add_port(current_user, str(params.port), 'tcp', 'openvpn')
         set_lastchange()
     return {'result': 'done'}
 
@@ -2980,6 +2980,7 @@ class NewUser(BaseModel):
     username: str = Query(..., title="Username")
     permission: permissions = Query("ro", title="permission of the user")
     vpn: VPN = Query("openvpn", title="default VPN for the user")
+    proxy: PROXY = Query("shadowsocks-rust", title="default Proxy for the user")
     shadowsocks_port: Optional[int] = Query(None, gt=0, lt=65535, title="Shadowsocks port")
     userid: Optional[int] = Query(None, title="User ID")
     ips: Optional[List[str]] = Query(None, title="Public exit IP")
@@ -3032,6 +3033,8 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
+    if params.proxy is not None:
+        user_json[params.username].update({"proxy": params.proxy})
     content['users'][0].update(user_json)
     if content:
         backup_config()

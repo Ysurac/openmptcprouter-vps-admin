@@ -1,3 +1,9 @@
+omr-vps-admin (0.6+20231102) unstable; urgency=medium
+
+    * Fix OpenVPN support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 01 Nov 2023 11:29:47 +0200
+
 omr-vps-admin (0.5+20231021) unstable; urgency=medium
 
     * Remove pip from postinst
