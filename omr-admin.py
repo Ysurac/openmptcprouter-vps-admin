@@ -1711,8 +1711,10 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         else:
             shadowsocks_go_conf = omr_config_data['users'][0][username]['shadowsocks-go']
         ss_go_txrx = get_bytes_ss_go(username)
-        ss_go_tx = ss_go_txrx['downlinkBytes']
-        ss_go_rx = ss_go_txrx['uplinkBytes']
+        if 'downlinkBytes' in ss_go_txrx:
+            ss_go_tx = int(ss_go_txrx['downlinkBytes'])
+        if 'uplinkBytes' in ss_go_txrx:
+            ss_go_rx = int(ss_go_txrx['uplinkBytes'])
 
     LOG.debug('Get config... mptcp')
     mptcp_version = mptcp_enabled = mptcp_checksum = '0'
