@@ -132,10 +132,10 @@ def get_bytes_ss_go(user):
         r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go stats timeout")
-        return 0
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     except requests.exceptions.RequestException as err:
         LOG.debug("Shadowsocks go stats error (" + str(err) + ")")
-        return 0
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     return r.json()
 
 def get_bytes_v2ray(t,user):
@@ -1711,10 +1711,8 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         else:
             shadowsocks_go_conf = omr_config_data['users'][0][username]['shadowsocks-go']
         ss_go_txrx = get_bytes_ss_go(username)
-        if 'downlinkBytes' in ss_go_txrx:
-            ss_go_tx = int(ss_go_txrx['downlinkBytes'])
-        if 'uplinkBytes' in ss_go_txrx:
-            ss_go_rx = int(ss_go_txrx['uplinkBytes'])
+        ss_go_tx = int(ss_go_txrx['downlinkBytes'])
+        ss_go_rx = int(ss_go_txrx['uplinkBytes'])
 
     LOG.debug('Get config... mptcp')
     mptcp_version = mptcp_enabled = mptcp_checksum = '0'

@@ -1,3 +1,9 @@
+omr-vps-admin (0.6+20231105) unstable; urgency=medium
+
+    * Really fix ss_go stats issue by returning a json instead of 0
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 05 Nov 2023 07:34:25 +0200
+
 omr-vps-admin (0.6+20231104) unstable; urgency=medium
 
     * Should fix ss_go stats issue
