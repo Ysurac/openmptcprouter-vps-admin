@@ -109,6 +109,38 @@ def get_bytes(t, iface='eth0'):
         return int(data)
     return 0
 
+def get_bytes_openvpn(user):
+    try:
+        ovpn_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ovpn_socket.settimeout(2)
+        ovpn_socket.connect(("127.0.0.1", 65302))
+        fd = ovpn_socket.makefile('rb')
+        line = fd.readline()
+        if not line.startswith('>INFO:OpenVPN'.encode()):
+            ovpn_socket.close()
+            LOG.debug("OpenVPN error")
+            return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+        ovpn_socket.send('status\r\n'.encode())
+        ovpn_stats = []
+        while True:
+            line = fd.readline()
+            ovpn_stats.append(line.decode())
+            if line.strip() == 'END'.encode():
+                break
+        ovpn_socket.close()
+    except socket.timeout as err:
+        LOG.debug("OpenVPN stats timeout (" + str(err) + ")")
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    except socket.error as err:
+        LOG.debug("OpenVPN stats error (" + str(err) + ")")
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    for data in ovpn_stats:
+        if user in data:
+            stats = data.split(',')
+            return { 'downlinkBytes': stats[2], 'uplinkBytes': stats[3] }
+    return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+
+
 def get_bytes_ss(port):
     try:
         ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -135,6 +167,8 @@ def get_bytes_ss_go(user):
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     except requests.exceptions.RequestException as err:
         LOG.debug("Shadowsocks go stats error (" + str(err) + ")")
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    if 'error' in r.json():
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     return r.json()
 
@@ -358,8 +392,13 @@ def v2ray_add_user(user, v2rayuuid='', restart=1):
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        os.system("systemctl -q restart v2ray")
+    if initial_md5 != final_md5:
+        try:
+            data = subprocess.check_output('/usr/bin/v2ray api adu --server=127.0.0.1:10085 -users ' + "'" + '{"tag":"omrin-vmess-tunnel","users":[{"user": "' + user + '","key": "' + v2rayuuid + '"}]}', shell = True)
+        except:
+            LOG.debug("V2Ray VMESS: Can't add user")
+        if restart == 1:
+            os.system("systemctl -q restart v2ray")
     return v2rayuuid
 
 def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
@@ -1358,8 +1397,11 @@ async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
     elif vpn == 'openvpn':
-        vpn_traffic_rx = get_bytes('rx', 'tun0')
-        vpn_traffic_tx = get_bytes('tx', 'tun0')
+        # vpn_traffic_rx = get_bytes('rx', 'tun0')
+        # vpn_traffic_tx = get_bytes('tx', 'tun0')
+        vpn_txrx = get_bytes_openvpn(username)
+        vpn_traffic_rx = vpn_txrx['uplinkBytes']
+        vpn_traffic_tx = vpn_txrx['downlinkBytes']
     elif vpn == 'openvpn_bonding':
         vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
@@ -1819,8 +1861,11 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
     elif vpn == 'openvpn':
-        vpn_traffic_rx = get_bytes('rx', 'tun0')
-        vpn_traffic_tx = get_bytes('tx', 'tun0')
+        #vpn_traffic_rx = get_bytes('rx', 'tun0')
+        #vpn_traffic_tx = get_bytes('tx', 'tun0')
+        vpn_txrx = get_bytes_openvpn(username)
+        vpn_traffic_rx = vpn_txrx['uplinkBytes']
+        vpn_traffic_tx = vpn_txrx['downlinkBytes']
     elif vpn == 'openvpn_bonding':
         vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
@@ -2330,9 +2375,14 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     xray_ss_ukey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.clients[] | select(.email=" + '"' + username + '"' + ") | .password' /etc/xray/xray-server.json").read().rstrip()
     xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
     xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
+    test_vless_reality = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ")' /etc/xray/xray-server.json").read().rstrip()
+    if test_vless_reality != '':
+        vless_reality = True
+    else:
+        vless_reality = False
     if os.path.isfile('/etc/xray/xray-vless-reality.json'):
         xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
-    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key }
+    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality}
     modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
         if params.vless_reality and not chk_vless_reality:
@@ -3020,7 +3070,10 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
         else:
             upsk = ''
         if os.path.isfile('/etc/v2ray/v2ray-server.json'):
-            uuid = v2ray_add_user(params.username)
+            if params.proxy is not None and params.proxy == 'v2ray-vmess':
+                uuid = v2ray_add_user(params.username,'',0)
+            else:
+                uuid = v2ray_add_user(params.username)
         else:
             uuid = ''
         if os.path.isfile('/etc/xray/xray-server.json'):

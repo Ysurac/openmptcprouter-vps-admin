@@ -1,3 +1,12 @@
+omr-vps-admin (0.7+20231116) unstable; urgency=medium
+
+    * Fix ss_go stats when ss_go return a json with an error message
+    * Add OpenVPN stats by users support
+    * Add V2Ray VMess add users via API
+    * XRay Vless-Reality fix
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 16 Nov 2023 11:49:41 +0200
+
 omr-vps-admin (0.6+20231105) unstable; urgency=medium
 
     * Really fix ss_go stats issue by returning a json instead of 0
