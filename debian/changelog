@@ -1,3 +1,10 @@
+omr-vps-admin (0.7+20231128) unstable; urgency=medium
+
+    * Fix global settings in json
+    * Fix when hostname website doesn't answer
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 28 Nov 2023 11:35:32 +0200
+
 omr-vps-admin (0.7+20231116) unstable; urgency=medium
 
     * Fix ss_go stats when ss_go return a json with an error message

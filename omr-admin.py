@@ -57,6 +57,7 @@ from starlette.responses import RedirectResponse, Response, JSONResponse
 #from starlette.requests import Request
 import netifaces
 
+#logging.basicConfig(filename='/tmp/omr-admin.log', encoding='utf-8', level=logging.DEBUG)
 LOG = logging.getLogger('api')
 LOG.setLevel(logging.ERROR)
 #LOG.setLevel(logging.DEBUG)
@@ -258,12 +259,9 @@ def check_username_serial(username, serial):
         data['users'][0][username]['serial_error'] = 1
     else:
         data['users'][0][username]['serial_error'] = int(data['users'][0][username]['serial_error']) + 1
-    if data and data != configdata:
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-            json.dump(data, outfile, indent=4)
-    else:
-        LOG.debug("Empty data for check_username_serial")
+    backup_config()
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
+        json.dump(data, outfile, indent=4)
     return False
 
 def set_global_param(key, value):
@@ -274,26 +272,23 @@ def set_global_param(key, value):
         configdata = json.loads(content)
         data = configdata
     except ValueError as e:
+        LOG.debug("Can't read file for set_global_param")
         return {'error': 'Config file not readable', 'route': 'global_param'}
-    data[key] = value
-    if data and data != configdata:
+    if not key in data or data[key] != value:
+        data[key] = value
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
     else:
-        LOG.debug("Empty data for set_global_param")
+        LOG.debug("Already exist data for set_global_param key:" + key)
 
 def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     content['users'][0][user].update(changes)
-    if content:
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-            json.dump(content, f, indent=4)
-    else:
-        LOG.debug("Empty data for modif_config_user")
-
+    backup_config()
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
+        json.dump(content, f, indent=4)
 
 def add_ss_user(port, key, userid=0, ip=''):
     with open('/etc/shadowsocks-libev/manager.json') as f:
@@ -1793,9 +1788,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     else:
         #ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
         if ipv4_addr == '':
-            ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ip.openmptcprouter.com').read().rstrip()
+            ipv4_addr = os.popen('wget -4 -qO- -t 1 -T 1 http://ip.openmptcprouter.com').read().rstrip()
         if ipv4_addr == '':
-            ipv4_addr = os.popen('wget -4 -qO- -T 1 http://ifconfig.me').read().rstrip()
+            ipv4_addr = os.popen('wget -4 -qO- -t 1 -T 1 http://ifconfig.me').read().rstrip()
         if ipv4_addr != '':
             set_global_param('ipv4', ipv4_addr)
 
@@ -1815,7 +1810,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     elif 'internet' in omr_config_data and not omr_config_data['internet']:
         vps_domain = ''
     else:
-        vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
+        vps_domain = os.popen('wget -4 -qO- -t 1 -T 1 http://hostname.openmptcprouter.com').read().rstrip()
         if vps_domain != '':
             set_global_param('hostname', vps_domain)
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
@@ -1969,7 +1964,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if 'hostname' in omr_config_data:
         vps_domain = omr_config_data['hostname']
     else:
-        vps_domain = os.popen('wget -4 -qO- -T 1 http://hostname.openmptcprouter.com').read().rstrip()
+        vps_domain = os.popen('wget -4 -qO- -t 1 -T 1 http://hostname.openmptcprouter.com').read().rstrip()
         if vps_domain != '':
             set_global_param('hostname', vps_domain)
 
