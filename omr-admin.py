@@ -3092,7 +3092,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
         LOG.debug("Empty data for add_user")
     # Create VPNs configuration
     if os.path.isfile('/etc/openvpn/tun0.conf'):
-        os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full "' + params.username + '" nopass')
+        os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa --batch build-client-full "' + params.username + '" nopass')
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
         add_glorytun_tcp(userid)
     if os.path.isfile('/etc/glorytun-udp/tun0'):

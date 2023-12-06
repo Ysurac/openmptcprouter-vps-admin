@@ -1,3 +1,9 @@
+omr-vps-admin (0.7+20231206) unstable; urgency=medium
+
+    * Fix adding OpenVPN user
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 03 Dec 2023 09:58:24 +0200
+
 omr-vps-admin (0.7+20231128) unstable; urgency=medium
 
     * Fix global settings in json
