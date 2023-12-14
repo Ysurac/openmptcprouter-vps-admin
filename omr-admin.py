@@ -1716,6 +1716,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             xray_ss_ukey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.clients[] | select(.email=" + '"' + username + '"' + ") | .password' /etc/xray/xray-server.json").read().rstrip()
             xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
             xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
+            xray_ss_method = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.method' /etc/xray/xray-server.json").read().rstrip()
             xray_vless_reality_public_key = ''
             if os.path.isfile('/etc/xray/xray-vless-reality.json'):
                 xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
@@ -1724,7 +1725,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
                 vless_reality = True
             else:
                 vless_reality = False
-            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key }
+            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key, 'ss_method': xray_ss_method }
             modif_config_user(username, {'xray': xray_conf})
         else:
             xray_conf = omr_config_data['users'][0][username]['xray']
@@ -2332,6 +2333,7 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
 class Xrayconfig(BaseModel):
     userid: str
     vless_reality: bool = Query(False, title="Enable or disable VLESS Reality")
+    ss_method: str = "2022-blake3-aes-256-gcm"
 
 @app.post('/xray', summary="Set xray settings")
 def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
@@ -2353,6 +2355,10 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
             for inbounds in xray_config['inbounds']:
                 if inbounds['tag'] == 'omrin-vless-reality':
                     xray_config['inbounds'].remove(inbounds)
+        for inbounds in xray_config['inbounds']:
+            if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
+                inbounds['settings']['method'] = params.ss_method
+
     with open('/etc/xray/xray-server.json', 'w') as outfile:
         json.dump(xray_config, outfile, indent=4)
     #with open('/etc/xray/xray-server.json') as f:
@@ -2377,7 +2383,7 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
         vless_reality = False
     if os.path.isfile('/etc/xray/xray-vless-reality.json'):
         xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
-    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality}
+    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method }
     modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
         if params.vless_reality and not chk_vless_reality:
