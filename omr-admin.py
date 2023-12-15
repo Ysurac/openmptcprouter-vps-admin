@@ -3205,11 +3205,11 @@ async def list_users(current_user: User = Depends(get_current_user)):
     return content['users'][0]
 
 @app.get('/speedtest', summary="Test speed from the server")
-async def speedtest():
+async def speedtest(current_user: User = Depends(get_current_user)):
     return FileResponse('/usr/share/omr-server/speedtest/test.img')
 
 @app.post('/speedtest', summary="Test upload speed from the server")
-async def speedtestul(file: UploadFile):
+async def speedtestul(file: UploadFile, current_user: User = Depends(get_current_user)):
     if not file:
         return {'result': 'No upload file sent'}
     else:
