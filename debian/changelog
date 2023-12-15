@@ -1,3 +1,10 @@
+omr-vps-admin (0.7+20231215) unstable; urgency=medium
+
+    * Require authentication for upload and download test
+    * Crypt method can be modified for XRay Shadowsocks
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 15 Dec 2023 19:33:51 +0200
+
 omr-vps-admin (0.7+20231206) unstable; urgency=medium
 
     * Fix adding OpenVPN user
