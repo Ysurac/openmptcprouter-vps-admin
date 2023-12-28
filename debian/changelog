@@ -1,3 +1,10 @@
+omr-vps-admin (0.8+20231228) unstable; urgency=medium
+
+    * Add function to get bypassed IPs from router
+    * Force 2022-blake3-aes-256-gcm for Shadowsocks-go
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 28 Dec 2023 19:48:29 +0200
+
 omr-vps-admin (0.7+20231215) unstable; urgency=medium
 
     * Require authentication for upload and download test

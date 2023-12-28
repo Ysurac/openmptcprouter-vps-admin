@@ -2090,7 +2090,9 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     except ValueError as e:
         return {'result': 'error', 'reason': 'Read only user', 'route': 'shadowsocks-go'}
     port = params.port
-    method = params.method
+    # If method is aes 128 then key need to be length 16 instead of 32, so force aes-256-gcm for now
+    #method = params.method
+    method = "2022-blake3-aes-256-gcm"
     fast_open = params.fast_open
     reuse_port = params.reuse_port
     mptcp = params.mptcp
@@ -2806,6 +2808,40 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
         set_lastchange()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wireguard'}
 
+class ByPass(BaseModel):
+    ipv4s: List[str] = []
+    ipv6s: List[str] = []
+    intf: str
+
+@app.post('/bypass', summary="Set IPs to Bypass")
+def bypass(*, bypassconfig: ByPass, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'bypass'}
+    bypassipv4s = bypassconfig.ipv4s
+    bypassipv6s = bypassconfig.ipv6s
+    if not bypassconfig.intf:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'bypass'}
+    if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-bypass.json'):
+        with open('/etc/openmptcprouter-vps-admin/omr-bypass.json') as f:
+            content = f.read()
+        content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+        try:
+            configdata = json.loads(content)
+            data = configdata
+        except ValueError as e:
+            return {'error': 'Config file not readable', 'route': 'lastchange'}
+    else:
+        data = {}
+        configdata = {}
+    data[bypassconfig.intf] = {}
+    data[bypassconfig.intf]["ipv4"] = bypassipv4s
+    data[bypassconfig.intf]["ipv6"] = bypassipv6s
+    #if data and data != configdata:
+    with open('/etc/openmptcprouter-vps-admin/omr-bypass.json', 'w') as outfile:
+        json.dump(data, outfile, indent=4)
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'bypass'}
+
+
 
 class Wanips(BaseModel):
     ips: str
@@ -2830,6 +2866,8 @@ class Lanips(BaseModel):
 # Set user lan config
 @app.post('/lan', summary="Set current user LAN IPs")
 def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'lan'}
     lanips = lanconfig.lanips
     if not lanips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'lan'}
