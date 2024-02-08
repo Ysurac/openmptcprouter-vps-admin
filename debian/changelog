@@ -1,3 +1,10 @@
+omr-vps-admin (0.8+20240208) unstable; urgency=medium
+
+    * Add localvpn in API status answer, for future use"
+    * Fix OpenVPN config status
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 08 Feb 2024 10:30:14 +0200
+
 omr-vps-admin (0.8+20231228) unstable; urgency=medium
 
     * Add function to get bypassed IPs from router
