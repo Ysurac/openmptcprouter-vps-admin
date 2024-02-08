@@ -1603,9 +1603,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     else:
         openvpn_client_ca = ''
     openvpn_port = '65301'
-    openvpn_cipher = 'AES-256-CBC'
-    if os.path.isfile('/etc/openvpn/openvpn-tun0.conf'):
-        with open('/etc/openvpn/openvpn-tun0.conf', "r") as openvpn_file:
+    openvpn_cipher = 'AES-256-GCM'
+    if os.path.isfile('/etc/openvpn/tun0.conf'):
+        with open('/etc/openvpn/tun0.conf', "r") as openvpn_file:
             for line in openvpn_file:
                 if 'port ' in line:
                     openvpn_port = line.replace(line[:5], '').rstrip()
