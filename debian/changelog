@@ -1,3 +1,9 @@
+omr-vps-admin (0.8+20240210) unstable; urgency=medium
+
+    * Fix typo
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sat, 10 Feb 2024 15:12:20 +0200
+
 omr-vps-admin (0.8+20240208) unstable; urgency=medium
 
     * Add localvpn in API status answer, for future use"
