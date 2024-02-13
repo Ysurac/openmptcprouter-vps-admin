@@ -1,3 +1,9 @@
+omr-vps-admin (0.8+20240213) unstable; urgency=medium
+
+    * Fix Shadowsocks-go add user and XRay/V2Ray remove user
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 13 Feb 2024 15:02:13 +0200
+
 omr-vps-admin (0.8+20240210) unstable; urgency=medium
 
     * Fix typo

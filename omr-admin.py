@@ -353,7 +353,7 @@ def remove_ss_user(port):
 
 def add_ss_go_user(user, key=''):
     try:
-        r = requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", data= {'username': user,'uPSK': key})
+        r = requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go add timeout")
     except requests.exceptions.RequestException as err:
@@ -3168,9 +3168,9 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     if os.path.isfile('/etc/shadowsocks-go/server.json'):
         remove_ss_go_user(params.username)
     if os.path.isfile('/etc/v2ray/v2ray-server.json'):
-        v2ray_remove_user(params.username)
+        v2ray_del_user(params.username)
     if os.path.isfile('/etc/xray/xray-server.json'):
-        xray_remove_user(params.username)
+        xray_del_user(params.username)
     if content:
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
