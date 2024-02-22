@@ -1835,8 +1835,8 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
                     if 'ULA=' in line:
                         ula = line.replace(line[:4], '').rstrip()
     else:
-        locaip6 = 'fe80::a00:1'
-        remoteip6 = 'fe80::a00:2'
+        locaip6 = 'fd00::a00:1'
+        remoteip6 = 'fd00::a00:2'
 
     vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][username]:
@@ -2912,8 +2912,8 @@ class VPNips(BaseModel):
 # Set user vpn IPs
 @app.post('/vpnips', summary="Set current user VPN IPs")
 def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user)):
-    if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'vpnips'}
+    #if current_user.permissions == "ro":
+    #    return {'result': 'permission', 'reason': 'Read only user', 'route': 'vpnips'}
     remoteip = vpnconfig.remoteip
     localip = vpnconfig.localip
     remoteip6 = vpnconfig.remoteip6
@@ -2938,11 +2938,11 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         if localip6:
             n.write('LOCALIP6=' + localip6 + "\n")
         else:
-            n.write('LOCALIP6=fe80::a0' + hex(userid)[2:] + ':1/126' + "\n")
+            n.write('LOCALIP6=fd00::a0' + hex(userid)[2:] + ':1/126' + "\n")
         if remoteip6:
             n.write('REMOTEIP6=' + remoteip6 + "\n")
         else:
-            n.write('REMOTEIP6=fe80::a0' + hex(userid)[2:] + ':2/126' + "\n")
+            n.write('REMOTEIP6=fd00::a0' + hex(userid)[2:] + ':2/126' + "\n")
         if ula:
             n.write('ULA=' + ula + "\n")
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
@@ -2974,9 +2974,9 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
             if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
                 n.write(line)
         if  not userid == 0:
-            n.write('OMR_ADDR_USER' + str(userid) + '=fe80::a0' + hex(userid)[2:] + ':2/126' + '\n')
+            n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
         elif userid == 0:
-            n.write('OMR_ADDR=fe80::a0' + hex(userid)[2:] + ':2/126' + '\n')
+            n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
 
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/params.vpn')

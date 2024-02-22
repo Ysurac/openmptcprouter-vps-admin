@@ -1,3 +1,10 @@
+omr-vps-admin (0.9+20240222) unstable; urgency=medium
+
+    * Use fd00 instead of fe80 for 6in4
+    * Allow all users to set VPN IPs in config
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 22 Feb 2024 18:17:04 +0200
+
 omr-vps-admin (0.8+20240213) unstable; urgency=medium
 
     * Fix Shadowsocks-go add user and XRay/V2Ray remove user
