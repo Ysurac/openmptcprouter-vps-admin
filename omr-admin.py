@@ -3149,7 +3149,11 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
         add_dsvpn(userid)
 
     set_lastchange(30)
-    os.execv(__file__, sys.argv)
+    #os.execv(__file__, sys.argv)
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        global fake_users_db
+        omr_config_data = json.load(f)
+        fake_users_db = omr_config_data['users'][0]
 
 class RemoveUser(BaseModel):
     username: str
@@ -3188,7 +3192,11 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         remove_dsvpn(userid)
     set_lastchange(30)
-    os.execv(__file__, sys.argv)
+    #os.execv(__file__, sys.argv)
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        global fake_users_db
+        omr_config_data = json.load(f)
+        fake_users_db = omr_config_data['users'][0]
 
 class ClienttoClient(BaseModel):
     enable: bool = False
