@@ -1,3 +1,11 @@
+omr-vps-admin (0.9+20240322) unstable; urgency=medium
+
+    * Fix OpenVPN stats
+    * Fix Shadowsocks Rust stats
+    * You can add notes in json to an existing user
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 22 Mar 2024 16:00:25 +0200
+
 omr-vps-admin (0.9+20240301) unstable; urgency=medium
 
     * Add/Remove users via API without script restart

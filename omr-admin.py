@@ -138,7 +138,7 @@ def get_bytes_openvpn(user):
     for data in ovpn_stats:
         if user in data:
             stats = data.split(',')
-            return { 'downlinkBytes': stats[2], 'uplinkBytes': stats[3] }
+            return { 'downlinkBytes': int(stats[2]), 'uplinkBytes': int(stats[3]) }
     return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
 
 
@@ -162,7 +162,7 @@ def get_bytes_ss(port):
 
 def get_bytes_ss_go(user):
     try:
-        r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
+        r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats")
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go stats timeout")
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
@@ -171,7 +171,10 @@ def get_bytes_ss_go(user):
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     if 'error' in r.json():
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
-    return r.json()
+    for userdata in r.json()['users']:
+        if userdata['username'] == user:
+            return { 'downlinkBytes': userdata['downlinkBytes'], 'uplinkBytes': userdata['uplinkBytes'] }
+    return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
 
 def get_bytes_v2ray(t,user):
     if t == "tx":
@@ -235,6 +238,18 @@ def get_username_from_userid(userid):
         if 'userid' in data['users'][0][user] and int(data['users'][0][user]['userid']) == userid:
             return user
     return ''
+
+def get_userid_from_username(username):
+    if username == 'openmptcprouter':
+        return 0
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = f.read()
+    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    try:
+        data = json.loads(content)
+    except ValueError as e:
+        return {'error': 'Config file not readable', 'route': 'get_username'}
+    return int(data['users'][0][username]['userid'])
 
 def check_username_serial(username, serial):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -1324,10 +1339,12 @@ async def mptcpsupport(request: Request):
 
 # Get VPS status
 @app.get('/status', summary="Get current server load average, uptime and release")
-async def status(userid: Optional[int] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
+async def status(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get status...')
     if not current_user.permissions == "admin":
         userid = current_user.userid
+    elif username is not None:
+        userid = get_userid_from_username(username)
     if userid is None:
         userid = 0
     username = get_username_from_userid(userid)
@@ -3154,6 +3171,18 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
         global fake_users_db
         omr_config_data = json.load(f)
         fake_users_db = omr_config_data['users'][0]
+
+class ExistingUser(BaseModel):
+    username: str = Query(..., title="Username")
+    note: list = []
+
+@app.post('/add_user_note', summary="Add a note to an user")
+def add_user_note(*, params: ExistingUser, current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
+    modif_config_user(params.username,{"note": params.note})
+    set_lastchange(30)
+
 
 class RemoveUser(BaseModel):
     username: str
