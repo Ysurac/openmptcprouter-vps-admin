@@ -1,3 +1,9 @@
+omr-vps-admin (0.9+20240324) unstable; urgency=medium
+
+    * Fix Shadowsocks Rust stats error
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 24 Mar 2024 21:35:13 +0200
+
 omr-vps-admin (0.9+20240322) unstable; urgency=medium
 
     * Fix OpenVPN stats

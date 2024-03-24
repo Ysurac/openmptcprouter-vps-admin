@@ -171,9 +171,10 @@ def get_bytes_ss_go(user):
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     if 'error' in r.json():
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
-    for userdata in r.json()['users']:
-        if userdata['username'] == user:
-            return { 'downlinkBytes': userdata['downlinkBytes'], 'uplinkBytes': userdata['uplinkBytes'] }
+    if 'users' in r.json():
+        for userdata in r.json()['users']:
+            if userdata['username'] == user:
+                return { 'downlinkBytes': userdata['downlinkBytes'], 'uplinkBytes': userdata['uplinkBytes'] }
     return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
 
 def get_bytes_v2ray(t,user):
