@@ -3284,6 +3284,15 @@ async def list_users(current_user: User = Depends(get_current_user)):
         content = json.load(f)
     return content['users'][0]
 
+@app.get('/get-number-of-users', summary="Get the total number of users")
+def get_number_of_users(current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'get-number-of-users'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = json.load(f)
+        users = len(content['users'][0]) - 1
+    return {'users': users}
+
 @app.get('/speedtest', summary="Test speed from the server")
 async def speedtest(current_user: User = Depends(get_current_user)):
     return FileResponse('/usr/share/omr-server/speedtest/test.img')

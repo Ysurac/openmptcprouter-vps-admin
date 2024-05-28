@@ -1,3 +1,9 @@
+omr-vps-admin (0.9+20240528) unstable; urgency=medium
+
+    * Add SOF-67: Returning total number of users by Dillon Ward
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 28 May 2024 14:50:19 +0200
+
 omr-vps-admin (0.9+20240516) unstable; urgency=medium
 
     * Fix Shadowsocks-Go user creation
