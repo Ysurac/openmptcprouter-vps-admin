@@ -292,6 +292,7 @@ def set_global_param(key, value):
         return {'error': 'Config file not readable', 'route': 'global_param'}
     if not key in data or data[key] != value:
         data[key] = value
+        LOG.debug("backup_config() in set_global_param")
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
@@ -302,6 +303,7 @@ def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     content['users'][0][user].update(changes)
+    LOG.debug("backup_config() in modif_config_user")
     backup_config()
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
         json.dump(content, f, indent=4)
@@ -709,9 +711,6 @@ def add_gre_tunnels():
             os.system("systemctl -q restart shadowsocks-libev-manager@manager")
     set_global_param('allips', allips)
 
-add_gre_tunnels()
-
-
 def add_glorytun_tcp(userid):
     port = '650{:02d}'.format(userid)
     ip = IPNetwork('10.255.255.0/24')
@@ -1075,6 +1074,7 @@ def set_lastchange(sync=0):
         return {'error': 'Config file not readable', 'route': 'lastchange'}
     data["lastchange"] = time.time() + sync
     if data and data != configdata:
+        LOG.debug("backup_config() in set_last_change")
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
@@ -1084,8 +1084,10 @@ def set_lastchange(sync=0):
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
     omr_config_data = json.load(f)
-    if 'debug' in omr_config_data and omr_config_data['debug']:
-        LOG.setLevel(logging.DEBUG)
+if 'debug' in omr_config_data and omr_config_data['debug']:
+    LOG.setLevel(logging.DEBUG)
+if not 'gre_tunnels' in omr_config_data or omr_config_data['gre_tunnels']:
+    add_gre_tunnels()
 
 fake_users_db = omr_config_data['users'][0]
 
@@ -1440,7 +1442,11 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         try:
             omr_config_data = json.load(f)
         except ValueError as e:
-            omr_config_data = {}
+            with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+                try:
+                    omr_config_data = json.load(f)
+                except ValueError as e:
+                    omr_config_data = {}
     LOG.debug('Get config... shadowsocks')
     proxy = 'shadowsocks'
     if 'proxy' in omr_config_data['users'][0][username]:
@@ -1715,6 +1721,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             v2ray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/v2ray/v2ray-server.json").read().rstrip()
             v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
             v2ray_conf = { 'key': v2ray_key, 'port': v2ray_port}
+            LOG.debug("modif_config_user for v2ray")
             modif_config_user(username, {'v2ray': v2ray_conf})
         else:
             v2ray_conf = omr_config_data['users'][0][username]['v2ray']
@@ -1744,6 +1751,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             else:
                 vless_reality = False
             xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key, 'ss_method': xray_ss_method }
+            LOG.debug("modif_config_user for xray")
             modif_config_user(username, {'xray': xray_conf})
         else:
             xray_conf = omr_config_data['users'][0][username]['xray']
@@ -1759,10 +1767,11 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         shadowsocks_go = True
         if not 'shadowsocks-go' in omr_config_data['users'][0][username]:
             shadowsocks_go_psk = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .psk' /etc/shadowsocks-go/server.json").read().rstrip()
-            shadowsocks_go_port = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .tcpListeners[0].address' /etc/shadowsocks-go/server.json | cut -d ':' -f1").read().rstrip()
+            shadowsocks_go_port = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .tcpListeners[0].address' /etc/shadowsocks-go/server.json | cut -d ':' -f2").read().rstrip()
             shadowsocks_go_protocol = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .protocol' /etc/shadowsocks-go/server.json").read().rstrip()
             shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + username + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
             shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': shadowsocks_go_port, 'protocol': shadowsocks_go_protocol }
+            LOG.debug("modif_config_user for shadowsocks-go")
             modif_config_user(username, {'shadowsocks-go': shadowsocks_go_conf})
         else:
             shadowsocks_go_conf = omr_config_data['users'][0][username]['shadowsocks-go']
@@ -1937,7 +1946,7 @@ class ShadowsocksConfigparams(BaseModel):
 @app.post('/shadowsocks', summary="Modify Shadowsocks-libev configuration")
 def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks'}
     ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
@@ -1973,6 +1982,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if 'port_conf' in data:
         portconf = data["port_conf"]
         portconf[str(port)]['key'] = key
+    LOG.debug("modif_config_user for shadowsocks_port")
     modif_config_user(current_user.username, {'shadowsocks_port': port})
     userid = current_user.userid
     if userid is None:
@@ -2085,7 +2095,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         #    os.system("systemctl restart shadowsocks-libev-manager@manager" + str(x) + ".service")
         shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks')
         shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks')
-        set_lastchange()
+        #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks'}
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'shadowsocks'}
@@ -2101,7 +2111,7 @@ class ShadowsocksGoConfigparams(BaseModel):
 @app.post('/shadowsocks-go', summary="Modify Shadowsocks-Go configuration")
 def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks-go'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-go/server.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-go/server.json') as f:
@@ -2119,6 +2129,7 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     reuse_port = params.reuse_port
     mptcp = params.mptcp
     #key = params.key
+    LOG.debug("modif_config_user for shadowsocks-go port")
     modif_config_user(current_user.username, {'shadowsocks-go_port': port})
     userid = current_user.userid
     if userid is None:
@@ -2137,7 +2148,7 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
         os.system("systemctl restart shadowsocks-go.service")
         shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks-go')
         shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks-go')
-        set_lastchange()
+        #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks-go'}
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'shadowsocks-go'}
@@ -2346,10 +2357,11 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
     v2ray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/v2ray/v2ray-server.json").read().rstrip()
     v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
     v2ray_conf = { 'key': v2ray_key, 'port': v2ray_port}
+    LOG.debug("modif_config_user for v2ray conf")
     modif_config_user(username, {'v2ray': v2ray_conf})
     if initial_md5 != final_md5:
         os.system("systemctl restart v2ray")
-        set_lastchange()
+        #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'v2ray'}
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'v2ray'}
@@ -2408,6 +2420,7 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     if os.path.isfile('/etc/xray/xray-vless-reality.json'):
         xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
     xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method }
+    LOG.debug("modif_config_user for xray conf")
     modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
         if params.vless_reality and not chk_vless_reality:
@@ -2415,7 +2428,7 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
         elif not params.vless_reality and chk_vless_reality:
             shorewall_del_port(current_user.username, '443', 'tcp', 'xray vless-reality')
         os.system("systemctl restart xray")
-        set_lastchange()
+        #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'xray'}
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'xray'}
@@ -2527,7 +2540,7 @@ class MPTCPparams(BaseModel):
 @app.post('/mptcp', summary="Modify MPTCP configuration of the server")
 def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'mptcp'}
     checksum = params.checksum
     path_manager = params.path_manager
@@ -2568,7 +2581,7 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
         os.system("systemctl -q restart xray")
         os.system("systemctl -q restart glorytun-tcp@tun0")
         os.system("systemctl -q restart openvpn@tun0")
-    set_lastchange()
+    #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
 class VPN(str, Enum):
@@ -2587,15 +2600,16 @@ class Vpn(BaseModel):
 @app.post('/vpn', summary="Set VPN used by the current user")
 def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'vpn'}
     vpn = vpnconfig.vpn
     if not vpn:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpn'}
     os.system('echo ' + vpn + ' > /etc/openmptcprouter-vps-admin/current-vpn')
+    LOG.debug("modif_config_user for vpn setting")
     modif_config_user(current_user.username, {'vpn': vpn})
     current_user.vpn = vpn
-    set_lastchange()
+    #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
 class PROXY(str, Enum):
@@ -2622,15 +2636,16 @@ class Proxy(BaseModel):
 @app.post('/proxy', summary="Set Proxy used by the current user")
 def proxy(*, proxyconfig: Proxy, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'proxy'}
     proxy = proxyconfig.proxy
     if not proxy:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'proxy'}
     os.system('echo ' + proxy + ' > /etc/openmptcprouter-vps-admin/current-proxy')
+    LOG.debug("modif_config_user for proxy")
     modif_config_user(current_user.username, {'proxy': proxy})
     #current_user.proxy = proxy
-    set_lastchange()
+    #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
 
@@ -2643,7 +2658,7 @@ class GlorytunConfig(BaseModel):
 @app.post('/glorytun', summary="Modify Glorytun configuration")
 def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'glorytun'}
     userid = current_user.userid
     if userid is None:
@@ -2693,7 +2708,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
         os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
     shorewall_add_port(current_user, str(port), 'tcp', 'glorytun')
     shorewall_add_port(current_user, str(port), 'udp', 'glorytun')
-    set_lastchange()
+    #set_lastchange()
     return {'result': 'done'}
 
 # Set A Dead Simple VPN config
@@ -2704,7 +2719,7 @@ class DSVPN(BaseModel):
 @app.post('/dsvpn', summary="Modify DSVPN configuration")
 def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'dsvpn'}
     userid = current_user.userid
     if userid is None:
@@ -2731,7 +2746,7 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     if initial_md5 != final_md5:
         os.system("systemctl -q restart dsvpn-server@dsvpn" + str(userid))
     shorewall_add_port(current_user, str(port), 'tcp', 'dsvpn')
-    set_lastchange()
+    #set_lastchange()
     return {'result': 'done'}
 
 # Set MLVPN config
@@ -2745,7 +2760,7 @@ class MLVPN(BaseModel):
 @app.post('/mlvpn', summary="Modify MLVPN configuration")
 def mlvpn(*, params: MLVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'mlvpn'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/mlvpn/mlvpn0.conf', 'rb'))).hexdigest()
     mlvpn_config = configparser.ConfigParser()
@@ -2760,7 +2775,7 @@ def mlvpn(*, params: MLVPN, current_user: User = Depends(get_current_user)):
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/mlvpn/mlvpn0.conf', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q restart mlvpn@mlvpn0")
-        set_lastchange()
+        #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mlvpn'}
 
 
@@ -2772,7 +2787,7 @@ class OpenVPN(BaseModel):
 @app.post('/openvpn', summary="Modify OpenVPN TCP configuration")
 def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        set_lastchange(10)
+        #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'openvpn'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
@@ -2791,7 +2806,7 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     if initial_md5 != final_md5:
         os.system("systemctl -q restart openvpn@tun0")
         shorewall_add_port(current_user, str(params.port), 'tcp', 'openvpn')
-        set_lastchange()
+        #set_lastchange()
     return {'result': 'done'}
 
 # Set WireGuard config
@@ -2827,7 +2842,7 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
     if initial_md5 != final_md5:
         os.system("wg setconf wg0 /etc/wireguard/wg0.conf")
         shorewall_add_port(current_user, str(wg_port), 'udp', 'wireguard')
-        set_lastchange()
+        #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wireguard'}
 
 class ByPass(BaseModel):
@@ -2851,7 +2866,7 @@ def bypass(*, bypassconfig: ByPass, current_user: User = Depends(get_current_use
             configdata = json.loads(content)
             data = configdata
         except ValueError as e:
-            return {'error': 'Config file not readable', 'route': 'lastchange'}
+            return {'error': 'Config file not readable', 'route': 'bypass'}
     else:
         data = {}
         configdata = {}
@@ -2893,6 +2908,7 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     lanips = lanconfig.lanips
     if not lanips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'lan'}
+    LOG.debug("modif_config_user for lanip")
     modif_config_user(current_user.username, {'lanips': lanips})
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
@@ -2917,7 +2933,7 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
         if initial_md5 != final_md5:
             os.system("systemctl -q restart openvpn@tun0")
-            set_lastchange()
+            #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'lan'}
 
 class VPNips(BaseModel):
@@ -2938,10 +2954,17 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     localip6 = vpnconfig.localip6
     ula = vpnconfig.ula
     if not remoteip or not localip:
+        return {'result': 'done', 'reason': 'No changes', 'route': 'vpnips'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    if 'vpnremoteip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnremoteip'] == remoteip and 'vpnlocalip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnlocalip'] == localip and ula and ('ula' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['ula'] == ula):
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
-    modif_config_user(current_user.username, {'vpnremoteip': remoteip})
-    modif_config_user(current_user.username, {'vpnlocalip': localip})
-    if ula:
+    if 'vpnremoteip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnremoteip'] != remoteip:
+        LOG.debug("modif_config_user for vpnips")
+        modif_config_user(current_user.username, {'vpnremoteip': remoteip})
+    if 'vpnlocalip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnlocalip'] != localip:
+        modif_config_user(current_user.username, {'vpnlocalip': localip})
+    if ula and ('ula' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['ula'] != ula):
         modif_config_user(current_user.username, {'ula': ula})
     userid = current_user.userid
     if userid is None:
@@ -2966,42 +2989,58 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q restart omr6in4@user" + str(userid))
-        set_lastchange()
+        #set_lastchange()
 
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
+    dataexist = False
     with open('/etc/shorewall/params.vpn', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
             if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
                 n.write(line)
-        if not userid == 0:
-            n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
-        elif userid == 0:
-            n.write('OMR_ADDR=' + remoteip + '\n')
+            elif not userid == 0:
+                n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
+                dataexist = True
+            if userid == 0:
+                n.write('OMR_ADDR=' + remoteip + '\n')
+                dataexist = True
+        if not dataexist:
+            if not userid == 0:
+                n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
+            elif userid == 0:
+                n.write('OMR_ADDR=' + remoteip + '\n')
     os.close(fd)
     move(tmpfile, '/etc/shorewall/params.vpn')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
-        set_lastchange()
+        #set_lastchange()
 
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
+    dataexist = False
     with open('/etc/shorewall6/params.vpn', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
             if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
                 n.write(line)
-        if  not userid == 0:
-            n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
-        elif userid == 0:
-            n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+            elif  not userid == 0:
+                n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                dataexist = True
+            elif userid == 0:
+                n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                dataexist = True
+        if not dataexist:
+            if  not userid == 0:
+                n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+            elif userid == 0:
+                n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
 
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/params.vpn')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall6")
-        set_lastchange()
+        #set_lastchange()
 
     return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
 
@@ -3144,13 +3183,15 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
             if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
                 shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, publicip)
                 shadowsocks_port = shadowsocks_port + 1
-    user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
+    if shadowsocks_port is not None:
+        user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
         user_json[params.username].update({"vpn": params.vpn})
     if params.proxy is not None:
         user_json[params.username].update({"proxy": params.proxy})
     content['users'][0].update(user_json)
     if content:
+        LOG.debug("backup_config() in add user")
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
@@ -3166,7 +3207,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         add_dsvpn(userid)
 
-    set_lastchange(30)
+    #set_lastchange(30)
     #os.execv(__file__, sys.argv)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         global fake_users_db
@@ -3182,7 +3223,7 @@ def add_user_note(*, params: ExistingUser, current_user: User = Depends(get_curr
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
     modif_config_user(params.username,{"note": params.note})
-    set_lastchange(30)
+    #set_lastchange(30)
 
 
 class RemoveUser(BaseModel):
@@ -3206,6 +3247,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     if os.path.isfile('/etc/xray/xray-server.json'):
         xray_del_user(params.username)
     if content:
+        LOG.debug("backup_config() in remove user")
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
             json.dump(content, f, indent=4)
@@ -3221,7 +3263,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         remove_glorytun_udp(userid)
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         remove_dsvpn(userid)
-    set_lastchange(30)
+    #set_lastchange(30)
     #os.execv(__file__, sys.argv)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         global fake_users_db

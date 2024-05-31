@@ -1,3 +1,12 @@
+omr-vps-admin (0.10+20240531) unstable; urgency=medium
+
+    * Add option to disable GRE tunnels
+    * Add more Debug logs
+    * Don't set VPN IPs if not really needed
+    * Disable set_lastchange function not used and not working
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 31 May 2024 13:17:23 +0200
+
 omr-vps-admin (0.9+20240528) unstable; urgency=medium
 
     * Add SOF-67: Returning total number of users by Dillon Ward
