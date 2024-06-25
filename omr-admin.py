@@ -1355,6 +1355,20 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
     vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
+    vps_cpu_count = os.cpu_count()
+    vps_memory = psutil.virtual_memory()
+    vps_memory_total = vps_memory.total
+    vps_memory_available = vps_memory.available
+    vps_memory_percent = vps_memory.percent
+    vps_memory_used = vps_memory.used
+    vps_memory_free = vps_memory.free
+    vps_disk = psutil.disk_usage('/')
+    vps_disk_total = vps_disk.total
+    vps_disk_used = vps_disk.used
+    vps_disk_free = vps_disk.free
+    vps_disk_percent = vps_disk.percent
+    vps_cpu_freq = psutil.cpu_freq().current
+    vps_cpu_model = os.popen("cat /proc/cpuinfo | awk -F: '/model name/ {print $2;exit}'").read().strip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_hostname = socket.gethostname()
     vps_current_time = time.time()
@@ -1422,7 +1436,7 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
     LOG.debug('Get status: done')
     if IFACE:
-        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'tx': ss_go_tx, 'rx': ss_go_rx}}
+        return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg,'cpu_model': vps_cpu_model, 'cpu_count': vps_cpu_count, 'memory_total': vps_memory_total, 'memory_available': vps_memory_available, 'memory_percent': vps_memory_percent, 'memory_used': vps_memory_used, 'memory_free': vps_memory_free,'disk_total': vps_disk_total, 'disk_used': vps_disk_used, 'disk_free': vps_disk_free, 'disk_percent': vps_disk_percent, 'cpu_freq': vps_cpu_freq, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'tx': ss_go_tx, 'rx': ss_go_rx}}
     else:
         return {'error': 'No iface defined', 'route': 'status'}
 
