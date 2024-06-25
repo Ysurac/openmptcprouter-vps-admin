@@ -1,3 +1,9 @@
+omr-vps-admin (0.11+20240625) unstable; urgency=medium
+
+    * Add memory, hard disk and CPU usage in status endpoint
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 25 June 2024 15:12:44 +0200
+
 omr-vps-admin (0.10+20240531) unstable; urgency=medium
 
     * Add option to disable GRE tunnels
