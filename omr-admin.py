@@ -1336,7 +1336,7 @@ async def mptcpsupport(request: Request):
             with open('/proc/net/mptcp_net/mptcp') as f:
                 if iptohex in f.read():
                     return {"mptcp": "working"}
-        elif not os.popen("ss -M | grep " + ip) == '':
+        elif not os.popen("timeout 2 ss -M | grep " + ip) == '':
             return {"mptcp": "working"}
         return {"mptcp": "not working"}
 
