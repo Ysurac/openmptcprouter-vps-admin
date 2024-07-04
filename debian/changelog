@@ -1,3 +1,9 @@
+omr-vps-admin (0.11+20240704) unstable; urgency=medium
+
+    * Use subprocess for ss -M command
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 04 Jul 2024 11:40:03 +0200
+
 omr-vps-admin (0.11+20240629) unstable; urgency=medium
 
     * Add a timeout on ss -M command

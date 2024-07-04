@@ -1336,8 +1336,12 @@ async def mptcpsupport(request: Request):
             with open('/proc/net/mptcp_net/mptcp') as f:
                 if iptohex in f.read():
                     return {"mptcp": "working"}
-        elif not os.popen("timeout 2 ss -M | grep " + ip) == '':
-            return {"mptcp": "working"}
+        else:
+            mptcpcheck = subprocess.Popen("timeout 2 ss -M | grep -q " + ip, shell=True, stdout=subprocess.PIPE)
+            mptcpcheck.communicate()
+            if mptcpcheck.returncode == 0:
+                return {"mptcp": "working"}
+            mptcpcheck.kill()
         return {"mptcp": "not working"}
 
 # Get VPS status
