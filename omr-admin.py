@@ -1371,7 +1371,10 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
     vps_disk_used = vps_disk.used
     vps_disk_free = vps_disk.free
     vps_disk_percent = vps_disk.percent
-    vps_cpu_freq = psutil.cpu_freq().current
+    try:
+        vps_cpu_freq = psutil.cpu_freq().current
+    except:
+        vps_cpu_freq = None
     vps_cpu_model = os.popen("cat /proc/cpuinfo | awk -F: '/model name/ {print $2;exit}'").read().strip()
     vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
     vps_hostname = socket.gethostname()
