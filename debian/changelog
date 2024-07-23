@@ -1,3 +1,9 @@
+omr-vps-admin (0.11+20240723) unstable; urgency=medium
+
+    * Remove netjson dependency and endpoint using it
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 23 Jul 2024 15:01:25 +0200
+
 omr-vps-admin (0.11+20240705) unstable; urgency=medium
 
     * psutil.cpu_freq only available in psutil >5.1.0 put request in a try/except block

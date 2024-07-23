@@ -39,7 +39,7 @@ import requests
 from jwt import PyJWTError
 from netaddr import *
 from ipaddress import ip_address, IPv4Address, IPv6Address
-from netjsonconfig import OpenWrt
+#from netjsonconfig import OpenWrt
 from fastapi import Depends, FastAPI, HTTPException, Security, Query, Request, UploadFile
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes, OAuth2
 from passlib.context import CryptContext
@@ -3120,21 +3120,21 @@ def list_backup(current_user: User = Depends(get_current_user)):
     else:
         return {'backup': False}
 
-@app.get('/backupshow', summary="Show current user backup")
-def show_backup(current_user: User = Depends(get_current_user)):
-    if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
-        router = OpenWrt(native=open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'))
-        return {'backup': True, 'data': router}
-    else:
-        return {'backup': False}
+#@app.get('/backupshow', summary="Show current user backup")
+#def show_backup(current_user: User = Depends(get_current_user)):
+#    if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
+#        router = OpenWrt(native=open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'))
+#        return {'backup': True, 'data': router}
+#    else:
+#        return {'backup': False}
 
-@app.post('/backupedit', summary="Modify current user backup")
-def edit_backup(params, current_user: User = Depends(get_current_user)):
-    if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'backupedit'}
-    o = OpenWrt(params)
-    o.write(current_user.username + '-backup', path='/var/opt/openmptcprouter/')
-    return {'result': 'done'}
+#@app.post('/backupedit', summary="Modify current user backup")
+#def edit_backup(params, current_user: User = Depends(get_current_user)):
+#    if current_user.permissions == "ro":
+#        return {'result': 'permission', 'reason': 'Read only user', 'route': 'backupedit'}
+#    o = OpenWrt(params)
+#    o.write(current_user.username + '-backup', path='/var/opt/openmptcprouter/')
+#    return {'result': 'done'}
 
 #class VPN(str, Enum):
 #    openvpn = "openvpn"
