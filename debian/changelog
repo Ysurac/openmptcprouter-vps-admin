@@ -1,3 +1,9 @@
+omr-vps-admin (0.12+20240725) unstable; urgency=medium
+
+    * Add server workers
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 25 Jul 2024 08:26:12 +0200
+
 omr-vps-admin (0.11+20240723) unstable; urgency=medium
 
     * Remove netjson dependency and endpoint using it

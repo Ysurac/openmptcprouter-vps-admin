@@ -163,6 +163,7 @@ def get_bytes_ss(port):
 def get_bytes_ss_go(user):
     try:
         r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats")
+        #r = requests.get(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/stats")
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go stats timeout")
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
@@ -372,6 +373,7 @@ def remove_ss_user(port):
 def add_ss_go_user(user, key=''):
     try:
         r = requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
+        #r = requests.post(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go add timeout")
     except requests.exceptions.RequestException as err:
@@ -381,6 +383,7 @@ def add_ss_go_user(user, key=''):
 def remove_ss_go_user(user):
     try:
         r = requests.delete(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
+        #r = requests.delete(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users/" + user)
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go remove timeout")
     except requests.exceptions.RequestException as err:
@@ -1236,6 +1239,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         token_data = TokenData(username=username)
     except PyJWTError:
         raise credentials_exception
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    fake_users_db = omr_config_data['users'][0]
+
     user = get_user(fake_users_db, username=token_data.username)
     if user is None:
         raise credentials_exception
@@ -1255,6 +1262,10 @@ async def homepage():
 # function is used to actually generate the token
 @app.post('/token', response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    fake_users_db = omr_config_data['users'][0]
+
     user = authenticate_user(fake_users_db, form_data.username, form_data.password)
     if not user:
         LOG.debug("Incorrect username or password")
@@ -1284,6 +1295,10 @@ async def login_basic(auth: BasicAuth = Depends(basic_auth)):
     try:
         decoded = base64.b64decode(auth).decode("ascii")
         username, _, password = decoded.partition(":")
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+            omr_config_data = json.load(f)
+            fake_users_db = omr_config_data['users'][0]
+
         user = authenticate_user(fake_users_db, username, password)
         if not user:
             raise HTTPException(status_code=400, detail="Incorrect email or password")
@@ -3230,10 +3245,10 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
 
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        global fake_users_db
-        omr_config_data = json.load(f)
-        fake_users_db = omr_config_data['users'][0]
+    #with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+    #    global fake_users_db
+    #    omr_config_data = json.load(f)
+    #    fake_users_db = omr_config_data['users'][0]
 
 class ExistingUser(BaseModel):
     username: str = Query(..., title="Username")
@@ -3286,10 +3301,10 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         remove_dsvpn(userid)
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        global fake_users_db
-        omr_config_data = json.load(f)
-        fake_users_db = omr_config_data['users'][0]
+    #with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+    #    global fake_users_db
+    #    omr_config_data = json.load(f)
+    #    fake_users_db = omr_config_data['users'][0]
 
 class ClienttoClient(BaseModel):
     enable: bool = False
@@ -3367,9 +3382,19 @@ async def speedtestul(file: UploadFile, current_user: User = Depends(get_current
     else:
         return {'filename': file.filename}
 
-def main(omrport: int, omrhost: str):
+def ipv6_enabled():
+    ipv6_enabled = False
+    addr = netifaces.ifaddresses('lo')
+    ipv4_addr_list = addrs[netifaces.AF_INET]
+    for ip_info in ipv4_addr_list:
+        addr = ip_info['addr']
+        if IPAddress(addr).version == 6:
+            ipv6_enabled = True
+    return ipv6_enabled
+
+def main(omrport: int, omrhost: str, workers: int):
     LOG.debug("Main OMR-Admin launch")
-    uvicorn.run(app, host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5)
+    uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=workers)
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -3377,12 +3402,19 @@ if __name__ == '__main__':
     omrport = 65500
     if 'port' in omr_config_data:
         omrport = omr_config_data["port"]
-    omrhost = '0.0.0.0'
+    if ipv6_enabled:
+        omrhost = '::'
+    else:
+        omrhost = '0.0.0.0'
     if 'host' in omr_config_data:
         omrhost = omr_config_data["host"]
+    workers = 4
+    if 'workers' in omr_config_data:
+        workers = omr_config_data["workers"]
     parser = argparse.ArgumentParser(description="OpenMPTCProuter Server API")
     parser.add_argument("--port", type=int, help="Listening port", default=omrport)
     parser.add_argument("--host", type=str, help="Listening host", default=omrhost)
+    parser.add_argument("--workers", type=str, help="Workers", default=workers)
     args = parser.parse_args()
-    main(args.port, args.host)
+    main(args.port, args.host, args.workers)
     #uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=6)
