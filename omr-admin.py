@@ -1488,22 +1488,24 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if 'proxy' in omr_config_data['users'][0][username]:
         proxy = omr_config_data['users'][0][username]['proxy']
 
-    with open('/etc/shadowsocks-libev/manager.json') as f:
-        content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        data = json.loads(content)
-    except ValueError as e:
-        data = {'port_key': '', 'server_port': 65101, 'method': 'chacha20'}
+    if os.path.isfile('/etc/shadowsocks-libev/manager.js'):
+        with open('/etc/shadowsocks-libev/manager.json') as f:
+            content = f.read()
+        content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+        try:
+            data = json.loads(content)
+        except ValueError as e:
+            data = {'server_port': 65101, 'method': 'chacha20'}
+    else:
+        data = {'server_port': 65101, 'method': 'chacha20'}
     #shadowsocks_port = data["server_port"]
     shadowsocks_port = current_user.shadowsocks_port
+    shadowsocks_key = ''
     if shadowsocks_port is not None:
         if 'port_key' in data:
             shadowsocks_key = data["port_key"][str(shadowsocks_port)]
-        else:
+        elif 'port_conf' in data:
             shadowsocks_key = data["port_conf"][str(shadowsocks_port)]["key"]
-    else:
-        shadowsocks_key = ''
     shadowsocks_method = data["method"]
     if 'fast_open' in data:
         shadowsocks_fast_open = data["fast_open"]
