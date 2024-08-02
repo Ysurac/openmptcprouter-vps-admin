@@ -62,9 +62,6 @@ LOG = logging.getLogger('api')
 LOG.setLevel(logging.ERROR)
 #LOG.setLevel(logging.DEBUG)
 
-# Generate a random secret key
-SECRET_KEY = uuid.uuid4().hex
-JWT_SECRET_KEY = uuid.uuid4().hex
 PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
@@ -1095,6 +1092,15 @@ if not 'gre_tunnels' in omr_config_data or omr_config_data['gre_tunnels']:
 
 fake_users_db = omr_config_data['users'][0]
 
+# Generate a random secret key
+if 'secret_key' in omr_config_data:
+    SECRET_KEY = omr_config_data['secret_key']
+else:
+    SECRET_KEY = uuid.uuid4().hex
+    set_global_param('secret_key',SECRET_KEY)
+
+
+
 def verify_password(plain_password, user_password):
     if secrets.compare_digest(plain_password,user_password):
         LOG.debug("password true")
@@ -1239,13 +1245,15 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             raise credentials_exception
         token_data = TokenData(username=username)
     except PyJWTError:
+        LOG.debug("PyJWTError")
         raise credentials_exception
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
     fake_users_db = omr_config_data['users'][0]
-
+    LOG.debug('token user: ' + token_data.username)
     user = get_user(fake_users_db, username=token_data.username)
     if user is None:
+        LOG.debug("user is none")
         raise credentials_exception
     return user
 
@@ -1849,7 +1857,6 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         ipv6_addr = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     if ipv6_addr != '':
         set_global_param('ipv6_addr', ipv6_addr)
-
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
     ipv4_addr = ''
