@@ -682,7 +682,7 @@ def add_gre_tunnels():
                                 user_gre_tunnels = {}
                                 if 'gre_tunnels' in content['users'][0][user]:
                                     user_gre_tunnels = content['users'][0][user]['gre_tunnels']
-                                if not gre_intf in user_gre_tunnels or user_gre_tunnels[gre_intf]['public_ip'] != str(addr):
+                                if os.path.isfile('/etc/shadowsocks-libev/manager.json') and (not gre_intf in user_gre_tunnels or user_gre_tunnels[gre_intf]['public_ip'] != str(addr)):
                                     with open('/etc/shadowsocks-libev/manager.json') as g:
                                         contentss = g.read()
                                     contentss = re.sub(",\s*}", "}", contentss) # pylint: disable=W1401
@@ -711,7 +711,8 @@ def add_gre_tunnels():
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
         if initial_md5 != final_md5:
             os.system("systemctl -q reload shorewall")
-            os.system("systemctl -q restart shadowsocks-libev-manager@manager")
+            if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+                os.system("systemctl -q restart shadowsocks-libev-manager@manager")
     set_global_param('allips', allips)
 
 def add_glorytun_tcp(userid):
@@ -1839,11 +1840,16 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         ipv6_network = omr_config_data['ipv6_network']
     else:
         ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+    if ipv6_network != '':
+        set_global_param('ipv6_network', ipv6_network)
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
     if 'ipv6_addr' in omr_config_data:
         ipv6_addr = omr_config_data['ipv6_addr']
     else:
         ipv6_addr = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
+    if ipv6_addr != '':
+        set_global_param('ipv6_addr', ipv6_addr)
+
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
     ipv4_addr = ''
@@ -1986,6 +1992,9 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks'}
+    if not os.path.isfile('/etc/shadowsocks-libev/manager.js'):
+        return {'result': 'warning', 'reason': 'Shadowsocks-lib not installed', 'route': 'shadowsocks'}
+
     ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-libev/manager.json') as f:
@@ -2151,6 +2160,9 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks-go'}
+    if not os.path.isfile('/etc/shadowsocks-go/server.json'):
+        return {'result': 'warning', 'reason': 'Shadowsocks-go not installed', 'route': 'shadowsocks-go'}
+
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-go/server.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-go/server.json') as f:
         content = f.read()
@@ -2380,7 +2392,10 @@ class V2rayconfig(BaseModel):
 @app.post('/v2ray', summary="Set v2ray settings")
 def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayredirect'}
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2ray'}
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return {'result': 'warning', 'reason': 'V2Ray not installed', 'route': 'v2ray'}
+
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     #with open('/etc/v2ray/v2ray-server.json') as f:
     #    v2ray_config = json.load(f)
@@ -2412,7 +2427,10 @@ class Xrayconfig(BaseModel):
 @app.post('/xray', summary="Set xray settings")
 def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayredirect'}
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xray'}
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return {'result': 'warning', 'reason': 'Xay not installed', 'route': 'xray'}
+
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     test_vless_reality = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ")' /etc/xray/xray-server.json").read().rstrip()
     if test_vless_reality != '':
@@ -2483,6 +2501,8 @@ class V2rayparams(BaseModel):
 def v2ray_redirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayredirect'}
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return {'result': 'warning', 'reason': 'V2Ray not installed', 'route': 'v2rayredirect'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
@@ -2510,6 +2530,9 @@ class Xrayparams(BaseModel):
 def xray_redirect(*, params: Xrayparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayredirect'}
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return {'result': 'warning', 'reason': 'Xay not installed', 'route': 'xrayredirect'}
+
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
@@ -2529,7 +2552,9 @@ def xray_redirect(*, params: Xrayparams, current_user: User = Depends(get_curren
 @app.post('/v2rayunredirect', summary="Remove a redirected port from Server to Router with V2Ray")
 def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayredirect'}
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'v2rayunredirect'}
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return {'result': 'warning', 'reason': 'V2Ray not installed', 'route': 'v2rayunredirect'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
@@ -2549,7 +2574,9 @@ def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_cu
 @app.post('/xrayunredirect', summary="Remove a redirected port from Server to Router with XRay")
 def xray_unredirect(*, params: Xrayparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayredirect'}
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayunredirect'}
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return {'result': 'warning', 'reason': 'Xay not installed', 'route': 'xrayunredirect'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
@@ -2614,11 +2641,16 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     move(tmpfile, '/etc/sysctl.d/90-shadowsocks.conf')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/sysctl.d/90-shadowsocks.conf', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
-        os.system("systemctl -q restart shadowsocks-libev-manager@manager")
-        os.system("systemctl -q restart v2ray")
-        os.system("systemctl -q restart xray")
-        os.system("systemctl -q restart glorytun-tcp@tun0")
-        os.system("systemctl -q restart openvpn@tun0")
+        if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+            os.system("systemctl -q restart shadowsocks-libev-manager@manager")
+        if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+            os.system("systemctl -q restart v2ray")
+        if os.path.isfile('/etc/xray/xray-server.json'):
+            os.system("systemctl -q restart xray")
+        if os.path.isfile('/etc/glorytun-tcp/tun0'):
+            os.system("systemctl -q restart glorytun-tcp@tun0")
+        if os.path.isfile('/etc/openvpn/tun0.conf'):
+            os.system("systemctl -q restart openvpn@tun0")
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
@@ -2698,6 +2730,9 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'glorytun'}
+    if not os.path.isfile('/etc/glorytun-tcp/tun0') and not os.path.isfile('/etc/glorytun-udp/tun0'):
+        return {'result': 'warning', 'reason': 'Glorytun is not installed', 'route': 'glorytun'}
+
     userid = current_user.userid
     if userid is None:
         userid = 0
@@ -2759,6 +2794,8 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'dsvpn'}
+    if not os.path.isfile('/etc/dsvpn/dsvpn'):
+        return {'result': 'warning', 'reason': 'DSVPN is not installed', 'route': 'dsvpn'}
     userid = current_user.userid
     if userid is None:
         userid = 0
@@ -2800,6 +2837,8 @@ def mlvpn(*, params: MLVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'mlvpn'}
+    if not os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
+        return {'result': 'warning', 'reason': 'MLVPN is not installed', 'route': 'mlvpn'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/mlvpn/mlvpn0.conf', 'rb'))).hexdigest()
     mlvpn_config = configparser.ConfigParser()
     mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
@@ -2827,6 +2866,8 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'openvpn'}
+    if not os.path.isfile('/etc/openvpn/tun0.conf'):
+        return {'result': 'warning', 'reason': 'OpenVPN is not installed', 'route': 'openvpn'}
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
@@ -2927,6 +2968,9 @@ def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
     ips = wanips.ips
     if not ips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'wan'}
+    if not os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+        return {'result': 'warning', 'reason': 'Shadowsocks-libev is not installed', 'route': 'wan'}
+
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/local.acl', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-libev/local.acl', 'w') as outfile:
         outfile.write('[white_list]\n')
@@ -2953,7 +2997,7 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     client2client = False
     if 'client2client' in omr_config_data:
         client2client = omr_config_data["client2client"]
-    if client2client == True:
+    if client2client == True and os.path.isfile('/etc/openvpn/tun0.conf'):
         with open('/etc/openvpn/ccd/' + current_user.username, 'w') as outfile:
             for lan in lanips:
                 ip = IPNetwork(lan)
@@ -3318,17 +3362,18 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
     set_global_param('client2client', params.enable)
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
-    with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if not 'client-to-client' in line:
-                n.write(line)
-        if params.enable == True:
-            n.write('client-to-client' + "\n")
-    os.close(fd)
-    move(tmpfile, '/etc/openvpn/tun0.conf')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        os.system("systemctl -q restart openvpn@tun0")
+    if os.path.isfile('/etc/openvpn/tun0.conf'):
+        with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
+            for line in f:
+                if not 'client-to-client' in line:
+                    n.write(line)
+            if params.enable == True:
+                n.write('client-to-client' + "\n")
+        os.close(fd)
+        move(tmpfile, '/etc/openvpn/tun0.conf')
+        final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
+        if initial_md5 != final_md5:
+            os.system("systemctl -q restart openvpn@tun0")
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/policy', 'r') as f, open(tmpfile, 'a+') as n:
