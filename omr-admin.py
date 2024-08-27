@@ -2184,8 +2184,9 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
         return {'result': 'error', 'reason': 'Read only user', 'route': 'shadowsocks-go'}
     port = params.port
     # If method is aes 128 then key need to be length 16 instead of 32, so force aes-256-gcm for now
-    #method = params.method
-    method = "2022-blake3-aes-256-gcm"
+    method = params.method
+    if method == "2022-blake3-aes-128-gcm":
+        method = "2022-blake3-aes-256-gcm"
     fast_open = params.fast_open
     reuse_port = params.reuse_port
     mptcp = params.mptcp
