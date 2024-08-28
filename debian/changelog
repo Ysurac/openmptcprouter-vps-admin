@@ -1,3 +1,10 @@
+omr-vps-admin (0.12+20240827) unstable; urgency=medium
+
+    * Add support for "none" encryption with Shadowsocks-go
+    * Check if there is really a modification before modifying config file
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 27 Aug 2024 15:14:37 +0200
+
 omr-vps-admin (0.12+20240819) unstable; urgency=medium
 
     * Add LAN IPs info in status return

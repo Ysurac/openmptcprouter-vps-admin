@@ -25,6 +25,7 @@ import shutil
 import psutil
 import time
 import uuid
+import copy
 from pprint import pprint
 from datetime import datetime, timedelta
 from tempfile import mkstemp
@@ -300,11 +301,15 @@ def set_global_param(key, value):
 def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
+    content_initial = copy.deepcopy(content)
     content['users'][0][user].update(changes)
-    LOG.debug("backup_config() in modif_config_user")
-    backup_config()
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-        json.dump(content, f, indent=4)
+    if content_initial != content:
+        LOG.debug("backup_config() in modif_config_user")
+        backup_config()
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
+            json.dump(content, f, indent=4)
+    else:
+        LOG.debug("No real changes in modif_config_user")
 
 def add_ss_user(port, key, userid=0, ip=''):
     with open('/etc/shadowsocks-libev/manager.json') as f:
