@@ -1,3 +1,11 @@
+omr-vps-admin (0.12+20240920) unstable; urgency=medium
+
+    * Fix Shadowsocks-go changes
+    * Fix Shadowsocks-libev changes
+    * Fix MPTCP support check
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 20 Sep 2024 08:09:20 +0200
+
 omr-vps-admin (0.12+20240827) unstable; urgency=medium
 
     * Add support for "none" encryption with Shadowsocks-go

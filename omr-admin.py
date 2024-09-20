@@ -1358,6 +1358,8 @@ async def status(request: Request):
 @app.get('/mptcpsupport')
 async def mptcpsupport(request: Request):
     ip = request.client.host
+    if type(ip_address(ip)) is IPv6Address:
+        ip = str(ip_address(ip).ipv4_mapped)
     if type(ip_address(ip)) is IPv4Address:
         ipr = list(reversed(ip.split('.')))
         iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, ipr))
@@ -1372,6 +1374,7 @@ async def mptcpsupport(request: Request):
                 return {"mptcp": "working"}
             mptcpcheck.kill()
         return {"mptcp": "not working"}
+    return {"mptcp": "check only support IPv4"}
 
 # Get VPS status
 @app.get('/status', summary="Get current server load average, uptime and release")
@@ -1502,7 +1505,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if 'proxy' in omr_config_data['users'][0][username]:
         proxy = omr_config_data['users'][0][username]['proxy']
 
-    if os.path.isfile('/etc/shadowsocks-libev/manager.js'):
+    if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         with open('/etc/shadowsocks-libev/manager.json') as f:
             content = f.read()
         content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
@@ -2008,7 +2011,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks'}
-    if not os.path.isfile('/etc/shadowsocks-libev/manager.js'):
+    if not os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         return {'result': 'warning', 'reason': 'Shadowsocks-lib not installed', 'route': 'shadowsocks'}
 
     ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
@@ -2197,7 +2200,12 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     mptcp = params.mptcp
     #key = params.key
     LOG.debug("modif_config_user for shadowsocks-go port")
-    modif_config_user(current_user.username, {'shadowsocks-go_port': port})
+    shadowsocks_go_psk = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .psk' /etc/shadowsocks-go/server.json").read().rstrip()
+    shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + current_user.username + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
+    shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': port, 'protocol': method }
+    modif_config_user(current_user.username, {'shadowsocks-go': shadowsocks_go_conf})
+
+    modif_config_user(current_user.username, {'shadowsocks-go': {'port': port,'method': method}})
     userid = current_user.userid
     if userid is None:
         userid = 0
