@@ -160,15 +160,32 @@ def get_bytes_ss(port):
 
 def get_bytes_ss_go(user):
     try:
-        r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats")
-        #r = requests.get(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/stats")
+        #r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats")
+        r = requests.get(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/stats")
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go stats timeout")
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     except requests.exceptions.RequestException as err:
         LOG.debug("Shadowsocks go stats error (" + str(err) + ")")
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
-    if 'error' in r.json():
+    try:
+        if 'error' in r.json():
+            return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    except requests.exceptions.JSONDecodeError:
+        try:
+            r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats")
+            #r = requests.get(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/stats")
+        except requests.exceptions.Timeout:
+            LOG.debug("Shadowsocks go stats timeout")
+            return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+        except requests.exceptions.RequestException as err:
+            LOG.debug("Shadowsocks go stats error (" + str(err) + ")")
+            return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    try:
+        if 'error' in r.json():
+            return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    except requests.exceptions.JSONDecodeError as err:
+        LOG.debug("Shadowsocks go stats error (" + str(err) + ")")
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     if 'users' in r.json():
         for userdata in r.json()['users']:
@@ -1924,7 +1941,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         locaip6 = 'fd00::a00:1'
         remoteip6 = 'fd00::a00:2'
 
-    vpn = 'glorytun_tcp'
+    vpn = 'openvpn'
     if 'vpn' in omr_config_data['users'][0][username]:
         vpn = omr_config_data['users'][0][username]['vpn']
 
@@ -3076,27 +3093,29 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     userid = current_user.userid
     if userid is None:
         userid = 0
-    if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
-        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
-    else:
-        initial_md5 = ''
-    with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'w+') as n:
-        n.write('LOCALIP=' + localip + "\n")
-        n.write('REMOTEIP=' + remoteip + "\n")
-        if localip6:
-            n.write('LOCALIP6=' + localip6 + "\n")
+
+    if not '6in4' in omr_config_data or omr_config_data['6in4']:
+        if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
+            initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
         else:
-            n.write('LOCALIP6=fd00::a0' + hex(userid)[2:] + ':1/126' + "\n")
-        if remoteip6:
-            n.write('REMOTEIP6=' + remoteip6 + "\n")
-        else:
-            n.write('REMOTEIP6=fd00::a0' + hex(userid)[2:] + ':2/126' + "\n")
-        if ula:
-            n.write('ULA=' + ula + "\n")
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        os.system("systemctl -q restart omr6in4@user" + str(userid))
-        #set_lastchange()
+            initial_md5 = ''
+        with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'w+') as n:
+            n.write('LOCALIP=' + localip + "\n")
+            n.write('REMOTEIP=' + remoteip + "\n")
+            if localip6:
+                n.write('LOCALIP6=' + localip6 + "\n")
+            else:
+                n.write('LOCALIP6=fd00::a0' + hex(userid)[2:] + ':1/126' + "\n")
+            if remoteip6:
+                n.write('REMOTEIP6=' + remoteip6 + "\n")
+            else:
+                n.write('REMOTEIP6=fd00::a0' + hex(userid)[2:] + ':2/126' + "\n")
+            if ula:
+                n.write('ULA=' + ula + "\n")
+        final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
+        if initial_md5 != final_md5:
+            os.system("systemctl -q restart omr6in4@user" + str(userid))
+            #set_lastchange()
 
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
@@ -3123,31 +3142,31 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         os.system("systemctl -q reload shorewall")
         #set_lastchange()
 
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    dataexist = False
-    with open('/etc/shorewall6/params.vpn', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
-                n.write(line)
-            elif  not userid == 0:
-                n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
-                dataexist = True
-            elif userid == 0:
-                n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
-                dataexist = True
-        if not dataexist:
-            if  not userid == 0:
-                n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
-            elif userid == 0:
-                n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
-
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall6/params.vpn')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        os.system("systemctl -q reload shorewall6")
-        #set_lastchange()
+    if not '6in4' in omr_config_data or omr_config_data['6in4']:
+        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
+        fd, tmpfile = mkstemp()
+        dataexist = False
+        with open('/etc/shorewall6/params.vpn', 'r') as f, open(tmpfile, 'a+') as n:
+            for line in f:
+                if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
+                    n.write(line)
+                elif  not userid == 0:
+                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                    dataexist = True
+                elif userid == 0:
+                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                    dataexist = True
+            if not dataexist:
+                if  not userid == 0:
+                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                elif userid == 0:
+                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+        os.close(fd)
+        move(tmpfile, '/etc/shorewall6/params.vpn')
+        final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
+        if initial_md5 != final_md5:
+            os.system("systemctl -q reload shorewall6")
+            #set_lastchange()
 
     return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
 

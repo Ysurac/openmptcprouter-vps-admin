@@ -1,3 +1,10 @@
+omr-vps-admin (0.13+20241016) unstable; urgency=medium
+
+    * Add Shadowsocks-go new API support
+    * Add option to disable 6in4
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com> Wed, 16 Oct 2024 15:49:13 +0200
+
 omr-vps-admin (0.12+20240920) unstable; urgency=medium
 
     * Fix Shadowsocks-go changes
