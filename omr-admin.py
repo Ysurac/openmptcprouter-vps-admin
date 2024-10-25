@@ -3369,10 +3369,10 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
-    shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
     userid = int(content['users'][0][params.username]['userid'])
     del content['users'][0][params.username]
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+        shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
         remove_ss_user(str(shadowsocks_port))
     if os.path.isfile('/etc/shadowsocks-go/server.json'):
         remove_ss_go_user(params.username)
