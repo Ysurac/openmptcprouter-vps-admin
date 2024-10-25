@@ -1,3 +1,9 @@
+omr-vps-admin (0.13+20241025) unstable; urgency=medium
+
+    * Fix Shadowsocks-go new API support on add/remove user
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com> Fri, 25 Oct 2024 10:09:14 +0200
+
 omr-vps-admin (0.13+20241016) unstable; urgency=medium
 
     * Add Shadowsocks-go new API support

@@ -391,22 +391,30 @@ def remove_ss_user(port):
 
 def add_ss_go_user(user, key=''):
     try:
-        r = requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
-        #r = requests.post(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
+        r = requests.post(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go add timeout")
     except requests.exceptions.RequestException as err:
-        LOG.debug("Shadowsocks go add error (" + str(err) + ")")
+        try:
+            r = requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
+        except requests.exceptions.Timeout:
+            LOG.debug("Shadowsocks go add timeout")
+        except requests.exceptions.RequestException as err:
+            LOG.debug("Shadowsocks go add error (" + str(err) + ")")
     return key
 
 def remove_ss_go_user(user):
     try:
-        r = requests.delete(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
-        #r = requests.delete(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users/" + user)
+        r = requests.delete(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users/" + user)
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go remove timeout")
     except requests.exceptions.RequestException as err:
-        LOG.debug("Shadowsocks go remove error (" + str(err) + ")")
+        try:
+            r = requests.delete(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
+        except requests.exceptions.Timeout:
+            LOG.debug("Shadowsocks go remove timeout")
+        except requests.exceptions.RequestException as err:
+            LOG.debug("Shadowsocks go remove error (" + str(err) + ")")
 
 def v2ray_add_user(user, v2rayuuid='', restart=1):
     if v2rayuuid == '': 
