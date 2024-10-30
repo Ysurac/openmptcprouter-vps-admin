@@ -3265,7 +3265,7 @@ class NewUser(BaseModel):
     permission: permissions = Query("ro", title="permission of the user")
     vpn: VPN = Query("openvpn", title="default VPN for the user")
     proxy: PROXY = Query("shadowsocks-rust", title="default Proxy for the user")
-    shadowsocks_port: Optional[int] = Query(None, gt=0, lt=65535, title="Shadowsocks port")
+    shadowsocks_port: Optional[int] = Query(None, gt=0, lt=65535, title="Shadowsocks-libev port")
     userid: Optional[int] = Query(None, title="User ID")
     ips: Optional[List[str]] = Query(None, title="Public exit IP")
 #    userid: int = Query(0, title="User ID",description="User ID is used to create port of each VPN and shadowsocks",gt=0,le=99)
@@ -3370,6 +3370,8 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     userid = int(content['users'][0][params.username]['userid'])
+    if userid == 0:
+        return {'result': 'not allowed', 'reason': 'Userid 0 is protected', 'route': 'remove_user'}
     del content['users'][0][params.username]
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
