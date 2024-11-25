@@ -454,21 +454,38 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
         data = json.load(f)
         exist = 0
         for inbounds in data['inbounds']:
+            custominbounds = {"inbounds": []}
             if inbounds['tag'] == 'omrin-tunnel':
                 inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 inbounds['settings']['clients'].append({'password': xrayuuid, 'email': user})
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 inbounds['settings']['accounts'].append({'pass': xrayuuid, 'user': user})
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 inbounds['settings']['clients'].append({'password': ukeyss2022, 'email': user})
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        os.system("systemctl -q restart xray")
+    #if initial_md5 != final_md5 and restart == 1:
+    #    os.system("systemctl -q restart xray")
+    
     return xrayuuid
 
 def v2ray_del_user(user, restart=1, protocol="vless"):
@@ -503,31 +520,47 @@ def xray_del_user(user, restart=1, protocol="vless"):
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
         for inbounds in data['inbounds']:
+            custominbounds = {"inbounds": []}
             if inbounds['tag'] == 'omrin-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 for xrayuser in inbounds['settings']['accounts']:
                     if xrayuser['user'] == user:
                         inbounds['settings']['accounts'].remove(xrayuser)
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        os.system("systemctl -q restart xray")
+    #if initial_md5 != final_md5 and restart == 1:
+    #    os.system("systemctl -q restart xray")
 
 def v2ray_add_outbound(tag,ip, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
@@ -1073,20 +1106,25 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall6")
 
-def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip=''):
+def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if source_dip == '':
-                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + gencomment in line:
+            if source_dip == '' and dest_ip == '':
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + gencomment in line:
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + gencomment  in line:
                     n.write(line)
             else:
-                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + ' to ' + source_dip + gencomment in line:
+                comment = ''
+                if source_dip != '':
+                    comment = ' to ' + source_dip
+                if dest_ip != '':
+                    comment = comment + ' from ' + dest_ip
+                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' to ' + source_dip + gencomment in line:
+                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
                     n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
@@ -3369,10 +3407,11 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
+    if not params.username in content['users'][0]:
+        return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'remove_user'}
     userid = int(content['users'][0][params.username]['userid'])
     if userid == 0:
         return {'result': 'not allowed', 'reason': 'Userid 0 is protected', 'route': 'remove_user'}
-    del content['users'][0][params.username]
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
         remove_ss_user(str(shadowsocks_port))
@@ -3382,6 +3421,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         v2ray_del_user(params.username)
     if os.path.isfile('/etc/xray/xray-server.json'):
         xray_del_user(params.username)
+    del content['users'][0][params.username]
     if content:
         LOG.debug("backup_config() in remove user")
         backup_config()

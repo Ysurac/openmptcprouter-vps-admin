@@ -1,3 +1,11 @@
+omr-vps-admin (0.14+20241125) unstable; urgency=medium
+
+    * Block removal of userid 0
+    * Add XRay users via API
+    * Fix Shorewall IPv6 delete rules
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 25 Nov 2024 10:09:35 +0200
+
 omr-vps-admin (0.14+20241025) unstable; urgency=medium
 
     * Fix remove user
