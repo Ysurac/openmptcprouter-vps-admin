@@ -3526,7 +3526,7 @@ async def speedtestul(file: UploadFile, current_user: User = Depends(get_current
 
 def ipv6_enabled():
     ipv6_enabled = False
-    addr = netifaces.ifaddresses('lo')
+    addrs = netifaces.ifaddresses('lo')
     ipv4_addr_list = addrs[netifaces.AF_INET]
     for ip_info in ipv4_addr_list:
         addr = ip_info['addr']
@@ -3544,7 +3544,7 @@ if __name__ == '__main__':
     omrport = 65500
     if 'port' in omr_config_data:
         omrport = omr_config_data["port"]
-    if ipv6_enabled:
+    if ipv6_enabled():
         omrhost = '::'
     else:
         omrhost = '0.0.0.0'

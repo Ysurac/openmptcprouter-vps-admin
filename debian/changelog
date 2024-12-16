@@ -1,3 +1,9 @@
+omr-vps-admin (0.14+20241216) unstable; urgency=medium
+
+    * Fix typos
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 16 Dec 2024 15:41:21 +0200
+
 omr-vps-admin (0.14+20241125) unstable; urgency=medium
 
     * Block removal of userid 0
