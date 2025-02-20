@@ -14,35 +14,34 @@ import configparser
 import argparse
 import subprocess
 import os
-import sys
+#import sys
 import glob
 import socket
-from operator import itemgetter, attrgetter
+from operator import itemgetter
 import re
 import hashlib
-import pathlib
+#import pathlib
 import shutil
-import psutil
 import time
-import uuid
 import copy
-from pprint import pprint
+#from pprint import pprint
 from datetime import datetime, timedelta
 from tempfile import mkstemp
 from typing import List, Optional
 from shutil import move
 from enum import Enum
 from os import path
+from ipaddress import ip_address, IPv4Address, IPv6Address
 import logging
 import uvicorn
 import jwt
 import requests
 from jwt import PyJWTError
 from netaddr import *
-from ipaddress import ip_address, IPv4Address, IPv6Address
+import psutil
 #from netjsonconfig import OpenWrt
-from fastapi import Depends, FastAPI, HTTPException, Security, Query, Request, UploadFile
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes, OAuth2
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2
 from passlib.context import CryptContext
 from fastapi.encoders import jsonable_encoder
 from fastapi.security.base import SecurityBase
@@ -51,17 +50,22 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.models import SecurityBase as SecurityBaseModel
-from fastapi.responses import StreamingResponse, FileResponse
-from pydantic import BaseModel, ValidationError # pylint: disable=E0611
+from fastapi.responses import FileResponse
+from pydantic import BaseModel # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse
 #from starlette.requests import Request
 import netifaces
 
 #logging.basicConfig(filename='/tmp/omr-admin.log', encoding='utf-8', level=logging.DEBUG)
-LOG = logging.getLogger('api')
-LOG.setLevel(logging.ERROR)
-#LOG.setLevel(logging.DEBUG)
+#LOG = logging.getLogger('api')
+
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(levelname)s: "
+                           "%(module)s:%(funcName)s:%(lineno)d - %(message)s")
+#LOG = logging.getLogger('OMR-Admin')
+LOG = logging.getLogger('uvicorn.error')
 
 PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
@@ -161,7 +165,7 @@ def get_bytes_ss(port):
 def get_bytes_ss_go(user):
     try:
         #r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats")
-        r = requests.get(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/stats")
+        r = requests.get(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/stats", timeout=5)
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go stats timeout")
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
@@ -173,7 +177,7 @@ def get_bytes_ss_go(user):
             return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     except requests.exceptions.JSONDecodeError:
         try:
-            r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats")
+            r = requests.get(url="http://127.0.0.1:65279/v1/servers/ss-2022/stats", timeout=5)
             #r = requests.get(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/stats")
         except requests.exceptions.Timeout:
             LOG.debug("Shadowsocks go stats timeout")
@@ -235,7 +239,7 @@ def checkIfProcessRunning(processName):
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
-    return False;
+    return False
 
 def file_as_bytes(file):
     with file:
@@ -276,8 +280,9 @@ def check_username_serial(username, serial):
         configdata = json.loads(content)
         data = configdata
     except ValueError as e:
-        return {'error': 'Config file not readable', 'route': 'check_serial'}
-    if 'serial_enforce' not in data or data['serial_enforce'] == False:
+        #return {'error': 'Config file not readable', 'route': 'check_serial'}
+        return False
+    if 'serial_enforce' not in data or data['serial_enforce'] is False:
         return True
     if 'serial' not in data['users'][0][username]:
         data['users'][0][username]['serial'] = serial
@@ -308,12 +313,12 @@ def set_global_param(key, value):
         return {'error': 'Config file not readable', 'route': 'global_param'}
     if not key in data or data[key] != value:
         data[key] = value
-        LOG.debug("backup_config() in set_global_param")
+        #LOG.debug("backup_config() in set_global_param")
         backup_config()
         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
             json.dump(data, outfile, indent=4)
-    else:
-        LOG.debug("Already exist data for set_global_param key:" + key)
+#    else:
+#        LOG.debug("Already exist data for set_global_param key:" + key)
 
 def modif_config_user(user, changes):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -417,37 +422,62 @@ def remove_ss_go_user(user):
             LOG.debug("Shadowsocks go remove error (" + str(err) + ")")
 
 def v2ray_add_user(user, v2rayuuid='', restart=1):
-    if v2rayuuid == '': 
+    if v2rayuuid == '':
         v2rayuuid = str(uuid.uuid1())
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
         exist = 0
         for inbounds in data['inbounds']:
+            custominbounds = {"inbounds": []}
             if inbounds['tag'] == 'omrin-tunnel':
                 inbounds['settings']['clients'].append({'id': v2rayuuid, 'level': 0, 'alterId': 0, 'email': user})
+                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                with open('/etc/v2ray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 inbounds['settings']['clients'].append({'id': v2rayuuid, 'level': 0, 'alterId': 0, 'email': user})
+                #os.system("v2ray api rmi --server=127.0.0.1:65080 omrin-vmess-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                with open('/etc/v2ray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 inbounds['settings']['clients'].append({'password': v2rayuuid, 'email': user})
+                #os.system("v2ray api rmi --server=127.0.0.1:65080 omrin-trojan-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                with open('/etc/v2ray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 inbounds['settings']['accounts'].append({'pass': v2rayuuid, 'user': user})
+                #os.system("v2ray api rmi --server=127.0.0.1:65080 omrin-socks-tunnel")
+                custominbounds['inbounds'].append(inbounds)
+                with open('/etc/v2ray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
-        try:
-            data = subprocess.check_output('/usr/bin/v2ray api adu --server=127.0.0.1:10085 -users ' + "'" + '{"tag":"omrin-vmess-tunnel","users":[{"user": "' + user + '","key": "' + v2rayuuid + '"}]}', shell = True)
-        except:
-            LOG.debug("V2Ray VMESS: Can't add user")
+        #try:
+        #    data = subprocess.check_output('/usr/bin/v2ray api adi --server=127.0.0.1:10085 -users ' + "'" + '{"tag":"omrin-vmess-tunnel","users":[{"user": "' + user + '","key": "' + v2rayuuid + '"}]}' + "'", shell = True)
+        #except:
+        #    LOG.debug("V2Ray VMESS: Can't add user")
         if restart == 1:
             os.system("systemctl -q restart v2ray")
     return v2rayuuid
 
 def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
-    if xrayuuid == '': 
+    if xrayuuid == '':
         xrayuuid = str(uuid.uuid1())
-    if ukeyss2022 == '': 
+    if ukeyss2022 == '':
         ukeyss2022 = str(base64.b64encode(os.urandom(15).encode('ascii')))
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
@@ -457,35 +487,49 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
             custominbounds = {"inbounds": []}
             if inbounds['tag'] == 'omrin-tunnel':
                 inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-vmess-tunnel")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 inbounds['settings']['clients'].append({'password': xrayuuid, 'email': user})
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-trojan-tunnel")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 inbounds['settings']['accounts'].append({'pass': xrayuuid, 'user': user})
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-socks-tunnel")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 inbounds['settings']['clients'].append({'password': ukeyss2022, 'email': user})
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-shadowsocks-tunnel")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     #if initial_md5 != final_md5 and restart == 1:
     #    os.system("systemctl -q restart xray")
-    
     return xrayuuid
 
 def v2ray_del_user(user, restart=1, protocol="vless"):
@@ -525,37 +569,52 @@ def xray_del_user(user, restart=1, protocol="vless"):
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-vmess-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-trojan-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 for xrayuser in inbounds['settings']['accounts']:
                     if xrayuser['user'] == user:
                         inbounds['settings']['accounts'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-socks-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
+                os.system("xray api rmi --server=127.0.0.1:65080 omrin-shadowsocks-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
-                os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                with open('/etc/xray/newconfig.json', 'w') as f:
+                    json.dump(custominbounds, f, indent=4)
+                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
+                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
@@ -668,7 +727,7 @@ def add_gre_tunnels():
             ipv4_addr_list = addrs[netifaces.AF_INET]
             for ip_info in ipv4_addr_list:
                 addr = ip_info['addr']
-                if not IPAddress(addr).is_private() and not IPAddress(addr).is_reserved():
+                if not IPAddress(addr).is_link_local() and not IPAddress(addr).is_ipv4_private_use() and not IPAddress(addr).is_reserved():
                     allips.append(addr)
                     nbip = nbip + 1
         except Exception as exception:
@@ -702,70 +761,72 @@ def add_gre_tunnels():
                                 if 'username' in content['users'][0][user]:
                                     username = content['users'][0][user]['username']
                                 gre_intf = 'gre-user' + str(userid) + '-ip' + str(nbip)
-                                with open('/etc/openmptcprouter-vps-admin/intf/' + gre_intf, 'w') as n:
-                                    n.write('INTF=' + str(intf.split(':')[0]) + "\n")
-                                    n.write('INTFADDR=' + str(addr) + "\n")
-                                    n.write('INTFNETMASK=' + str(netmask) + "\n")
-                                    n.write('NETWORK=' + str(network) + "\n")
-                                    n.write('LOCALIP=' + str(list(network)[1]) + "\n")
-                                    n.write('REMOTEIP=' + str(list(network)[2]) + "\n")
-                                    n.write('NETMASK=255.255.255.252' + "\n")
-                                    n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
-                                    n.write('USERNAME=' + str(username) + "\n")
-                                    n.write('USERID=' + str(userid) + "\n")
-                                fd, tmpfile = mkstemp()
-                                with open('/etc/shorewall/snat', 'r') as h, open(tmpfile, 'a+') as n:
-                                    for line in h:
-                                        if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in line:
-                                            n.write(line)
-                                    n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(iface) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
-                                    n.write('SNAT(' + str(list(network)[1]) + ')	-	' + gre_intf + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
-                                os.close(fd)
-                                move(tmpfile, '/etc/shorewall/snat')
-                                #fd, tmpfile = mkstemp()
-                                #with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
-                                #    for line in h:
-                                #        if not 'gre-user' + str(userid) + '-ip' + str(nbip) in line:
-                                #            n.write(line)
-                                #    n.write('vpn	gre-user' + str(userid) + '-ip' + str(nbip) + '	nosmurfs,tcpflags' + "\n")
-                                #os.close(fd)
-                                #move(tmpfile, '/etc/shorewall/interfaces')
-                                if str(iface) != IFACE:
+                                if not os.path.isfile('/etc/openmptcprouter-vps-admin/intf/' + gre_intf):
+                                    with open('/etc/openmptcprouter-vps-admin/intf/' + gre_intf, 'w') as n:
+                                        n.write('INTF=' + str(intf.split(':')[0]) + "\n")
+                                        n.write('INTFADDR=' + str(addr) + "\n")
+                                        n.write('INTFNETMASK=' + str(netmask) + "\n")
+                                        n.write('NETWORK=' + str(network) + "\n")
+                                        n.write('LOCALIP=' + str(list(network)[1]) + "\n")
+                                        n.write('REMOTEIP=' + str(list(network)[2]) + "\n")
+                                        n.write('NETMASK=255.255.255.252' + "\n")
+                                        n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
+                                        n.write('USERNAME=' + str(username) + "\n")
+                                        n.write('USERID=' + str(userid) + "\n")
                                     fd, tmpfile = mkstemp()
-                                    with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
+                                    with open('/etc/shorewall/snat', 'r') as h, open(tmpfile, 'a+') as n:
                                         for line in h:
-                                            if not str(iface) in line:
+                                            if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in line:
                                                 n.write(line)
-                                        n.write('net	' + str(iface) + '	dhcp,nosmurfs,tcpflags,routefilter,sourceroute=0' + "\n")
+                                        n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(iface) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
+                                        n.write('SNAT(' + str(list(network)[1]) + ')	-	' + gre_intf + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
                                     os.close(fd)
-                                    move(tmpfile, '/etc/shorewall/interfaces')
-                                user_gre_tunnels = {}
-                                if 'gre_tunnels' in content['users'][0][user]:
-                                    user_gre_tunnels = content['users'][0][user]['gre_tunnels']
-                                if os.path.isfile('/etc/shadowsocks-libev/manager.json') and (not gre_intf in user_gre_tunnels or user_gre_tunnels[gre_intf]['public_ip'] != str(addr)):
-                                    with open('/etc/shadowsocks-libev/manager.json') as g:
-                                        contentss = g.read()
-                                    contentss = re.sub(",\s*}", "}", contentss) # pylint: disable=W1401
-                                    datass = json.loads(contentss)
-                                    makechange = True
-                                    if 'port_conf' in datass:
-                                        for sscport in datass['port_conf']:
-                                            if 'local_address' in datass['port_conf'][sscport] and datass['port_conf'][sscport]['local_address'] == str(addr):
-                                                shadowsocks_port = sscport
-                                                makechange = False
-                                    if makechange:
-                                        ss_port = content['users'][0][user]['shadowsocks_port']
-                                        if 'port_key' in datass:
-                                            ss_key = datass['port_key'][str(ss_port)]
+                                    move(tmpfile, '/etc/shorewall/snat')
+                                    #fd, tmpfile = mkstemp()
+                                    #with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
+                                    #    for line in h:
+                                    #        if not 'gre-user' + str(userid) + '-ip' + str(nbip) in line:
+                                    #            n.write(line)
+                                    #    n.write('vpn	gre-user' + str(userid) + '-ip' + str(nbip) + '	nosmurfs,tcpflags' + "\n")
+                                    #os.close(fd)
+                                    #move(tmpfile, '/etc/shorewall/interfaces')
+                                    if str(iface) != IFACE:
+                                        fd, tmpfile = mkstemp()
+                                        with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
+                                            for line in h:
+                                                if not str(iface) in line:
+                                                    n.write(line)
+                                            n.write('net	' + str(iface) + '	dhcp,nosmurfs,tcpflags,routefilter,sourceroute=0' + "\n")
+                                        os.close(fd)
+                                        move(tmpfile, '/etc/shorewall/interfaces')
+                                    user_gre_tunnels = {}
+                                    if 'gre_tunnels' in content['users'][0][user]:
+                                        user_gre_tunnels = content['users'][0][user]['gre_tunnels']
+                                    if os.path.isfile('/etc/shadowsocks-libev/manager.json') and (not gre_intf in user_gre_tunnels or user_gre_tunnels[gre_intf]['public_ip'] != str(addr)):
+                                        with open('/etc/shadowsocks-libev/manager.json') as g:
+                                            contentss = g.read()
+                                        contentss = re.sub(",\s*}", "}", contentss) # pylint: disable=W1401
+                                        datass = json.loads(contentss)
+                                        makechange = True
+                                        shadowsocks_port = 65101
                                         if 'port_conf' in datass:
-                                            ss_key = datass['port_conf'][str(ss_port)]['key']
-                                        if gre_intf not in user_gre_tunnels:
-                                            user_gre_tunnels[gre_intf] = {}
-                                        shadowsocks_port = str(add_ss_user('', ss_key, userid, str(addr)))
-                                    user_gre_tunnels[gre_intf] = {'shadowsocks_port': shadowsocks_port, 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
-                                    #user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
-                                    modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
-                        nbip = nbip + 1
+                                            for sscport in datass['port_conf']:
+                                                if 'local_address' in datass['port_conf'][sscport] and datass['port_conf'][sscport]['local_address'] == str(addr):
+                                                    shadowsocks_port = sscport
+                                                    makechange = False
+                                        if makechange:
+                                            ss_port = content['users'][0][user]['shadowsocks_port']
+                                            if 'port_key' in datass:
+                                                ss_key = datass['port_key'][str(ss_port)]
+                                            if 'port_conf' in datass:
+                                                ss_key = datass['port_conf'][str(ss_port)]['key']
+                                            if gre_intf not in user_gre_tunnels:
+                                                user_gre_tunnels[gre_intf] = {}
+                                            shadowsocks_port = str(add_ss_user('', ss_key, userid, str(addr))) # pylint: disable=E0606
+                                            user_gre_tunnels[gre_intf] = {'shadowsocks_port': shadowsocks_port, 'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
+                                            #user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
+                                            modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
+                            nbip = nbip + 1
             except Exception as exception:
                 pass
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
@@ -861,12 +922,11 @@ def add_dsvpn(userid):
     dsvpn_key = secrets.token_hex(32)
     with open('/etc/dsvpn/dsvpn' + str(userid) + '.key', 'w') as f:
         f.write(dsvpn_key.upper())
-    os.system("systemctl -q enable dsvpn@dsvpn" + str(userid))
-    os.system("systemctl -q restart dsvpn@dsvpn" + str(userid))
-
+    os.system("systemctl -q restart dsvpn-server@dsvpn" + str(userid))
+    os.system("systemctl -q enable dsvpn-server@dsvpn" + str(userid))
 def remove_dsvpn(userid):
-    os.system("systemctl -q disable dsvpn@dsvpn" + str(userid))
-    os.system("systemctl -q stop dsvpn@dsvpn" + str(userid))
+    os.system("systemctl -q disable dsvpn-server@dsvpn" + str(userid))
+    os.system("systemctl -q stop dsvpn-server@dsvpn" + str(userid))
     os.remove('/etc/dsvpn/dsvpn' + str(userid))
     os.remove('/etc/dsvpn/dsvpn' + str(userid) + '.key')
 
@@ -1253,14 +1313,14 @@ class OAuth2PasswordBearerCookie(OAuth2):
         else:
             authorization = False
 
-        if not authorization or scheme.lower() != "bearer":
+        if not authorization or scheme.lower() != "bearer": # pylint: disable=E0606
             if self.auto_error:
                 raise HTTPException(
                     status_code=HTTP_403_FORBIDDEN, detail="Not authenticated"
                 )
             else:
                 return None
-        return param
+        return param # pylint: disable=E0606
 
 class BasicAuth(SecurityBase):
     def __init__(self, scheme_name: str = None, auto_error: bool = True):
@@ -1413,7 +1473,7 @@ async def get_documentation(current_user: User = Depends(get_current_active_user
 
 # Get Client IP
 @app.get('/clienthost')
-async def status(request: Request):
+async def clienthost(request: Request):
     client_host = request.client.host
     return {"client_host": client_host}
 
@@ -2089,6 +2149,8 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     #key = data["key"]
     if 'timeout' in data:
         timeout = data["timeout"]
+    else:
+        timeout = 600
     if 'verbose' in data:
         verbose = data["verbose"]
     else:
@@ -2219,7 +2281,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         json.dump(shadowsocks_config, outfile, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
-        os.system("systemctl restart shadowsocks-libev-manager@manager.service")
+        os.system("systemctl -q restart shadowsocks-libev-manager@manager.service")
         #for x in range(1, os.cpu_count()):
         #    os.system("systemctl restart shadowsocks-libev-manager@manager" + str(x) + ".service")
         shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks')
@@ -2283,7 +2345,7 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
         json.dump(data, outfile, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-go/server.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
-        os.system("systemctl restart shadowsocks-go.service")
+        os.system("systemctl -q restart shadowsocks-go.service")
         shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks-go')
         shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks-go')
         #set_lastchange()
@@ -2501,7 +2563,7 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
     LOG.debug("modif_config_user for v2ray conf")
     modif_config_user(username, {'v2ray': v2ray_conf})
     if initial_md5 != final_md5:
-        os.system("systemctl restart v2ray")
+        os.system("systemctl -q restart v2ray")
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'v2ray'}
     else:
@@ -2563,15 +2625,15 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
         vless_reality = False
     if os.path.isfile('/etc/xray/xray-vless-reality.json'):
         xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
-    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method }
-    LOG.debug("modif_config_user for xray conf")
-    modif_config_user(username, {'xray': xray_conf})
+        xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method }
+        LOG.debug("modif_config_user for xray conf")
+        modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
         if params.vless_reality and not chk_vless_reality:
             shorewall_add_port(current_user, '443', 'tcp', 'xray vless-reality')
         elif not params.vless_reality and chk_vless_reality:
             shorewall_del_port(current_user.username, '443', 'tcp', 'xray vless-reality')
-        os.system("systemctl restart xray")
+        os.system("systemctl -q restart xray")
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'xray'}
     else:
@@ -3133,8 +3195,10 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         LOG.debug("modif_config_user for vpnips")
         modif_config_user(current_user.username, {'vpnremoteip': remoteip})
     if 'vpnlocalip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnlocalip'] != localip:
+        LOG.debug("modif_config_user for vpn local ip")
         modif_config_user(current_user.username, {'vpnlocalip': localip})
     if ula and ('ula' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['ula'] != ula):
+        LOG.debug("modif_config_user for ula")
         modif_config_user(current_user.username, {'ula': ula})
     userid = current_user.userid
     if userid is None:
@@ -3223,7 +3287,7 @@ def update(current_user: User = Depends(get_current_user)):
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'update'}
     LOG.debug("Update VPS...")
     with open("/etc/openmptcprouter-vps-admin/update", mode='a'): pass
-    os.system("systemctl stop omr")
+    os.system("systemctl -q stop omr")
     os.system("systemctl -q restart omr-update")
     LOG.debug("Update VPS... done")
     return {'result': 'done', 'route': 'update'}
@@ -3264,6 +3328,7 @@ def list_backup(current_user: User = Depends(get_current_user)):
     for fname in files:
         fileData[os.path.relpath(fname,'/var/opt/openmptcprouter/')] = os.stat(fname).st_mtime
     sorted_files = sorted(fileData.items(), key = itemgetter(1))
+    modiftime = "0"
     if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
         modiftime = os.path.getmtime('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz')
     if len(sorted_files) > 0:
@@ -3306,10 +3371,12 @@ class NewUser(BaseModel):
     shadowsocks_port: Optional[int] = Query(None, gt=0, lt=65535, title="Shadowsocks-libev port")
     userid: Optional[int] = Query(None, title="User ID")
     ips: Optional[List[str]] = Query(None, title="Public exit IP")
-#    userid: int = Query(0, title="User ID",description="User ID is used to create port of each VPN and shadowsocks",gt=0,le=99)
+    user_key: Optional[str] = Query(None, title="User key")
+    shadowsocks_key: Optional[str] = Query(None, title="Shadowsocks key")
+    shadowsocks2022_key: Optional[str] = Query(None, title="Shadowsocks 2022 key")
 
 @app.post('/add_user', summary="Add a new user")
-def add_user(*, params: NewUser, current_user: User = Depends(get_current_user)):
+def add_user(*, params: NewUser, current_user: User = Depends(get_current_user), request: Request):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -3332,13 +3399,17 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
 #    if params.shadowsocks_port is None:
 #    shadowsocks_port = '651{:02d}'.format(userid)
     shadowsocks_port = params.shadowsocks_port
-    shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
-    shadowsocks2022_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode())
+    shadowsocks_key = params.shadowsocks_key
+    if shadowsocks_key is None:
+        shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
+    shadowsocks2022_key = params.shadowsocks2022_key
+    if shadowsocks2022_key is None:
+        shadowsocks2022_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
     if not publicips:
         if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-            shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid)
+            shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key, userid)
         if os.path.isfile('/etc/shadowsocks-go/server.json'):
-            upsk = add_ss_go_user(params.username, shadowsocks2022_key.decode('utf-8'))
+            upsk = add_ss_go_user(params.username, shadowsocks2022_key)
         else:
             upsk = ''
         if os.path.isfile('/etc/v2ray/v2ray-server.json'):
@@ -3371,13 +3442,18 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user))
         LOG.debug("Empty data for add_user")
     # Create VPNs configuration
     if os.path.isfile('/etc/openvpn/tun0.conf'):
-        os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa --batch build-client-full "' + params.username + '" nopass')
+        LOG.debug("Create user " + params.username + " in OpenVPN")
+        os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa --batch build-client-full "' + params.username + '" nopass' + ' >/dev/null 2>&1')
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
+        LOG.debug("Create user " + params.username + " in Glorytun-TCP")
         add_glorytun_tcp(userid)
     if os.path.isfile('/etc/glorytun-udp/tun0'):
+        LOG.debug("Create user " + params.username + " in Glorytun-UDP")
         add_glorytun_udp(userid)
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
+        LOG.debug("Create user " + params.username + " in DSVPN")
         add_dsvpn(userid)
+    LOG.info("User admin (IP: " + request.client.host + ") added user " + params.username)
 
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
@@ -3402,13 +3478,14 @@ class RemoveUser(BaseModel):
     username: str
 
 @app.post('/remove_user', summary="Remove an user")
-def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user)):
+def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user), request: Request):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = json.load(f)
     if not params.username in content['users'][0]:
         return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'remove_user'}
+    LOG.debug("Remove user " + params.username)
     userid = int(content['users'][0][params.username]['userid'])
     if userid == 0:
         return {'result': 'not allowed', 'reason': 'Userid 0 is protected', 'route': 'remove_user'}
@@ -3430,16 +3507,17 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     else:
         LOG.debug("Empty data for remover_user")
     if os.path.isfile('/etc/openvpn/tun0.conf'):
-        os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username)
-        os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl')
-        os.system('rm -f /etc/openvpn/ca/pki/reqs/' + params.username + '.req')
-        os.system("systemctl -q restart openvpn@tun0")
+        os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username + ' >/dev/null 2>&1')
+        os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl' + ' >/dev/null 2>&1')
+        os.system('rm -f /etc/openvpn/ca/pki/reqs/' + params.username + '.req' + ' >/dev/null 2>&1')
+        os.system("systemctl -q restart openvpn@tun0" + ' >/dev/null 2>&1')
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
         remove_glorytun_tcp(userid)
     if os.path.isfile('/etc/glorytun-udp/tun0'):
         remove_glorytun_udp(userid)
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         remove_dsvpn(userid)
+    LOG.info("User admin (IP: " + request.client.host + " removed user " + params.username)
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
     #with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -3536,7 +3614,7 @@ def ipv6_enabled():
 
 def main(omrport: int, omrhost: str, workers: int):
     LOG.debug("Main OMR-Admin launch")
-    uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=workers)
+    uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='info', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=workers)
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
