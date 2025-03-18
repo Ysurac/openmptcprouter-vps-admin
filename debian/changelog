@@ -1,3 +1,9 @@
+omr-vps-admin (0.14+20250318) unstable; urgency=medium
+
+    * Fix V2Ray/XRay API ports
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 18 Mar 2025 09:53:21 +0200
+
 omr-vps-admin (0.14+20250220) unstable; urgency=medium
 
     * Fix XRay multi users

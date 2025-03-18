@@ -437,7 +437,7 @@ def v2ray_add_user(user, v2rayuuid='', restart=1):
                 with open('/etc/v2ray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
+                os.system("v2ray api adi --server=127.0.0.1:10085 /etc/v2ray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 inbounds['settings']['clients'].append({'id': v2rayuuid, 'level': 0, 'alterId': 0, 'email': user})
                 #os.system("v2ray api rmi --server=127.0.0.1:65080 omrin-vmess-tunnel")
@@ -445,7 +445,7 @@ def v2ray_add_user(user, v2rayuuid='', restart=1):
                 with open('/etc/v2ray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
+                os.system("v2ray api adi --server=127.0.0.1:10085 /etc/v2ray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 inbounds['settings']['clients'].append({'password': v2rayuuid, 'email': user})
                 #os.system("v2ray api rmi --server=127.0.0.1:65080 omrin-trojan-tunnel")
@@ -453,7 +453,7 @@ def v2ray_add_user(user, v2rayuuid='', restart=1):
                 with open('/etc/v2ray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
+                os.system("v2ray api adi --server=127.0.0.1:10085 /etc/v2ray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 inbounds['settings']['accounts'].append({'pass': v2rayuuid, 'user': user})
                 #os.system("v2ray api rmi --server=127.0.0.1:65080 omrin-socks-tunnel")
@@ -461,7 +461,7 @@ def v2ray_add_user(user, v2rayuuid='', restart=1):
                 with open('/etc/v2ray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("v2ray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("v2ray api adi --server=127.0.0.1:65080 /etc/v2ray/newconfig.json >/dev/null 2>&1")
+                os.system("v2ray api adi --server=127.0.0.1:10085 /etc/v2ray/newconfig.json >/dev/null 2>&1")
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
@@ -492,7 +492,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
                 #os.system("xray api rmi --server=127.0.0.1:65080 omrin-vmess-tunnel")
@@ -500,7 +500,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 inbounds['settings']['clients'].append({'password': xrayuuid, 'email': user})
                 #os.system("xray api rmi --server=127.0.0.1:65080 omrin-trojan-tunnel")
@@ -508,7 +508,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 inbounds['settings']['accounts'].append({'pass': xrayuuid, 'user': user})
                 #os.system("xray api rmi --server=127.0.0.1:65080 omrin-socks-tunnel")
@@ -516,7 +516,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 inbounds['settings']['clients'].append({'password': ukeyss2022, 'email': user})
                 #os.system("xray api rmi --server=127.0.0.1:65080 omrin-shadowsocks-tunnel")
@@ -524,7 +524,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
@@ -569,52 +569,52 @@ def xray_del_user(user, restart=1, protocol="vless"):
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel >/dev/null 2>&1")
+                os.system("xray api rmi --server=127.0.0.1:10086 omrin-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-vmess-tunnel >/dev/null 2>&1")
+                os.system("xray api rmi --server=127.0.0.1:10086 omrin-vmess-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-trojan-tunnel >/dev/null 2>&1")
+                os.system("xray api rmi --server=127.0.0.1:10086 omrin-trojan-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 for xrayuser in inbounds['settings']['accounts']:
                     if xrayuser['user'] == user:
                         inbounds['settings']['accounts'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-socks-tunnel >/dev/null 2>&1")
+                os.system("xray api rmi --server=127.0.0.1:10086 omrin-socks-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 for xrayuser in inbounds['settings']['clients']:
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                os.system("xray api rmi --server=127.0.0.1:65080 omrin-shadowsocks-tunnel >/dev/null 2>&1")
+                os.system("xray api rmi --server=127.0.0.1:10086 omrin-shadowsocks-tunnel >/dev/null 2>&1")
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                os.system("xray api adi --server=127.0.0.1:65080 /etc/xray/newconfig.json >/dev/null 2>&1")
+                os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
