@@ -1,3 +1,9 @@
+omr-vps-admin (0.14+20250319) unstable; urgency=medium
+
+    * Fix VPN IPs in Shorewall params.vpn
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 19 Mar 2025 09:35:48 +0200
+
 omr-vps-admin (0.14+20250318) unstable; urgency=medium
 
     * Fix V2Ray/XRay API ports

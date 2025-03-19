@@ -3237,7 +3237,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
             elif not userid == 0:
                 n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
                 dataexist = True
-            if userid == 0:
+            elif userid == 0:
                 n.write('OMR_ADDR=' + remoteip + '\n')
                 dataexist = True
         if not dataexist:
