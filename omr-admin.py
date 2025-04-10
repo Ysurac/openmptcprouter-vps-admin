@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2024 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
+# Copyright (C) 2018-2025 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
 #
 # This is free software, licensed under the GNU General Public License v3.0.
 # See /LICENSE for more information.
@@ -3517,7 +3517,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         remove_glorytun_udp(userid)
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         remove_dsvpn(userid)
-    LOG.info("User admin (IP: " + request.client.host + " removed user " + params.username)
+    LOG.info("User admin (IP: " + request.client.host + ") removed user " + params.username)
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
     #with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -3605,11 +3605,11 @@ async def speedtestul(file: UploadFile, current_user: User = Depends(get_current
 def ipv6_enabled():
     ipv6_enabled = False
     addrs = netifaces.ifaddresses('lo')
-    ipv4_addr_list = addrs[netifaces.AF_INET]
-    for ip_info in ipv4_addr_list:
+    ipv6_addr_list = addrs[netifaces.AF_INET6]
+    for ip_info in ipv6_addr_list:
         addr = ip_info['addr']
         if IPAddress(addr).version == 6:
-            ipv6_enabled = True
+            return True
     return ipv6_enabled
 
 def main(omrport: int, omrhost: str, workers: int):

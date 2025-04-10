@@ -1,3 +1,9 @@
+omr-vps-admin (0.14+20250410) unstable; urgency=medium
+
+    * Fix IPv6 detection
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 10 Apr 2025 19:30:23 +0200
+
 omr-vps-admin (0.14+20250319) unstable; urgency=medium
 
     * Fix VPN IPs in Shorewall params.vpn
