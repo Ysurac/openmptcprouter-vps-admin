@@ -1,3 +1,9 @@
+omr-vps-admin (0.15+20250519) unstable; urgency=medium
+
+    * Add XRay multi IPs support
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 19 May 2025 17:18:30 +0200
+
 omr-vps-admin (0.14+20250410) unstable; urgency=medium
 
     * Fix IPv6 detection
