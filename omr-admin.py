@@ -3562,7 +3562,24 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username + ' >/dev/null 2>&1')
         os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl' + ' >/dev/null 2>&1')
         os.system('rm -f /etc/openvpn/ca/pki/reqs/' + params.username + '.req' + ' >/dev/null 2>&1')
-        os.system("systemctl -q restart openvpn@tun0" + ' >/dev/null 2>&1')
+        # Kill user via OpenVPN API
+        try:
+            ovpn_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ovpn_socket.settimeout(2)
+            ovpn_socket.connect(("127.0.0.1", 65302))
+            fd = ovpn_socket.makefile('rb')
+            line = fd.readline()
+            if not line.startswith('>INFO:OpenVPN'.encode()):
+                ovpn_socket.close()
+                LOG.debug("OpenVPN error")
+            else
+                ovpn_socket.send('kill ' + params.username + '\r\n'.encode())
+            ovpn_socket.close()
+        except socket.timeout as err:
+            LOG.debug("OpenVPN stats timeout (" + str(err) + ")")
+        except socket.error as err:
+            LOG.debug("OpenVPN stats error (" + str(err) + ")")
+        #os.system("systemctl -q restart openvpn@tun0" + ' >/dev/null 2>&1')
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
         remove_glorytun_tcp(userid)
     if os.path.isfile('/etc/glorytun-udp/tun0'):
