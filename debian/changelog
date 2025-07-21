@@ -1,3 +1,9 @@
+omr-vps-admin (0.15+20250721) unstable; urgency=medium
+
+    * Fix a typo
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 21 Jul 2025 14:25:14 +0200
+
 omr-vps-admin (0.15+20250717) unstable; urgency=medium
 
     * Don't restart OpenVPN when user removed

@@ -3572,7 +3572,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
             if not line.startswith('>INFO:OpenVPN'.encode()):
                 ovpn_socket.close()
                 LOG.debug("OpenVPN error")
-            else
+            else:
                 ovpn_socket.send('kill ' + params.username + '\r\n'.encode())
             ovpn_socket.close()
         except socket.timeout as err:
