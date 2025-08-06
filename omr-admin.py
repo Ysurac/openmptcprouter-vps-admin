@@ -232,6 +232,30 @@ def get_bytes_xray(t,user):
     else:
         return 0
 
+def get_bytes_softether(user):
+    createBytesPayload = {
+        "jsonrpc": "2.0",
+        "id": "rpc_call_id",
+        "method": "GetUser",
+        "params": {
+            "HubName_str": "OMRVPN",
+            "Name_str": user,
+        },
+    }
+    try:
+        r = requests.post(url="http://127.0.0.1:65390/api", json=createUserPayload, headers=softethervpnPassword, verify=False)
+    except requests.exceptions.Timeout:
+        LOG.debug("SoftEther VPN get bytes timeout")
+    except requests.exceptions.RequestException as err:
+        LOG.debug("SoftEther VPN get bytes error (" + str(err) + ")")
+    try:
+        if 'error' in r.json():
+            return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    except requests.exceptions.JSONDecodeError as err:
+        LOG.debug("Shadowsocks go stats error (" + str(err) + ")")
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+    return { 'downlinkBytes': r.json()['result']['Recv.UnicastBytes_u64'], 'uplinkBytes': r.json()['result']['Send.UnicastBytes_u64'] }
+
 def checkIfProcessRunning(processName):
     for proc in psutil.process_iter():
         try:
@@ -421,6 +445,43 @@ def remove_ss_go_user(user):
         except requests.exceptions.RequestException as err:
             LOG.debug("Shadowsocks go remove error (" + str(err) + ")")
 
+def add_softether_user(user, password):
+    createUserPayload = {
+        "jsonrpc": "2.0",
+        "id": "rpc_call_id",
+        "method": "CreateUser",
+        "params": {
+            "HubName_str": "OMRVPN",
+            "Name_str": user,
+            "AuthType_u32": 1,
+            "Auth_Password_str": password,
+        },
+    }
+    try:
+        r = requests.post(url="http://127.0.0.1:65390/api", json=createUserPayload, headers=softethervpnPassword, verify=False)
+    except requests.exceptions.Timeout:
+        LOG.debug("SoftEther VPN add timeout")
+    except requests.exceptions.RequestException as err:
+        LOG.debug("SoftEther VPN remove error (" + str(err) + ")")
+    return password
+
+def remove_softether_user(user):
+    removeUserPayload = {
+        "jsonrpc": "2.0",
+        "id": "rpc_call_id",
+        "method": "DeleteUser",
+        "params": {
+            "HubName_str": "OMRVPN",
+            "Name_str": user,
+        },
+    }
+    try:
+        r = requests.post(url="http://127.0.0.1:65390/api", json=removeUserPayload, headers=softethervpnPassword, verify=False)
+    except requests.exceptions.Timeout:
+        LOG.debug("SoftEther VPN add timeout")
+    except requests.exceptions.RequestException as err:
+        LOG.debug("SoftEther VPN remove error (" + str(err) + ")")
+
 def v2ray_add_user(user, v2rayuuid='', restart=1):
     if v2rayuuid == '':
         v2rayuuid = str(uuid.uuid1())
@@ -544,7 +605,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
     #    os.system("systemctl -q restart xray")
     return xrayuuid
 
-def v2ray_del_user(user, restart=1, protocol="vless"):
+def v2ray_del_user(user, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -571,7 +632,7 @@ def v2ray_del_user(user, restart=1, protocol="vless"):
     if initial_md5 != final_md5 and restart == 1:
         os.system("systemctl -q restart v2ray")
 
-def xray_del_user(user, restart=1, protocol="vless"):
+def xray_del_user(user, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
@@ -748,7 +809,7 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
             for ip_info in ipv4_addr_list:
                 addr = ip_info['addr']
                 #LOG.debug("Check if " + str(addr) + " is not IPv4 or reserved")
-                if not IPAddress(addr).is_link_local() and not IPAddress(addr).is_reserved():
+                if not IPAddress(addr).is_link_local() and not IPAddress(addr).is_reserved() and not IPAddress(addr).is_private():
                     allips.append(addr)
                     nbip = nbip + 1
         except Exception as exception:
@@ -765,7 +826,7 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
                 ipv4_addr_list = addrs[netifaces.AF_INET]
                 for ip_info in ipv4_addr_list:
                     addr = ip_info['addr']
-                    if not IPAddress(addr).is_private() and not IPAddress(addr).is_reserved():
+                    if not IPAddress(addr).is_private() and not IPAddress(addr).is_reserved() and not IPAddress(addr).is_link_local():
                         netmask = ip_info['netmask']
                         ip = IPNetwork('10.255.249.0/24')
                         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -854,11 +915,17 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
                                         xray_user = str(username) + gre_intf
                                         xrayuuid = str(uuid.uuid1())
                                         ukeyss2022 = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
+                                        LOG.debug("Delete XRay user...")
+                                        xray_del_user(xray_user)
                                         LOG.debug("Create XRay user...")
                                         xray_add_user(xray_user,xrayuuid,ukeyss2022)
                                         xray_tag = 'output-' + str(addr)
+                                        LOG.debug("Delete XRay routing...")
+                                        xray_del_routing(xray_tag)
                                         LOG.debug("Add XRay routing...")
                                         xray_add_routing(xray_tag,xray_user,0)
+                                        LOG.debug("Delete XRay outbound...")
+                                        xray_del_outbound(xray_tag)
                                         LOG.debug("Add XRay outbound...")
                                         xray_add_outbound(xray_tag,str(addr),0)
                                         if gre_intf not in user_gre_tunnels:
@@ -1269,6 +1336,8 @@ else:
     SECRET_KEY = uuid.uuid4().hex
     set_global_param('secret_key',SECRET_KEY)
 
+if 'softethervpn_admin_password' in omr_config_data:
+    softethervpnPassword = { "X-VPNADMIN-PASSWORD": omr_config_data['softethervpn_admin_password'] }
 
 
 def verify_password(plain_password, user_password):
@@ -1638,6 +1707,11 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
     elif vpn == 'openvpn_bonding':
         vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
+    elif vpn == 'softether':
+        vpn_txrx = get_bytes_softether(username)
+        vpn_traffic_rx = vpn_txrx['uplinkBytes']
+        vpn_traffic_tx = vpn_txrx['downlinkBytes']
+
     LOG.debug('Get status: done')
     if IFACE:
         return {'vps': {'time': vps_current_time, 'loadavg': vps_loadavg,'cpu_model': vps_cpu_model, 'cpu_count': vps_cpu_count, 'memory_total': vps_memory_total, 'memory_available': vps_memory_available, 'memory_percent': vps_memory_percent, 'memory_used': vps_memory_used, 'memory_free': vps_memory_free,'disk_total': vps_disk_total, 'disk_used': vps_disk_used, 'disk_free': vps_disk_free, 'disk_percent': vps_disk_percent, 'cpu_freq': vps_cpu_freq, 'uptime': vps_uptime, 'mptcp': mptcp_enabled, 'hostname': vps_hostname, 'kernel': vps_kernel, 'omr_version': vps_omr_version}, 'network': {'tx': get_bytes('tx', IFACE), 'rx': get_bytes('rx', IFACE)}, 'shadowsocks': {'traffic': ss_traffic}, 'vpn': {'tx': vpn_traffic_tx, 'rx': vpn_traffic_rx}, 'v2ray': {'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'tx': ss_go_tx, 'rx': ss_go_rx}}
@@ -1863,6 +1937,18 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
 
     if os.path.isfile('/etc/openvpn/bonding1.conf'):
         available_vpn.append("openvpn_bonding")
+
+    softether = False
+    if os.path.isfile('/var/lib/softether/vpn_server.config'):
+        available_vpn.append("softether")
+        softether = True
+    softether_password = ''
+    if 'softethervpn' in omr_config_data['users'][0][username]:
+        softether_password = omr_config_data['users'][0][username]['softethervpn']
+    softether_port = '65390'
+    softether_cipher = 'AES-256-GCM'
+    softether_host_ip = '10.255.210.1'
+    softether_client_ip = 'dhcp'
 
     LOG.debug('Get config... mlvpn')
     if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
@@ -2123,6 +2209,10 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     elif vpn == 'openvpn_bonding':
         vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
         vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
+    elif vpn == 'softether':
+        vpn_txrx = get_bytes_softether(username)
+        vpn_traffic_rx = vpn_txrx['uplinkBytes']
+        vpn_traffic_tx = vpn_txrx['downlinkBytes']
 
     #vpn = current_user.vpn
     available_proxy = ["shadowsocks", "shadowsocks-go","v2ray","v2ray-vmess","v2ray-socks","v2ray-trojan","xray","xray-vless-reality","xray-vmess","xray-socks","xray-trojan","xray-shadowsocks"]
@@ -2154,7 +2244,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'localvpn': localvpn}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -2860,6 +2950,7 @@ class VPN(str, Enum):
     glorytunudp = "glorytun_udp"
     dsvpn = "dsvpn"
     mlvpn = "mlvpn"
+    softether = "softether"
     none = "none"
 
 class Vpn(BaseModel):
@@ -3085,6 +3176,56 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
         os.system("systemctl -q restart openvpn@tun0")
         shorewall_add_port(current_user, str(params.port), 'tcp', 'openvpn')
         #set_lastchange()
+    return {'result': 'done'}
+
+# Set SoftEther VPN config
+class SoftEtherVPN(BaseModel):
+#    port: int = Query(..., gt=0, lt=65535)
+    cipher: str = "AES-256-GCM"
+    password: str = ""
+
+@app.post('/softethervpn', summary="Modify SoftEther VPN configuration")
+def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'softethervpn'}
+    if not os.path.isfile('/var/lib/softether/vpn_server.conf'):
+        return {'result': 'warning', 'reason': 'SoftEther VPN is not installed', 'route': 'softethervpn'}
+    cipherPayload = {
+        "jsonrpc": "2.0",
+        "id": "rpc_call_id",
+        "method": "SetServerCipher",
+        "params": {
+            "String_str": params.cipher
+        }
+    }
+    try:
+        r = requests.post(url="http://127.0.0.1:65390/api", json=cipherPayload, headers=softethervpnPassword, verify=False)
+    except requests.exceptions.Timeout:
+        LOG.debug("SoftEther VPN change cipher timeout")
+        return {'result': 'error'}
+    except requests.exceptions.RequestException as err:
+        LOG.debug("SoftEther VPN change cipher error (" + str(err) + ")")
+        return {'result': 'error'}
+    if params.password != "":
+        passwordPayload = {
+            "jsonrpc": "2.0",
+            "id": "rpc_call_id",
+            "method": "SetUser",
+            "params": {
+                "HubName_str": "OMRVPN",
+                "Name_str": current_user,
+                "Auth_Password_str": params.password 
+            }
+        }
+        try:
+            r = requests.post(url="http://127.0.0.1:65390/api", json=passwordPayload, headers=softethervpnPassword, verify=False)
+        except requests.exceptions.Timeout:
+            LOG.debug("SoftEther VPN change password timeout")
+            return {'result': 'error'}
+        except requests.exceptions.RequestException as err:
+            LOG.debug("SoftEther VPN change password error (" + str(err) + ")")
+            return {'result': 'error'}
+    #shorewall_add_port(current_user, str(params.port), 'tcp', 'softethervpn')
     return {'result': 'done'}
 
 # Set WireGuard config
@@ -3423,6 +3564,7 @@ class NewUser(BaseModel):
     user_key: Optional[str] = Query(None, title="User key")
     shadowsocks_key: Optional[str] = Query(None, title="Shadowsocks key")
     shadowsocks2022_key: Optional[str] = Query(None, title="Shadowsocks 2022 key")
+    softethervpn_pass: Optional[str] = Query(None, title="SoftEther VPN password")
 
 @app.post('/add_user', summary="Add a new user")
 def add_user(*, params: NewUser, current_user: User = Depends(get_current_user), request: Request):
@@ -3505,6 +3647,13 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         LOG.debug("Create user " + params.username + " in DSVPN")
         add_dsvpn(userid)
+    if os.path.isfile('/var/lib/softether/vpn_server.config'):
+        LOG.debug("Create user " + params.username + " in SoftEther VPN")
+        if softethervpn_pass is None:
+            sofethervpn_pass = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
+        add_softether_user(userid,softether_pass)
+        modif_config_user(userid,{'softethervpn': {'password': softethervpn_pass}})
+
     LOG.info("User admin (IP: " + request.client.host + ") added user " + params.username)
 
     #set_lastchange(30)
@@ -3586,6 +3735,8 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         remove_glorytun_udp(userid)
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         remove_dsvpn(userid)
+    if os.path.isfile('/var/lib/softether/vpn_server.config'):
+        remove_softether_user(userid)
     LOG.info("User admin (IP: " + request.client.host + ") removed user " + params.username)
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
