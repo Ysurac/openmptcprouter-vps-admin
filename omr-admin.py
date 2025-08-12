@@ -243,11 +243,13 @@ def get_bytes_softether(user):
         },
     }
     try:
-        r = requests.post(url="http://127.0.0.1:65390/api", json=createUserPayload, headers=softethervpnPassword, verify=False)
+        r = requests.post(url="http://127.0.0.1:65390/api", json=createBytesPayload, headers=softethervpnPassword, verify=False)
     except requests.exceptions.Timeout:
         LOG.debug("SoftEther VPN get bytes timeout")
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     except requests.exceptions.RequestException as err:
         LOG.debug("SoftEther VPN get bytes error (" + str(err) + ")")
+        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     try:
         if 'error' in r.json():
             return { 'downlinkBytes': 0, 'uplinkBytes': 0 }

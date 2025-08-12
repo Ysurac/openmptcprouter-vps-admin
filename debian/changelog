@@ -1,3 +1,9 @@
+omr-vps-admin (0.16+20250812) unstable; urgency=medium
+
+    * Fix on SoftEther data usage
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 12 Aug 2025 08:18:34 +0200
+
 omr-vps-admin (0.16+20250806) unstable; urgency=medium
 
     * Add initial SoftEther VPN suppport
