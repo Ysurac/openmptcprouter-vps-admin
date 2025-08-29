@@ -1,3 +1,9 @@
+omr-vps-admin (0.16+20250829) unstable; urgency=medium
+
+    * Increase CRL expiration date
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 29 Aug 2025 14:28:55 +0200
+
 omr-vps-admin (0.16+20250812) unstable; urgency=medium
 
     * Fix on SoftEther data usage

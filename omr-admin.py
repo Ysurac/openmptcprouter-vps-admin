@@ -3711,7 +3711,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         LOG.debug("Empty data for remover_user")
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username + ' >/dev/null 2>&1')
-        os.system('cd /etc/openvpn/ca && ./easyrsa gen-crl' + ' >/dev/null 2>&1')
+        os.system('cd /etc/openvpn/ca && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl' + ' >/dev/null 2>&1')
         os.system('rm -f /etc/openvpn/ca/pki/reqs/' + params.username + '.req' + ' >/dev/null 2>&1')
         # Kill user via OpenVPN API
         try:
