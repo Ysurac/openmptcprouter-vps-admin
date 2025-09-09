@@ -1,3 +1,9 @@
+omr-vps-admin (0.16+20250909) unstable; urgency=medium
+
+    * Fix CRL permission
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 09 Sep 2025 15:20:14 +0200
+
 omr-vps-admin (0.16+20250829) unstable; urgency=medium
 
     * Increase CRL expiration date
