@@ -276,7 +276,7 @@ def get_username_from_userid(userid):
         return 'openmptcprouter'
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -291,7 +291,7 @@ def get_userid_from_username(username):
         return 0
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -301,7 +301,7 @@ def get_userid_from_username(username):
 def check_username_serial(username, serial):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         configdata = json.loads(content)
         data = configdata
@@ -330,7 +330,7 @@ def check_username_serial(username, serial):
 def set_global_param(key, value):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         configdata = json.loads(content)
         data = configdata
@@ -362,7 +362,7 @@ def modif_config_user(user, changes):
 def add_ss_user(port, key, userid=0, ip=''):
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     if ip == '' and 'port_key' in data:
         if port is None or port == '' or port == 0 or port == 'None':
@@ -400,7 +400,7 @@ def add_ss_user(port, key, userid=0, ip=''):
 def remove_ss_user(port):
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     if 'port_key' in data:
         if str(port) in data['port_key']:
@@ -891,7 +891,7 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
                                 if os.path.isfile('/etc/shadowsocks-libev/manager.json') and not 'shadowsocks_port' in user_gre_tunnels[gre_intf]:
                                     with open('/etc/shadowsocks-libev/manager.json') as g:
                                         contentss = g.read()
-                                    contentss = re.sub(",\s*}", "}", contentss) # pylint: disable=W1401
+                                    contentss = re.sub(r",\s*}", "}", contentss) # pylint: disable=W1401
                                     datass = json.loads(contentss)
                                     makechange = True
                                     shadowsocks_port = 65101
@@ -1305,7 +1305,7 @@ def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip
 def set_lastchange(sync=0):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         configdata = json.loads(content)
         data = configdata
@@ -1749,7 +1749,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         with open('/etc/shadowsocks-libev/manager.json') as f:
             content = f.read()
-        content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+        content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
         try:
             data = json.loads(content)
         except ValueError as e:
@@ -2282,7 +2282,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -2451,7 +2451,7 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-go/server.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-go/server.json') as f:
         content = f.read()
-    content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         data = json.loads(content)
     except ValueError as e:
@@ -3282,7 +3282,7 @@ def bypass(*, bypassconfig: ByPass, current_user: User = Depends(get_current_use
     if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-bypass.json'):
         with open('/etc/openmptcprouter-vps-admin/omr-bypass.json') as f:
             content = f.read()
-        content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
+        content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
         try:
             configdata = json.loads(content)
             data = configdata
@@ -3361,8 +3361,8 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     return {'result': 'done', 'reason': 'changes applied', 'route': 'lan'}
 
 class VPNips(BaseModel):
-    remoteip: str = Query(..., pattern='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
-    localip: str = Query(..., pattern='^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
+    remoteip: str = Query(..., pattern=r'^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
+    localip: str = Query(..., pattern=r'^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
     remoteip6: Optional[str] = None
     localip6: Optional[str] = None
     ula: Optional[str] = None
