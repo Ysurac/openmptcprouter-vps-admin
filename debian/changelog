@@ -1,3 +1,9 @@
+omr-vps-admin (0.16+20251126) unstable; urgency=medium
+
+    * Fix IPv6 (https://github.com/Ysurac/openmptcprouter/issues/4155)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 26 Nov 2025 16:19:12 +0200
+
 omr-vps-admin (0.16+20250918) unstable; urgency=medium
 
     * Fix invalid escape sequence
