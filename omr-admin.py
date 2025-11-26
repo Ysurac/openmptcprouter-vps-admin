@@ -3828,7 +3828,7 @@ async def speedtestul(file: UploadFile, current_user: User = Depends(get_current
 def ipv6_enabled():
     ipv6_enabled = False
     addrs = netifaces.ifaddresses('lo')
-    ipv6_addr_list = addrs[netifaces.AF_INET6]
+    ipv6_addr_list = addrs.get(netifaces.AF_INET6,[])
     for ip_info in ipv6_addr_list:
         addr = ip_info['addr']
         if IPAddress(addr).version == 6:
