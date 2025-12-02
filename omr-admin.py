@@ -2057,6 +2057,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
             xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
             xray_ss_method = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.method' /etc/xray/xray-server.json").read().rstrip()
+            xray_transport = os.popen("jq -r '(.inbounds[0].streamSettings.network)' /etc/xrayxray-server.json").read().rstrip()
             xray_vless_reality_public_key = ''
             if os.path.isfile('/etc/xray/xray-vless-reality.json'):
                 xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
@@ -2065,7 +2066,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
                 vless_reality = True
             else:
                 vless_reality = False
-            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key, 'ss_method': xray_ss_method }
+            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key, 'ss_method': xray_ss_method, 'transport': xray_transport }
             LOG.debug("modif_config_user for xray")
             modif_config_user(username, {'xray': xray_conf})
         else:
@@ -2710,10 +2711,16 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'v2ray'}
 
+class XRAYTRANSPORT(str, Enum):
+    tcp = "tcp"
+    grpc = "grpc"
+    xhttp = "xhttp"
+
 class Xrayconfig(BaseModel):
     userid: str
     vless_reality: bool = Query(False, title="Enable or disable VLESS Reality")
     ss_method: str = "2022-blake3-aes-256-gcm"
+    transport: XRAYTRANSPORT = Query("tcp", title="Choose transport")
 
 @app.post('/xray', summary="Set xray settings")
 def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
@@ -2741,6 +2748,7 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
         for inbounds in xray_config['inbounds']:
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 inbounds['settings']['method'] = params.ss_method
+            inbounds['streamSettings']['network'] = params.transport
 
     with open('/etc/xray/xray-server.json', 'w') as outfile:
         json.dump(xray_config, outfile, indent=4)
