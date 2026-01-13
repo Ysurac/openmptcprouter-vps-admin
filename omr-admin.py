@@ -33,6 +33,7 @@ from enum import Enum
 from os import path
 from ipaddress import ip_address, IPv4Address, IPv6Address
 import logging
+import asyncio
 import uvicorn
 import jwt
 import requests
@@ -3845,7 +3846,12 @@ def ipv6_enabled():
 
 def main(omrport: int, omrhost: str, workers: int):
     LOG.debug("Main OMR-Admin launch")
-    uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='info', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=workers)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='info', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=workers, loop="asyncio")
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
