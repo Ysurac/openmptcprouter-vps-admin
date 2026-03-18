@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2025 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
+# Copyright (C) 2018-2026 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
 #
 # This is free software, licensed under the GNU General Public License v3.0.
 # See /LICENSE for more information.
@@ -17,6 +17,7 @@ import os
 #import sys
 import glob
 import socket
+import socket as _socket
 from operator import itemgetter
 import re
 import hashlib
@@ -54,7 +55,7 @@ from fastapi.openapi.models import SecurityBase as SecurityBaseModel
 from fastapi.responses import FileResponse
 from pydantic import BaseModel # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
-from starlette.responses import RedirectResponse, Response, JSONResponse
+from starlette.responses import RedirectResponse, Response, JSONResponse, StreamingResponse
 #from starlette.requests import Request
 import netifaces
 
@@ -614,19 +615,19 @@ def v2ray_del_user(user, restart=1):
         data = json.load(f)
         for inbounds in data['inbounds']:
             if inbounds['tag'] == 'omrin-tunnel':
-                for v2rayuser in inbounds['settings']['clients']:
+                for v2rayuser in list(inbounds['settings']['clients']):
                     if v2rayuser['email'] == user:
                         inbounds['settings']['clients'].remove(v2rayuser)
             if inbounds['tag'] == 'omrin-vmess-tunnel':
-                for v2rayuser in inbounds['settings']['clients']:
+                for v2rayuser in list(inbounds['settings']['clients']):
                     if v2rayuser['email'] == user:
                         inbounds['settings']['clients'].remove(v2rayuser)
             if inbounds['tag'] == 'omrin-trojan-tunnel':
-                for v2rayuser in inbounds['settings']['clients']:
+                for v2rayuser in list(inbounds['settings']['clients']):
                     if v2rayuser['email'] == user:
                         inbounds['settings']['clients'].remove(v2rayuser)
             if inbounds['tag'] == 'omrin-socks-tunnel':
-                for v2rayuser in inbounds['settings']['accounts']:
+                for v2rayuser in list(inbounds['settings']['accounts']):
                     if v2rayuser['user'] == user:
                         inbounds['settings']['accounts'].remove(v2rayuser)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
@@ -642,7 +643,7 @@ def xray_del_user(user, restart=1):
         for inbounds in data['inbounds']:
             custominbounds = {"inbounds": []}
             if inbounds['tag'] == 'omrin-tunnel':
-                for xrayuser in inbounds['settings']['clients']:
+                for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
                 os.system("xray api rmi --server=127.0.0.1:10086 omrin-tunnel >/dev/null 2>&1")
@@ -652,7 +653,7 @@ def xray_del_user(user, restart=1):
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
                 os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-vmess-tunnel':
-                for xrayuser in inbounds['settings']['clients']:
+                for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
                 os.system("xray api rmi --server=127.0.0.1:10086 omrin-vmess-tunnel >/dev/null 2>&1")
@@ -662,7 +663,7 @@ def xray_del_user(user, restart=1):
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
                 os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-trojan-tunnel':
-                for xrayuser in inbounds['settings']['clients']:
+                for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
                 os.system("xray api rmi --server=127.0.0.1:10086 omrin-trojan-tunnel >/dev/null 2>&1")
@@ -672,7 +673,7 @@ def xray_del_user(user, restart=1):
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
                 os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-socks-tunnel':
-                for xrayuser in inbounds['settings']['accounts']:
+                for xrayuser in list(inbounds['settings']['accounts']):
                     if xrayuser['user'] == user:
                         inbounds['settings']['accounts'].remove(xrayuser)
                 os.system("xray api rmi --server=127.0.0.1:10086 omrin-socks-tunnel >/dev/null 2>&1")
@@ -682,7 +683,7 @@ def xray_del_user(user, restart=1):
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
                 os.system("xray api adi --server=127.0.0.1:10086 /etc/xray/newconfig.json >/dev/null 2>&1")
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
-                for xrayuser in inbounds['settings']['clients']:
+                for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
                 os.system("xray api rmi --server=127.0.0.1:10086 omrin-shadowsocks-tunnel >/dev/null 2>&1")
@@ -723,7 +724,7 @@ def v2ray_del_outbound(tag, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
-        for outbounds in data['outbounds']:
+        for outbounds in list(data['outbounds']):
             if outbounds['tag'] == tag:
                 data['outbounds'].remove(outbounds)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
@@ -736,7 +737,7 @@ def xray_del_outbound(tag, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
-        for outbounds in data['outbounds']:
+        for outbounds in list(data['outbounds']):
             if outbounds['tag'] == tag:
                 data['outbounds'].remove(outbounds)
     with open('/etc/xray/xray-server.json', 'w') as f:
@@ -778,7 +779,7 @@ def v2ray_del_routing(tag, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
-        for rules in data['routing']['rules']:
+        for rules in list(data['routing']['rules']):
             if rules['outboundTag'] == tag:
                 data['routing']['rules'].remove(rules)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
@@ -791,7 +792,7 @@ def xray_del_routing(tag, restart=1):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
-        for rules in data['routing']['rules']:
+        for rules in list(data['routing']['rules']):
             if rules['outboundTag'] == tag:
                 data['routing']['rules'].remove(rules)
     with open('/etc/xray/xray-server.json', 'w') as f:
@@ -1111,10 +1112,10 @@ def v2ray_del_port(user, port, proto, name, destip, destport):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
-        for inbounds in data['inbounds']:
+        for inbounds in list(data['inbounds']):
             if inbounds['tag'] == tag:
                 data['inbounds'].remove(inbounds)
-        for routing in data['routing']['rules']:
+        for routing in list(data['routing']['rules']):
             if routing['inboundTag'][0] == tag:
                 data['routing']['rules'].remove(routing)
     with open('/etc/v2ray/v2ray-server.json', 'w') as f:
@@ -1133,10 +1134,10 @@ def xray_del_port(user, port, proto, name, destip, destport):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
-        for inbounds in data['inbounds']:
+        for inbounds in list(data['inbounds']):
             if inbounds['tag'] == tag:
                 data['inbounds'].remove(inbounds)
-        for routing in data['routing']['rules']:
+        for routing in list(data['routing']['rules']):
             if routing['inboundTag'][0] == tag:
                 data['routing']['rules'].remove(routing)
     with open('/etc/xray/xray-server.json', 'w') as f:
@@ -1225,7 +1226,7 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
+def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -1309,7 +1310,7 @@ def set_lastchange(sync=0):
     content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
         configdata = json.loads(content)
-        data = configdata
+        data = copy.deepcopy(configdata)
     except ValueError as e:
         return {'error': 'Config file not readable', 'route': 'lastchange'}
     data["lastchange"] = time.time() + sync
@@ -1382,7 +1383,7 @@ class User(BaseModel):
     vpn_client_ip: str = None
     permissions: str = 'rw'
     shadowsocks_port: int = None
-    disabled: bool = 'false'
+    disabled: bool = False
     userid: int = None
 
 
@@ -1596,7 +1597,10 @@ async def clienthost(request: Request):
 async def mptcpsupport(request: Request):
     ip = request.client.host
     if type(ip_address(ip)) is IPv6Address:
-        ip = str(ip_address(ip).ipv4_mapped)
+        mapped = ip_address(ip).ipv4_mapped
+        if mapped is None:
+            return {"mptcp": "check only support IPv4"}
+        ip = str(mapped)
     if type(ip_address(ip)) is IPv4Address:
         ipr = list(reversed(ip.split('.')))
         iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, ipr))
@@ -1660,12 +1664,13 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
             omr_config_data = json.load(f)
         except ValueError as e:
             omr_config_data = {}
+    user_config = omr_config_data['users'][0][username]
     proxy = 'shadowsocks'
-    if 'proxy' in omr_config_data['users'][0][username]:
-        proxy = omr_config_data['users'][0][username]['proxy']
-    shadowsocks_port = current_user.shadowsocks_port
+    if 'proxy' in user_config:
+        proxy = user_config['proxy']
+    shadowsocks_port = user_config.get('shadowsocks_port')
     if not shadowsocks_port == None and proxy == 'shadowsocks':
-        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+        ss_traffic = get_bytes_ss(shadowsocks_port)
     else:
         ss_traffic = 0
     ss_go_tx = 0
@@ -1742,10 +1747,11 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
                     omr_config_data = json.load(f)
                 except ValueError as e:
                     omr_config_data = {}
+    user_config = omr_config_data['users'][0][username]
     LOG.debug('Get config... shadowsocks')
     proxy = 'shadowsocks'
-    if 'proxy' in omr_config_data['users'][0][username]:
-        proxy = omr_config_data['users'][0][username]['proxy']
+    if 'proxy' in user_config:
+        proxy = user_config['proxy']
 
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         with open('/etc/shadowsocks-libev/manager.json') as f:
@@ -1758,7 +1764,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     else:
         data = {'server_port': 65101, 'method': 'chacha20'}
     #shadowsocks_port = data["server_port"]
-    shadowsocks_port = current_user.shadowsocks_port
+    shadowsocks_port = user_config.get('shadowsocks_port')
     shadowsocks_key = ''
     if shadowsocks_port is not None:
         if 'port_key' in data:
@@ -1800,9 +1806,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         shadowsocks_obfs = False
         shadowsocks_obfs_plugin = ''
         shadowsocks_obfs_type = ''
-    shadowsocks_port = current_user.shadowsocks_port
+    shadowsocks_port = user_config.get('shadowsocks_port')
     if not shadowsocks_port == None and proxy == 'shadowsocks':
-        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+        ss_traffic = get_bytes_ss(shadowsocks_port)
     else:
         ss_traffic = 0
 
@@ -1947,7 +1953,11 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         softether = True
     softether_password = ''
     if 'softethervpn' in omr_config_data['users'][0][username]:
-        softether_password = omr_config_data['users'][0][username]['softethervpn']
+        softethervpn_config = omr_config_data['users'][0][username]['softethervpn']
+        if isinstance(softethervpn_config, dict):
+            softether_password = softethervpn_config.get('password', '')
+        else:
+            softether_password = softethervpn_config
     softether_port = '65390'
     softether_cipher = 'AES-256-GCM'
     softether_host_ip = '10.255.210.1'
@@ -2058,7 +2068,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
             xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
             xray_ss_method = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.method' /etc/xray/xray-server.json").read().rstrip()
-            xray_transport = os.popen("jq -r '(.inbounds[0].streamSettings.network)' /etc/xrayxray-server.json").read().rstrip()
+            xray_transport = os.popen("jq -r '(.inbounds[0].streamSettings.network)' /etc/xray/xray-server.json").read().rstrip()
             xray_vless_reality_public_key = ''
             if os.path.isfile('/etc/xray/xray-vless-reality.json'):
                 xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
@@ -2163,7 +2173,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         if vps_domain != '':
             set_global_param('hostname', vps_domain)
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
-    user_permissions = current_user.permissions
+    user_permissions = user_config.get('permissions', current_user.permissions)
 
     internet = True
     if 'internet' in omr_config_data and not omr_config_data['internet']:
@@ -2183,7 +2193,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
                     if 'ULA=' in line:
                         ula = line.replace(line[:4], '').rstrip()
     else:
-        locaip6 = 'fd00::a00:1'
+        localip6 = 'fd00::a00:1'
         remoteip6 = 'fd00::a00:2'
 
     vpn = 'openvpn'
@@ -2472,8 +2482,6 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + current_user.username + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
     shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': port, 'protocol': method }
     modif_config_user(current_user.username, {'shadowsocks-go': shadowsocks_go_conf})
-
-    modif_config_user(current_user.username, {'shadowsocks-go': {'port': port,'method': method}})
     userid = current_user.userid
     if userid is None:
         userid = 0
@@ -3199,7 +3207,7 @@ class SoftEtherVPN(BaseModel):
 def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'softethervpn'}
-    if not os.path.isfile('/var/lib/softether/vpn_server.conf'):
+    if not os.path.isfile('/var/lib/softether/vpn_server.config'):
         return {'result': 'warning', 'reason': 'SoftEther VPN is not installed', 'route': 'softethervpn'}
     cipherPayload = {
         "jsonrpc": "2.0",
@@ -3224,7 +3232,7 @@ def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_curre
             "method": "SetUser",
             "params": {
                 "HubName_str": "OMRVPN",
-                "Name_str": current_user,
+                "Name_str": current_user.username,
                 "Auth_Password_str": params.password 
             }
         }
@@ -3236,6 +3244,7 @@ def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_curre
         except requests.exceptions.RequestException as err:
             LOG.debug("SoftEther VPN change password error (" + str(err) + ")")
             return {'result': 'error'}
+        modif_config_user(current_user.username, {'softethervpn': {'password': params.password}})
     #shorewall_add_port(current_user, str(params.port), 'tcp', 'softethervpn')
     return {'result': 'done'}
 
@@ -3607,6 +3616,9 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     shadowsocks2022_key = params.shadowsocks2022_key
     if shadowsocks2022_key is None:
         shadowsocks2022_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
+    softethervpn_pass = params.softethervpn_pass
+    upsk = ''
+    uuid = ''
     if not publicips:
         if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
             shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key, userid)
@@ -3626,7 +3638,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     else:
         for publicip in publicips:
             if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-                shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, publicip)
+                shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key, userid, publicip)
                 shadowsocks_port = shadowsocks_port + 1
             if os.path.isfile('/etc/xray/xray-server.json'):
                 xray_add_user(params.username,uuid,upsk)
@@ -3661,9 +3673,9 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     if os.path.isfile('/var/lib/softether/vpn_server.config'):
         LOG.debug("Create user " + params.username + " in SoftEther VPN")
         if softethervpn_pass is None:
-            sofethervpn_pass = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
-        add_softether_user(userid,softether_pass)
-        modif_config_user(userid,{'softethervpn': {'password': softethervpn_pass}})
+            softethervpn_pass = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
+        add_softether_user(params.username, softethervpn_pass)
+        modif_config_user(params.username, {'softethervpn': {'password': softethervpn_pass}})
 
     LOG.info("User admin (IP: " + request.client.host + ") added user " + params.username)
 
@@ -3748,7 +3760,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     if os.path.isfile('/etc/dsvpn/dsvpn0'):
         remove_dsvpn(userid)
     if os.path.isfile('/var/lib/softether/vpn_server.config'):
-        remove_softether_user(userid)
+        remove_softether_user(params.username)
     LOG.info("User admin (IP: " + request.client.host + ") removed user " + params.username)
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
@@ -3823,16 +3835,48 @@ def get_number_of_users(current_user: User = Depends(get_current_user)):
         users = len(content['users'][0]) - 1
     return {'users': users}
 
-@app.get('/speedtest', summary="Test speed from the server")
-async def speedtest(current_user: User = Depends(get_current_user)):
-    return FileResponse('/usr/share/omr-server/speedtest/test.img')
+@app.get('/speedtest', summary="Test download speed from the server")
+async def speedtest(request: Request, size: Optional[int] = Query(10), current_user: User = Depends(get_current_user)):
+    size_bytes = min(max(size, 1), 100) * 1024 * 1024
+    chunk = b'\x00' * 65536
+
+    mptcp = _mptcp_status_for_ip(request.client.host)
+
+    async def generate():
+        remaining = size_bytes
+        while remaining > 0:
+            send = min(65536, remaining)
+            yield chunk[:send]
+            remaining -= send
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(size_bytes),
+            "Cache-Control": "no-store",
+            "Content-Disposition": "attachment; filename=speedtest.bin",
+            "X-MPTCP": mptcp,
+        }
+    )
 
 @app.post('/speedtest', summary="Test upload speed from the server")
-async def speedtestul(file: UploadFile, current_user: User = Depends(get_current_user)):
+async def speedtestul(request: Request, file: UploadFile, current_user: User = Depends(get_current_user)):
     if not file:
         return {'result': 'No upload file sent'}
-    else:
-        return {'filename': file.filename}
+
+    mptcp = _mptcp_status_for_ip(request.client.host)
+
+    start = time.time()
+    size = 0
+    while True:
+        chunk = await file.read(65536)
+        if not chunk:
+            break
+        size += len(chunk)
+    elapsed = time.time() - start
+    speed_mbps = round((size * 8) / (elapsed * 1_000_000), 2) if elapsed > 0 and size > 0 else 0
+    return {'bytes': size, 'duration': round(elapsed, 3), 'speed_mbps': speed_mbps, 'mptcp': mptcp}
 
 def ipv6_enabled():
     ipv6_enabled = False
@@ -3844,6 +3888,70 @@ def ipv6_enabled():
             return True
     return ipv6_enabled
 
+# MPTCP support -----------------------------------------------------------
+
+# Protocol number for MPTCP sockets (Linux ≥ 5.6).
+IPPROTO_MPTCP = 262
+
+
+def _mptcp_status_for_ip(client_ip: str) -> str:
+    """Return 'active', 'inactive', or 'unknown' for *client_ip*."""
+    try:
+        addr = ip_address(client_ip)
+        if isinstance(addr, IPv6Address):
+            mapped = addr.ipv4_mapped
+            if mapped is None:
+                return 'unknown'
+            addr = mapped
+        if not isinstance(addr, IPv4Address):
+            return 'unknown'
+        ipr = list(reversed(str(addr).split('.')))
+        iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, ipr))
+        if path.exists('/proc/net/mptcp_net/mptcp'):
+            with open('/proc/net/mptcp_net/mptcp') as f:
+                return 'active' if iptohex in f.read() else 'inactive'
+        # Kernel ≥ 5.6 path
+        result = subprocess.run(
+            ['ss', '-MtnH'],
+            capture_output=True, text=True, timeout=2
+        )
+        return 'active' if str(addr) in result.stdout else 'inactive'
+    except Exception:
+        return 'unknown'
+
+
+class MPTCPServer(uvicorn.Server):
+    """uvicorn Server that tries to bind with an MPTCP socket.
+
+    Falls back to a normal TCP socket transparently if the kernel does
+    not support MPTCP (i.e. ``IPPROTO_MPTCP`` is unavailable or the
+    ``bind()`` call fails).
+    """
+
+    def _make_mptcp_socket(self, host: str, port: int) -> Optional[_socket.socket]:
+        af = _socket.AF_INET6 if ':' in host else _socket.AF_INET
+        try:
+            sock = _socket.socket(af, _socket.SOCK_STREAM, IPPROTO_MPTCP)
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            sock.setblocking(False)
+            sock.bind((host, port))
+            sock.listen(128)
+            LOG.info("MPTCP server socket bound on %s:%d", host, port)
+            return sock
+        except OSError as exc:
+            LOG.info("MPTCP socket unavailable (%s) – falling back to TCP", exc)
+            return None
+
+    async def serve(self, sockets=None):
+        if sockets is None:
+            host = self.config.host or '0.0.0.0'
+            port = self.config.port
+            sock = self._make_mptcp_socket(host, port)
+            if sock is not None:
+                sockets = [sock]
+        await super().serve(sockets=sockets)
+
+
 def main(omrport: int, omrhost: str, workers: int):
     LOG.debug("Main OMR-Admin launch")
     try:
@@ -3851,7 +3959,30 @@ def main(omrport: int, omrhost: str, workers: int):
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='info', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=workers, loop="asyncio")
+    ssl_opts = dict(
+        ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',
+        ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem',
+        ssl_version=5,
+    )
+    if workers <= 1:
+        # Single-worker: use MPTCPServer so the listening socket is MPTCP-aware.
+        config = uvicorn.Config(
+            "__main__:app",
+            host=omrhost, port=omrport, log_level='info',
+            loop="asyncio", **ssl_opts
+        )
+        server = MPTCPServer(config=config)
+        loop.run_until_complete(server.serve())
+    else:
+        # Multi-worker: uvicorn spawns subprocesses; each worker creates its
+        # own socket.  Pass factory=None and let each worker try MPTCP via
+        # the regular uvicorn.run path (socket override is not supported for
+        # multi-process mode, so we fall back to standard TCP here).
+        uvicorn.run(
+            "__main__:app",
+            host=omrhost, port=omrport, log_level='info',
+            workers=workers, loop="asyncio", **ssl_opts
+        )
 
 if __name__ == '__main__':
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
