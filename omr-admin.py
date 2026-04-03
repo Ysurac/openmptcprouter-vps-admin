@@ -15,6 +15,7 @@ import ipaddress
 import argparse
 import subprocess
 import os
+import platform
 #import sys
 import glob
 import socket
@@ -274,15 +275,45 @@ def file_as_bytes(file):
     with file:
         return file.read()
 
+def read_proc(path):
+    """Read a /proc or /sys/fs file and return stripped string, '' on error."""
+    try:
+        with open(path, 'r') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+def read_omr_config():
+    """Read and parse omr-admin-config.json, tolerating trailing commas."""
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = f.read()
+    content = re.sub(r",\s*}", "}", content)  # pylint: disable=W1401
+    try:
+        return json.loads(content)
+    except ValueError:
+        return {}
+
+def get_omr_version():
+    """Python equivalent of: grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'"""
+    for filepath in glob.glob('/etc/*'):
+        if not os.path.isfile(filepath):
+            continue
+        try:
+            with open(filepath, 'r', errors='ignore') as f:
+                for line in f:
+                    if 'OpenMPTCProuter VPS' in line:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            return parts[3]
+        except OSError:
+            pass
+    return ''
+
 def get_username_from_userid(userid):
     if userid == 0:
         return 'openmptcprouter'
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        data = json.loads(content)
-    except ValueError as e:
+    data = read_omr_config()
+    if not data:
         return {'error': 'Config file not readable', 'route': 'get_username'}
     for user in data['users'][0]:
         if 'userid' in data['users'][0][user] and int(data['users'][0][user]['userid']) == userid:
@@ -292,24 +323,14 @@ def get_username_from_userid(userid):
 def get_userid_from_username(username):
     if username == 'openmptcprouter':
         return 0
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        data = json.loads(content)
-    except ValueError as e:
+    data = read_omr_config()
+    if not data:
         return {'error': 'Config file not readable', 'route': 'get_username'}
     return int(data['users'][0][username]['userid'])
 
 def check_username_serial(username, serial):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        configdata = json.loads(content)
-        data = configdata
-    except ValueError as e:
-        #return {'error': 'Config file not readable', 'route': 'check_serial'}
+    data = read_omr_config()
+    if not data:
         return False
     if 'serial_enforce' not in data or data['serial_enforce'] is False:
         return True
@@ -331,13 +352,8 @@ def check_username_serial(username, serial):
     return False
 
 def set_global_param(key, value):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        configdata = json.loads(content)
-        data = configdata
-    except ValueError as e:
+    data = read_omr_config()
+    if not data:
         LOG.debug("Can't read file for set_global_param")
         return {'error': 'Config file not readable', 'route': 'global_param'}
     if not key in data or data[key] != value:
@@ -1313,14 +1329,10 @@ def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip
         os.system("systemctl -q reload shorewall6")
 
 def set_lastchange(sync=0):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        configdata = json.loads(content)
-        data = copy.deepcopy(configdata)
-    except ValueError as e:
+    configdata = read_omr_config()
+    if not configdata:
         return {'error': 'Config file not readable', 'route': 'lastchange'}
+    data = copy.deepcopy(configdata)
     data["lastchange"] = time.time() + sync
     if data and data != configdata:
         LOG.debug("backup_config() in set_last_change")
@@ -1604,6 +1616,10 @@ async def clienthost(request: Request):
 @app.get('/mptcpsupport')
 async def mptcpsupport(request: Request):
     ip = request.client.host
+    try:
+        ip_address(ip)
+    except ValueError:
+        return {"mptcp": "check only support IPv4"}
     if type(ip_address(ip)) is IPv6Address:
         mapped = ip_address(ip).ipv4_mapped
         if mapped is None:
@@ -1639,7 +1655,7 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
     if not current_user.permissions == "admin" and serial is not None:
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
-    vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1\" \"$2\" \"$3}'").read().rstrip()
+    vps_loadavg = ' '.join(read_proc('/proc/loadavg').split()[:3])
     vps_cpu_count = os.cpu_count()
     vps_memory = psutil.virtual_memory()
     vps_memory_total = vps_memory.total
@@ -1656,22 +1672,23 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
         vps_cpu_freq = psutil.cpu_freq().current
     except:
         vps_cpu_freq = None
-    vps_cpu_model = os.popen("cat /proc/cpuinfo | awk -F: '/model name/ {print $2;exit}'").read().strip()
-    vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
+    vps_cpu_model = ''
+    with open('/proc/cpuinfo', 'r') as _f:
+        for _line in _f:
+            if _line.startswith('model name'):
+                vps_cpu_model = _line.split(':', 1)[1].strip()
+                break
+    vps_uptime = read_proc('/proc/uptime').split()[0]
     vps_hostname = socket.gethostname()
     vps_current_time = time.time()
-    vps_kernel = os.popen('uname -r').read().rstrip()
-    vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
+    vps_kernel = platform.uname().release
+    vps_omr_version = get_omr_version()
     mptcp_enabled = "0"
     if path.exists("/proc/sys/net/mptcp/mptcp_enabled"):
-        mptcp_enabled = os.popen('sysctl -qn net.mptcp.mptcp_enabled').read().rstrip()
+        mptcp_enabled = read_proc('/proc/sys/net/mptcp/mptcp_enabled')
     elif path.exists("/proc/sys/net/mptcp/enabled"):
-        mptcp_enabled = os.popen('sysctl -qn net.mptcp.enabled').read().rstrip()
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        try:
-            omr_config_data = json.load(f)
-        except ValueError as e:
-            omr_config_data = {}
+        mptcp_enabled = read_proc('/proc/sys/net/mptcp/enabled')
+    omr_config_data = read_omr_config()
     user_config = omr_config_data['users'][0][username]
     proxy = 'shadowsocks'
     if 'proxy' in user_config:
@@ -1749,15 +1766,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if not current_user.permissions == "admin" and serial is not None:
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        try:
-            omr_config_data = json.load(f)
-        except ValueError as e:
-            with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-                try:
-                    omr_config_data = json.load(f)
-                except ValueError as e:
-                    omr_config_data = {}
+    omr_config_data = read_omr_config()
     user_config = omr_config_data['users'][0][username]
     LOG.debug('Get config... shadowsocks')
     proxy = 'shadowsocks'
@@ -2078,8 +2087,10 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if os.path.isfile('/etc/v2ray/v2ray-server.json'):
         v2ray = True
         if not 'v2ray' in omr_config_data['users'][0][username]:
-            v2ray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/v2ray/v2ray-server.json").read().rstrip()
-            v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
+            with open('/etc/v2ray/v2ray-server.json') as _f:
+                _v2 = json.load(_f)
+            v2ray_key = next((c.get('id', '') for c in _v2['inbounds'][0].get('settings', {}).get('clients', []) if c.get('email') == username), '')
+            v2ray_port = str(_v2['inbounds'][0].get('port', ''))
             v2ray_conf = { 'key': v2ray_key, 'port': v2ray_port}
             LOG.debug("modif_config_user for v2ray")
             modif_config_user(username, {'v2ray': v2ray_conf})
@@ -2096,21 +2107,24 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if os.path.isfile('/etc/xray/xray-server.json'):
         xray = True
         if not 'xray' in omr_config_data['users'][0][username]:
-            xray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/xray/xray-server.json").read().rstrip()
-            xray_ss_skey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.password' /etc/xray/xray-server.json").read().rstrip()
-            xray_ss_ukey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.clients[] | select(.email==" + '"' + username + '"' + ") | .password' /etc/xray/xray-server.json").read().rstrip()
+            with open('/etc/xray/xray-server.json') as _f:
+                _xr = json.load(_f)
+            xray_key = next((c.get('id', '') for c in _xr['inbounds'][0].get('settings', {}).get('clients', []) if c.get('email') == username), '')
+            xray_port = str(_xr['inbounds'][0].get('port', ''))
+            xray_ss_skey = xray_ss_ukey = xray_ss_method = ''
+            xray_transport = _xr['inbounds'][0].get('streamSettings', {}).get('network', 'tcp')
+            for _ib in _xr['inbounds']:
+                if _ib.get('tag') == 'omrin-shadowsocks-tunnel':
+                    xray_ss_skey = _ib.get('settings', {}).get('password', '')
+                    xray_ss_method = _ib.get('settings', {}).get('method', '')
+                    xray_ss_ukey = next((c.get('password', '') for c in _ib.get('settings', {}).get('clients', []) if c.get('email') == username), '')
             xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
-            xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
-            xray_ss_method = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.method' /etc/xray/xray-server.json").read().rstrip()
-            xray_transport = os.popen("jq -r '(.inbounds[0].streamSettings.network)' /etc/xray/xray-server.json").read().rstrip()
             xray_vless_reality_public_key = ''
             if os.path.isfile('/etc/xray/xray-vless-reality.json'):
-                xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
-            test_vless_reality = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ")' /etc/xray/xray-server.json").read().rstrip()
-            if test_vless_reality != '':
-                vless_reality = True
-            else:
-                vless_reality = False
+                with open('/etc/xray/xray-vless-reality.json') as _f:
+                    _vr = json.load(_f)
+                xray_vless_reality_public_key = next((ib.get('streamSettings', {}).get('realitySettings', {}).get('publicKey', '') for ib in _vr['inbounds'] if ib.get('tag') == 'omrin-vless-reality'), '')
+            vless_reality = any(ib.get('tag') == 'omrin-vless-reality' for ib in _xr['inbounds'])
             xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key, 'ss_method': xray_ss_method, 'transport': xray_transport }
             LOG.debug("modif_config_user for xray")
             modif_config_user(username, {'xray': xray_conf})
@@ -2127,10 +2141,17 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if os.path.isfile('/etc/shadowsocks-go/server.json'):
         shadowsocks_go = True
         if not 'shadowsocks-go' in omr_config_data['users'][0][username]:
-            shadowsocks_go_psk = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .psk' /etc/shadowsocks-go/server.json").read().rstrip()
-            shadowsocks_go_port = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .tcpListeners[0].address' /etc/shadowsocks-go/server.json | cut -d ':' -f2").read().rstrip()
-            shadowsocks_go_protocol = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .protocol' /etc/shadowsocks-go/server.json").read().rstrip()
-            shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + username + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
+            with open('/etc/shadowsocks-go/server.json') as _f:
+                _sg = json.load(_f)
+            _srv = next((s for s in _sg.get('servers', []) if s.get('name') == 'ss-2022'), {})
+            shadowsocks_go_psk = _srv.get('psk', '')
+            _listeners = _srv.get('tcpListeners', [{}])
+            shadowsocks_go_port = _listeners[0].get('address', ':').rsplit(':', 1)[-1] if _listeners else ''
+            shadowsocks_go_protocol = _srv.get('protocol', '')
+            shadowsocks_go_upsk = ''
+            if os.path.isfile('/etc/shadowsocks-go/upsks.json'):
+                with open('/etc/shadowsocks-go/upsks.json') as _f:
+                    shadowsocks_go_upsk = json.load(_f).get(username, '')
             shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': shadowsocks_go_port, 'protocol': shadowsocks_go_protocol }
             LOG.debug("modif_config_user for shadowsocks-go")
             modif_config_user(username, {'shadowsocks-go': shadowsocks_go_conf})
@@ -2144,67 +2165,80 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     mptcp_version = mptcp_enabled = mptcp_checksum = '0'
     mptcp_path_manager = mptcp_scheduler = mptcp_syn_retries = ''
     if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
-        mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
-        mptcp_checksum = os.popen('sysctl -n net.mptcp.mptcp_checksum').read().rstrip()
-        mptcp_path_manager = os.popen('sysctl -n  net.mptcp.mptcp_path_manager').read().rstrip()
-        mptcp_scheduler = os.popen('sysctl -n net.mptcp.mptcp_scheduler').read().rstrip()
-        mptcp_syn_retries = os.popen('sysctl -n net.mptcp.mptcp_syn_retries').read().rstrip()
-        mptcp_version = os.popen('sysctl -n net.mptcp.mptcp_version').read().rstrip()
+        mptcp_enabled = read_proc('/proc/sys/net/mptcp/mptcp_enabled')
+        mptcp_checksum = read_proc('/proc/sys/net/mptcp/mptcp_checksum')
+        mptcp_path_manager = read_proc('/proc/sys/net/mptcp/mptcp_path_manager')
+        mptcp_scheduler = read_proc('/proc/sys/net/mptcp/mptcp_scheduler')
+        mptcp_syn_retries = read_proc('/proc/sys/net/mptcp/mptcp_syn_retries')
+        mptcp_version = read_proc('/proc/sys/net/mptcp/mptcp_version')
     elif path.exists('/proc/sys/net/mptcp/enabled'):
-        mptcp_enabled = os.popen('sysctl -n net.mptcp.enabled').read().rstrip()
-        mptcp_checksum = os.popen('sysctl -n net.mptcp.checksum_enabled').read().rstrip()
+        mptcp_enabled = read_proc('/proc/sys/net/mptcp/enabled')
+        mptcp_checksum = read_proc('/proc/sys/net/mptcp/checksum_enabled')
         mptcp_version = '1'
 
-    congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
+    congestion_control = read_proc('/proc/sys/net/ipv4/tcp_congestion_control')
 
     LOG.debug('Get config... ipv6')
     if 'ipv6_network' in omr_config_data:
         ipv6_network = omr_config_data['ipv6_network']
     else:
-        ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+        try:
+            _ip6out = subprocess.check_output(['ip', '-6', 'addr', 'show', IFACE6], timeout=2, stderr=subprocess.DEVNULL).decode()
+            _m = re.search(r'inet6 (\S+) scope global', _ip6out)
+            ipv6_network = _m.group(1) if _m else ''
+        except (subprocess.SubprocessError, OSError):
+            ipv6_network = ''
     if ipv6_network != '':
         set_global_param('ipv6_network', ipv6_network)
-    #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
     if 'ipv6_addr' in omr_config_data:
         ipv6_addr = omr_config_data['ipv6_addr']
     else:
-        ipv6_addr = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
+        ipv6_addr = ipv6_network.split('/')[0] if ipv6_network else ''
     if ipv6_addr != '':
         set_global_param('ipv6_addr', ipv6_addr)
-    #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
     ipv4_addr = ''
     if 'ipv4' in omr_config_data:
         ipv4_addr = omr_config_data['ipv4']
     elif 'internet' in omr_config_data and not omr_config_data['internet']:
-        ipv4_addr = os.popen('ip -4 addr show ' + IFACE +' | grep -oP "(?<=inet ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
+        try:
+            _ip4out = subprocess.check_output(['ip', '-4', 'addr', 'show', IFACE], timeout=2, stderr=subprocess.DEVNULL).decode()
+            _m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/', _ip4out)
+            ipv4_addr = _m.group(1) if _m else ''
+        except (subprocess.SubprocessError, OSError):
+            ipv4_addr = ''
     else:
-        #ipv4_addr = os.popen("dig -4 TXT +timeout=2 +tries=1 +short o-o.myaddr.l.google.com @ns1.google.com | awk -F'\"' '{ print $2}'").read().rstrip()
-        if ipv4_addr == '':
-            ipv4_addr = os.popen('wget -4 -qO- -t 1 -T 1 http://ip.openmptcprouter.com').read().rstrip()
-        if ipv4_addr == '':
-            ipv4_addr = os.popen('wget -4 -qO- -t 1 -T 1 http://ifconfig.me').read().rstrip()
-        if ipv4_addr != '':
+        try:
+            ipv4_addr = requests.get('http://ip.openmptcprouter.com', timeout=2).text.strip()
+        except Exception:
+            pass
+        if not ipv4_addr:
+            try:
+                ipv4_addr = requests.get('http://ifconfig.me', timeout=2).text.strip()
+            except Exception:
+                pass
+        if ipv4_addr:
             set_global_param('ipv4', ipv4_addr)
 
-    test_aes = os.popen('cat /proc/cpuinfo | grep aes').read().rstrip()
-    if test_aes == '':
-        vps_aes = False
-    else:
-        vps_aes = True
-    vps_kernel = os.popen('uname -r').read().rstrip()
-    vps_machine = os.popen('uname -m').read().rstrip()
-    vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
-    vps_loadavg = os.popen("cat /proc/loadavg | awk '{print $1" "$2" "$3}'").read().rstrip()
-    vps_uptime = os.popen("cat /proc/uptime | awk '{print $1}'").read().rstrip()
+    with open('/proc/cpuinfo', 'r') as _f:
+        vps_aes = 'aes' in _f.read()
+    _uname = platform.uname()
+    vps_kernel = _uname.release
+    vps_machine = _uname.machine
+    vps_omr_version = get_omr_version()
+    vps_loadavg = ' '.join(read_proc('/proc/loadavg').split()[:3])
+    vps_uptime = read_proc('/proc/uptime').split()[0]
     LOG.debug('get hostname')
     if 'hostname' in omr_config_data:
         vps_domain = omr_config_data['hostname']
     elif 'internet' in omr_config_data and not omr_config_data['internet']:
         vps_domain = ''
     else:
-        vps_domain = os.popen('wget -4 -qO- -t 1 -T 1 http://hostname.openmptcprouter.com').read().rstrip()
-        if vps_domain != '':
+        try:
+            vps_domain = requests.get('http://hostname.openmptcprouter.com', timeout=2).text.strip()
+        except Exception:
+            vps_domain = ''
+        if vps_domain:
             set_global_param('hostname', vps_domain)
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
     user_permissions = user_config.get('permissions', current_user.permissions)
@@ -2274,7 +2308,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         available_proxy = [proxy]
 
     localvpn = ""
-    if os.popen('ip l | grep " vpn"').read().rstrip() != '':
+    if any(iface.startswith('vpn') for iface in netifaces.interfaces()):
         localvpn = "vpn1"
 
     lanips = ""
@@ -2327,7 +2361,12 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if not os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         return {'result': 'warning', 'reason': 'Shadowsocks-lib not installed', 'route': 'shadowsocks'}
 
-    ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+    try:
+        _ip6out = subprocess.check_output(['ip', '-6', 'addr', 'show', IFACE6], timeout=2, stderr=subprocess.DEVNULL).decode()
+        _m = re.search(r'inet6 (\S+) scope global', _ip6out)
+        ipv6_network = _m.group(1) if _m else ''
+    except (subprocess.SubprocessError, OSError):
+        ipv6_network = ''
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
@@ -2378,8 +2417,11 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if 'hostname' in omr_config_data:
         vps_domain = omr_config_data['hostname']
     else:
-        vps_domain = os.popen('wget -4 -qO- -t 1 -T 1 http://hostname.openmptcprouter.com').read().rstrip()
-        if vps_domain != '':
+        try:
+            vps_domain = requests.get('http://hostname.openmptcprouter.com', timeout=2).text.strip()
+        except Exception:
+            vps_domain = ''
+        if vps_domain:
             set_global_param('hostname', vps_domain)
 
     if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
@@ -2515,8 +2557,12 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     mptcp = params.mptcp
     #key = params.key
     LOG.debug("modif_config_user for shadowsocks-go port")
-    shadowsocks_go_psk = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .psk' /etc/shadowsocks-go/server.json").read().rstrip()
-    shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + current_user.username + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
+    _srv = next((s for s in data.get('servers', []) if s.get('name') == 'ss-2022'), {})
+    shadowsocks_go_psk = _srv.get('psk', '')
+    shadowsocks_go_upsk = ''
+    if os.path.isfile('/etc/shadowsocks-go/upsks.json'):
+        with open('/etc/shadowsocks-go/upsks.json') as _f:
+            shadowsocks_go_upsk = json.load(_f).get(current_user.username, '')
     shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': port, 'protocol': method }
     modif_config_user(current_user.username, {'shadowsocks-go': shadowsocks_go_conf})
     userid = current_user.userid
@@ -2734,28 +2780,15 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
     if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
         return {'result': 'warning', 'reason': 'V2Ray not installed', 'route': 'v2ray'}
 
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
-    #with open('/etc/v2ray/v2ray-server.json') as f:
-    #    v2ray_config = json.load(f)
-    #v2ruserid = params.userid
-    #for inbounds in v2ray_config['inbounds']:
-    #    if inbounds['tag'] == 'omrin-tunnel':
-    #        inbounds['settings']['clients'][0]['id'] = v2ruserid
-    #with open('/etc/v2ray/v2ray-server.json', 'w') as outfile:
-    #    json.dump(v2ray_config, outfile, indent=4)
     username = current_user.username
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
-    v2ray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/v2ray/v2ray-server.json").read().rstrip()
-    v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
+    with open('/etc/v2ray/v2ray-server.json') as f:
+        v2ray_config = json.load(f)
+    v2ray_key = next((c.get('id', '') for c in v2ray_config['inbounds'][0].get('settings', {}).get('clients', []) if c.get('email') == username), '')
+    v2ray_port = str(v2ray_config['inbounds'][0].get('port', ''))
     v2ray_conf = { 'key': v2ray_key, 'port': v2ray_port}
     LOG.debug("modif_config_user for v2ray conf")
     modif_config_user(username, {'v2ray': v2ray_conf})
-    if initial_md5 != final_md5:
-        os.system("systemctl -q restart v2ray")
-        #set_lastchange()
-        return {'result': 'done', 'reason': 'changes applied', 'route': 'v2ray'}
-    else:
-        return {'result': 'done', 'reason': 'no changes', 'route': 'v2ray'}
+    return {'result': 'done', 'reason': 'no changes', 'route': 'v2ray'}
 
 class XRAYTRANSPORT(str, Enum):
     tcp = "tcp"
@@ -2775,54 +2808,49 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     if not os.path.isfile('/etc/xray/xray-server.json'):
         return {'result': 'warning', 'reason': 'Xay not installed', 'route': 'xray'}
 
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
-    test_vless_reality = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ")' /etc/xray/xray-server.json").read().rstrip()
-    if test_vless_reality != '':
-        chk_vless_reality = True
-    else:
-        chk_vless_reality = False
-    with open('/etc/xray/xray-server.json') as f:
-        xray_config = json.load(f)
-        if params.vless_reality and not chk_vless_reality:
-            with open('/etc/xray/xray-vless-reality.json') as f:
-                vless_reality_config = json.load(f)
-            xray_config['inbounds'].append(vless_reality_config['inbounds'][0])
-        elif not params.vless_reality and chk_vless_reality:
-            for inbounds in xray_config['inbounds']:
-                if inbounds['tag'] == 'omrin-vless-reality':
-                    xray_config['inbounds'].remove(inbounds)
-        for inbounds in xray_config['inbounds']:
-            if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
-                inbounds['settings']['method'] = params.ss_method
+    # Read file once — compute initial MD5, parse JSON, avoid re-reads later
+    with open('/etc/xray/xray-server.json', 'rb') as f:
+        _initial_bytes = f.read()
+    initial_md5 = hashlib.md5(_initial_bytes).hexdigest()
+    xray_config = json.loads(_initial_bytes)
+
+    chk_vless_reality = any(ib.get('tag') == 'omrin-vless-reality' for ib in xray_config['inbounds'])
+    if params.vless_reality and not chk_vless_reality:
+        with open('/etc/xray/xray-vless-reality.json') as f:
+            vless_reality_config = json.load(f)
+        xray_config['inbounds'].append(vless_reality_config['inbounds'][0])
+    elif not params.vless_reality and chk_vless_reality:
+        xray_config['inbounds'] = [ib for ib in xray_config['inbounds'] if ib.get('tag') != 'omrin-vless-reality']
+    for inbounds in xray_config['inbounds']:
+        if inbounds.get('tag') == 'omrin-shadowsocks-tunnel':
+            inbounds['settings']['method'] = params.ss_method
+        if 'streamSettings' in inbounds:
             inbounds['streamSettings']['network'] = params.transport
 
     with open('/etc/xray/xray-server.json', 'w') as outfile:
         json.dump(xray_config, outfile, indent=4)
-    #with open('/etc/xray/xray-server.json') as f:
-    #    xray_config = json.load(f)
-    #xruserid = params.userid
-    #for inbounds in xray_config['inbounds']:
-    #    if inbounds['tag'] == 'omrin-tunnel':
-    #        inbounds['settings']['clients'][0]['id'] = xruserid
-    #with open('/etc/xray/xray-server.json', 'w') as outfile:
-    #    json.dump(xray_config, outfile, indent=4)
+    # Compute final MD5 from in-memory dump — no extra disk read
+    final_md5 = hashlib.md5(json.dumps(xray_config, indent=4).encode()).hexdigest()
+
     username = current_user.username
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
-    xray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/xray/xray-server.json").read().rstrip()
-    xray_ss_skey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.password' /etc/xray/xray-server.json").read().rstrip()
-    xray_ss_ukey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.clients[] | select(.email==" + '"' + username + '"' + ") | .password' /etc/xray/xray-server.json").read().rstrip()
+    # Extract all values from in-memory xray_config — no jq subprocesses
+    xray_key = next((c.get('id', '') for c in xray_config['inbounds'][0].get('settings', {}).get('clients', []) if c.get('email') == username), '')
+    xray_port = str(xray_config['inbounds'][0].get('port', ''))
+    xray_ss_skey = xray_ss_ukey = ''
+    for _ib in xray_config['inbounds']:
+        if _ib.get('tag') == 'omrin-shadowsocks-tunnel':
+            xray_ss_skey = _ib.get('settings', {}).get('password', '')
+            xray_ss_ukey = next((c.get('password', '') for c in _ib.get('settings', {}).get('clients', []) if c.get('email') == username), '')
     xray_ss_key = xray_ss_skey + ':' + xray_ss_ukey
-    xray_port = os.popen('jq -r .inbounds[0].port /etc/xray/xray-server.json').read().rstrip()
-    test_vless_reality = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ")' /etc/xray/xray-server.json").read().rstrip()
-    if test_vless_reality != '':
-        vless_reality = True
-    else:
-        vless_reality = False
+    vless_reality = any(ib.get('tag') == 'omrin-vless-reality' for ib in xray_config['inbounds'])
+    xray_vless_reality_public_key = ''
     if os.path.isfile('/etc/xray/xray-vless-reality.json'):
-        xray_vless_reality_public_key = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-vless-reality' + '"' + ") | .streamSettings.realitySettings.publicKey' /etc/xray/xray-vless-reality.json").read().rstrip()
-        xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method }
-        LOG.debug("modif_config_user for xray conf")
-        modif_config_user(username, {'xray': xray_conf})
+        with open('/etc/xray/xray-vless-reality.json') as f:
+            _vr = json.load(f)
+        xray_vless_reality_public_key = next((ib.get('streamSettings', {}).get('realitySettings', {}).get('publicKey', '') for ib in _vr['inbounds'] if ib.get('tag') == 'omrin-vless-reality'), '')
+    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method }
+    LOG.debug("modif_config_user for xray conf")
+    modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
         if params.vless_reality and not chk_vless_reality:
             shorewall_add_port(current_user, '443', 'tcp', 'xray vless-reality')
@@ -3345,6 +3373,8 @@ class WireGuard(BaseModel):
 
 @app.post('/wireguard', summary="Modify Wireguard configuration")
 def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'wireguard'}
     if not os.path.isfile('/etc/wireguard/wg0.conf'):
         return {'result': 'error', 'reason': 'Wireguard config not found', 'route': 'wireguard'}
     wg_config = configparser.ConfigParser(strict=False)
@@ -3412,6 +3442,8 @@ class Wanips(BaseModel):
 # Set WANIP
 @app.post('/wan', summary="Set WAN IPs")
 def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
+    #if current_user.permissions == "ro":
+    #    return {'result': 'permission', 'reason': 'Read only user', 'route': 'wan'}
     ips = wanips.ips
     if not ips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'wan'}
@@ -3860,6 +3892,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     #    global fake_users_db
     #    omr_config_data = json.load(f)
     #    fake_users_db = omr_config_data['users'][0]
+    return {'result': 'done', 'reason': 'user removed', 'route': 'remove_user'}
 
 class ClienttoClient(BaseModel):
     enable: bool = False
