@@ -2039,7 +2039,10 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     LOG.debug('Get config... mqvpn')
     if os.path.isfile('/etc/mqvpn/server.json'):
         with open('/etc/mqvpn/server.json') as _f:
-            mqvpn_cfg = json.load(_f)
+            try:
+                mqvpn_cfg = json.load(_f)
+            except json.JSONDecodeError:
+                mqvpn_cfg = {}
         mqvpn_users = mqvpn_cfg.get('users', [])
         mqvpn_user_entry = next((u for u in mqvpn_users if u.get('name') == username), None)
         mqvpn_key = mqvpn_user_entry['key'] if mqvpn_user_entry else ''

@@ -3,6 +3,8 @@ omr-vps-admin (0.17+20260407) unstable; urgency=medium
     * Add mqvpn support
     * optimize code
     * add cython support
+    * Rename to omradmin.py
+    * Add unit tests
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 07 Apr 2026 10:01:21 +0200
 

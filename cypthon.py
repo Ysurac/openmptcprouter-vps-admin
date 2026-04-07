@@ -19,8 +19,8 @@ class BuildExecutable(Command):
     def finalize_options(self): pass
 
     def run(self):
-        source = "omr-admin.py"
-        c_file = "omr-admin.c"
+        source = "omradmin.py"
+        c_file = "omradmin.c"
         output = "omr-admin"
 
         # Step 1: Cython -> C with --embed (adds main() entry point)
@@ -49,7 +49,7 @@ class BuildExecutable(Command):
         extra_ldflags += (sysconfig.get_config_var("SYSLIBS") or "").split()
 
         cmd = [
-            "gcc", "-O2",
+            "gcc", "-O1", "-pipe",
             f"-I{py_include}",
             c_file,
             f"-L{py_libdir}",
