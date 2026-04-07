@@ -31,6 +31,7 @@ class BuildExecutable(Command):
                 "--embed",
                 "-3",
                 "--module-name", "omradmin",
+                "--directive", "annotation_typing=False",
                 "--output-file", c_file,
                 source,
             ],

@@ -896,7 +896,7 @@ class TestBackupGet:
         assert r.status_code == 403
 
     def test_returns_data_key(self, user_client):
-        with patch("builtins.open", side_effect=_mock_open):
+        with patch("os.path.isfile", return_value=True):
             r = user_client.get("/backupget")
         assert "data" in r.json()
 

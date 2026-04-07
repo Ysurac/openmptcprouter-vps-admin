@@ -206,17 +206,30 @@ def get_bytes_v2ray(t,user):
         side="downlink"
     else:
         side="uplink"
+    stat_name = f"user>>>{user}>>>traffic>>>{side}"
     try:
-        data = subprocess.check_output('/usr/bin/v2ray api stats --server=127.0.0.1:10085 -json ' + "'" + 'user>>>' + user + '>>>traffic>>>' + side + "'" + ' 2>/dev/null | jq -r .stat[0].value | tr -d " " | tr -d "\n"', shell = True)
-        #data = subprocess.check_output('/usr/bin/v2ctl api --server=127.0.0.1:10085 StatsService.GetStats ' + "'" + 'name: "user>>>' + user + '>>>traffic>>>' + side + '"' + "'" + ' 2>/dev/null | grep value | cut -d: -f2 | tr -d " "', shell = True)
-    except:
+        data = subprocess.run(
+            ["/usr/bin/v2ray", "api", "stats", "--server=127.0.0.1:10085", "-json", stat_name],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
         return 0
-    if data.decode("utf-8") != '' and data.decode("utf-8") != 'null':
-        try:
-            return int(data.decode("utf-8"))
-        except ValueError:
-            return 0
-    else:
+    if data.returncode != 0 or data.stdout.strip() == '':
+        return 0
+    try:
+        payload = json.loads(data.stdout)
+    except ValueError:
+        return 0
+    stats = payload.get('stat', [])
+    if not stats:
+        return 0
+    value = stats[0].get('value')
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return 0
 
 def get_bytes_xray(t,user):
@@ -224,16 +237,28 @@ def get_bytes_xray(t,user):
         side="downlink"
     else:
         side="uplink"
+    stat_name = f"user>>>{user}>>>traffic>>>{side}"
     try:
-        data = subprocess.check_output('/usr/bin/xray api stats --server=127.0.0.1:10086 -name ' + "'" + 'user>>>' + user + '>>>traffic>>>' + side + "'" + ' 2>/dev/null | jq -r .stat.value | tr -d " " | tr -d "\n"', shell = True)
-    except:
+        data = subprocess.run(
+            ["/usr/bin/xray", "api", "stats", "--server=127.0.0.1:10086", "-name", stat_name],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
         return 0
-    if data.decode("utf-8") != '' and data.decode("utf-8") != 'null':
-        try:
-            return int(data.decode("utf-8"))
-        except ValueError:
-            return 0
-    else:
+    if data.returncode != 0 or data.stdout.strip() == '':
+        return 0
+    try:
+        payload = json.loads(data.stdout)
+    except ValueError:
+        return 0
+    stat = payload.get('stat', {})
+    value = stat.get('value')
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return 0
 
 def get_bytes_softether(user):
@@ -1472,7 +1497,11 @@ class BasicAuth(SecurityBase):
                     status_code=HTTP_403_FORBIDDEN, detail="Not authenticated"
                 )
             else:
-                return None
+                raise HTTPException(
+                    status_code=401,
+                    detail="Not authenticated",
+                    headers={"WWW-Authenticate": "Basic"},
+                )
         return param
 
 basic_auth = BasicAuth(auto_error=False)
@@ -1559,7 +1588,7 @@ async def route_logout_and_remove_cookie():
 
 # Login for doc
 @app.get("/login_basic")
-async def login_basic(auth: BasicAuth = Depends(basic_auth)):
+async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
     if not auth:
         response = Response(headers={"WWW-Authenticate": "Basic"}, status_code=401)
         return response
@@ -1589,6 +1618,8 @@ async def login_basic(auth: BasicAuth = Depends(basic_auth)):
             httponly=True,
             max_age=1800,
             expires=1800,
+            secure=(request.url.scheme == "https"),
+            samesite="lax",
         )
         return response
 
@@ -3642,14 +3673,22 @@ def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_curre
 
 @app.get('/backupget', summary="Get current user router backup file")
 def send_backup(filename: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
-    if filename is not None and current_user.username in filename:
-        with open('/var/opt/openmptcprouter/' + filename, "rb") as backup_file:
-            file_base64 = base64.b64encode(backup_file.read())
-            file_base64utf = file_base64.decode('utf-8')
-    else:
-        with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', "rb") as backup_file:
-            file_base64 = base64.b64encode(backup_file.read())
-            file_base64utf = file_base64.decode('utf-8')
+    backup_dir = '/var/opt/openmptcprouter'
+    backup_name = current_user.username + '-backup.tar.gz'
+    if filename is not None:
+        # Accept only direct filenames for the current user to avoid traversal.
+        candidate = os.path.basename(filename)
+        if candidate != filename:
+            return {'result': 'error', 'reason': 'Invalid filename', 'route': 'backupget'}
+        if not candidate.startswith(current_user.username + '-') or not candidate.endswith('-backup.tar.gz'):
+            return {'result': 'error', 'reason': 'Invalid filename', 'route': 'backupget'}
+        backup_name = candidate
+    backup_path = os.path.join(backup_dir, backup_name)
+    if not os.path.isfile(backup_path):
+        return {'result': 'error', 'reason': 'Backup not found', 'route': 'backupget'}
+    with open(backup_path, "rb") as backup_file:
+        file_base64 = base64.b64encode(backup_file.read())
+        file_base64utf = file_base64.decode('utf-8')
     return {'data': file_base64utf}
 
 @app.get('/backuplist', summary="List available current user backup")
@@ -4100,7 +4139,7 @@ def main(omrport: int, omrhost: str, workers: int):
     if workers <= 1:
         # Single-worker: use MPTCPServer so the listening socket is MPTCP-aware.
         config = uvicorn.Config(
-            "__main__:app",
+            app,
             host=omrhost, port=omrport, log_level='info',
             loop="asyncio", **ssl_opts
         )
@@ -4112,12 +4151,23 @@ def main(omrport: int, omrhost: str, workers: int):
         # the regular uvicorn.run path (socket override is not supported for
         # multi-process mode, so we fall back to standard TCP here).
         uvicorn.run(
-            "__main__:app",
+            "omradmin:app",
             host=omrhost, port=omrport, log_level='info',
             workers=workers, loop="asyncio", **ssl_opts
         )
 
 if __name__ == '__main__':
+    import sys
+    # When compiled with Cython, multiprocessing re-executes the binary with
+    # "-c <code>" to spawn worker/resource-tracker processes. Intercept that
+    # here before argparse sees it.
+    if len(sys.argv) >= 2 and sys.argv[1] == '-c':
+        code = sys.argv[2]
+        # Shift away '-c <code>' so remaining args (e.g. '--multiprocessing-fork')
+        # are at the positions multiprocessing internals expect.
+        sys.argv = [sys.argv[0]] + sys.argv[3:]
+        exec(code)
+        sys.exit(0)
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
     omrport = 65500
