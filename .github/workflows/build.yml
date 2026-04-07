@@ -17,7 +17,7 @@ jobs:
     - name: Move deb packages
       run: mkdir packages && mv ../*.deb packages/
       
-    - uses: actions/upload-artifact@v1
+    - uses: actions/upload-artifact@v4
       with:
         name: Debian packages
         path: packages
