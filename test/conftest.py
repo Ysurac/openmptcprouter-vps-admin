@@ -141,7 +141,7 @@ def _mock_open(path, mode="r", *args, **kwargs):
 builtins.open = _mock_open
 try:
     _module_path = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "omr-admin.py")
+        os.path.join(os.path.dirname(__file__), "..", "omradmin.py")
     )
     _spec = importlib.util.spec_from_file_location("omr_admin", _module_path)
     omr_admin = importlib.util.module_from_spec(_spec)
