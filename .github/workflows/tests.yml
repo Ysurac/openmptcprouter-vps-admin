@@ -1,0 +1,42 @@
+name: Unit Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - develop
+      - main
+      - master
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            fastapi \
+            uvicorn \
+            pyjwt \
+            passlib \
+            python-multipart \
+            requests \
+            httpx \
+            psutil \
+            netaddr \
+            netifaces \
+            pydantic \
+            pytest \
+            pytest-asyncio \
+            anyio
+
+      - name: Run unit tests
+        run: python -m pytest test/ -v
