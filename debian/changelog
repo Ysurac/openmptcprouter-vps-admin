@@ -1,3 +1,10 @@
+omr-vps-admin (0.17+20260414) unstable; urgency=medium
+
+    * Check if proxy/vpn exists before adding user
+    * some stability fix
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 14 Apr 2026 17:43:26 +0200
+
 omr-vps-admin (0.17+20260407) unstable; urgency=medium
 
     * Add mqvpn support

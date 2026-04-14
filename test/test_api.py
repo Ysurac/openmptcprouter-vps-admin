@@ -1029,6 +1029,269 @@ class TestRemoveUser:
         assert api_calls[0]["name"] == "readonly"
 
 
+class TestAddUserResponseFields:
+    """Verify the user record written to config contains the expected fields."""
+
+    _PAYLOAD = {
+        "username": "newuser",
+        "permission": "rw",
+        "vpn": "glorytun_tcp",
+        "proxy": "shadowsocks",
+    }
+
+    def test_response_is_200(self, admin_client):
+        r = admin_client.post("/add_user", json=self._PAYLOAD)
+        assert r.status_code == 200
+
+    def test_custom_userid_is_respected(self, admin_client):
+        payload = {**self._PAYLOAD, "userid": 42}
+        written = {}
+
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            admin_client.post("/add_user", json=payload)
+
+        assert written.get("users", [{}])[0].get("newuser", {}).get("userid") == "42"
+
+    def test_auto_userid_is_above_existing_max(self, admin_client):
+        # Config has userid=2 ("readonly"); new user should get at least 3
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            admin_client.post("/add_user", json=self._PAYLOAD)
+
+        userid = int(written.get("users", [{}])[0].get("newuser", {}).get("userid", 0))
+        assert userid >= 3
+
+    def test_vpn_field_saved(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            admin_client.post("/add_user", json={**self._PAYLOAD, "vpn": "glorytun_tcp"})
+
+        assert written.get("users", [{}])[0].get("newuser", {}).get("vpn") == "glorytun_tcp"
+
+    def test_proxy_field_saved(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            admin_client.post("/add_user", json={**self._PAYLOAD, "proxy": "shadowsocks"})
+
+        assert written.get("users", [{}])[0].get("newuser", {}).get("proxy") == "shadowsocks"
+
+    def test_password_is_uppercase_hex(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            admin_client.post("/add_user", json=self._PAYLOAD)
+
+        pw = written.get("users", [{}])[0].get("newuser", {}).get("user_password", "")
+        assert pw == pw.upper()
+        assert len(pw) == 64  # 32 bytes hex
+
+    def test_invalid_permission_returns_422(self, admin_client):
+        r = admin_client.post("/add_user", json={**self._PAYLOAD, "permission": "superadmin"})
+        assert r.status_code == 422
+
+    def test_invalid_vpn_returns_422(self, admin_client):
+        r = admin_client.post("/add_user", json={**self._PAYLOAD, "vpn": "notavpn"})
+        assert r.status_code == 422
+
+    def test_username_with_special_chars_does_not_break_config(self, admin_client):
+        # Regression: old code used string concat to build JSON; quotes in
+        # username would produce invalid JSON and raise an exception.
+        r = admin_client.post("/add_user", json={**self._PAYLOAD, "username": 'user"inject'})
+        # Should not 500 — either 200 (accepted) or 422 (validation rejects it)
+        assert r.status_code in (200, 422)
+
+    def test_add_user_calls_shadowsocks_when_installed(self, admin_client):
+        ss_calls = []
+
+        def _mock_add_ss(port, key, userid=0, ip=''):
+            ss_calls.append({"port": port, "key": key, "userid": userid})
+            return port
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/shadowsocks-libev/manager.json")),
+            patch("omr_admin.add_ss_user", side_effect=_mock_add_ss),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(ss_calls) == 1
+
+    def test_add_user_calls_openvpn_when_installed(self, admin_client):
+        run_calls = []
+
+        def _mock_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", side_effect=_mock_run),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        easyrsa_calls = [c for c in run_calls if c and c[0] == "./easyrsa"]
+        assert len(easyrsa_calls) == 1
+        assert "build-client-full" in easyrsa_calls[0]
+
+
+class TestRemoveUserSideEffects:
+    """Verify that remove_user triggers the right cleanup calls."""
+
+    def test_removes_shadowsocks_port_when_installed(self, admin_client):
+        ss_calls = []
+
+        def _mock_remove_ss(port):
+            ss_calls.append(port)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/shadowsocks-libev/manager.json")),
+            patch("omr_admin.remove_ss_user", side_effect=_mock_remove_ss),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert len(ss_calls) == 1
+        assert ss_calls[0] == "65102"  # shadowsocks_port from MOCK_CONFIG
+
+    def test_remove_user_calls_v2ray_when_installed(self, admin_client):
+        v2ray_calls = []
+
+        def _mock_v2ray_del(user, *args, **kwargs):
+            v2ray_calls.append(user)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/v2ray/v2ray-server.json")),
+            patch("omr_admin.v2ray_del_user", side_effect=_mock_v2ray_del),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert v2ray_calls == ["readonly"]
+
+    def test_remove_user_calls_xray_when_installed(self, admin_client):
+        xray_calls = []
+
+        def _mock_xray_del(user, *args, **kwargs):
+            xray_calls.append(user)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/xray/xray-server.json")),
+            patch("omr_admin.xray_del_user", side_effect=_mock_xray_del),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert xray_calls == ["readonly"]
+
+    def test_remove_user_calls_openvpn_revoke_when_installed(self, admin_client):
+        run_calls = []
+
+        def _mock_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", side_effect=_mock_run),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        revoke_calls = [c for c in run_calls if c and "revoke" in c]
+        assert len(revoke_calls) == 1
+        assert "readonly" in revoke_calls[0]
+
+    def test_remove_user_calls_softether_when_installed(self, admin_client):
+        se_calls = []
+
+        def _mock_remove_se(user):
+            se_calls.append(user)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/var/lib/softether/vpn_server.config")),
+            patch("omr_admin.remove_softether_user", side_effect=_mock_remove_se),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert se_calls == ["readonly"]
+
+    def test_user_is_deleted_from_config(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert "readonly" not in written.get("users", [{}])[0]
+
+    def test_user_without_shadowsocks_port_does_not_crash(self, admin_client):
+        # A user with no shadowsocks_port in config — remove_ss_user should not be called
+        import json as _json
+        import copy
+
+        config_no_ss = copy.deepcopy(
+            _json.loads(__import__("conftest")._CONFIG_JSON)
+        )
+        del config_no_ss["users"][0]["readonly"]["shadowsocks_port"]
+        config_json = _json.dumps(config_no_ss)
+
+        def _open_no_ss(path, mode="r", *args, **kwargs):
+            import io
+            sp = str(path)
+            if sp == "/etc/openmptcprouter-vps-admin/omr-admin-config.json":
+                binary = "b" in str(mode)
+                return io.BytesIO(config_json.encode()) if binary else io.StringIO(config_json)
+            from conftest import _mock_open
+            return _mock_open(path, mode, *args, **kwargs)
+
+        ss_calls = []
+        with (
+            patch("builtins.open", side_effect=_open_no_ss),
+            patch("os.path.isfile", _isfile_for("/etc/shadowsocks-libev/manager.json")),
+            patch("omr_admin.remove_ss_user", side_effect=ss_calls.append),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert len(ss_calls) == 0  # no port → no removal call
+
+
 class TestClientToClient:
     def test_requires_auth(self, unauth_client):
         r = unauth_client.post("/client2client", json={"enable": True})

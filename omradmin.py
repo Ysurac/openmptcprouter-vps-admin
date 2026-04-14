@@ -46,7 +46,6 @@ import psutil
 #from netjsonconfig import OpenWrt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2
-from passlib.context import CryptContext
 from fastapi.encoders import jsonable_encoder
 from fastapi.security.base import SecurityBase
 from fastapi.security.utils import get_authorization_scheme_param
@@ -76,22 +75,26 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
 
 # Get main net interface
-FILE = open('/etc/shorewall/params.net', "r")
-READ = FILE.read()
 IFACE = None
-for line in READ.splitlines():
-    if 'NET_IFACE=' in line:
-        IFACE = line.split('=', 1)[1]
-FILE.close()
+try:
+    with open('/etc/shorewall/params.net', "r") as FILE:
+        READ = FILE.read()
+        for line in READ.splitlines():
+            if 'NET_IFACE=' in line:
+                IFACE = line.split('=', 1)[1]
+except OSError as err:
+    LOG.warning("Could not read /etc/shorewall/params.net: %s", err)
 
 # Get ipv6 net interface
-FILE = open('/etc/shorewall6/params.net', "r")
-READ = FILE.read()
 IFACE6 = None
-for line in READ.splitlines():
-    if 'NET_IFACE=' in line:
-        IFACE6 = line.split('=', 1)[1]
-FILE.close()
+try:
+    with open('/etc/shorewall6/params.net', "r") as FILE:
+        READ = FILE.read()
+        for line in READ.splitlines():
+            if 'NET_IFACE=' in line:
+                IFACE6 = line.split('=', 1)[1]
+except OSError as err:
+    LOG.warning("Could not read /etc/shorewall6/params.net: %s", err)
 
 def delete_oldest_files(path, keep = 10):
     files = glob.glob(path)
@@ -351,6 +354,8 @@ def get_userid_from_username(username):
     data = read_omr_config()
     if not data:
         return {'error': 'Config file not readable', 'route': 'get_username'}
+    if username not in data['users'][0]:
+        return {'error': 'Unknown user', 'route': 'get_username'}
     return int(data['users'][0][username]['userid'])
 
 def check_username_serial(username, serial):
@@ -404,7 +409,11 @@ def modif_config_user(user, changes):
         LOG.debug("No real changes in modif_config_user")
 
 def add_ss_user(port, key, userid=0, ip=''):
-    with open('/etc/shadowsocks-libev/manager.json') as f:
+    try:
+        f_ss = open('/etc/shadowsocks-libev/manager.json')
+    except FileNotFoundError:
+        return port
+    with f_ss as f:
         content = f.read()
     content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
@@ -442,16 +451,18 @@ def add_ss_user(port, key, userid=0, ip=''):
     return port
 
 def remove_ss_user(port):
-    with open('/etc/shadowsocks-libev/manager.json') as f:
+    try:
+        f_ss = open('/etc/shadowsocks-libev/manager.json')
+    except FileNotFoundError:
+        return
+    with f_ss as f:
         content = f.read()
     content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     data = json.loads(content)
     if 'port_key' in data:
-        if str(port) in data['port_key']:
-            del data['port_key'][str(port)]
+        data['port_key'].pop(str(port), None)
     else:
-        if str(port) in data['port_conf']:
-            del data['port_conf'][str(port)]
+        data['port_conf'].pop(str(port), None)
     with open('/etc/shadowsocks-libev/manager.json', 'w') as f:
         json.dump(data, f, indent=4)
     try:
@@ -465,6 +476,8 @@ def remove_ss_user(port):
         LOG.debug("Shadowsocks remove error (" + str(err) + ")")
 
 def add_ss_go_user(user, key=''):
+    if not os.path.exists('/etc/shadowsocks-go/server.json'):
+        return key
     try:
         r = requests.post(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
     except requests.exceptions.Timeout:
@@ -479,6 +492,8 @@ def add_ss_go_user(user, key=''):
     return key
 
 def remove_ss_go_user(user):
+    if not os.path.exists('/etc/shadowsocks-go/server.json'):
+        return
     try:
         r = requests.delete(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users/" + user)
     except requests.exceptions.Timeout:
@@ -531,6 +546,10 @@ def remove_softether_user(user):
 def v2ray_add_user(user, v2rayuuid='', restart=1):
     if v2rayuuid == '':
         v2rayuuid = str(uuid.uuid1())
+    if not shutil.which('v2ray') and not os.path.isfile('/usr/bin/v2ray'):
+        return v2rayuuid
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return v2rayuuid
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -586,6 +605,10 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
         xrayuuid = str(uuid.uuid1())
     if ukeyss2022 == '':
         ukeyss2022 = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
+    if not shutil.which('xray') and not os.path.isfile('/usr/bin/xray'):
+        return xrayuuid
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return xrayuuid
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
@@ -599,7 +622,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
+                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
                 LOG.debug(tt)
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
@@ -608,7 +631,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
+                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
                 LOG.debug(tt)
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 inbounds['settings']['clients'].append({'password': xrayuuid, 'email': user})
@@ -617,7 +640,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
+                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
                 LOG.debug(tt)
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 inbounds['settings']['accounts'].append({'pass': xrayuuid, 'user': user})
@@ -626,7 +649,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
+                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
                 LOG.debug(tt)
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 inbounds['settings']['clients'].append({'password': ukeyss2022, 'email': user})
@@ -635,7 +658,7 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
+                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
                 LOG.debug(tt)
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
@@ -652,6 +675,10 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
     return xrayuuid
 
 def v2ray_del_user(user, restart=1):
+    if not shutil.which('v2ray') and not os.path.isfile('/usr/bin/v2ray'):
+        return
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -679,6 +706,10 @@ def v2ray_del_user(user, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_del_user(user, restart=1):
+    if not shutil.which('xray') and not os.path.isfile('/usr/bin/xray'):
+        return
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
@@ -688,52 +719,52 @@ def xray_del_user(user, restart=1):
                 for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             if inbounds['tag'] == 'omrin-vmess-tunnel':
                 for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-vmess-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-vmess-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             if inbounds['tag'] == 'omrin-trojan-tunnel':
                 for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-trojan-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-trojan-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             if inbounds['tag'] == 'omrin-socks-tunnel':
                 for xrayuser in list(inbounds['settings']['accounts']):
                     if xrayuser['user'] == user:
                         inbounds['settings']['accounts'].remove(xrayuser)
-                subprocess.run(["xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-socks-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-socks-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 for xrayuser in list(inbounds['settings']['clients']):
                     if xrayuser['email'] == user:
                         inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-shadowsocks-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-shadowsocks-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 custominbounds['inbounds'].append(inbounds)
                 with open('/etc/xray/newconfig.json', 'w') as f:
                     json.dump(custominbounds, f, indent=4)
                 #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
@@ -741,6 +772,8 @@ def xray_del_user(user, restart=1):
     #    subprocess.run(["systemctl", "-q", "restart", "xray"], check=False)
 
 def v2ray_add_outbound(tag,ip, restart=1):
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -752,6 +785,8 @@ def v2ray_add_outbound(tag,ip, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_add_outbound(tag,ip, restart=1):
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
@@ -763,6 +798,8 @@ def xray_add_outbound(tag,ip, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "xray"], check=False)
 
 def v2ray_del_outbound(tag, restart=1):
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -776,6 +813,8 @@ def v2ray_del_outbound(tag, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_del_outbound(tag, restart=1):
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
@@ -789,6 +828,8 @@ def xray_del_outbound(tag, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "xray"], check=False)
 
 def v2ray_add_routing(tag, user, restart=1):
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -804,6 +845,8 @@ def v2ray_add_routing(tag, user, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_add_routing(tag, user, restart=1):
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
@@ -818,6 +861,8 @@ def xray_add_routing(tag, user, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "xray"], check=False)
 
 def v2ray_del_routing(tag, restart=1):
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
@@ -831,6 +876,8 @@ def v2ray_del_routing(tag, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_del_routing(tag, restart=1):
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
@@ -992,6 +1039,8 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
     set_global_param('allips', allips)
 
 def add_glorytun_tcp(userid):
+    if not os.path.isfile('/etc/glorytun-tcp/tun0'):
+        return
     port = '650{:02d}'.format(userid)
     ip = IPNetwork('10.255.255.0/24')
     subnets = ip.subnet(30)
@@ -1018,11 +1067,15 @@ def add_glorytun_tcp(userid):
     subprocess.run(["systemctl", "-q", "restart", f"glorytun-tcp@tun{userid}"], check=False)
 
 def remove_glorytun_tcp(userid):
+    if not os.path.isfile('/etc/glorytun-tcp/tun' + str(userid) + '.key'):
+        return
     subprocess.run(["systemctl", "-q", "disable", f"glorytun-tcp@tun{userid}"], check=False)
     subprocess.run(["systemctl", "-q", "stop", f"glorytun-tcp@tun{userid}"], check=False)
     os.remove('/etc/glorytun-tcp/tun' + str(userid) + '.key')
 
 def add_glorytun_udp(userid):
+    if not os.path.isfile('/etc/glorytun-udp/tun0'):
+        return
     port = '650{:02d}'.format(userid)
     ip = IPNetwork('10.255.254.0/24')
     subnets = ip.subnet(30)
@@ -1050,6 +1103,8 @@ def add_glorytun_udp(userid):
     subprocess.run(["systemctl", "-q", "restart", f"glorytun-udp@tun{userid}"], check=False)
 
 def remove_glorytun_udp(userid):
+    if not os.path.isfile('/etc/glorytun-udp/tun' + str(userid) + '.key'):
+        return
     subprocess.run(["systemctl", "-q", "disable", f"glorytun-udp@tun{userid}"], check=False)
     subprocess.run(["systemctl", "-q", "stop", f"glorytun-udp@tun{userid}"], check=False)
     os.remove('/etc/glorytun-udp/tun' + str(userid) + '.key')
@@ -1057,6 +1112,8 @@ def remove_glorytun_udp(userid):
 
 
 def add_dsvpn(userid):
+    if not os.path.isfile('/etc/dsvpn/dsvpn0'):
+        return
     port = '654{:02d}'.format(userid)
     ip = IPNetwork('10.255.251.0/24')
     subnets = ip.subnet(30)
@@ -1079,6 +1136,8 @@ def add_dsvpn(userid):
     subprocess.run(["systemctl", "-q", "restart", f"dsvpn-server@dsvpn{userid}"], check=False)
     subprocess.run(["systemctl", "-q", "enable", f"dsvpn-server@dsvpn{userid}"], check=False)
 def remove_dsvpn(userid):
+    if not os.path.isfile('/etc/dsvpn/dsvpn' + str(userid)):
+        return
     subprocess.run(["systemctl", "-q", "disable", f"dsvpn-server@dsvpn{userid}"], check=False)
     subprocess.run(["systemctl", "-q", "stop", f"dsvpn-server@dsvpn{userid}"], check=False)
     os.remove('/etc/dsvpn/dsvpn' + str(userid))
@@ -1101,6 +1160,8 @@ def ordered(obj):
         return obj
 
 def v2ray_add_port(user, port, proto, name, destip, destport):
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return
     userid = user.userid
     if userid is None:
         userid = 0
@@ -1126,6 +1187,8 @@ def v2ray_add_port(user, port, proto, name, destip, destport):
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_add_port(user, port, proto, name, destip, destport):
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return
     userid = user.userid
     if userid is None:
         userid = 0
@@ -1152,6 +1215,8 @@ def xray_add_port(user, port, proto, name, destip, destport):
 
 
 def v2ray_del_port(user, port, proto, name, destip, destport):
+    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        return
     userid = user.userid
     if userid is None:
         userid = 0
@@ -1174,6 +1239,8 @@ def v2ray_del_port(user, port, proto, name, destip, destport):
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_del_port(user, port, proto, name, destip, destport):
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return
     userid = user.userid
     if userid is None:
         userid = 0
@@ -1372,7 +1439,7 @@ with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
     omr_config_data = json.load(f)
 if 'debug' in omr_config_data and omr_config_data['debug']:
     LOG.setLevel(logging.DEBUG)
-if not 'gre_tunnels' in omr_config_data or omr_config_data['gre_tunnels']:
+if 'gre_tunnels' in omr_config_data and omr_config_data['gre_tunnels']:
     LOG.debug("Add GRE tunnels")
     add_gre_tunnels()
 
@@ -1385,6 +1452,7 @@ else:
     SECRET_KEY = uuid.uuid4().hex
     set_global_param('secret_key',SECRET_KEY)
 
+softethervpnPassword = {}
 if 'softethervpn_admin_password' in omr_config_data:
     softethervpnPassword = { "X-VPNADMIN-PASSWORD": omr_config_data['softethervpn_admin_password'] }
 
@@ -1506,7 +1574,6 @@ class BasicAuth(SecurityBase):
 
 basic_auth = BasicAuth(auto_error=False)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearerCookie(tokenUrl="/token")
 
@@ -1623,7 +1690,7 @@ async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
         )
         return response
 
-    except:
+    except Exception:
         response = Response(headers={"WWW-Authenticate": "Basic"}, status_code=401)
         return response
 
@@ -1664,11 +1731,13 @@ async def mptcpsupport(request: Request):
                 if iptohex in f.read():
                     return {"mptcp": "working"}
         else:
-            mptcpcheck = subprocess.Popen("timeout 2 ss -M | grep -q " + ip, shell=True, stdout=subprocess.PIPE)
-            mptcpcheck.communicate()
-            if mptcpcheck.returncode == 0:
-                return {"mptcp": "working"}
-            mptcpcheck.kill()
+            try:
+                mptcpcheck = subprocess.Popen(["ss", "-M"], stdout=subprocess.PIPE)
+                ss_output, _ = mptcpcheck.communicate(timeout=2)
+                if ip.encode() in ss_output:
+                    return {"mptcp": "working"}
+            except subprocess.TimeoutExpired:
+                mptcpcheck.kill()
         return {"mptcp": "not working"}
     return {"mptcp": "check only support IPv4"}
 
@@ -1701,7 +1770,7 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
     vps_disk_percent = vps_disk.percent
     try:
         vps_cpu_freq = psutil.cpu_freq().current
-    except:
+    except Exception:
         vps_cpu_freq = None
     vps_cpu_model = ''
     with open('/proc/cpuinfo', 'r') as _f:
@@ -3768,7 +3837,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     else:
         publicips = params.ips
     user_key = secrets.token_hex(32)
-    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ json.dumps(publicips) +'}}')
+    user_json = {params.username: {"username": params.username, "permissions": params.permission, "user_password": user_key.upper(), "disabled": "false", "userid": str(userid), "public_ips": publicips}}
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
 #    shadowsocks_port = '651{:02d}'.format(userid)
@@ -3882,8 +3951,9 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     if userid == 0:
         return {'result': 'not allowed', 'reason': 'Userid 0 is protected', 'route': 'remove_user'}
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-        shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
-        remove_ss_user(str(shadowsocks_port))
+        shadowsocks_port = content['users'][0][params.username].get('shadowsocks_port')
+        if shadowsocks_port is not None:
+            remove_ss_user(str(shadowsocks_port))
     if os.path.isfile('/etc/shadowsocks-go/server.json'):
         remove_ss_go_user(params.username)
     if os.path.isfile('/etc/v2ray/v2ray-server.json'):
