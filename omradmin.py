@@ -1146,9 +1146,28 @@ def remove_dsvpn(userid):
 def add_mqvpn(username):
     mqvpn_user_key = secrets.token_urlsafe(32)
     mqvpn_api({'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key})
+    try:
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_config = json.load(f)
+        users = mqvpn_config.get('users', [])
+        if not any(u.get('name') == username for u in users):
+            users.append({'name': username, 'key': mqvpn_user_key})
+            mqvpn_config['users'] = users
+        with open('/etc/mqvpn/server.json', 'w') as f:
+            json.dump(mqvpn_config, f, indent=2)
+    except Exception as e:
+        LOG.debug("MQVPN add user json error (" + str(e) + ")")
 
 def remove_mqvpn(username):
     mqvpn_api({'cmd': 'remove_user', 'name': username})
+    try:
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_config = json.load(f)
+        mqvpn_config['users'] = [u for u in mqvpn_config.get('users', []) if u.get('name') != username]
+        with open('/etc/mqvpn/server.json', 'w') as f:
+            json.dump(mqvpn_config, f, indent=2)
+    except Exception as e:
+        LOG.debug("MQVPN remove user json error (" + str(e) + ")")
 
 
 def ordered(obj):
@@ -3988,7 +4007,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
                 ovpn_socket.close()
                 LOG.debug("OpenVPN error")
             else:
-                ovpn_socket.send('kill ' + params.username + '\r\n'.encode())
+                ovpn_socket.send(('kill ' + params.username + '\r\n').encode())
             ovpn_socket.close()
         except socket.timeout as err:
             LOG.debug("OpenVPN stats timeout (" + str(err) + ")")

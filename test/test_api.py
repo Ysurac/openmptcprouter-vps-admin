@@ -1028,6 +1028,49 @@ class TestRemoveUser:
         assert api_calls[0]["cmd"] == "remove_user"
         assert api_calls[0]["name"] == "readonly"
 
+    def test_remove_user_mqvpn_user_removed_from_json(self, admin_client):
+        """remove_mqvpn must delete the user from /etc/mqvpn/server.json, not only via API."""
+        import io as _io
+        import json as _json
+        import copy
+        from conftest import _mock_open as _base_open, MQVPN_CONFIG
+
+        # Seed the MQVPN config with the user we're about to remove
+        config_with_readonly = copy.deepcopy(MQVPN_CONFIG)
+        config_with_readonly["users"].append({"name": "readonly", "key": "some-key"})
+        config_json = _json.dumps(config_with_readonly)
+
+        written_json = {}
+
+        def _open_mqvpn(path, mode="r", *args, **kwargs):
+            sp = str(path)
+            if sp == "/etc/mqvpn/server.json":
+                if "w" in str(mode):
+                    buf = _io.StringIO()
+                    original_close = buf.close
+
+                    def _capture_on_close():
+                        buf.seek(0)
+                        written_json.update(_json.loads(buf.read()))
+                        original_close()
+
+                    buf.close = _capture_on_close
+                    return buf
+                return _io.StringIO(config_json)
+            return _base_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", return_value={"ok": True}),
+            patch("builtins.open", side_effect=_open_mqvpn),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        names = [u["name"] for u in written_json.get("users", [])]
+        assert "readonly" not in names
+        assert "openmptcprouter" in names  # other users preserved
+
 
 class TestAddUserResponseFields:
     """Verify the user record written to config contains the expected fields."""
@@ -1164,6 +1207,373 @@ class TestAddUserResponseFields:
         assert "build-client-full" in easyrsa_calls[0]
 
 
+class TestAddUserSideEffects:
+    """Verify that add_user triggers the right VPN/proxy setup calls."""
+
+    _PAYLOAD = {
+        "username": "newuser",
+        "permission": "rw",
+        "vpn": "openvpn",
+        "proxy": "shadowsocks-rust",
+    }
+
+    # ------------------------------------------------------------------
+    # OpenVPN
+    # ------------------------------------------------------------------
+
+    def test_openvpn_cert_build_includes_username(self, admin_client):
+        run_calls = []
+
+        def _mock_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", side_effect=_mock_run),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        build_calls = [c for c in run_calls if c and "build-client-full" in c]
+        assert len(build_calls) == 1
+        assert "newuser" in build_calls[0]
+        assert "nopass" in build_calls[0]
+
+    def test_openvpn_cert_build_sets_cert_expire_env(self, admin_client):
+        envs = []
+
+        def _mock_run(cmd, *args, **kwargs):
+            envs.append(kwargs.get("env", {}))
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", side_effect=_mock_run),
+        ):
+            admin_client.post("/add_user", json=self._PAYLOAD)
+
+        build_envs = [e for e in envs if e]
+        assert len(build_envs) >= 1
+        assert build_envs[0].get("EASYRSA_CERT_EXPIRE") == "3650"
+
+    def test_openvpn_vpn_field_saved_in_config(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("omr_admin.json.dump", side_effect=_capture),
+        ):
+            admin_client.post("/add_user", json={**self._PAYLOAD, "vpn": "openvpn"})
+
+        assert written.get("users", [{}])[0].get("newuser", {}).get("vpn") == "openvpn"
+
+    # ------------------------------------------------------------------
+    # MQVPN
+    # ------------------------------------------------------------------
+
+    def test_mqvpn_add_user_key_is_non_empty(self, admin_client):
+        api_calls = []
+
+        def _mock_mqvpn_api(cmd):
+            api_calls.append(cmd)
+            return {"ok": True}
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(api_calls) == 1
+        assert api_calls[0]["cmd"] == "add_user"
+        assert api_calls[0]["name"] == "newuser"
+        key = api_calls[0].get("key", "")
+        assert isinstance(key, str) and len(key) > 0
+
+    def test_mqvpn_uses_unique_key_per_call(self, admin_client):
+        """Each add_user call must generate a fresh random MQVPN key."""
+        keys = []
+
+        def _mock_mqvpn_api(cmd):
+            keys.append(cmd.get("key", ""))
+            return {"ok": True}
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
+        ):
+            admin_client.post("/add_user", json={**self._PAYLOAD, "username": "user1"})
+            admin_client.post("/add_user", json={**self._PAYLOAD, "username": "user2"})
+
+        assert len(keys) == 2
+        assert keys[0] != keys[1]
+
+    def test_mqvpn_user_written_to_json(self, admin_client):
+        """New user must be persisted in /etc/mqvpn/server.json, not only via API."""
+        import io as _io
+        import json as _json
+        from conftest import _mock_open as _base_open, MQVPN_CONFIG
+        import copy
+
+        written_json = {}
+
+        def _open_capture(path, mode="r", *args, **kwargs):
+            sp = str(path)
+            if sp == "/etc/mqvpn/server.json" and "w" in str(mode):
+                buf = _io.StringIO()
+                original_close = buf.close
+
+                def _capture_on_close():
+                    buf.seek(0)
+                    written_json.update(_json.loads(buf.read()))
+                    original_close()
+
+                buf.close = _capture_on_close
+                return buf
+            return _base_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", return_value={"ok": True}),
+            patch("builtins.open", side_effect=_open_capture),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        names = [u["name"] for u in written_json.get("users", [])]
+        assert "newuser" in names
+
+    def test_mqvpn_json_key_matches_api_key(self, admin_client):
+        """The key written to server.json must be the same one sent to the API."""
+        import io as _io
+        import json as _json
+        from conftest import _mock_open as _base_open
+
+        api_calls = []
+        written_json = {}
+
+        def _mock_mqvpn_api(cmd):
+            api_calls.append(cmd)
+            return {"ok": True}
+
+        def _open_capture(path, mode="r", *args, **kwargs):
+            sp = str(path)
+            if sp == "/etc/mqvpn/server.json" and "w" in str(mode):
+                buf = _io.StringIO()
+                original_close = buf.close
+
+                def _capture_on_close():
+                    buf.seek(0)
+                    written_json.update(_json.loads(buf.read()))
+                    original_close()
+
+                buf.close = _capture_on_close
+                return buf
+            return _base_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
+            patch("builtins.open", side_effect=_open_capture),
+        ):
+            admin_client.post("/add_user", json=self._PAYLOAD)
+
+        api_key = api_calls[0]["key"]
+        json_entry = next((u for u in written_json.get("users", []) if u["name"] == "newuser"), None)
+        assert json_entry is not None
+        assert json_entry["key"] == api_key
+
+    # ------------------------------------------------------------------
+    # Shadowsocks-rust  (uses the shadowsocks-go backend config)
+    # ------------------------------------------------------------------
+
+    def test_ss_go_add_user_called_with_username(self, admin_client):
+        ss_go_calls = []
+
+        def _mock_add_ss_go(user, key=""):
+            ss_go_calls.append({"user": user, "key": key})
+            return key
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/shadowsocks-go/server.json")),
+            patch("omr_admin.add_ss_go_user", side_effect=_mock_add_ss_go),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(ss_go_calls) == 1
+        assert ss_go_calls[0]["user"] == "newuser"
+
+    def test_ss_go_proxy_field_saved_as_shadowsocks_rust(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/shadowsocks-go/server.json")),
+            patch("omr_admin.add_ss_go_user", return_value="somekey"),
+            patch("omr_admin.json.dump", side_effect=_capture),
+        ):
+            admin_client.post("/add_user", json={**self._PAYLOAD, "proxy": "shadowsocks-rust"})
+
+        assert written.get("users", [{}])[0].get("newuser", {}).get("proxy") == "shadowsocks-rust"
+
+    def test_ss_go_not_called_when_not_installed(self, admin_client):
+        ss_go_calls = []
+
+        def _mock_add_ss_go(user, key=""):
+            ss_go_calls.append(user)
+            return key
+
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin.add_ss_go_user", side_effect=_mock_add_ss_go),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(ss_go_calls) == 0
+
+    # ------------------------------------------------------------------
+    # Combined scenarios
+    # ------------------------------------------------------------------
+
+    def test_openvpn_and_mqvpn_both_invoked(self, admin_client):
+        run_calls = []
+        api_calls = []
+
+        def _mock_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        def _mock_mqvpn_api(cmd):
+            api_calls.append(cmd)
+            return {"ok": True}
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/mqvpn/server.json")),
+            patch("subprocess.run", side_effect=_mock_run),
+            patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        easyrsa_calls = [c for c in run_calls if c and c[0] == "./easyrsa"]
+        assert len(easyrsa_calls) >= 1
+        assert len(api_calls) == 1
+        assert api_calls[0]["cmd"] == "add_user"
+
+    def test_openvpn_and_ss_go_both_invoked(self, admin_client):
+        run_calls = []
+        ss_go_calls = []
+
+        def _mock_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        def _mock_add_ss_go(user, key=""):
+            ss_go_calls.append(user)
+            return key
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/shadowsocks-go/server.json")),
+            patch("subprocess.run", side_effect=_mock_run),
+            patch("omr_admin.add_ss_go_user", side_effect=_mock_add_ss_go),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        easyrsa_calls = [c for c in run_calls if c and c[0] == "./easyrsa"]
+        assert len(easyrsa_calls) >= 1
+        assert ss_go_calls == ["newuser"]
+
+    def test_mqvpn_and_ss_go_both_invoked(self, admin_client):
+        api_calls = []
+        ss_go_calls = []
+
+        def _mock_mqvpn_api(cmd):
+            api_calls.append(cmd)
+            return {"ok": True}
+
+        def _mock_add_ss_go(user, key=""):
+            ss_go_calls.append(user)
+            return key
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json", "/etc/shadowsocks-go/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
+            patch("omr_admin.add_ss_go_user", side_effect=_mock_add_ss_go),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(api_calls) == 1
+        assert api_calls[0]["cmd"] == "add_user"
+        assert ss_go_calls == ["newuser"]
+
+    # ------------------------------------------------------------------
+    # MQVPN presence / absence
+    # ------------------------------------------------------------------
+
+    def test_mqvpn_not_called_when_not_installed(self, admin_client):
+        api_calls = []
+
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin.mqvpn_api", side_effect=api_calls.append),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(api_calls) == 0
+
+    # ------------------------------------------------------------------
+    # SoftEther presence / absence
+    # ------------------------------------------------------------------
+
+    def test_softether_not_called_when_not_installed(self, admin_client):
+        se_calls = []
+
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin.add_softether_user", side_effect=se_calls.append),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(se_calls) == 0
+
+    def test_softether_called_when_installed(self, admin_client):
+        se_calls = []
+
+        def _mock_add_se(user, password):
+            se_calls.append({"user": user, "password": password})
+            return password
+
+        with (
+            patch("os.path.isfile", _isfile_for("/var/lib/softether/vpn_server.config")),
+            patch("omr_admin.add_softether_user", side_effect=_mock_add_se),
+            patch("omr_admin.modif_config_user"),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert len(se_calls) == 1
+        assert se_calls[0]["user"] == "newuser"
+        assert isinstance(se_calls[0]["password"], str) and len(se_calls[0]["password"]) > 0
+
+
 class TestRemoveUserSideEffects:
     """Verify that remove_user triggers the right cleanup calls."""
 
@@ -1290,6 +1700,245 @@ class TestRemoveUserSideEffects:
 
         assert r.json()["result"] == "done"
         assert len(ss_calls) == 0  # no port → no removal call
+
+    def test_openvpn_socket_sends_bytes_kill_command(self, admin_client):
+        """send() must receive bytes — catches the str+bytes concatenation bug."""
+        import socket as _socket_mod
+
+        sent = []
+
+        mock_fd = MagicMock()
+        mock_fd.readline.return_value = b">INFO:OpenVPN Management Interface"
+
+        mock_sock = MagicMock()
+        mock_sock.makefile.return_value = mock_fd
+        mock_sock.send.side_effect = lambda data: sent.append(data)
+
+        _real_socket = _socket_mod.socket
+
+        def _mock_socket_class(family=_socket_mod.AF_INET, type=_socket_mod.SOCK_STREAM,
+                                proto=0, fileno=None):
+            # Pass through internal calls (e.g. asyncio socketpair wrapping an fd)
+            if fileno is not None:
+                return _real_socket(family, type, proto, fileno)
+            return mock_sock
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("socket.socket", side_effect=_mock_socket_class),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert len(sent) == 1
+        assert isinstance(sent[0], bytes), "send() must be called with bytes, not str"
+        assert sent[0] == b"kill readonly\r\n"
+
+    def test_openvpn_socket_bad_banner_skips_kill(self, admin_client):
+        """If the banner is not the OpenVPN INFO line, no kill command is sent."""
+        import socket as _socket_mod
+
+        sent = []
+
+        mock_fd = MagicMock()
+        mock_fd.readline.return_value = b"UNEXPECTED BANNER"
+
+        mock_sock = MagicMock()
+        mock_sock.makefile.return_value = mock_fd
+        mock_sock.send.side_effect = lambda data: sent.append(data)
+
+        _real_socket = _socket_mod.socket
+
+        def _mock_socket_class(family=_socket_mod.AF_INET, type=_socket_mod.SOCK_STREAM,
+                                proto=0, fileno=None):
+            if fileno is not None:
+                return _real_socket(family, type, proto, fileno)
+            return mock_sock
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("socket.socket", side_effect=_mock_socket_class),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert len(sent) == 0
+
+    def test_openvpn_socket_timeout_does_not_crash(self, admin_client):
+        """A socket timeout during OpenVPN kill must not propagate as a 500."""
+        import socket as _socket_mod
+
+        _real_socket = _socket_mod.socket
+
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = _socket_mod.timeout("timed out")
+
+        def _mock_socket_class(family=_socket_mod.AF_INET, type=_socket_mod.SOCK_STREAM,
+                                proto=0, fileno=None):
+            if fileno is not None:
+                return _real_socket(family, type, proto, fileno)
+            return mock_sock
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("socket.socket", side_effect=_mock_socket_class),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+
+    def test_openvpn_socket_error_does_not_crash(self, admin_client):
+        """A generic socket error during OpenVPN kill must not propagate as a 500."""
+        import socket as _socket_mod
+
+        _real_socket = _socket_mod.socket
+
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = _socket_mod.error("connection refused")
+
+        def _mock_socket_class(family=_socket_mod.AF_INET, type=_socket_mod.SOCK_STREAM,
+                                proto=0, fileno=None):
+            if fileno is not None:
+                return _real_socket(family, type, proto, fileno)
+            return mock_sock
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("socket.socket", side_effect=_mock_socket_class),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+
+    # ------------------------------------------------------------------
+    # Shadowsocks-rust (shadowsocks-go backend)
+    # ------------------------------------------------------------------
+
+    def test_remove_user_calls_ss_go_when_installed(self, admin_client):
+        ss_go_calls = []
+
+        def _mock_remove_ss_go(user):
+            ss_go_calls.append(user)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/shadowsocks-go/server.json")),
+            patch("omr_admin.remove_ss_go_user", side_effect=_mock_remove_ss_go),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert ss_go_calls == ["readonly"]
+
+    def test_remove_user_ss_go_not_called_when_not_installed(self, admin_client):
+        ss_go_calls = []
+
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin.remove_ss_go_user", side_effect=ss_go_calls.append),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert len(ss_go_calls) == 0
+
+    # ------------------------------------------------------------------
+    # Combined scenarios
+    # ------------------------------------------------------------------
+
+    def test_remove_user_openvpn_socket_and_mqvpn_both_invoked(self, admin_client):
+        import socket as _socket_mod
+
+        sent = []
+        api_calls = []
+
+        mock_fd = MagicMock()
+        mock_fd.readline.return_value = b">INFO:OpenVPN Management Interface"
+        mock_sock = MagicMock()
+        mock_sock.makefile.return_value = mock_fd
+        mock_sock.send.side_effect = lambda data: sent.append(data)
+
+        _real_socket = _socket_mod.socket
+
+        def _mock_socket_class(family=_socket_mod.AF_INET, type=_socket_mod.SOCK_STREAM,
+                                proto=0, fileno=None):
+            if fileno is not None:
+                return _real_socket(family, type, proto, fileno)
+            return mock_sock
+
+        def _mock_mqvpn_api(cmd):
+            api_calls.append(cmd)
+            return {"ok": True}
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/mqvpn/server.json")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("socket.socket", side_effect=_mock_socket_class),
+            patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert len(sent) == 1
+        assert sent[0] == b"kill readonly\r\n"
+        assert len(api_calls) == 1
+        assert api_calls[0]["cmd"] == "remove_user"
+        assert api_calls[0]["name"] == "readonly"
+
+    def test_remove_user_openvpn_socket_and_ss_go_both_invoked(self, admin_client):
+        import socket as _socket_mod
+
+        sent = []
+        ss_go_calls = []
+
+        mock_fd = MagicMock()
+        mock_fd.readline.return_value = b">INFO:OpenVPN Management Interface"
+        mock_sock = MagicMock()
+        mock_sock.makefile.return_value = mock_fd
+        mock_sock.send.side_effect = lambda data: sent.append(data)
+
+        _real_socket = _socket_mod.socket
+
+        def _mock_socket_class(family=_socket_mod.AF_INET, type=_socket_mod.SOCK_STREAM,
+                                proto=0, fileno=None):
+            if fileno is not None:
+                return _real_socket(family, type, proto, fileno)
+            return mock_sock
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/shadowsocks-go/server.json")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("socket.socket", side_effect=_mock_socket_class),
+            patch("omr_admin.remove_ss_go_user", side_effect=ss_go_calls.append),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert sent == [b"kill readonly\r\n"]
+        assert ss_go_calls == ["readonly"]
+
+    def test_remove_user_mqvpn_and_ss_go_both_invoked(self, admin_client):
+        api_calls = []
+        ss_go_calls = []
+
+        def _mock_mqvpn_api(cmd):
+            api_calls.append(cmd)
+            return {"ok": True}
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json", "/etc/shadowsocks-go/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
+            patch("omr_admin.remove_ss_go_user", side_effect=ss_go_calls.append),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+
+        assert r.json()["result"] == "done"
+        assert len(api_calls) == 1
+        assert api_calls[0]["cmd"] == "remove_user"
+        assert ss_go_calls == ["readonly"]
 
 
 class TestClientToClient:

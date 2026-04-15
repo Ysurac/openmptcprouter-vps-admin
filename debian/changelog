@@ -1,3 +1,10 @@
+omr-vps-admin (0.17+20260415) unstable; urgency=medium
+
+    * fix openvpn remove user
+    * add mqvpn user in JSON and not only in API
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 15 Apr 2026 11:58:34 +0200
+
 omr-vps-admin (0.17+20260414) unstable; urgency=medium
 
     * Check if proxy/vpn exists before adding user
