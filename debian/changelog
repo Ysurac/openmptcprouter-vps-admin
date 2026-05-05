@@ -1,3 +1,19 @@
+omr-vps-admin (0.17+20260504) unstable; urgency=medium
+
+  * Add MQVPN congestion control (cc) support: bbr2|bbr|cubic|new_reno|copa|unlimited
+  * Add MQVPN fec_scheme, reinjection_mode, cc enums with validation
+  * Add MQVPN per-user fixed IP support via /mqvpn_user endpoint
+  * Expose MQVPN fixed_ip and full config (fec, reinjection, cc) in /config response
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 04 May 2026 00:00:00 +0200
+
+omr-vps-admin (0.17+20260417) unstable; urgency=medium
+
+    * Return error if OpenVPN certificate creation fails when adding user
+    * Auto-create OpenVPN certificate for existing users if missing
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 17 Apr 2026 00:00:00 +0200
+
 omr-vps-admin (0.17+20260415) unstable; urgency=medium
 
     * fix openvpn remove user

@@ -84,6 +84,7 @@ MQVPN_CONFIG = {
     ],
     "max_clients": 64,
     "scheduler": "wlb",
+    "cc": "bbr2",
 }
 _MQVPN_CONFIG_JSON = json.dumps(MQVPN_CONFIG)
 

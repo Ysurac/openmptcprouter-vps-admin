@@ -1143,7 +1143,7 @@ def remove_dsvpn(userid):
     os.remove('/etc/dsvpn/dsvpn' + str(userid))
     os.remove('/etc/dsvpn/dsvpn' + str(userid) + '.key')
 
-def add_mqvpn(username):
+def add_mqvpn(username, fixed_ip=None):
     mqvpn_user_key = secrets.token_urlsafe(32)
     mqvpn_api({'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key})
     try:
@@ -1151,7 +1151,10 @@ def add_mqvpn(username):
             mqvpn_config = json.load(f)
         users = mqvpn_config.get('users', [])
         if not any(u.get('name') == username for u in users):
-            users.append({'name': username, 'key': mqvpn_user_key})
+            entry = {'name': username, 'key': mqvpn_user_key}
+            if fixed_ip:
+                entry['fixed_ip'] = fixed_ip
+            users.append(entry)
             mqvpn_config['users'] = users
         with open('/etc/mqvpn/server.json', 'w') as f:
             json.dump(mqvpn_config, f, indent=2)
@@ -2051,6 +2054,14 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     #else:
     #    openvpn_key = ''
     openvpn_key = ''
+    if not os.path.isfile('/etc/openvpn/ca/pki/private/' + username + '.key') or not os.path.isfile('/etc/openvpn/ca/pki/issued/' + username + '.crt'):
+        if os.path.isfile('/etc/openvpn/tun0.conf'):
+            LOG.debug("OpenVPN cert missing for %s, creating it", username)
+            env = os.environ.copy()
+            env['EASYRSA_CERT_EXPIRE'] = '3650'
+            result = subprocess.run(["./easyrsa", "--batch", "build-client-full", username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
+            if result.returncode != 0:
+                LOG.error("easyrsa failed for %s: %s", username, result.stderr.decode())
     if os.path.isfile('/etc/openvpn/ca/pki/private/' + username + '.key'):
         with open('/etc/openvpn/ca/pki/private/' + username + '.key', "rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
@@ -2134,19 +2145,31 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         mqvpn_users = mqvpn_cfg.get('users', [])
         mqvpn_user_entry = next((u for u in mqvpn_users if u.get('name') == username), None)
         mqvpn_key = mqvpn_user_entry['key'] if mqvpn_user_entry else ''
+        mqvpn_fixed_ip = mqvpn_user_entry.get('fixed_ip', '') if mqvpn_user_entry else ''
         mqvpn_scheduler = mqvpn_cfg.get('scheduler', 'wlb')
         mqvpn_listen = mqvpn_cfg.get('listen', '0.0.0.0:443')
         mqvpn_port = mqvpn_listen.split(':')[-1] if ':' in mqvpn_listen else '443'
+        mqvpn_fec_enable = mqvpn_cfg.get('fec_enable', False)
+        mqvpn_fec_scheme = mqvpn_cfg.get('fec_scheme', 'xor')
+        mqvpn_reinjection_control = mqvpn_cfg.get('reinjection_control', False)
+        mqvpn_reinjection_mode = mqvpn_cfg.get('reinjection_mode', 'default')
+        mqvpn_cc = mqvpn_cfg.get('cc', 'bbr2')
         mqvpn_subnet = mqvpn_cfg.get('subnet', '10.255.220.0/24')
         mqvpn_net = ipaddress.ip_network(mqvpn_subnet, strict=False)
         mqvpn_hosts = list(mqvpn_net.hosts())
         mqvpn_host_ip = str(mqvpn_hosts[0]) if mqvpn_hosts else '10.255.220.1'
-        mqvpn_client_ip = str(mqvpn_hosts[1]) if len(mqvpn_hosts) > 1 else '10.255.220.2'
+        mqvpn_client_ip = mqvpn_fixed_ip if mqvpn_fixed_ip else (str(mqvpn_hosts[1]) if len(mqvpn_hosts) > 1 else '10.255.220.2')
         available_vpn.append("mqvpn")
     else:
         mqvpn_key = ''
+        mqvpn_fixed_ip = ''
         mqvpn_scheduler = ''
         mqvpn_port = ''
+        mqvpn_fec_enable = False
+        mqvpn_fec_scheme = ''
+        mqvpn_reinjection_control = False
+        mqvpn_reinjection_mode = ''
+        mqvpn_cc = ''
         mqvpn_host_ip = '10.255.220.1'
         mqvpn_client_ip = '10.255.220.2'
 
@@ -2451,7 +2474,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -3376,10 +3399,34 @@ def mqvpn_api(cmd: dict) -> dict:
         return {'ok': False, 'error': str(e)}
 
 # Set MQVPN config
+class MQVPNcc(str, Enum):
+    bbr2 = "bbr2"
+    bbr = "bbr"
+    cubic = "cubic"
+    new_reno = "new_reno"
+    copa = "copa"
+    unlimited = "unlimited"
+
+class MQVPNReinjectionMode(str, Enum):
+    default = "default"
+    deadline = "deadline"
+    dgram = "dgram"
+
+class MQVPNFecScheme(str, Enum):
+    galois_calculation = "galois_calculation"
+    packet_mask = "packet_mask"
+    reed_solomon = "reed_solomon"
+    xor = "xor"
+
 class MQVPN(BaseModel):
     key: str
     scheduler: str = 'wlb'
     port: int = Query(443, gt=0, lt=65535)
+    fec_enable: bool = False
+    fec_scheme: MQVPNFecScheme = MQVPNFecScheme.xor
+    reinjection_control: bool = False
+    reinjection_mode: MQVPNReinjectionMode = MQVPNReinjectionMode.default
+    cc: MQVPNcc = MQVPNcc.bbr2
 
 @app.post('/mqvpn', summary="Modify MQVPN configuration")
 def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_user)):
@@ -3394,6 +3441,11 @@ def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_
     mqvpn_cfg['auth_key'] = params.key
     mqvpn_cfg['scheduler'] = params.scheduler
     mqvpn_cfg['listen'] = host_part + ':' + str(params.port)
+    mqvpn_cfg['fec_enable'] = params.fec_enable
+    mqvpn_cfg['fec_scheme'] = params.fec_scheme
+    mqvpn_cfg['reinjection_control'] = params.reinjection_control
+    mqvpn_cfg['reinjection_mode'] = params.reinjection_mode
+    mqvpn_cfg['cc'] = params.cc
     with open('/etc/mqvpn/server.json', 'w') as f:
         json.dump(mqvpn_cfg, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/mqvpn/server.json', 'rb'))).hexdigest()
@@ -3402,6 +3454,34 @@ def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_
         #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn'}
 
+# Set MQVPN per-user config (fixed IP)
+class MQVPNUser(BaseModel):
+    username: str
+    fixed_ip: Optional[str] = None
+
+@app.post('/mqvpn_user', summary="Set or clear a fixed IP for an MQVPN user")
+def mqvpn_user_set_config(*, params: MQVPNUser, current_user: User = Depends(get_current_user)):
+    if current_user.permissions not in ("admin",):
+        return {'result': 'permission', 'reason': 'Admin only', 'route': 'mqvpn_user'}
+    if not os.path.isfile('/etc/mqvpn/server.json'):
+        return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn_user'}
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/mqvpn/server.json', 'rb'))).hexdigest()
+    with open('/etc/mqvpn/server.json') as f:
+        mqvpn_cfg = json.load(f)
+    users = mqvpn_cfg.get('users', [])
+    user_entry = next((u for u in users if u.get('name') == params.username), None)
+    if user_entry is None:
+        return {'result': 'error', 'reason': 'User not found', 'route': 'mqvpn_user'}
+    if params.fixed_ip:
+        user_entry['fixed_ip'] = params.fixed_ip
+    else:
+        user_entry.pop('fixed_ip', None)
+    with open('/etc/mqvpn/server.json', 'w') as f:
+        json.dump(mqvpn_cfg, f, indent=4)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/mqvpn/server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        subprocess.run(["systemctl", "-q", "restart", "mqvpn"], check=False)
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_user'}
 
 
 # Set OpenVPN config
@@ -3900,6 +3980,16 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
         user_json[params.username].update({"vpn": params.vpn})
     if params.proxy is not None:
         user_json[params.username].update({"proxy": params.proxy})
+    # Create OpenVPN cert first — fail early before saving the user
+    if os.path.isfile('/etc/openvpn/tun0.conf'):
+        LOG.debug("Create user " + params.username + " in OpenVPN")
+        env = os.environ.copy()
+        env['EASYRSA_CERT_EXPIRE'] = '3650'
+        result = subprocess.run(["./easyrsa", "--batch", "build-client-full", params.username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
+        if result.returncode != 0 or not os.path.isfile('/etc/openvpn/ca/pki/issued/' + params.username + '.crt'):
+            LOG.error("easyrsa failed for %s: %s", params.username, result.stderr.decode())
+            return {'result': 'error', 'reason': 'OpenVPN certificate creation failed', 'route': 'add_user'}
+
     content['users'][0].update(user_json)
     if content:
         LOG.debug("backup_config() in add user")
@@ -3908,12 +3998,6 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
             json.dump(content, f, indent=4)
     else:
         LOG.debug("Empty data for add_user")
-    # Create VPNs configuration
-    if os.path.isfile('/etc/openvpn/tun0.conf'):
-        LOG.debug("Create user " + params.username + " in OpenVPN")
-        env = os.environ.copy()
-        env['EASYRSA_CERT_EXPIRE'] = '3650'
-        subprocess.run(["./easyrsa", "--batch", "build-client-full", params.username, "nopass"], cwd="/etc/openvpn/ca", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
         LOG.debug("Create user " + params.username + " in Glorytun-TCP")
         add_glorytun_tcp(userid)
@@ -4032,6 +4116,36 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     #    omr_config_data = json.load(f)
     #    fake_users_db = omr_config_data['users'][0]
     return {'result': 'done', 'reason': 'user removed', 'route': 'remove_user'}
+
+class ModifyUser(BaseModel):
+    username: str = Query(..., title="Username")
+    user_password: Optional[str] = Query(None, title="New password for the user")
+    disabled: Optional[bool] = Query(None, title="Disable or enable the user")
+    vpn: Optional[VPN] = Query(None, title="VPN for the user")
+    proxy: Optional[PROXY] = Query(None, title="Proxy for the user")
+
+@app.post('/modify_user', summary="Modify an existing user")
+def modify_user(*, params: ModifyUser, current_user: User = Depends(get_current_user), request: Request):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'modify_user'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        content = json.load(f)
+    if params.username not in content['users'][0]:
+        return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'modify_user'}
+    changes = {}
+    if params.user_password is not None:
+        changes['user_password'] = params.user_password
+    if params.disabled is not None:
+        changes['disabled'] = "true" if params.disabled else "false"
+    if params.vpn is not None:
+        changes['vpn'] = params.vpn
+    if params.proxy is not None:
+        changes['proxy'] = params.proxy
+    if not changes:
+        return {'result': 'error', 'reason': 'No changes provided', 'route': 'modify_user'}
+    modif_config_user(params.username, changes)
+    LOG.info("User admin (IP: " + request.client.host + ") modified user " + params.username)
+    return {'result': 'done', 'reason': 'user modified', 'route': 'modify_user'}
 
 class ClienttoClient(BaseModel):
     enable: bool = False

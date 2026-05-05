@@ -660,7 +660,7 @@ def _mock_mqvpn_socket(response: dict = None):
 
 
 class TestMqvpn:
-    _PAYLOAD = {"key": "new-auth-key", "scheduler": "rr", "port": 443}
+    _PAYLOAD = {"key": "new-auth-key", "scheduler": "wlb", "port": 443, "fec_enable": True, "fec_scheme": "reed_solomon", "reinjection_control": True, "reinjection_mode": "deadline", "cc": "bbr2"}
 
     def test_requires_auth(self, unauth_client):
         r = unauth_client.post("/mqvpn", json=self._PAYLOAD)
@@ -705,6 +705,11 @@ class TestMqvpn:
         written = json.loads(capture.read())
         assert written["auth_key"] == self._PAYLOAD["key"]
         assert written["scheduler"] == self._PAYLOAD["scheduler"]
+        assert written["fec_enable"] == self._PAYLOAD["fec_enable"]
+        assert written["fec_scheme"] == self._PAYLOAD["fec_scheme"]
+        assert written["reinjection_control"] == self._PAYLOAD["reinjection_control"]
+        assert written["reinjection_mode"] == self._PAYLOAD["reinjection_mode"]
+        assert written["cc"] == self._PAYLOAD["cc"]
 
     def test_config_returns_user_key_not_auth_key(self, user_client):
         """/config must expose the current user's key, not the global auth_key."""
@@ -1266,7 +1271,7 @@ class TestAddUserSideEffects:
             real_json_dump(data, f, **kw)
 
         with (
-            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/openvpn/ca/pki/issued/newuser.crt")),
             patch("subprocess.run", return_value=MagicMock(returncode=0)),
             patch("omr_admin.json.dump", side_effect=_capture),
         ):
@@ -1462,7 +1467,7 @@ class TestAddUserSideEffects:
             return {"ok": True}
 
         with (
-            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/mqvpn/server.json")),
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/mqvpn/server.json", "/etc/openvpn/ca/pki/issued/newuser.crt")),
             patch("subprocess.run", side_effect=_mock_run),
             patch("omr_admin.mqvpn_api", side_effect=_mock_mqvpn_api),
         ):
@@ -1939,6 +1944,161 @@ class TestRemoveUserSideEffects:
         assert len(api_calls) == 1
         assert api_calls[0]["cmd"] == "remove_user"
         assert ss_go_calls == ["readonly"]
+
+
+class TestModifyUser:
+    def test_requires_auth(self, unauth_client):
+        r = unauth_client.post("/modify_user", json={"username": "readonly"})
+        assert r.status_code == 403
+
+    def test_non_admin_denied(self, user_client):
+        r = user_client.post("/modify_user", json={"username": "readonly", "disabled": True})
+        assert r.json()["result"] == "permission"
+
+    def test_ro_denied(self, ro_client):
+        r = ro_client.post("/modify_user", json={"username": "readonly", "disabled": True})
+        assert r.json()["result"] == "permission"
+
+    def test_nonexistent_user_returns_error(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "ghost", "disabled": True})
+        assert r.json()["result"] == "error"
+
+    def test_no_changes_returns_error(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly"})
+        assert r.json()["result"] == "error"
+
+    def test_modify_password_returns_done(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly", "user_password": "newpassword"})
+        assert r.json()["result"] == "done"
+
+    def test_modify_disabled_returns_done(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly", "disabled": True})
+        assert r.json()["result"] == "done"
+
+    def test_modify_vpn_returns_done(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly", "vpn": "glorytun_tcp"})
+        assert r.json()["result"] == "done"
+
+    def test_modify_proxy_returns_done(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly", "proxy": "shadowsocks"})
+        assert r.json()["result"] == "done"
+
+    def test_invalid_vpn_returns_422(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly", "vpn": "notavpn"})
+        assert r.status_code == 422
+
+    def test_invalid_proxy_returns_422(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly", "proxy": "notaproxy"})
+        assert r.status_code == 422
+
+    def test_password_written_to_config(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            r = admin_client.post("/modify_user", json={"username": "readonly", "user_password": "newpass"})
+
+        assert r.json()["result"] == "done"
+        assert written.get("users", [{}])[0].get("readonly", {}).get("user_password") == "newpass"
+
+    def test_disabled_true_stored_as_string_true(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            r = admin_client.post("/modify_user", json={"username": "readonly", "disabled": True})
+
+        assert r.json()["result"] == "done"
+        assert written.get("users", [{}])[0].get("readonly", {}).get("disabled") == "true"
+
+    def test_disabled_false_stored_as_string_false(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            r = admin_client.post("/modify_user", json={"username": "readonly", "disabled": False})
+
+        assert r.json()["result"] == "done"
+        assert written.get("users", [{}])[0].get("readonly", {}).get("disabled") == "false"
+
+    def test_vpn_written_to_config(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            r = admin_client.post("/modify_user", json={"username": "readonly", "vpn": "openvpn"})
+
+        assert r.json()["result"] == "done"
+        assert written.get("users", [{}])[0].get("readonly", {}).get("vpn") == "openvpn"
+
+    def test_proxy_written_to_config(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            r = admin_client.post("/modify_user", json={"username": "readonly", "proxy": "xray"})
+
+        assert r.json()["result"] == "done"
+        assert written.get("users", [{}])[0].get("readonly", {}).get("proxy") == "xray"
+
+    def test_multiple_fields_written_to_config(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            r = admin_client.post("/modify_user", json={
+                "username": "readonly",
+                "user_password": "newpass",
+                "disabled": True,
+                "vpn": "glorytun_udp",
+                "proxy": "v2ray",
+            })
+
+        assert r.json()["result"] == "done"
+        user = written.get("users", [{}])[0].get("readonly", {})
+        assert user.get("user_password") == "newpass"
+        assert user.get("disabled") == "true"
+        assert user.get("vpn") == "glorytun_udp"
+        assert user.get("proxy") == "v2ray"
+
+    def test_other_users_not_affected(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            admin_client.post("/modify_user", json={"username": "readonly", "vpn": "dsvpn"})
+
+        users = written.get("users", [{}])[0]
+        assert "openmptcprouter" in users
+        assert "admin" in users
 
 
 class TestClientToClient:
