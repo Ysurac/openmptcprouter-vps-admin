@@ -44,7 +44,7 @@ from jwt import PyJWTError
 from netaddr import *
 import psutil
 #from netjsonconfig import OpenWrt
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2
 from fastapi.encoders import jsonable_encoder
 from fastapi.security.base import SecurityBase
@@ -321,8 +321,13 @@ def read_omr_config():
     except ValueError:
         return {}
 
+_OMR_VERSION_CACHE: Optional[str] = None
+
 def get_omr_version():
     """Python equivalent of: grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'"""
+    global _OMR_VERSION_CACHE
+    if _OMR_VERSION_CACHE is not None:
+        return _OMR_VERSION_CACHE
     for filepath in glob.glob('/etc/*'):
         if not os.path.isfile(filepath):
             continue
@@ -332,10 +337,12 @@ def get_omr_version():
                     if 'OpenMPTCProuter VPS' in line:
                         parts = line.split()
                         if len(parts) >= 4:
-                            return parts[3]
+                            _OMR_VERSION_CACHE = parts[3]
+                            return _OMR_VERSION_CACHE
         except OSError:
             pass
-    return ''
+    _OMR_VERSION_CACHE = ''
+    return _OMR_VERSION_CACHE
 
 def get_username_from_userid(userid):
     if userid == 0:
@@ -4239,18 +4246,12 @@ async def speedtest(request: Request, size: Optional[int] = Query(10), current_u
     )
 
 @app.post('/speedtest', summary="Test upload speed from the server")
-async def speedtestul(request: Request, file: UploadFile, current_user: User = Depends(get_current_user)):
-    if not file:
-        return {'result': 'No upload file sent'}
-
+async def speedtestul(request: Request, current_user: User = Depends(get_current_user)):
     mptcp = _mptcp_status_for_ip(request.client.host)
 
     start = time.time()
     size = 0
-    while True:
-        chunk = await file.read(65536)
-        if not chunk:
-            break
+    async for chunk in request.stream():
         size += len(chunk)
     elapsed = time.time() - start
     speed_mbps = round((size * 8) / (elapsed * 1_000_000), 2) if elapsed > 0 and size > 0 else 0
@@ -4385,13 +4386,13 @@ if __name__ == '__main__':
         omrhost = '0.0.0.0'
     if 'host' in omr_config_data:
         omrhost = omr_config_data["host"]
-    workers = 4
+    workers = 2
     if 'workers' in omr_config_data:
         workers = omr_config_data["workers"]
     parser = argparse.ArgumentParser(description="OpenMPTCProuter Server API")
     parser.add_argument("--port", type=int, help="Listening port", default=omrport)
     parser.add_argument("--host", type=str, help="Listening host", default=omrhost)
-    parser.add_argument("--workers", type=str, help="Workers", default=workers)
+    parser.add_argument("--workers", type=int, help="Workers", default=workers)
     args = parser.parse_args()
     main(args.port, args.host, args.workers)
     #uvicorn.run("__main__:app", host=omrhost, port=omrport, log_level='error', ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem', ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem', ssl_version=5, workers=6)

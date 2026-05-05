@@ -1,3 +1,11 @@
+omr-vps-admin (0.17+20260505) unstable; urgency=medium
+
+  * Fix excessive physical I/O: cache get_omr_version() result at first call instead of scanning /etc/* on every /status and /config request
+  * Fix /speedtest POST: replace UploadFile (which spooled uploads to disk) with request.stream() to avoid double disk I/O per upload test
+  * Fix --workers CLI argument type: was str instead of int, making the flag non-functional
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 05 May 2026 00:00:00 +0200
+
 omr-vps-admin (0.17+20260504) unstable; urgency=medium
 
   * Add MQVPN congestion control (cc) support: bbr2|bbr|cubic|new_reno|copa|unlimited
