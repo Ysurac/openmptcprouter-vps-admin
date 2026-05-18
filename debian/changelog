@@ -1,3 +1,9 @@
+omr-vps-admin (0.17+20260518b) unstable; urgency=medium
+
+  * Sync shadowsocks-rust users to xray and mqvpn at startup via FastAPI lifespan handler
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 18 May 2026 00:00:00 +0200
+
 omr-vps-admin (0.17+20260518) unstable; urgency=medium
 
   * Fix easyrsa failure when recreating a user: remove stale PKI index entry, private key, issued cert and .req file before build-client-full

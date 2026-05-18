@@ -37,6 +37,7 @@ from os import path
 from ipaddress import ip_address, IPv4Address, IPv6Address
 import logging
 import asyncio
+import contextlib
 import uvicorn
 import jwt
 import requests
@@ -1606,7 +1607,59 @@ basic_auth = BasicAuth(auto_error=False)
 
 oauth2_scheme = OAuth2PasswordBearerCookie(tokenUrl="/token")
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, title="OpenMPTCProuter Server API")
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    sync_ss_go_users()
+    yield
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, title="OpenMPTCProuter Server API", lifespan=_lifespan)
+
+
+def sync_ss_go_users():
+    if not os.path.isfile('/etc/shadowsocks-go/upsks.json'):
+        return
+    try:
+        with open('/etc/shadowsocks-go/upsks.json') as f:
+            upsks = json.load(f)
+    except Exception as e:
+        LOG.debug("sync_ss_go_users: failed to read upsks.json: " + str(e))
+        return
+
+    xray_users = set()
+    if os.path.isfile('/etc/xray/xray-server.json'):
+        try:
+            with open('/etc/xray/xray-server.json') as f:
+                xray_data = json.load(f)
+            for inbound in xray_data.get('inbounds', []):
+                settings = inbound.get('settings', {})
+                for client in settings.get('clients', []):
+                    if 'email' in client:
+                        xray_users.add(client['email'])
+                for account in settings.get('accounts', []):
+                    if 'user' in account:
+                        xray_users.add(account['user'])
+        except Exception as e:
+            LOG.debug("sync_ss_go_users: failed to read xray config: " + str(e))
+
+    mqvpn_users = set()
+    if os.path.isfile('/etc/mqvpn/server.json'):
+        try:
+            with open('/etc/mqvpn/server.json') as f:
+                mqvpn_data = json.load(f)
+            for u in mqvpn_data.get('users', []):
+                if 'name' in u:
+                    mqvpn_users.add(u['name'])
+        except Exception as e:
+            LOG.debug("sync_ss_go_users: failed to read mqvpn config: " + str(e))
+
+    for username, upsk in upsks.items():
+        if os.path.isfile('/etc/xray/xray-server.json') and username not in xray_users:
+            LOG.info("sync_ss_go_users: adding %s to xray", username)
+            xray_add_user(username, '', upsk)
+        if os.path.isfile('/etc/mqvpn/server.json') and username not in mqvpn_users:
+            LOG.info("sync_ss_go_users: adding %s to mqvpn", username)
+            add_mqvpn(username)
 
 
 def create_access_token(*, data: dict, expires_delta: timedelta = None):
