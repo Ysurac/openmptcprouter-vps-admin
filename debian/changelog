@@ -1,3 +1,9 @@
+omr-vps-admin (0.17+20260518) unstable; urgency=medium
+
+  * Fix easyrsa failure when recreating a user: remove stale PKI index entry, private key, issued cert and .req file before build-client-full
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 18 May 2026 00:00:00 +0200
+
 omr-vps-admin (0.17+20260511) unstable; urgency=medium
 
   * Fix vpnips: remove /126 prefix length from IPv6 addresses written to shorewall6 params

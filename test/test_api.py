@@ -1212,6 +1212,258 @@ class TestAddUserResponseFields:
         assert "build-client-full" in easyrsa_calls[0]
 
 
+class TestAddUserEasyrsaPkiCleanup:
+    """Verify that add_user cleans up stale PKI entries before calling build-client-full.
+
+    This covers the recreate-user scenario: easyrsa revoke leaves the private
+    key and issued cert on disk and marks the CN in index.txt as revoked (R).
+    Without cleanup, build-client-full fails because the CN is already known.
+    """
+
+    _PAYLOAD = {
+        "username": "newuser",
+        "permission": "rw",
+        "vpn": "glorytun_tcp",
+        "proxy": "shadowsocks",
+    }
+
+    # ------------------------------------------------------------------
+    # index.txt cleanup
+    # ------------------------------------------------------------------
+
+    def test_stale_index_entry_is_removed_before_build(self, admin_client):
+        """Lines with /CN=<username> must be stripped from index.txt before easyrsa runs."""
+        import io as _io
+        from conftest import _mock_open as _base_open
+
+        index_content = (
+            "V\t260101000000Z\t\t01\tunknown\t/CN=otheruser\n"
+            "R\t260101000000Z\t260101000000Z\t02\tunknown\t/CN=newuser\n"
+        )
+        written_index = {}
+
+        def _open_index(path, mode="r", *args, **kwargs):
+            sp = str(path)
+            if sp == "/etc/openvpn/ca/pki/index.txt":
+                if "w" in str(mode):
+                    buf = _io.StringIO()
+                    original_close = buf.close
+
+                    def _capture_on_close():
+                        buf.seek(0)
+                        written_index["content"] = buf.read()
+                        original_close()
+
+                    buf.close = _capture_on_close
+                    return buf
+                return _io.StringIO(index_content)
+            return _base_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/openvpn/ca/pki/index.txt")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("builtins.open", side_effect=_open_index),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert "written_index" in written_index or "/CN=newuser" not in written_index.get("content", "")
+        assert "/CN=otheruser" in written_index.get("content", "/CN=otheruser")
+
+    def test_index_with_no_stale_entry_is_not_rewritten(self, admin_client):
+        """If index.txt has no entry for this CN, it must not be rewritten."""
+        import io as _io
+        from conftest import _mock_open as _base_open
+
+        index_content = "V\t260101000000Z\t\t01\tunknown\t/CN=otheruser\n"
+        write_calls = []
+
+        def _open_index(path, mode="r", *args, **kwargs):
+            sp = str(path)
+            if sp == "/etc/openvpn/ca/pki/index.txt":
+                if "w" in str(mode):
+                    write_calls.append(sp)
+                    return _io.StringIO()
+                return _io.StringIO(index_content)
+            return _base_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/openvpn/ca/pki/index.txt")),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("builtins.open", side_effect=_open_index),
+        ):
+            admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert len(write_calls) == 0
+
+    # ------------------------------------------------------------------
+    # Stale file removal
+    # ------------------------------------------------------------------
+
+    def test_stale_req_file_is_removed(self, admin_client):
+        """The .req file for the username must be deleted before build-client-full."""
+        removed = []
+
+        def _isfile(p):
+            return str(p) in (
+                "/etc/openvpn/tun0.conf",
+                f"/etc/openvpn/ca/pki/reqs/newuser.req",
+            )
+
+        def _remove(p):
+            removed.append(str(p))
+
+        with (
+            patch("os.path.isfile", side_effect=_isfile),
+            patch("os.remove", side_effect=_remove),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert "/etc/openvpn/ca/pki/reqs/newuser.req" in removed
+
+    def test_stale_private_key_is_removed(self, admin_client):
+        """The .key file for the username must be deleted before build-client-full."""
+        removed = []
+
+        def _isfile(p):
+            return str(p) in (
+                "/etc/openvpn/tun0.conf",
+                f"/etc/openvpn/ca/pki/private/newuser.key",
+            )
+
+        def _remove(p):
+            removed.append(str(p))
+
+        with (
+            patch("os.path.isfile", side_effect=_isfile),
+            patch("os.remove", side_effect=_remove),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert "/etc/openvpn/ca/pki/private/newuser.key" in removed
+
+    def test_stale_issued_cert_is_removed(self, admin_client):
+        """The .crt file for the username must be deleted before build-client-full."""
+        removed = []
+
+        def _isfile(p):
+            return str(p) in (
+                "/etc/openvpn/tun0.conf",
+                f"/etc/openvpn/ca/pki/issued/newuser.crt",
+            )
+
+        def _remove(p):
+            removed.append(str(p))
+
+        with (
+            patch("os.path.isfile", side_effect=_isfile),
+            patch("os.remove", side_effect=_remove),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert "/etc/openvpn/ca/pki/issued/newuser.crt" in removed
+
+    def test_all_three_stale_files_removed(self, admin_client):
+        """All three stale PKI files are removed in a single add_user call."""
+        removed = []
+
+        def _isfile(p):
+            return str(p) in (
+                "/etc/openvpn/tun0.conf",
+                "/etc/openvpn/ca/pki/reqs/newuser.req",
+                "/etc/openvpn/ca/pki/private/newuser.key",
+                "/etc/openvpn/ca/pki/issued/newuser.crt",
+            )
+
+        def _remove(p):
+            removed.append(str(p))
+
+        with (
+            patch("os.path.isfile", side_effect=_isfile),
+            patch("os.remove", side_effect=_remove),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert "/etc/openvpn/ca/pki/reqs/newuser.req" in removed
+        assert "/etc/openvpn/ca/pki/private/newuser.key" in removed
+        assert "/etc/openvpn/ca/pki/issued/newuser.crt" in removed
+
+    def test_no_stale_files_means_no_remove_calls(self, admin_client):
+        """os.remove must not be called when no stale PKI files exist."""
+        removed = []
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("os.remove", side_effect=removed.append),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        pki_removes = [p for p in removed if "/etc/openvpn/ca/pki/" in str(p)]
+        assert len(pki_removes) == 0
+
+    # ------------------------------------------------------------------
+    # build-client-full is still called after cleanup
+    # ------------------------------------------------------------------
+
+    def test_build_client_full_called_after_cleanup(self, admin_client):
+        """easyrsa build-client-full must be called even when stale files existed."""
+        run_calls = []
+        removed = []
+
+        def _isfile(p):
+            return str(p) in (
+                "/etc/openvpn/tun0.conf",
+                "/etc/openvpn/ca/pki/private/newuser.key",
+                "/etc/openvpn/ca/pki/issued/newuser.crt",
+            )
+
+        def _mock_run(cmd, *args, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.isfile", side_effect=_isfile),
+            patch("os.remove", side_effect=removed.append),
+            patch("subprocess.run", side_effect=_mock_run),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        build_calls = [c for c in run_calls if c and "build-client-full" in c]
+        assert len(build_calls) == 1
+        assert "newuser" in build_calls[0]
+
+    # ------------------------------------------------------------------
+    # easyrsa failure after cleanup returns an error
+    # ------------------------------------------------------------------
+
+    def test_easyrsa_failure_after_cleanup_returns_error(self, admin_client):
+        """If build-client-full still fails after cleanup, add_user returns an error."""
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = b"Already exists"
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("subprocess.run", return_value=mock_result),
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert r.json()["result"] == "error"
+        assert r.json()["route"] == "add_user"
+
+
 class TestAddUserSideEffects:
     """Verify that add_user triggers the right VPN/proxy setup calls."""
 

@@ -2064,6 +2064,22 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if not os.path.isfile('/etc/openvpn/ca/pki/private/' + username + '.key') or not os.path.isfile('/etc/openvpn/ca/pki/issued/' + username + '.crt'):
         if os.path.isfile('/etc/openvpn/tun0.conf'):
             LOG.debug("OpenVPN cert missing for %s, creating it", username)
+            index_file = '/etc/openvpn/ca/pki/index.txt'
+            if os.path.isfile(index_file):
+                with open(index_file, 'r') as f:
+                    lines = f.readlines()
+                filtered = [l for l in lines if '/CN=' + username not in l]
+                if len(filtered) != len(lines):
+                    LOG.debug("Removing stale PKI index entry for %s", username)
+                    with open(index_file, 'w') as f:
+                        f.writelines(filtered)
+            for stale in [
+                f"/etc/openvpn/ca/pki/reqs/{username}.req",
+                f"/etc/openvpn/ca/pki/private/{username}.key",
+                f"/etc/openvpn/ca/pki/issued/{username}.crt",
+            ]:
+                if os.path.isfile(stale):
+                    os.remove(stale)
             env = os.environ.copy()
             env['EASYRSA_CERT_EXPIRE'] = '3650'
             result = subprocess.run(["./easyrsa", "--batch", "build-client-full", username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
@@ -3914,7 +3930,7 @@ class permissions(str, Enum):
 class NewUser(BaseModel):
     username: str = Query(..., title="Username")
     permission: permissions = Query("ro", title="permission of the user")
-    vpn: VPN = Query("openvpn", title="default VPN for the user")
+    vpn: VPN = Query("mqvpn", title="default VPN for the user")
     proxy: PROXY = Query("shadowsocks-rust", title="default Proxy for the user")
     shadowsocks_port: Optional[int] = Query(None, gt=0, lt=65535, title="Shadowsocks-libev port")
     userid: Optional[int] = Query(None, title="User ID")
@@ -3990,6 +4006,23 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     # Create OpenVPN cert first — fail early before saving the user
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         LOG.debug("Create user " + params.username + " in OpenVPN")
+        # Clean up any leftover revoked PKI entry for this CN so easyrsa can reissue
+        index_file = '/etc/openvpn/ca/pki/index.txt'
+        if os.path.isfile(index_file):
+            with open(index_file, 'r') as f:
+                lines = f.readlines()
+            filtered = [l for l in lines if '/CN=' + params.username not in l]
+            if len(filtered) != len(lines):
+                LOG.debug("Removing stale PKI index entry for %s", params.username)
+                with open(index_file, 'w') as f:
+                    f.writelines(filtered)
+        for stale in [
+            f"/etc/openvpn/ca/pki/reqs/{params.username}.req",
+            f"/etc/openvpn/ca/pki/private/{params.username}.key",
+            f"/etc/openvpn/ca/pki/issued/{params.username}.crt",
+        ]:
+            if os.path.isfile(stale):
+                os.remove(stale)
         env = os.environ.copy()
         env['EASYRSA_CERT_EXPIRE'] = '3650'
         result = subprocess.run(["./easyrsa", "--batch", "build-client-full", params.username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
