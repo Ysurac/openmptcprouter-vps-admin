@@ -3801,16 +3801,16 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
                 if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
                     n.write(line)
                 elif  not userid == 0:
-                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
                     dataexist = True
                 elif userid == 0:
-                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
                     dataexist = True
             if not dataexist:
                 if  not userid == 0:
-                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
                 elif userid == 0:
-                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2/126' + '\n')
+                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
         os.close(fd)
         move(tmpfile, '/etc/shorewall6/params.vpn')
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()

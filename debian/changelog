@@ -1,3 +1,9 @@
+omr-vps-admin (0.17+20260511) unstable; urgency=medium
+
+  * Fix vpnips: remove /126 prefix length from IPv6 addresses written to shorewall6 params
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 11 May 2026 00:00:00 +0200
+
 omr-vps-admin (0.17+20260505) unstable; urgency=medium
 
   * Fix excessive physical I/O: cache get_omr_version() result at first call instead of scanning /etc/* on every /status and /config request
