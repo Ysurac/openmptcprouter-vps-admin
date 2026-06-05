@@ -1,8 +1,24 @@
-omr-vps-admin (0.17+20260518b) unstable; urgency=medium
+omr-vps-admin (0.18) unstable; urgency=medium
+
+  * Add optional omr_metrics module: per-interface WAN metrics storage and retrieval (JSON and InfluxDB 3.x backends)
+  * Add decision engine in omr_metrics: PyTorch MLP scorer with heuristic fallback assigning ip route nexthop weights from interface metrics
+  * Add cost field per WAN interface: lower cost biases routing decision weight toward that interface
+  * Add predictive mode for decision engine: linear regression on historical metrics with configurable horizon (predict=true&horizon=N on GET /metrics/decision, InfluxDB required)
+  * Add online learning endpoint POST /metrics/decision/train for fine-tuning the scorer from operator feedback
+  * Load MPTCP BPF schedulers at startup from /usr/share/bpf/scheduler and re-apply configured scheduler after registration
+  * Add MPTCP upstream kernel parameters to /config and POST /mptcp: close_timeout, pm_type, stale_loss_cnt, syn_retrans_before_tcp_fallback
+  * Fix MPTCP sysctl handling for upstream kernel: use net.mptcp.scheduler/path_manager/syn_retries instead of mptcp_* names, write correct sysctl.d entries per kernel variant
+  * Fix deprecation warning: replace datetime.utcnow() with datetime.now(timezone.utc)
+  * Fix crash on startup when users list is missing from omr-admin-config.json
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 05 Jun 2026 00:00:00 +0200
+
+omr-vps-admin (0.17+20260523) unstable; urgency=medium
 
   * Sync shadowsocks-rust users to xray and mqvpn at startup via FastAPI lifespan handler
+  * Fix MPTCP BPF scheduler warning on service restart: treat "File exists" as already-loaded instead of an error
 
- -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 18 May 2026 00:00:00 +0200
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 23 May 2026 00:00:00 +0200
 
 omr-vps-admin (0.17+20260518) unstable; urgency=medium
 

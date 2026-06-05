@@ -1,0 +1,1321 @@
+# Copyright (C) 2026 Ycarus (Yannick Chabanois) <ycarus@zugaina.org> for OpenMPTCProuter
+# SPDX-License-Identifier: AGPL-3.0
+#
+# Optional module: router metrics endpoints + PyTorch decision engine.
+# The router posts one interface payload per call (via omr-tracker post-tracking hooks).
+# Loaded by omradmin.py when present; safe to remove to disable the feature entirely.
+#
+# Storage backends
+# ----------------
+# JSON (default): /etc/openmptcprouter-vps-admin/omr-metrics.json
+# InfluxDB 3.x:   enabled by adding an "influxdb" block to omr-admin-config.json:
+#
+#   "influxdb": {
+#     "url":    "http://localhost:8181",
+#     "token":  "<your-token>",
+#     "org":    "omr",          (ignored by v3, kept for config compatibility)
+#     "bucket": "omr_metrics"   (optional, default: "omr_metrics")
+#   }
+#
+# Requires:  pip install influxdb3-python
+# Falls back silently to JSON if the package is absent or the server is unreachable.
+#
+# Decision engine
+# ---------------
+# GET  /metrics/decision       — model-assigned weight per WAN interface
+# POST /metrics/decision/train — submit quality feedback to fine-tune the model
+# POST /metrics/decision/reset — reset model to heuristic init (admin only)
+#
+# Requires: pip install torch
+# Returns HTTP 501 when PyTorch is not installed.
+
+import json
+import math
+import os
+import logging
+import threading
+import time
+import urllib.request
+import urllib.error
+from typing import Optional, Dict
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from starlette.responses import JSONResponse
+
+LOG = logging.getLogger('uvicorn.error')
+
+METRICS_FILE = '/etc/openmptcprouter-vps-admin/omr-metrics.json'
+OMR_CONFIG_FILE = '/etc/openmptcprouter-vps-admin/omr-admin-config.json'
+DECISION_MODEL_FILE = '/etc/openmptcprouter-vps-admin/omr-decision-model.pt'
+
+# ---------------------------------------------------------------------------
+# Engine runtime stats (thread-safe counters, reset only on process restart)
+# ---------------------------------------------------------------------------
+
+_stats_lock = threading.Lock()
+_engine_stats: dict = {
+    # torch inference (full model)
+    "inference_count": 0,
+    "inference_total_ms": 0.0,
+    "last_inference_ms": None,
+    # heuristic fallback (no torch)
+    "heuristic_count": 0,
+    "heuristic_total_ms": 0.0,
+    "last_heuristic_ms": None,
+    # training
+    "training_count": 0,
+    "training_total_ms": 0.0,
+    "last_training_ms": None,
+    "last_training_loss": None,
+    "cumulative_loss": 0.0,
+    # model lifecycle
+    "model_resets": 0,
+    "model_loaded_at": None,   # Unix timestamp of last load/init
+}
+
+
+def _stats_update(**kw):
+    with _stats_lock:
+        for k, v in kw.items():
+            _engine_stats[k] = v
+
+
+def _stats_inc(count_key: str, ms_key: str, elapsed_ms: float):
+    with _stats_lock:
+        _engine_stats[count_key] += 1
+        _engine_stats[ms_key] += elapsed_ms
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models — mirror the JSON produced by 040-metrics on the router
+# ---------------------------------------------------------------------------
+
+class SignalMetrics(BaseModel):
+    quality: Optional[float] = None
+    operator: Optional[str] = None
+    state: Optional[str] = None
+    type: Optional[str] = None      # 'wifi' | 'modemmanager' | 'qmi'
+    rssi: Optional[float] = None
+    rsrp: Optional[float] = None
+    rsrq: Optional[float] = None
+    sinr: Optional[float] = None
+
+
+class WifiMetrics(BaseModel):
+    ssid: Optional[str] = None
+    bssid: Optional[str] = None
+    mode: Optional[str] = None
+    channel: Optional[int] = None
+    signal: Optional[int] = None    # dBm
+    noise: Optional[int] = None     # dBm
+    bitrate: Optional[str] = None
+    quality: Optional[int] = None
+    quality_max: Optional[int] = None
+
+
+class TCMetrics(BaseModel):
+    qdisc: Optional[str] = None
+    sent_bytes: Optional[int] = None
+    sent_pkts: Optional[int] = None
+    dropped: Optional[int] = None
+    overlimits: Optional[int] = None
+    requeues: Optional[int] = None
+    backlog_bytes: Optional[int] = None
+    backlog_pkts: Optional[int] = None
+    ecn_mark: Optional[int] = None
+    drop_overlimit: Optional[int] = None
+    flows: Optional[int] = None
+    throttled: Optional[int] = None
+    flows_plimit: Optional[int] = None
+    new_flow_count: Optional[int] = None
+
+
+class BBRMetrics(BaseModel):
+    bw: Optional[int] = None             # bytes/s
+    pacing_rate: Optional[int] = None    # bytes/s
+    delivery_rate: Optional[int] = None  # bytes/s
+    cwnd: Optional[int] = None           # packets
+    min_rtt: Optional[float] = None      # ms
+    retrans: Optional[int] = None
+
+
+class CongestionMetrics(BaseModel):
+    score: Optional[int] = None          # 0-100
+    level: Optional[str] = None          # none | low | moderate | high | severe
+
+
+class BandwidthMetrics(BaseModel):
+    rx_bytes: Optional[int] = None
+    tx_bytes: Optional[int] = None
+    rx_bps: Optional[int] = None         # bytes/s
+    tx_bps: Optional[int] = None         # bytes/s
+
+
+class InterfaceMetrics(BaseModel):
+    """Mirrors the JSON written by 040-metrics for one WAN interface."""
+    interface: str
+    device: Optional[str] = None
+    status: Optional[str] = None
+    status_msg: Optional[str] = None
+    device_ip: Optional[str] = None
+    device_ip6: Optional[str] = None
+    gateway: Optional[str] = None
+    gateway6: Optional[str] = None
+    weight: Optional[int] = 100           # nexthop weight (1-255, default 100)
+    cost: Optional[int] = None           # interface routing cost (lower = preferred)
+    asn: Optional[str] = None            # ASN of the WAN (e.g. "AS1234")
+    latency: Optional[float] = None      # ms
+    rtt_min: Optional[float] = None      # ms
+    rtt_max: Optional[float] = None      # ms
+    loss: Optional[float] = None         # percent
+    jitter: Optional[float] = None       # ms
+    signal: Optional[SignalMetrics] = None
+    wifi: Optional[WifiMetrics] = None
+    tc: Optional[TCMetrics] = None
+    bbr: Optional[BBRMetrics] = None
+    congestion: Optional[CongestionMetrics] = None
+    bandwidth: Optional[BandwidthMetrics] = None
+    timestamp: Optional[int] = None      # Unix epoch
+
+
+class DecisionFeedback(BaseModel):
+    """Feedback used to fine-tune the interface scorer."""
+    best_interface: Optional[str] = None   # shorthand: 1.0 for this iface, 0.0 rest
+    weights: Optional[Dict[str, float]] = None  # free-form {iface: weight}
+    learning_rate: float = 0.01
+
+
+# ---------------------------------------------------------------------------
+# Storage backends
+# ---------------------------------------------------------------------------
+
+class JSONBackend:
+    """Stores the latest interface metrics per user in a single JSON file."""
+
+    def read_all(self) -> dict:
+        if not os.path.isfile(METRICS_FILE):
+            return {}
+        try:
+            with open(METRICS_FILE) as f:
+                return json.load(f)
+        except Exception as exc:
+            LOG.debug("omr_metrics JSON: read error: %s", exc)
+            return {}
+
+    def read_user(self, username: str) -> dict:
+        return self.read_all().get(username, {})
+
+    def read_history(self, username: str, interface: Optional[str],
+                     since_seconds: int, limit: int):
+        return [] if interface is not None else {}  # JSON backend: latest snapshot only
+
+    def write_interface(self, username: str, payload: dict):
+        data = self.read_all()
+        data.setdefault(username, {})[payload["interface"]] = payload
+        tmp = METRICS_FILE + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=4)
+            os.replace(tmp, METRICS_FILE)
+        except Exception as exc:
+            LOG.debug("omr_metrics JSON: write error: %s", exc)
+
+
+class InfluxBackend:
+    """Stores metrics in InfluxDB 3.x.
+
+    Each interface write creates one InfluxDB point with:
+      - tags:   username, interface, device, status
+      - fields: individual numeric metrics (latency, loss, …) for time-series
+                queries, plus a 'json_payload' string field for full retrieval.
+
+    Reads fetch the latest json_payload per interface via a SQL query.
+    """
+
+    _MEASUREMENT = "interface_metrics"
+
+    def __init__(self, url: str, token: str, org: str, bucket: str):
+        from influxdb_client_3 import InfluxDBClient3  # noqa: PLC0415
+        # org is not used in InfluxDB 3; bucket becomes the database name
+        self._client = InfluxDBClient3(host=url, token=token, database=bucket)
+        self._bucket = bucket
+
+    def _query(self, username: Optional[str] = None) -> dict:
+        """Return {username: {interface: payload}} for the latest data point."""
+        if username:
+            sql = (
+                f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
+                f"WHERE time >= now() - interval '7 days' AND username = $username "
+                f"ORDER BY time DESC"
+            )
+            params: dict = {"username": username}
+        else:
+            sql = (
+                f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
+                f"WHERE time >= now() - interval '7 days' "
+                f"ORDER BY time DESC"
+            )
+            params = {}
+        try:
+            table = self._client.query(sql, query_parameters=params or None)
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB: query error: %s", exc)
+            return {}
+
+        result: dict = {}
+        seen: set = set()
+        try:
+            d = table.to_pydict()
+            for uname, iface, payload_str in zip(
+                d.get("username", []),
+                d.get("interface", []),
+                d.get("json_payload", []),
+            ):
+                key = (uname, iface)
+                if key in seen:
+                    continue  # ORDER BY time DESC — first occurrence is latest
+                seen.add(key)
+                try:
+                    result.setdefault(uname, {})[iface] = json.loads(payload_str)
+                except Exception:
+                    pass
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB: result parse error: %s", exc)
+        return result
+
+    def read_all(self) -> dict:
+        return self._query()
+
+    def read_user(self, username: str) -> dict:
+        return self._query(username).get(username, {})
+
+    def read_history(self, username: str, interface: Optional[str],
+                     since_seconds: int, limit: int):
+        """Return history for one interface (list) or all interfaces (dict).
+
+        When *interface* is None every interface for the user is returned as
+        ``{interface_name: [payload, ...]}`` ordered oldest-first per interface.
+        When *interface* is given a plain list is returned (backward-compatible).
+        """
+        if interface is not None:
+            return self._read_history_iface(username, interface, since_seconds, limit)
+        return self._read_history_all(username, since_seconds, limit)
+
+    def _parse_history_rows(self, table) -> list:
+        result = []
+        try:
+            d = table.to_pydict()
+            for ts, payload_str in zip(d.get("time", []), d.get("json_payload", [])):
+                try:
+                    entry = json.loads(payload_str)
+                    if "timestamp" not in entry and ts is not None:
+                        entry["timestamp"] = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
+                    result.append(entry)
+                except Exception:
+                    pass
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB history: result parse error: %s", exc)
+        return result
+
+    def _read_history_iface(self, username: str, interface: str,
+                            since_seconds: int, limit: int) -> list:
+        sql = (
+            f"SELECT time, json_payload FROM {self._MEASUREMENT} "
+            f"WHERE username = $username AND interface = $interface "
+            f"AND time >= now() - interval '{since_seconds} seconds' "
+            f"ORDER BY time ASC "
+            f"LIMIT {int(limit)}"
+        )
+        try:
+            table = self._client.query(
+                sql, query_parameters={"username": username, "interface": interface}
+            )
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB history: query error: %s", exc)
+            return []
+        return self._parse_history_rows(table)
+
+    def _read_history_all(self, username: str, since_seconds: int, limit: int) -> dict:
+        sql = (
+            f"SELECT time, interface, json_payload FROM {self._MEASUREMENT} "
+            f"WHERE username = $username "
+            f"AND time >= now() - interval '{since_seconds} seconds' "
+            f"ORDER BY time ASC "
+            f"LIMIT {int(limit)}"
+        )
+        try:
+            table = self._client.query(sql, query_parameters={"username": username})
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB history: query error: %s", exc)
+            return {}
+
+        result: dict = {}
+        try:
+            d = table.to_pydict()
+            for ts, iface, payload_str in zip(
+                d.get("time", []),
+                d.get("interface", []),
+                d.get("json_payload", []),
+            ):
+                try:
+                    entry = json.loads(payload_str)
+                    if "timestamp" not in entry and ts is not None:
+                        entry["timestamp"] = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
+                    result.setdefault(iface, []).append(entry)
+                except Exception:
+                    pass
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB history: result parse error: %s", exc)
+        return result
+
+    def write_interface(self, username: str, payload: dict):
+        from influxdb_client_3 import Point  # noqa: PLC0415
+        iface = payload["interface"]
+        ts = payload.get("timestamp") or int(time.time())
+
+        p = (Point(self._MEASUREMENT)
+             .tag("username", username)
+             .tag("interface", iface)
+             .tag("device", payload.get("device") or "")
+             .tag("status", payload.get("status") or "")
+             .field("json_payload", json.dumps(payload)))
+
+        # Top-level string fields
+        for f in ("status_msg", "device_ip", "device_ip6", "gateway", "gateway6", "asn"):
+            v = payload.get(f)
+            if v:
+                p = p.field(f, str(v))
+
+        # Top-level numeric fields
+        for f in ("latency", "rtt_min", "rtt_max", "loss", "jitter", "weight", "cost"):
+            v = payload.get(f)
+            if v is not None:
+                p = p.field(f, float(v))
+
+        # Bandwidth and BBR (all numeric)
+        for section, fields in (
+            ("bandwidth", ("rx_bytes", "tx_bytes", "rx_bps", "tx_bps")),
+            ("bbr",       ("bw", "pacing_rate", "delivery_rate", "cwnd", "min_rtt", "retrans")),
+        ):
+            sec = payload.get(section) or {}
+            for f in fields:
+                v = sec.get(f)
+                if v is not None:
+                    p = p.field(f"{section}_{f}", float(v))
+
+        # Congestion
+        cong = payload.get("congestion") or {}
+        if cong.get("score") is not None:
+            p = p.field("congestion_score", float(cong["score"]))
+        if cong.get("level"):
+            p = p.field("congestion_level", str(cong["level"]))
+
+        # Signal
+        sig = payload.get("signal") or {}
+        for f in ("quality", "rssi", "rsrp", "rsrq", "sinr"):
+            v = sig.get(f)
+            if v is not None:
+                p = p.field(f"signal_{f}", float(v))
+        for f in ("operator", "state", "type"):
+            v = sig.get(f)
+            if v:
+                p = p.field(f"signal_{f}", str(v))
+
+        # Wifi
+        wifi = payload.get("wifi") or {}
+        for f in ("signal", "noise", "channel", "quality", "quality_max"):
+            v = wifi.get(f)
+            if v is not None:
+                p = p.field(f"wifi_{f}", float(v))
+        for f in ("ssid", "bssid", "mode", "bitrate"):
+            v = wifi.get(f)
+            if v:
+                p = p.field(f"wifi_{f}", str(v))
+
+        # TC
+        tc = payload.get("tc") or {}
+        for f in ("sent_bytes", "sent_pkts", "dropped", "overlimits", "requeues",
+                  "ecn_mark", "drop_overlimit", "backlog_bytes", "backlog_pkts",
+                  "flows", "throttled", "flows_plimit", "new_flow_count"):
+            v = tc.get(f)
+            if v is not None:
+                p = p.field(f"tc_{f}", float(v))
+        if tc.get("qdisc"):
+            p = p.field("tc_qdisc", str(tc["qdisc"]))
+
+        p = p.time(ts, write_precision="s")
+        try:
+            self._client.write(record=p)
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB: write error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Backend singleton
+# ---------------------------------------------------------------------------
+
+_backend: Optional[object] = None
+
+
+def _init_backend():
+    """Read omr-admin-config.json and return the appropriate backend."""
+    try:
+        with open(OMR_CONFIG_FILE) as f:
+            config = json.load(f)
+        influx_cfg = config.get("influxdb") or {}
+        if influx_cfg.get("url") and influx_cfg.get("token"):
+            try:
+                backend = InfluxBackend(
+                    url=influx_cfg["url"],
+                    token=influx_cfg["token"],
+                    org=influx_cfg.get("org", "omr"),
+                    bucket=influx_cfg.get("bucket", "omr_metrics"),
+                )
+                LOG.info("omr_metrics: InfluxDB backend at %s bucket=%s",
+                         influx_cfg["url"], influx_cfg.get("bucket", "omr_metrics"))
+                return backend
+            except ImportError:
+                LOG.warning("omr_metrics: influxdb3-python not installed – falling back to JSON")
+            except Exception as exc:
+                LOG.warning("omr_metrics: InfluxDB init failed (%s) – falling back to JSON", exc)
+    except Exception as exc:
+        LOG.debug("omr_metrics: config read: %s", exc)
+
+    LOG.info("omr_metrics: JSON backend at %s", METRICS_FILE)
+    return JSONBackend()
+
+
+def _get_backend():
+    global _backend
+    if _backend is None:
+        _backend = _init_backend()
+    return _backend
+
+
+def _read_all() -> dict:
+    return _get_backend().read_all()
+
+
+def _read_user(username: str) -> dict:
+    return _get_backend().read_user(username)
+
+
+def _write_interface(username: str, payload: dict):
+    _get_backend().write_interface(username, payload)
+
+
+# Accepted shorthands for the ?since= query parameter → seconds.
+_SINCE_PRESETS: dict = {
+    "15m": 900,    "30m": 1800,
+    "1h":  3600,   "6h":  21600,  "12h": 43200,
+    "24h": 86400,  "2d":  172800, "7d":  604800,
+    "30d": 2592000,
+}
+
+
+def _parse_since(since: str) -> int:
+    """Return seconds for a shorthand like '1h', '7d', or a raw integer string."""
+    s = since.strip().lower()
+    if s in _SINCE_PRESETS:
+        return _SINCE_PRESETS[s]
+    try:
+        return max(60, int(s))
+    except ValueError:
+        return 3600  # default: 1 h
+
+
+def _read_history(username: str, interface: Optional[str], since_seconds: int, limit: int):
+    return _get_backend().read_history(username, interface, since_seconds, limit)
+
+
+# ---------------------------------------------------------------------------
+# Decision engine — predictive extrapolation (pure Python, no torch required)
+# ---------------------------------------------------------------------------
+
+# Half-life for exponential weighting: a point this many seconds old gets
+# half the weight of the most recent point.  300 s = 5 min is a good default
+# for WAN metrics that are sampled every ~30 s.
+PREDICT_HALFLIFE_S: float = 300.0
+
+# (path, lo_clamp, hi_clamp) — path is a 1- or 2-tuple into the payload dict.
+# Clamping keeps extrapolated values inside physically meaningful bounds.
+_PREDICTABLE: list = [
+    (("latency",),             0.0,   None),   # ms ≥ 0
+    (("loss",),                0.0,  100.0),   # % in [0, 100]
+    (("jitter",),              0.0,   None),   # ms ≥ 0
+    (("congestion", "score"),  0.0,  100.0),   # score in [0, 100]
+    (("bandwidth",  "rx_bps"), 0.0,   None),   # bytes/s ≥ 0
+    (("bandwidth",  "tx_bps"), 0.0,   None),
+    (("bbr",        "bw"),     0.0,   None),
+    (("signal",     "quality"),0.0,  100.0),   # % in [0, 100]
+]
+
+# Public name kept for backward compatibility (used in tests and the doc).
+PREDICTABLE_FIELDS: list = [path for path, _, _ in _PREDICTABLE]
+
+
+def _linear_predict_at(timestamps: list, values: list, target_ts: float,
+                       halflife_s: float = PREDICT_HALFLIFE_S) -> Optional[float]:
+    """Exponentially weighted linear regression on (Unix-seconds, value) pairs.
+
+    Points decay with half-life *halflife_s*: a point that is halflife_s seconds
+    older than the most recent one carries half the weight.  This makes the
+    extrapolation much more responsive to recent behaviour than plain OLS.
+
+    Returns None when fewer than 2 valid points are available.
+    """
+    pairs = [
+        (float(t), float(v))
+        for t, v in zip(timestamps, values)
+        if t is not None and v is not None
+    ]
+    if len(pairs) < 2:
+        return pairs[-1][1] if pairs else None
+
+    ts_seq, vs_seq = zip(*pairs)
+    t_max = max(ts_seq)
+    decay = math.log(2) / halflife_s if halflife_s > 0 else 0.0
+    ws = [math.exp(-decay * (t_max - ti)) for ti in ts_seq]
+
+    w_sum = sum(ws)
+    t_mean = sum(w * t for w, t in zip(ws, ts_seq)) / w_sum
+    v_mean = sum(w * v for w, v in zip(ws, vs_seq)) / w_sum
+
+    num = sum(ws[i] * (ts_seq[i] - t_mean) * (vs_seq[i] - v_mean) for i in range(len(pairs)))
+    den = sum(ws[i] * (ts_seq[i] - t_mean) ** 2 for i in range(len(pairs)))
+
+    if den == 0.0:
+        return v_mean
+    slope = num / den
+    return slope * (target_ts - t_mean) + v_mean
+
+
+def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
+    """Return a copy of the latest payload with PREDICTABLE_FIELDS replaced by
+    exponentially weighted linear extrapolations *horizon_seconds* into the future.
+
+    Each history entry must carry a 'timestamp' (Unix seconds) field; entries
+    without one are skipped for regression.  Falls back to the current value
+    when fewer than 2 timestamped points exist for a field.  Predicted values
+    are clamped to physically valid ranges (e.g. loss stays in [0, 100]).
+    """
+    if not history:
+        return {}
+    payload = dict(history[-1])
+    latest_ts = payload.get("timestamp") or time.time()
+    target_ts = float(latest_ts) + horizon_seconds
+
+    for path, lo, hi in _PREDICTABLE:
+        timestamps: list = []
+        values: list = []
+        for p in history:
+            ts = p.get("timestamp")
+            v: object = p
+            for key in path:
+                v = (v or {}).get(key) if isinstance(v, dict) else None
+            if ts is not None and v is not None:
+                timestamps.append(float(ts))
+                values.append(float(v))
+
+        predicted = _linear_predict_at(timestamps, values, target_ts)
+        if predicted is None:
+            continue
+
+        if lo is not None:
+            predicted = max(lo, predicted)
+        if hi is not None:
+            predicted = min(hi, predicted)
+
+        if len(path) == 1:
+            payload[path[0]] = predicted
+        else:
+            nested = dict(payload.get(path[0]) or {})
+            nested[path[1]] = predicted
+            payload[path[0]] = nested
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Decision engine — feature extraction (pure Python, no torch required)
+# ---------------------------------------------------------------------------
+
+# Each feature is in [0, 1] with higher = better.
+FEATURE_NAMES = [
+    "inv_latency",    # 1 - clip(latency ms,        0,  2000) / 2000
+    "inv_loss",       # 1 - clip(loss %,            0,   100) / 100
+    "inv_jitter",     # 1 - clip(jitter ms,         0,   500) / 500
+    "inv_congestion", # 1 - clip(congestion.score,  0,   100) / 100
+    "rx_bps",         # clip(bandwidth.rx_bps,      0, 100 MB/s) / 100 MB/s
+    "tx_bps",         # clip(bandwidth.tx_bps,      0, 100 MB/s) / 100 MB/s
+    "signal",         # clip(signal.quality,        0,   100) / 100
+    "bbr_bw",         # clip(bbr.bw,               0, 100 MB/s) / 100 MB/s
+    "inv_ecn",        # 1 - clip(tc.ecn_mark,       0,  1000) / 1000
+    "inv_dropped",    # 1 - clip(tc.dropped,        0,  1000) / 1000
+]
+N_FEATURES = len(FEATURE_NAMES)
+
+# Per-feature importance priors used to seed the first hidden neuron.
+_FEATURE_IMPORTANCES = [2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5]
+
+
+def _extract_features(payload: dict) -> list:
+    """Return an N_FEATURES list of floats in [0, 1] where higher = better.
+
+    Missing values fall back to a neutral 0.5 (or 0.0 / 1.0 where noted).
+    """
+    def _n(v, lo, hi, inv=False, default=0.5):
+        if v is None:
+            return default
+        v = max(lo, min(hi, float(v)))
+        t = (v - lo) / (hi - lo) if hi != lo else 0.0
+        return 1.0 - t if inv else t
+
+    bw   = payload.get("bandwidth")  or {}
+    sig  = payload.get("signal")     or {}
+    bbr  = payload.get("bbr")        or {}
+    tc   = payload.get("tc")         or {}
+    cong = payload.get("congestion") or {}
+
+    return [
+        _n(payload.get("latency"),  0,   2000, inv=True),
+        _n(payload.get("loss"),     0,    100, inv=True),
+        _n(payload.get("jitter"),   0,    500, inv=True),
+        _n(cong.get("score"),       0,    100, inv=True),
+        _n(bw.get("rx_bps"),        0,  100e6, default=0.0),
+        _n(bw.get("tx_bps"),        0,  100e6, default=0.0),
+        _n(sig.get("quality"),      0,    100, default=0.5),
+        _n(bbr.get("bw"),           0,  100e6, default=0.0),
+        _n(tc.get("ecn_mark"),      0,   1000, inv=True, default=1.0),
+        _n(tc.get("dropped"),       0,   1000, inv=True, default=1.0),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Decision engine — PyTorch model (optional, graceful 501 when absent)
+# ---------------------------------------------------------------------------
+
+try:
+    import torch
+    import torch.nn as nn
+    _TORCH_AVAILABLE = True
+
+    class InterfaceScorer(nn.Module):
+        """2-hidden-layer MLP scoring WAN interfaces from their feature vectors.
+
+        Input:  (n_interfaces, N_FEATURES) — all features in [0, 1], higher = better
+        Output: (n_interfaces,) unnormalized scores
+        Apply softmax externally across the interface dimension to get weights.
+        """
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(N_FEATURES, 16), nn.ReLU(),
+                nn.Linear(16, 8),          nn.ReLU(),
+                nn.Linear(8, 1),
+            )
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            return self.net(x).squeeze(-1)
+
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+_decision_model = None
+
+
+def _make_model():
+    """Create a fresh InterfaceScorer with heuristic-informed initial weights."""
+    model = InterfaceScorer()
+    imp = torch.tensor(_FEATURE_IMPORTANCES, dtype=torch.float32)
+    imp = imp / imp.norm()
+    with torch.no_grad():
+        # Prime the first hidden neuron to approximate the hand-crafted score.
+        nn.init.xavier_uniform_(model.net[0].weight)
+        model.net[0].weight.data[0] = imp
+        model.net[0].bias.data.zero_()
+        nn.init.xavier_uniform_(model.net[2].weight)
+        model.net[2].bias.data.zero_()
+        nn.init.xavier_uniform_(model.net[4].weight)
+        model.net[4].bias.data.zero_()
+    model.eval()
+    return model
+
+
+def _get_model():
+    global _decision_model
+    if _decision_model is not None:
+        return _decision_model
+    if os.path.isfile(DECISION_MODEL_FILE):
+        try:
+            m = InterfaceScorer()
+            m.load_state_dict(
+                torch.load(DECISION_MODEL_FILE, map_location="cpu", weights_only=True)
+            )
+            m.eval()
+            _decision_model = m
+            _stats_update(model_loaded_at=time.time())
+            LOG.info("omr_decision: loaded model from %s", DECISION_MODEL_FILE)
+            return _decision_model
+        except Exception as exc:
+            LOG.warning("omr_decision: cannot load model (%s) – reinitializing", exc)
+    _decision_model = _make_model()
+    _stats_update(model_loaded_at=time.time())
+    return _decision_model
+
+
+def _save_model(model):
+    tmp = DECISION_MODEL_FILE + '.tmp'
+    try:
+        torch.save(model.state_dict(), tmp)
+        os.replace(tmp, DECISION_MODEL_FILE)
+    except Exception as exc:
+        LOG.debug("omr_decision: save error: %s", exc)
+
+
+def _safe_float(v: float, default: float = 0.0) -> float:
+    """Return v rounded to 4 decimal places, or default when v is nan or ±inf."""
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return round(v, 4)
+
+
+def _cost_factor(payload: dict) -> float:
+    """Return 1/cost so that lower cost → higher score. Neutral (1.0) when absent."""
+    c = payload.get("cost")
+    return 1.0 / float(c) if c and c > 0 else 1.0
+
+
+def _apply_cost(raw: list, interfaces: list, user_data: dict) -> list:
+    """Scale raw scores by each interface's cost factor and renormalise."""
+    scaled = [raw[i] * _cost_factor(user_data[interfaces[i]]) for i in range(len(interfaces))]
+    total = sum(scaled)
+    if total == 0.0:
+        eq = 1.0 / len(interfaces) if interfaces else 1.0
+        return [eq] * len(interfaces)
+    return [v / total for v in scaled]
+
+
+def _compute_weights_heuristic(user_data: dict) -> dict:
+    """Compute interface weights without PyTorch, using congestion score as the
+    primary signal.  Falls back to latency and loss when congestion is absent.
+    Offline interfaces (status != 'online' or no latency) get weight 1.
+    """
+    _t0 = time.perf_counter()
+    interfaces = list(user_data.keys())
+    raw: list = []
+    for iface in interfaces:
+        p = user_data[iface]
+        status  = p.get("status")
+        latency = p.get("latency")
+        if (status and status != "online") or latency is None:
+            raw.append(0.0)
+            continue
+
+        cong  = (p.get("congestion") or {}).get("score")   # 0-100, lower = better
+        loss  = p.get("loss")                               # %, lower = better
+        lat   = latency                                     # ms, lower = better
+
+        if cong is not None:
+            quality = max(0.0, 100.0 - float(cong)) / 100.0
+        else:
+            # Derive a proxy from latency + loss when congestion is missing.
+            lat_q  = max(0.0, 1.0 - min(float(lat),  2000.0) / 2000.0)
+            loss_q = max(0.0, 1.0 - min(float(loss),  100.0) / 100.0) if loss is not None else 0.5
+            quality = (lat_q + loss_q) / 2.0
+
+        raw.append(quality)
+
+    raw = _apply_cost(raw, interfaces, user_data)
+
+    total = sum(raw)
+    if total == 0.0:
+        eq = 1.0 / len(interfaces) if interfaces else 1.0
+        raw = [eq] * len(interfaces)
+    else:
+        raw = [v / total for v in raw]
+
+    elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+    _stats_inc("heuristic_count", "heuristic_total_ms", elapsed_ms)
+    _stats_update(last_heuristic_ms=round(elapsed_ms, 3))
+
+    n = len(interfaces)
+    return {
+        "weights": {iface: max(1, round(raw[i] * n * 100)) for i, iface in enumerate(interfaces)},
+        "scores":  {iface: round(raw[i] * 100, 2)          for i, iface in enumerate(interfaces)},
+    }
+
+
+def _compute_weights(user_data: dict, explain: bool = False) -> dict:
+    """Run the scorer against current interface metrics and return weights.
+
+    Interfaces with status != 'online' are masked (score = -inf → weight ≈ 0).
+    When all interfaces are offline softmax produces nan; we fall back to equal
+    weights so the result is always finite and JSON-serializable.
+    Returns {'weights': {...}, 'scores': {...}, optionally 'features': {...}}.
+    """
+    _t0 = time.perf_counter()
+    model = _get_model()
+    interfaces = list(user_data.keys())
+    features = {iface: _extract_features(payload) for iface, payload in user_data.items()}
+
+    feat_tensor = torch.tensor(
+        [features[iface] for iface in interfaces], dtype=torch.float32
+    )
+
+    with torch.no_grad():
+        scores = model(feat_tensor)
+        for idx, iface in enumerate(interfaces):
+            p      = user_data[iface]
+            status  = p.get("status")
+            latency = p.get("latency")
+            # Treat as down when: status is not "online", status is "ERROR",
+            # or latency is null (check failed / interface unreachable).
+            if (status and status != "online") or latency is None:
+                scores[idx] = float("-inf")
+        weights = torch.softmax(scores, dim=0)
+
+    raw_weights = [float(weights[i]) for i in range(len(interfaces))]
+    # All-offline edge case: softmax(-inf, …) → 0/0 → nan; use equal fallback.
+    if any(math.isnan(w) for w in raw_weights):
+        eq = 1.0 / len(interfaces) if interfaces else 1.0
+        raw_weights = [eq] * len(interfaces)
+
+    raw_weights = _apply_cost(raw_weights, interfaces, user_data)
+
+    # Weights: integers [1, 255] for ip route nexthop weight (higher = higher priority).
+    # Scores:  softmax × 100, rounded to 2 dp — quality percentage [0, 100].
+    int_weights = [max(1, round(w * 255)) for w in raw_weights]
+    scores_pct  = [round(w * 100, 2) for w in raw_weights]
+
+    elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+    _stats_inc("inference_count", "inference_total_ms", elapsed_ms)
+    _stats_update(last_inference_ms=round(elapsed_ms, 3))
+
+    result: dict = {
+        "weights": {iface: int_weights[i] for i, iface in enumerate(interfaces)},
+        "scores":  {iface: scores_pct[i]  for i, iface in enumerate(interfaces)},
+    }
+    if explain:
+        result["features"] = {
+            iface: dict(zip(FEATURE_NAMES, [round(v, 4) for v in features[iface]]))
+            for iface in interfaces
+        }
+    return result
+
+
+def _train_step(user_data: dict, target_weights: dict, lr: float) -> float:
+    """One SGD step minimising MSE between predicted and target weights.
+
+    Returns the scalar loss value. Saves the model after training.
+    At least two interfaces are required; returns 0.0 otherwise.
+    """
+    interfaces = list(user_data.keys())
+    if len(interfaces) < 2:
+        return 0.0
+
+    _t0 = time.perf_counter()
+    model = _get_model()
+    features = {iface: _extract_features(payload) for iface, payload in user_data.items()}
+    feat_tensor = torch.tensor(
+        [features[iface] for iface in interfaces], dtype=torch.float32
+    )
+    target = torch.tensor(
+        [float(target_weights.get(iface, 0.0)) for iface in interfaces],
+        dtype=torch.float32,
+    )
+    total = target.sum()
+    if total > 0:
+        target = target / total
+
+    model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    optimizer.zero_grad()
+    pred = torch.softmax(model(feat_tensor), dim=0)
+    loss = torch.nn.functional.mse_loss(pred, target)
+    loss.backward()
+    optimizer.step()
+    model.eval()
+
+    loss_val = float(loss)
+    elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+    with _stats_lock:
+        _engine_stats["training_count"] += 1
+        _engine_stats["training_total_ms"] += elapsed_ms
+        _engine_stats["last_training_ms"] = round(elapsed_ms, 3)
+        _engine_stats["last_training_loss"] = round(loss_val, 6)
+        _engine_stats["cumulative_loss"] += loss_val
+    return loss_val
+
+
+# ---------------------------------------------------------------------------
+# Engine diagnostics helpers
+# ---------------------------------------------------------------------------
+
+def _model_meta() -> dict:
+    """Return static metadata about the decision model (no inference)."""
+    meta: dict = {"torch_available": _TORCH_AVAILABLE}
+    if not _TORCH_AVAILABLE:
+        return meta
+
+    file_bytes: Optional[int] = None
+    if os.path.isfile(DECISION_MODEL_FILE):
+        try:
+            file_bytes = os.path.getsize(DECISION_MODEL_FILE)
+        except OSError:
+            pass
+    meta["model_file_bytes"] = file_bytes
+
+    param_count: Optional[int] = None
+    try:
+        m = _get_model()
+        param_count = sum(p.numel() for p in m.parameters())
+    except Exception:
+        pass
+    meta["model_parameters"] = param_count
+    meta["model_loaded_at"] = _engine_stats.get("model_loaded_at")
+    return meta
+
+
+_INFLUX_METRIC_PREFIXES = (
+    # InfluxDB 3.x (IOx / Rust) process metrics exposed via /metrics
+    "process_resident_memory_bytes",
+    "process_virtual_memory_bytes",
+    "process_cpu_seconds_total",
+    "iox_catalog_",
+    "iox_ingester_",
+    "iox_querier_",
+    "iox_write_",
+    "iox_read_",
+    "iox_wal_",
+    # InfluxDB 2.x (Go) equivalents
+    "influxdb_",
+    "go_memstats_",
+    "go_gc_",
+    "storage_",
+    "queryd_",
+    "http_api_",
+)
+
+
+def _parse_prometheus_metrics(text: str) -> dict:
+    """Parse a Prometheus /metrics text payload into {metric_name: value}.
+
+    Only lines that start with a known prefix and are not comments are kept.
+    Label sets are collapsed by keeping only the first occurrence of each base name.
+    """
+    result: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not any(line.startswith(p) for p in _INFLUX_METRIC_PREFIXES):
+            continue
+        # metric_name{labels} value [timestamp]  OR  metric_name value [timestamp]
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        name_labels, value_str = parts[0], parts[1]
+        base = name_labels.split("{")[0]
+        if base in result:
+            continue
+        try:
+            result[base] = float(value_str)
+        except ValueError:
+            pass
+    return result
+
+
+def _fetch_influx_metrics(influx_url: str, token: str, timeout: int = 5) -> dict:
+    """Fetch Prometheus metrics from InfluxDB's /metrics endpoint.
+
+    Returns a filtered dict of metric_name → float, or an error key on failure.
+    """
+    url = influx_url.rstrip("/") + "/metrics"
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", f"Token {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return {"error": f"HTTP {resp.status}"}
+            return _parse_prometheus_metrics(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.URLError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+_INFLUX_CONFIG_PATHS = [
+    # InfluxDB 3.x
+    "/etc/influxdb3/config.toml",
+    "/etc/influxdb3.toml",
+    # InfluxDB 2.x
+    "/etc/influxdb/config.toml",
+    "/etc/influxdb/influxdb.conf",
+]
+
+_INFLUX_DATA_DIRS = [
+    # InfluxDB 3.x defaults
+    "/var/lib/influxdb3",
+    # InfluxDB 2.x default
+    "/var/lib/influxdb",
+]
+
+
+def _find_influx_data_dir() -> Optional[str]:
+    """Return the InfluxDB data directory by reading config or trying defaults."""
+    # Try to extract from config files (TOML key  data-dir  or  path)
+    for cfg_path in _INFLUX_CONFIG_PATHS:
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            with open(cfg_path) as f:
+                for line in f:
+                    line = line.strip()
+                    # Match:  data-dir = "/some/path"  or  path = "/some/path"
+                    for key in ("data-dir", "data_dir", "path"):
+                        if line.startswith(key):
+                            parts = line.split("=", 1)
+                            if len(parts) == 2:
+                                val = parts[1].strip().strip('"').strip("'")
+                                if val and os.path.isdir(val):
+                                    return val
+        except OSError:
+            pass
+
+    for d in _INFLUX_DATA_DIRS:
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def _dir_size_bytes(path: str) -> int:
+    """Return total bytes of all regular files under *path* (follows no symlinks)."""
+    total = 0
+    try:
+        for dirpath, _, filenames in os.walk(path):
+            for fname in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, fname))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _backend_meta() -> dict:
+    """Return storage backend stats."""
+    backend = _get_backend()
+    if isinstance(backend, JSONBackend):
+        size: Optional[int] = None
+        try:
+            size = os.path.getsize(METRICS_FILE) if os.path.isfile(METRICS_FILE) else 0
+        except OSError:
+            pass
+        return {"backend": "json", "file_bytes": size, "file_path": METRICS_FILE}
+
+    # InfluxDB backend — read config to get URL + token, then fetch /metrics
+    influx_cfg: dict = {}
+    try:
+        with open(OMR_CONFIG_FILE) as f:
+            influx_cfg = json.load(f).get("influxdb") or {}
+    except Exception:
+        pass
+    url   = influx_cfg.get("url", "")
+    token = influx_cfg.get("token", "")
+    bucket = influx_cfg.get("bucket", "omr_metrics")
+    result: dict = {"backend": "influxdb", "url": url, "bucket": bucket}
+
+    data_dir = _find_influx_data_dir()
+    result["data_dir"] = data_dir
+    result["data_dir_bytes"] = _dir_size_bytes(data_dir) if data_dir else None
+
+    if url:
+        result["influxdb_metrics"] = _fetch_influx_metrics(url, token)
+    return result
+
+
+def _engine_diagnostics() -> dict:
+    """Assemble the full engine diagnostics snapshot."""
+    with _stats_lock:
+        stats = dict(_engine_stats)
+
+    # Derived averages (avoid ZeroDivision)
+    ic = stats["inference_count"]
+    hc = stats["heuristic_count"]
+    tc = stats["training_count"]
+    stats["avg_inference_ms"]  = round(stats["inference_total_ms"]  / ic, 3) if ic else None
+    stats["avg_heuristic_ms"]  = round(stats["heuristic_total_ms"]  / hc, 3) if hc else None
+    stats["avg_training_ms"]   = round(stats["training_total_ms"]   / tc, 3) if tc else None
+    stats["avg_training_loss"] = round(stats["cumulative_loss"]      / tc, 6) if tc else None
+
+    return {
+        "model":   _model_meta(),
+        "runtime": stats,
+        "storage": _backend_meta(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Router factory — avoids circular imports with omradmin.py
+# ---------------------------------------------------------------------------
+
+def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
+    """Return an APIRouter with /metrics and /metrics/decision endpoints."""
+    router = APIRouter()
+
+    # ---- metrics storage endpoints ----------------------------------------
+
+    @router.get('/metrics', summary="Get stored router metrics for the current user")
+    async def get_metrics(
+        username: Optional[str] = Query(None),
+        interface: Optional[str] = Query(None),
+        current_user: User = Depends(get_current_user),
+    ):
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        user_data = _read_user(target)
+        if interface:
+            return user_data.get(interface, {})
+        return user_data
+
+    @router.post('/metrics', summary="Store router metrics for one WAN interface")
+    async def set_metrics(
+        metrics: InterfaceMetrics,
+        username: Optional[str] = Query(None),
+        current_user: User = Depends(get_current_active_user),
+    ):
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        payload = metrics.model_dump()
+        if payload.get('timestamp') is None:
+            payload['timestamp'] = int(time.time())
+        _write_interface(target, payload)
+        return {'result': 'ok'}
+
+    @router.get('/metrics/all', summary="Get stored metrics for all users (admin only)")
+    async def get_all_metrics(current_user: User = Depends(get_current_user)):
+        if current_user.permissions != "admin":
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail="Admin only")
+        return _read_all()
+
+    _501_history = JSONResponse(
+        status_code=501,
+        content={"error": "History not available with JSON backend", "hint": "Configure InfluxDB in omr-admin-config.json"},
+    )
+
+    @router.get('/metrics/history', summary="Get historical metrics for WAN interfaces (InfluxDB only)")
+    async def get_metrics_history(
+        interface: Optional[str] = Query(None, description="WAN interface name; omit to get all interfaces"),
+        since: str = Query("1h", description="How far back to look: 15m 30m 1h 6h 12h 24h 2d 7d 30d or seconds"),
+        limit: int = Query(1000, ge=1, le=10000, description="Maximum number of data points"),
+        username: Optional[str] = Query(None),
+        current_user: User = Depends(get_current_user),
+    ):
+        if isinstance(_get_backend(), JSONBackend):
+            return _501_history
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        since_seconds = _parse_since(since)
+        return _read_history(target, interface, since_seconds, limit)
+
+    # ---- decision endpoints -----------------------------------------------
+
+    _501 = JSONResponse(
+        status_code=501,
+        content={"error": "PyTorch not installed", "hint": "pip install torch"},
+    )
+
+    @router.get('/metrics/decision', summary="Get model-assigned weight for each WAN interface")
+    async def get_decision(
+        username: Optional[str] = Query(None),
+        explain: bool = Query(False, description="Include per-interface feature breakdown"),
+        predict: bool = Query(False, description="Extrapolate metrics forward in time before scoring"),
+        horizon: int = Query(300, ge=1, le=86400, description="Prediction horizon in seconds (default 300 = 5 min)"),
+        current_user: User = Depends(get_current_user),
+    ):
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        user_data = _read_user(target)
+        if not user_data:
+            return {}
+
+        if predict:
+            predicted_data = {}
+            for iface in user_data:
+                hist = _read_history(target, iface,
+                                     since_seconds=max(horizon * 10, 3600), limit=50)
+                if len(hist) >= 2:
+                    predicted_data[iface] = _predict_payload(hist, horizon_seconds=horizon)
+                else:
+                    predicted_data[iface] = user_data[iface]
+            user_data = predicted_data
+
+        if not _TORCH_AVAILABLE:
+            return _compute_weights_heuristic(user_data)
+        return _compute_weights(user_data, explain=explain)
+
+    @router.post('/metrics/decision/train',
+                 summary="Submit interface quality feedback to fine-tune the scorer")
+    async def train_decision(
+        feedback: DecisionFeedback,
+        username: Optional[str] = Query(None),
+        current_user: User = Depends(get_current_active_user),
+    ):
+        if not _TORCH_AVAILABLE:
+            return _501
+        from fastapi import HTTPException
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        user_data = _read_user(target)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="No metrics stored for this user")
+
+        if feedback.best_interface:
+            if feedback.best_interface not in user_data:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unknown interface: {feedback.best_interface}",
+                )
+            target_weights = {
+                iface: (1.0 if iface == feedback.best_interface else 0.0)
+                for iface in user_data
+            }
+        elif feedback.weights:
+            target_weights = {
+                iface: float(feedback.weights.get(iface, 0.0)) for iface in user_data
+            }
+        else:
+            raise HTTPException(status_code=422, detail="Provide 'best_interface' or 'weights'")
+
+        loss = _train_step(user_data, target_weights, feedback.learning_rate)
+        _save_model(_get_model())
+        return {"result": "ok", "loss": round(loss, 6)}
+
+    @router.post('/metrics/decision/reset',
+                 summary="Reset the scorer to heuristic initialization (admin only)")
+    async def reset_decision(current_user: User = Depends(get_current_user)):
+        if not _TORCH_AVAILABLE:
+            return _501
+        from fastapi import HTTPException
+        if current_user.permissions != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        global _decision_model
+        _decision_model = _make_model()
+        _save_model(_decision_model)
+        with _stats_lock:
+            _engine_stats["model_resets"] += 1
+            _engine_stats["model_loaded_at"] = time.time()
+        return {"result": "ok"}
+
+    # ---- engine diagnostics endpoint ----------------------------------------
+
+    @router.get('/metrics/engine',
+                summary="Decision engine and storage backend diagnostics (admin only)")
+    async def get_engine_diagnostics(current_user: User = Depends(get_current_user)):
+        from fastapi import HTTPException
+        if current_user.permissions != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        import asyncio
+        return await asyncio.to_thread(_engine_diagnostics)
+
+    return router

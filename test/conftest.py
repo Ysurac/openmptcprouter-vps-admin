@@ -139,6 +139,10 @@ def _mock_open(path, mode="r", *args, **kwargs):
 # Import the real module with file mocks active at import time
 # ---------------------------------------------------------------------------
 
+_PARENT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
+
 builtins.open = _mock_open
 try:
     _module_path = os.path.normpath(

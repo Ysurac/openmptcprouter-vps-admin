@@ -15,8 +15,9 @@ import ipaddress
 import argparse
 import subprocess
 import os
+import sys
+sys.path.insert(0, '/usr/share/omr-admin')
 import platform
-#import sys
 import glob
 import socket
 import socket as _socket
@@ -28,7 +29,7 @@ import shutil
 import time
 import copy
 #from pprint import pprint
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from tempfile import mkstemp
 from typing import List, Optional
 from shutil import move
@@ -70,6 +71,13 @@ logging.basicConfig(level=logging.INFO,
                            "%(module)s:%(funcName)s:%(lineno)d - %(message)s")
 #LOG = logging.getLogger('OMR-Admin')
 LOG = logging.getLogger('uvicorn.error')
+
+class _MetricsAccessFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return '"/metrics' not in msg
+
+logging.getLogger('uvicorn.access').addFilter(_MetricsAccessFilter())
 
 PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
@@ -1607,8 +1615,49 @@ basic_auth = BasicAuth(auto_error=False)
 
 oauth2_scheme = OAuth2PasswordBearerCookie(tokenUrl="/token")
 
+def load_mptcp_bpf_schedulers():
+    bpf_dir = '/usr/share/bpf/scheduler'
+    bpf_pin_dir = '/sys/fs/bpf/mptcp'
+    if not os.path.isdir(bpf_dir):
+        return
+    os.makedirs(bpf_pin_dir, exist_ok=True)
+    loaded = False
+    for fname in os.listdir(bpf_dir):
+        if not fname.endswith('.o'):
+            continue
+        obj_path = os.path.join(bpf_dir, fname)
+        try:
+            result = subprocess.run(
+                ['bpftool', 'struct_ops', 'register', obj_path, bpf_pin_dir],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                LOG.info('Loaded MPTCP BPF scheduler: ' + fname)
+                loaded = True
+            elif 'File exists' in result.stderr:
+                LOG.debug('MPTCP BPF scheduler already registered: ' + fname)
+                loaded = True
+            else:
+                LOG.warning('Failed to load MPTCP BPF scheduler ' + fname + ': ' + result.stderr.strip())
+        except Exception as e:
+            LOG.warning('Error loading MPTCP BPF scheduler ' + fname + ': ' + str(e))
+    if loaded:
+        # sysctl.d is applied before this service starts, so BPF schedulers aren't loaded yet at
+        # that point — re-apply the configured scheduler now that BPF programs are registered.
+        sysctl_conf = '/etc/sysctl.d/90-shadowsocks.conf'
+        if os.path.isfile(sysctl_conf):
+            with open(sysctl_conf, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('net.mptcp.mptcp_scheduler=') or line.startswith('net.mptcp.scheduler='):
+                        subprocess.run(['sysctl', '-qw', line], check=False)
+                        LOG.info('Re-applied scheduler after BPF load: ' + line)
+                        break
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(app):
+    load_mptcp_bpf_schedulers()
     sync_ss_go_users()
     yield
 
@@ -1665,9 +1714,9 @@ def sync_ss_go_users():
 def create_access_token(*, data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=60)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=60)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -1690,7 +1739,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
-    fake_users_db = omr_config_data['users'][0]
+    users = omr_config_data.get('users')
+    if not users:
+        raise credentials_exception
+    fake_users_db = users[0]
     LOG.debug('token user: ' + token_data.username)
     user = get_user(fake_users_db, username=token_data.username)
     if user is None:
@@ -1702,6 +1754,13 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
     if current_user.disabled:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
+
+try:
+    from omr_metrics import create_router as _create_metrics_router
+    app.include_router(_create_metrics_router(get_current_user, get_current_active_user, User))
+    LOG.info("omr_metrics module loaded")
+except ImportError:
+    pass
 
 # Show something at homepage
 @app.get("/")
@@ -2385,6 +2444,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     LOG.debug('Get config... mptcp')
     mptcp_version = mptcp_enabled = mptcp_checksum = '0'
     mptcp_path_manager = mptcp_scheduler = mptcp_syn_retries = ''
+    mptcp_close_timeout = mptcp_pm_type = mptcp_stale_loss_cnt = mptcp_syn_retrans_before_tcp_fallback = ''
     if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
         mptcp_enabled = read_proc('/proc/sys/net/mptcp/mptcp_enabled')
         mptcp_checksum = read_proc('/proc/sys/net/mptcp/mptcp_checksum')
@@ -2395,6 +2455,20 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     elif path.exists('/proc/sys/net/mptcp/enabled'):
         mptcp_enabled = read_proc('/proc/sys/net/mptcp/enabled')
         mptcp_checksum = read_proc('/proc/sys/net/mptcp/checksum_enabled')
+        if path.exists('/proc/sys/net/mptcp/scheduler'):
+            mptcp_scheduler = read_proc('/proc/sys/net/mptcp/scheduler')
+        if path.exists('/proc/sys/net/mptcp/path_manager'):
+            mptcp_path_manager = read_proc('/proc/sys/net/mptcp/path_manager')
+        if path.exists('/proc/sys/net/mptcp/pm_type'):
+            mptcp_pm_type = read_proc('/proc/sys/net/mptcp/pm_type')
+        if path.exists('/proc/sys/net/mptcp/syn_retries'):
+            mptcp_syn_retries = read_proc('/proc/sys/net/mptcp/syn_retries')
+        if path.exists('/proc/sys/net/mptcp/close_timeout'):
+            mptcp_close_timeout = read_proc('/proc/sys/net/mptcp/close_timeout')
+        if path.exists('/proc/sys/net/mptcp/stale_loss_cnt'):
+            mptcp_stale_loss_cnt = read_proc('/proc/sys/net/mptcp/stale_loss_cnt')
+        if path.exists('/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback'):
+            mptcp_syn_retrans_before_tcp_fallback = read_proc('/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback')
         mptcp_version = '1'
 
     congestion_control = read_proc('/proc/sys/net/ipv4/tcp_congestion_control')
@@ -2550,7 +2624,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -3195,6 +3269,10 @@ class MPTCPparams(BaseModel):
     syn_retries: int
     congestion_control: str
     version: int = 0
+    close_timeout: int = 0
+    pm_type: int = 0
+    stale_loss_cnt: int = 0
+    syn_retrans_before_tcp_fallback: int = 0
 
 @app.post('/mptcp', summary="Modify MPTCP configuration of the server")
 def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)):
@@ -3207,6 +3285,10 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     syn_retries = params.syn_retries
     congestion_control = params.congestion_control
     version = params.version
+    close_timeout = params.close_timeout
+    pm_type = params.pm_type
+    stale_loss_cnt = params.stale_loss_cnt
+    syn_retrans_before_tcp_fallback = params.syn_retrans_before_tcp_fallback
     if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'mptcp'}
     if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
@@ -3217,6 +3299,20 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
         subprocess.run(["sysctl", "-qw", f"net.mptcp.mptcp_version={version}"], check=False)
     else:
         subprocess.run(["sysctl", "-qw", f"net.mptcp.checksum_enabled={checksum}"], check=False)
+        if scheduler:
+            subprocess.run(["sysctl", "-qw", f"net.mptcp.scheduler={scheduler}"], check=False)
+        if path_manager:
+            subprocess.run(["sysctl", "-qw", f"net.mptcp.path_manager={path_manager}"], check=False)
+        if syn_retries:
+            subprocess.run(["sysctl", "-qw", f"net.mptcp.syn_retries={syn_retries}"], check=False)
+        if close_timeout:
+            subprocess.run(["sysctl", "-qw", f"net.mptcp.close_timeout={close_timeout}"], check=False)
+        if pm_type:
+            subprocess.run(["sysctl", "-qw", f"net.mptcp.pm_type={pm_type}"], check=False)
+        if stale_loss_cnt:
+            subprocess.run(["sysctl", "-qw", f"net.mptcp.stale_loss_cnt={stale_loss_cnt}"], check=False)
+        if syn_retrans_before_tcp_fallback:
+            subprocess.run(["sysctl", "-qw", f"net.mptcp.syn_retrans_before_tcp_fallback={syn_retrans_before_tcp_fallback}"], check=False)
     subprocess.run(["sysctl", "-qw", f"net.ipv4.tcp_congestion_control={congestion_control}"], check=False)
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/sysctl.d/90-shadowsocks.conf', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
@@ -3224,12 +3320,29 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
         for line in f:
             if not 'net.mptcp' in line and not 'net.ipv4.tcp_congestion_control' in line:
                 n.write(line)
-        n.write('net.mptcp.mptcp_checksum=' + checksum + "\n")
-        n.write('net.mptcp.mptcp_path_manager=' + path_manager + "\n")
-        n.write('net.mptcp.mptcp_scheduler=' + scheduler + "\n")
-        n.write('net.mptcp.mptcp_syn_retries=' + str(syn_retries) + "\n")
-        n.write('net.mptcp.mptcp_version=' + str(version) + "\n")
-        n.write('net.mptcp.checksum_enabled=' + checksum + "\n")
+        if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
+            n.write('net.mptcp.mptcp_checksum=' + checksum + "\n")
+            n.write('net.mptcp.mptcp_path_manager=' + path_manager + "\n")
+            n.write('net.mptcp.mptcp_scheduler=' + scheduler + "\n")
+            n.write('net.mptcp.mptcp_syn_retries=' + str(syn_retries) + "\n")
+            n.write('net.mptcp.mptcp_version=' + str(version) + "\n")
+            n.write('net.mptcp.checksum_enabled=' + checksum + "\n")
+        else:
+            n.write('net.mptcp.checksum_enabled=' + checksum + "\n")
+            if scheduler:
+                n.write('net.mptcp.scheduler=' + scheduler + "\n")
+            if path_manager:
+                n.write('net.mptcp.path_manager=' + path_manager + "\n")
+            if syn_retries:
+                n.write('net.mptcp.syn_retries=' + str(syn_retries) + "\n")
+            if close_timeout:
+                n.write('net.mptcp.close_timeout=' + str(close_timeout) + "\n")
+            if pm_type:
+                n.write('net.mptcp.pm_type=' + str(pm_type) + "\n")
+            if stale_loss_cnt:
+                n.write('net.mptcp.stale_loss_cnt=' + str(stale_loss_cnt) + "\n")
+            if syn_retrans_before_tcp_fallback:
+                n.write('net.mptcp.syn_retrans_before_tcp_fallback=' + str(syn_retrans_before_tcp_fallback) + "\n")
         n.write('net.ipv4.tcp_congestion_control=' + congestion_control + "\n")
     os.close(fd)
     move(tmpfile, '/etc/sysctl.d/90-shadowsocks.conf')

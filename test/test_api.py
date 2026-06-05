@@ -536,6 +536,342 @@ class TestMPTCP:
         r = user_client.post("/mptcp", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
 
+    def test_optional_v1_fields_accepted(self, user_client):
+        payload = {**self._PAYLOAD, "close_timeout": 120, "pm_type": 1,
+                   "stale_loss_cnt": 4, "syn_retrans_before_tcp_fallback": 2}
+        r = user_client.post("/mptcp", json=payload)
+        assert r.json()["result"] == "done"
+
+    def test_missing_optional_v1_fields_still_succeed(self, user_client):
+        r = user_client.post("/mptcp", json=self._PAYLOAD)
+        assert r.json()["result"] == "done"
+
+
+class TestMPTCPV0Scheduler:
+    """v0 (out-of-tree) kernel: net.mptcp.mptcp_scheduler sysctl path."""
+
+    _PAYLOAD = {
+        "checksum": "0",
+        "path_manager": "default",
+        "scheduler": "bpf_red",
+        "syn_retries": 3,
+        "congestion_control": "bbr",
+        "version": 0,
+    }
+
+    def _v0_exists(self, p):
+        return str(p) == "/proc/sys/net/mptcp/mptcp_enabled"
+
+    def test_uses_mptcp_scheduler_sysctl(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v0_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "done"
+        assert any("net.mptcp.mptcp_scheduler=bpf_red" in " ".join(c) for c in sysctl_calls)
+
+    def test_does_not_use_v1_scheduler_sysctl(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v0_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            user_client.post("/mptcp", json=self._PAYLOAD)
+
+        flat = " ".join(" ".join(c) for c in sysctl_calls)
+        assert "net.mptcp.scheduler=bpf_red" not in flat or "mptcp_scheduler" in flat
+
+
+class TestMPTCPV1Scheduler:
+    """v1 (upstream) kernel: net.mptcp.scheduler sysctl path and new sysctls."""
+
+    _PAYLOAD = {
+        "checksum": "0",
+        "path_manager": "default",
+        "scheduler": "bpf_red",
+        "syn_retries": 3,
+        "congestion_control": "bbr",
+        "version": 0,
+        "close_timeout": 60,
+        "pm_type": 0,
+        "stale_loss_cnt": 4,
+        "syn_retrans_before_tcp_fallback": 2,
+    }
+
+    def _v1_exists(self, p):
+        return str(p) in (
+            "/proc/sys/net/mptcp/enabled",
+            "/proc/sys/net/mptcp/scheduler",
+            "/proc/sys/net/mptcp/syn_retries",
+            "/proc/sys/net/mptcp/path_manager",
+            "/proc/sys/net/mptcp/pm_type",
+            "/proc/sys/net/mptcp/close_timeout",
+            "/proc/sys/net/mptcp/stale_loss_cnt",
+            "/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback",
+        )
+
+    def test_uses_v1_scheduler_sysctl(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "done"
+        assert any("net.mptcp.scheduler=bpf_red" in " ".join(c) for c in sysctl_calls)
+
+    def test_does_not_use_v0_scheduler_sysctl(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert not any("mptcp_scheduler" in " ".join(c) for c in sysctl_calls)
+
+    def test_applies_close_timeout(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert any("net.mptcp.close_timeout=60" in " ".join(c) for c in sysctl_calls)
+
+    def test_applies_stale_loss_cnt(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert any("net.mptcp.stale_loss_cnt=4" in " ".join(c) for c in sysctl_calls)
+
+    def test_applies_syn_retrans_before_tcp_fallback(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert any("net.mptcp.syn_retrans_before_tcp_fallback=2" in " ".join(c) for c in sysctl_calls)
+
+    def test_zero_optional_fields_not_applied(self, user_client):
+        """Fields that default to 0 must not emit a sysctl call when omitted."""
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        base = {k: v for k, v in self._PAYLOAD.items()
+                if k not in ("close_timeout", "pm_type", "stale_loss_cnt",
+                             "syn_retrans_before_tcp_fallback")}
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            user_client.post("/mptcp", json=base)
+
+        flat = " ".join(" ".join(c) for c in sysctl_calls)
+        assert "close_timeout" not in flat
+        assert "stale_loss_cnt" not in flat
+        assert "syn_retrans_before_tcp_fallback" not in flat
+
+
+class TestLoadMptcpBpfSchedulers:
+    """load_mptcp_bpf_schedulers() must re-apply the scheduler sysctl after loading BPF."""
+
+    _SYSCTL_CONF_V0 = "net.mptcp.mptcp_scheduler=bpf_red\nnet.ipv4.tcp_congestion_control=bbr\n"
+    _SYSCTL_CONF_V1 = "net.mptcp.scheduler=bpf_red\nnet.ipv4.tcp_congestion_control=bbr\n"
+
+    def test_reapplies_v0_scheduler_after_bpf_load(self):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        def _open_conf(p, mode="r", *a, **kw):
+            if str(p) == "/etc/sysctl.d/90-shadowsocks.conf":
+                return io.StringIO(self._SYSCTL_CONF_V0)
+            return _mock_open(p, mode, *a, **kw)
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.makedirs"),
+            patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
+            patch("subprocess.run", side_effect=_run),
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_conf),
+        ):
+            omr_admin.load_mptcp_bpf_schedulers()
+
+        assert any("net.mptcp.mptcp_scheduler=bpf_red" in " ".join(c) for c in sysctl_calls)
+
+    def test_reapplies_v1_scheduler_after_bpf_load(self):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        def _open_conf(p, mode="r", *a, **kw):
+            if str(p) == "/etc/sysctl.d/90-shadowsocks.conf":
+                return io.StringIO(self._SYSCTL_CONF_V1)
+            return _mock_open(p, mode, *a, **kw)
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.makedirs"),
+            patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
+            patch("subprocess.run", side_effect=_run),
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_conf),
+        ):
+            omr_admin.load_mptcp_bpf_schedulers()
+
+        assert any("net.mptcp.scheduler=bpf_red" in " ".join(c) for c in sysctl_calls)
+
+    def test_no_reapply_when_bpf_load_fails(self):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=1)
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.makedirs"),
+            patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            omr_admin.load_mptcp_bpf_schedulers()
+
+        assert not any("mptcp_scheduler" in " ".join(c) or "net.mptcp.scheduler" in " ".join(c)
+                       for c in sysctl_calls)
+
+    def test_no_op_when_bpf_dir_missing(self):
+        with patch("os.path.isdir", return_value=False):
+            omr_admin.load_mptcp_bpf_schedulers()
+
+
+class TestMPTCPV1ConfigRead:
+    """GET /config must return v1 MPTCP fields when the v1 proc path exists."""
+
+    def _v1_exists(self, p):
+        return str(p) in (
+            "/proc/sys/net/mptcp/enabled",
+            "/proc/sys/net/mptcp/scheduler",
+            "/proc/sys/net/mptcp/syn_retries",
+            "/proc/sys/net/mptcp/path_manager",
+            "/proc/sys/net/mptcp/pm_type",
+            "/proc/sys/net/mptcp/close_timeout",
+            "/proc/sys/net/mptcp/stale_loss_cnt",
+            "/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback",
+        )
+
+    def _proc_open(self, p, mode="r", *a, **kw):
+        values = {
+            "/proc/sys/net/mptcp/enabled": "1",
+            "/proc/sys/net/mptcp/checksum_enabled": "0",
+            "/proc/sys/net/mptcp/scheduler": "bpf_red",
+            "/proc/sys/net/mptcp/syn_retries": "3",
+            "/proc/sys/net/mptcp/path_manager": "default",
+            "/proc/sys/net/mptcp/pm_type": "0",
+            "/proc/sys/net/mptcp/close_timeout": "60",
+            "/proc/sys/net/mptcp/stale_loss_cnt": "4",
+            "/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback": "2",
+            "/proc/sys/net/ipv4/tcp_congestion_control": "bbr",
+        }
+        if str(p) in values:
+            return io.StringIO(values[str(p)])
+        return _mock_open(p, mode, *a, **kw)
+
+    def test_config_returns_v1_scheduler(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("builtins.open", side_effect=self._proc_open),
+        ):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        assert r.json()["mptcp"]["scheduler"] == "bpf_red"
+
+    def test_config_returns_close_timeout(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("builtins.open", side_effect=self._proc_open),
+        ):
+            r = user_client.get("/config")
+        assert r.json()["mptcp"]["close_timeout"] == "60"
+
+    def test_config_returns_stale_loss_cnt(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("builtins.open", side_effect=self._proc_open),
+        ):
+            r = user_client.get("/config")
+        assert r.json()["mptcp"]["stale_loss_cnt"] == "4"
+
+    def test_config_returns_syn_retrans_before_tcp_fallback(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("builtins.open", side_effect=self._proc_open),
+        ):
+            r = user_client.get("/config")
+        assert r.json()["mptcp"]["syn_retrans_before_tcp_fallback"] == "2"
+
+    def test_config_returns_pm_type(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("builtins.open", side_effect=self._proc_open),
+        ):
+            r = user_client.get("/config")
+        assert r.json()["mptcp"]["pm_type"] == "0"
+
 
 # ===========================================================================
 # VPN / Proxy selection
