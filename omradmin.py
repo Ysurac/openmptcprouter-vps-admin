@@ -75,7 +75,7 @@ LOG = logging.getLogger('uvicorn.error')
 class _MetricsAccessFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
-        return '"/metrics' not in msg
+        return '"/metrics' not in msg and '127.0.0.1' not in msg
 
 logging.getLogger('uvicorn.access').addFilter(_MetricsAccessFilter())
 
@@ -1997,13 +1997,20 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
 
 # Get VPS config
 @app.get('/config', summary="Get full server configuration for current user")
-async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
+async def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get config...')
     if not current_user.permissions == "admin":
         userid = current_user.userid
+        username = None
+    if username is not None:
+        userid = get_userid_from_username(username)
+        if isinstance(userid, dict):
+            return userid
     if userid is None:
         userid = 0
     username = get_username_from_userid(userid)
+    if not username:
+        return {'error': 'Unknown user', 'route': 'config'}
     if not current_user.permissions == "admin" and serial is not None:
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
@@ -3299,11 +3306,11 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
         subprocess.run(["sysctl", "-qw", f"net.mptcp.mptcp_version={version}"], check=False)
     else:
         subprocess.run(["sysctl", "-qw", f"net.mptcp.checksum_enabled={checksum}"], check=False)
-        if scheduler:
+        if scheduler and path.exists('/proc/sys/net/mptcp/scheduler'):
             subprocess.run(["sysctl", "-qw", f"net.mptcp.scheduler={scheduler}"], check=False)
-        if path_manager:
+        if path_manager and path.exists('/proc/sys/net/mptcp/path_manager'):
             subprocess.run(["sysctl", "-qw", f"net.mptcp.path_manager={path_manager}"], check=False)
-        if syn_retries:
+        if syn_retries and path.exists('/proc/sys/net/mptcp/syn_retries'):
             subprocess.run(["sysctl", "-qw", f"net.mptcp.syn_retries={syn_retries}"], check=False)
         if close_timeout:
             subprocess.run(["sysctl", "-qw", f"net.mptcp.close_timeout={close_timeout}"], check=False)
@@ -3329,11 +3336,11 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
             n.write('net.mptcp.checksum_enabled=' + checksum + "\n")
         else:
             n.write('net.mptcp.checksum_enabled=' + checksum + "\n")
-            if scheduler:
+            if scheduler and path.exists('/proc/sys/net/mptcp/scheduler'):
                 n.write('net.mptcp.scheduler=' + scheduler + "\n")
-            if path_manager:
+            if path_manager and path.exists('/proc/sys/net/mptcp/path_manager'):
                 n.write('net.mptcp.path_manager=' + path_manager + "\n")
-            if syn_retries:
+            if syn_retries and path.exists('/proc/sys/net/mptcp/syn_retries'):
                 n.write('net.mptcp.syn_retries=' + str(syn_retries) + "\n")
             if close_timeout:
                 n.write('net.mptcp.close_timeout=' + str(close_timeout) + "\n")

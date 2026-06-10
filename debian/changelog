@@ -1,3 +1,11 @@
+omr-vps-admin (0.18+20260610) unstable; urgency=medium
+
+  * Add username query parameter to GET /config for admin user lookup by name
+  * Return proper error response when userid has no matching user in GET /config
+  * Filter uvicorn access logs from 127.0.0.1
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 10 Jun 2026 00:00:00 +0200
+
 omr-vps-admin (0.18) unstable; urgency=medium
 
   * Add optional omr_metrics module: per-interface WAN metrics storage and retrieval (JSON and InfluxDB 3.x backends)
