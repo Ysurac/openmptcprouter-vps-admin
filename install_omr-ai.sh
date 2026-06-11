@@ -20,7 +20,7 @@ set -eu
 INFLUX_ORG="omr"              # kept for omr-admin-config.json compatibility; ignored by v3
 INFLUX_BUCKET="omr_metrics"
 INFLUX_RETENTION="30d"        # retention period (e.g. "30d", "168h"); "" = infinite
-INFLUX_HOST="http://localhost:8181"
+INFLUX_HOST="http://127.0.0.1:65501"
 INFLUX_NODE_ID="omr-node"
 INFLUX_DATA_DIR="/var/lib/influxdb3/data"
 
@@ -104,7 +104,7 @@ cat > "$INFLUX_CONF" <<EOF
 node-id      = "${INFLUX_NODE_ID}"
 object-store = "file"
 data-dir     = "${INFLUX_DATA_DIR}"
-http-bind    = "0.0.0.0:8181"
+http-bind    = "127.0.0.1:65501"
 # Allow health and ping without a token so monitoring tools and this script
 # can reach them regardless of whether auth is enabled.
 disable-authz = "health,ping"
@@ -261,20 +261,14 @@ fi
 # ---------------------------------------------------------------------------
 # 7. Deploy omr_metrics.py to the installed location and restart omr-admin
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -f "${SCRIPT_DIR}/omr_metrics.py" ]; then
-    step "Deploying omr_metrics.py..."
-    # omradmin.py adds /usr/share/omr-admin to sys.path, so that is the
-    # canonical location for omr_metrics.py.
-    dest=/usr/share/omr-admin/omr_metrics.py
-    mkdir -p /usr/share/omr-admin
-    cp "${SCRIPT_DIR}/omr_metrics.py" "$dest"
-    log "  -> ${dest}"
-    systemctl restart omr-admin 2>/dev/null || true
-    log "omr-admin restarted."
-else
-    log "omr_metrics.py not found next to this script — skipping deploy."
-fi
+step "Downloading omr_metrics.py..."
+dest=/usr/share/omr-admin/omr_metrics.py
+mkdir -p /usr/share/omr-admin
+curl -fsSL "https://raw.githubusercontent.com/Ysurac/openmptcprouter-vps-admin/refs/heads/develop/omr_metrics.py" \
+    -o "$dest"
+log "  -> ${dest}"
+systemctl restart omr-admin 2>/dev/null || true
+log "omr-admin restarted."
 
 # ---------------------------------------------------------------------------
 # 8. Inject influxdb block into omr-admin-config.json
