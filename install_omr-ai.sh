@@ -21,6 +21,7 @@ INFLUX_ORG="omr"              # kept for omr-admin-config.json compatibility; ig
 INFLUX_BUCKET="omr_metrics"
 INFLUX_RETENTION="30d"        # retention period (e.g. "30d", "168h"); "" = infinite
 INFLUX_HOST="http://127.0.0.1:65501"
+export INFLUXDB3_HOST="$INFLUX_HOST"
 INFLUX_NODE_ID="omr-node"
 INFLUX_DATA_DIR="/var/lib/influxdb3/data"
 
@@ -148,7 +149,7 @@ if ADMIN_TOKEN=$(_read_saved_token) && [ -n "$ADMIN_TOKEN" ]; then
     log "Using existing admin token from ${CREDS_FILE}"
 else
     step "Bootstrapping admin token..."
-    ADMIN_TOKEN=$(influxdb3 --host "$INFLUX_HOST" create token --admin --format json 2>/dev/null | _extract_token || true)
+    ADMIN_TOKEN=$(influxdb3 create token --admin --format json 2>/dev/null | _extract_token || true)
 
     if [ -z "$ADMIN_TOKEN" ]; then
         # Admin token exists in the catalog but we don't have it saved.
@@ -164,7 +165,7 @@ else
                 sleep 1
                 _i=$((_i + 1))
             done
-            TOKEN_JSON=$(influxdb3 --host "$INFLUX_HOST" create token --admin --format json 2>/dev/null || true)
+            TOKEN_JSON=$(influxdb3 create token --admin --format json 2>/dev/null || true)
             ADMIN_TOKEN=$(echo "$TOKEN_JSON" | _extract_token || true)
         else
             echo ""
@@ -190,7 +191,7 @@ step "Creating database '${INFLUX_BUCKET}'..."
 RETENTION_FLAG=""
 [ -n "$INFLUX_RETENTION" ] && RETENTION_FLAG="--retention-period ${INFLUX_RETENTION}"
 # shellcheck disable=SC2086
-influxdb3 --host "$INFLUX_HOST" create database "$INFLUX_BUCKET" \
+influxdb3 create database "$INFLUX_BUCKET" \
     --token "$ADMIN_TOKEN" \
     $RETENTION_FLAG 2>&1 | grep -v "already exists" || true
 log "Database ready."
