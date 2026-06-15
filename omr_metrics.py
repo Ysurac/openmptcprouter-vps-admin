@@ -53,6 +53,39 @@ DECISION_MODEL_FILE = '/etc/openmptcprouter-vps-admin/omr-decision-model.pt'
 # Engine runtime stats (thread-safe counters, reset only on process restart)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# EMA weight smoothing (prevents rapid oscillation between similar WANs)
+# ---------------------------------------------------------------------------
+
+# Blend fraction for the new observation: 0.3 = 30 % new, 70 % previous.
+# At 30-second polling intervals this gives ~60-90 s for a sustained quality
+# change to fully propagate, while a hard offline event still fires immediately
+# (the offline mask sets score to −∞, bypassing EMA for that interface).
+EMA_ALPHA: float = 0.3
+
+_weight_ema: dict = {}   # {username: {interface: float}}
+_ema_lock = threading.Lock()
+
+
+def _apply_ema(username: str, weights: dict) -> dict:
+    """Blend *weights* (int, [1, 255]) with the per-user EMA history.
+
+    First call for a username initialises the EMA at the current weights so
+    there is no cold-start jump.  Interfaces that disappear are evicted from
+    the EMA state automatically.
+    """
+    if not weights:
+        return weights
+    with _ema_lock:
+        prev = _weight_ema.get(username, {})
+        new_ema: dict = {}
+        for iface, w in weights.items():
+            p = prev.get(iface, float(w))   # no prior → start at current value
+            new_ema[iface] = EMA_ALPHA * float(w) + (1.0 - EMA_ALPHA) * p
+        _weight_ema[username] = new_ema
+    return {iface: max(1, round(v)) for iface, v in new_ema.items()}
+
+
 _stats_lock = threading.Lock()
 _engine_stats: dict = {
     # torch inference (full model)
@@ -591,6 +624,67 @@ def _linear_predict_at(timestamps: list, values: list, target_ts: float,
     return slope * (target_ts - t_mean) + v_mean
 
 
+def _weighted_slope(timestamps: list, values: list,
+                    halflife_s: float = PREDICT_HALFLIFE_S) -> Optional[float]:
+    """Exponentially weighted OLS slope (value/second) over (timestamp, value) pairs.
+
+    Uses the same decay logic as _linear_predict_at so recent points dominate.
+    Returns None when fewer than 2 valid pairs exist.
+    """
+    pairs = [
+        (float(t), float(v))
+        for t, v in zip(timestamps, values)
+        if t is not None and v is not None
+    ]
+    if len(pairs) < 2:
+        return None
+    ts_seq, vs_seq = zip(*pairs)
+    t_max = max(ts_seq)
+    decay = math.log(2) / halflife_s if halflife_s > 0 else 0.0
+    ws = [math.exp(-decay * (t_max - ti)) for ti in ts_seq]
+    w_sum = sum(ws)
+    t_mean = sum(w * t for w, t in zip(ws, ts_seq)) / w_sum
+    v_mean = sum(w * v for w, v in zip(ws, vs_seq)) / w_sum
+    num = sum(ws[i] * (ts_seq[i] - t_mean) * (vs_seq[i] - v_mean) for i in range(len(pairs)))
+    den = sum(ws[i] * (ts_seq[i] - t_mean) ** 2 for i in range(len(pairs)))
+    return num / den if den != 0.0 else 0.0
+
+
+def _extract_trend_features(history: list) -> list:
+    """Return 4 trend features in [0, 1]: 0.5 = stable, >0.5 = improving, <0.5 = degrading.
+
+    Falls back to 0.5 (neutral) when history has fewer than 2 timestamped points.
+    Slope is computed with exponential weighting so recent samples dominate.
+    """
+    def _slope(path: tuple) -> Optional[float]:
+        ts_list: list = []
+        val_list: list = []
+        for p in history:
+            ts = p.get("timestamp")
+            v: object = p
+            for key in path:
+                v = (v or {}).get(key) if isinstance(v, dict) else None
+            if ts is not None and v is not None:
+                ts_list.append(float(ts))
+                val_list.append(float(v))
+        return _weighted_slope(ts_list, val_list)
+
+    def _trend(path: tuple, scale: float, inv: bool) -> float:
+        """slope/s → [0,1]; inv=True means lower values are better."""
+        s = _slope(path)
+        if s is None:
+            return 0.5
+        t = max(-1.0, min(1.0, s / scale))
+        return 0.5 + (-t if inv else t) * 0.5
+
+    return [
+        _trend(("latency",),             scale=0.10, inv=True),   # ms/s, lower=better
+        _trend(("loss",),                scale=0.01, inv=True),   # %/s,  lower=better
+        _trend(("bandwidth", "rx_bps"),  scale=1e4,  inv=False),  # B/s², higher=better
+        _trend(("jitter",),              scale=0.05, inv=True),   # ms/s, lower=better
+    ]
+
+
 def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
     """Return a copy of the latest payload with PREDICTABLE_FIELDS replaced by
     exponentially weighted linear extrapolations *horizon_seconds* into the future.
@@ -643,27 +737,42 @@ def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
 
 # Each feature is in [0, 1] with higher = better.
 FEATURE_NAMES = [
-    "inv_latency",    # 1 - clip(latency ms,        0,  2000) / 2000
-    "inv_loss",       # 1 - clip(loss %,            0,   100) / 100
-    "inv_jitter",     # 1 - clip(jitter ms,         0,   500) / 500
-    "inv_congestion", # 1 - clip(congestion.score,  0,   100) / 100
-    "rx_bps",         # clip(bandwidth.rx_bps,      0, 100 MB/s) / 100 MB/s
-    "tx_bps",         # clip(bandwidth.tx_bps,      0, 100 MB/s) / 100 MB/s
-    "signal",         # clip(signal.quality,        0,   100) / 100
-    "bbr_bw",         # clip(bbr.bw,               0, 100 MB/s) / 100 MB/s
-    "inv_ecn",        # 1 - clip(tc.ecn_mark,       0,  1000) / 1000
-    "inv_dropped",    # 1 - clip(tc.dropped,        0,  1000) / 1000
+    # --- static features (current snapshot) ---
+    "inv_latency",     # 1 - clip(latency ms,          0,  2000) / 2000
+    "inv_loss",        # 1 - clip(loss %,              0,   100) / 100
+    "inv_jitter",      # 1 - clip(jitter ms,           0,   500) / 500
+    "inv_congestion",  # 1 - clip(congestion.score,    0,   100) / 100
+    "rx_bps",          # clip(bandwidth.rx_bps,        0, 100 MB/s) / 100 MB/s
+    "tx_bps",          # clip(bandwidth.tx_bps,        0, 100 MB/s) / 100 MB/s
+    "signal",          # clip(signal.quality,          0,   100) / 100
+    "bbr_bw",          # clip(bbr.bw,                 0, 100 MB/s) / 100 MB/s
+    "inv_ecn",         # 1 - clip(tc.ecn_mark,         0,  1000) / 1000
+    "inv_dropped",     # 1 - clip(tc.dropped,          0,  1000) / 1000
+    "inv_rtt_spread",  # 1 - clip(rtt_max-rtt_min ms,  0,   500) / 500  (buffer bloat)
+    "signal_rsrp",     # clip(rsrp + 140,              0,    80) / 80   (cellular)
+    "signal_sinr",     # clip(sinr  + 20,              0,    50) / 50   (cellular)
+    "inv_bbr_min_rtt", # 1 - clip(bbr.min_rtt ms,      0,  2000) / 2000 (clean RTT)
+    # --- trend features (neutral 0.5 when history unavailable) ---
+    "trend_latency",   # 0.5=stable, >0.5=improving, <0.5=degrading
+    "trend_loss",
+    "trend_rx_bps",
+    "trend_jitter",
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
 # Per-feature importance priors used to seed the first hidden neuron.
-_FEATURE_IMPORTANCES = [2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5]
+_FEATURE_IMPORTANCES = [
+    2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5,  # original 10
+    1.5, 0.6, 0.7, 1.0,                                   # new static 4
+    1.2, 1.5, 0.8, 0.8,                                   # trend 4
+]
 
 
-def _extract_features(payload: dict) -> list:
+def _extract_features(payload: dict, history: Optional[list] = None) -> list:
     """Return an N_FEATURES list of floats in [0, 1] where higher = better.
 
     Missing values fall back to a neutral 0.5 (or 0.0 / 1.0 where noted).
+    Trend features (last 4) are computed from *history* when provided; otherwise 0.5.
     """
     def _n(v, lo, hi, inv=False, default=0.5):
         if v is None:
@@ -678,7 +787,15 @@ def _extract_features(payload: dict) -> list:
     tc   = payload.get("tc")         or {}
     cong = payload.get("congestion") or {}
 
-    return [
+    rtt_min = payload.get("rtt_min")
+    rtt_max = payload.get("rtt_max")
+    rtt_spread = (
+        max(0.0, float(rtt_max) - float(rtt_min))
+        if rtt_min is not None and rtt_max is not None
+        else None
+    )
+
+    static = [
         _n(payload.get("latency"),  0,   2000, inv=True),
         _n(payload.get("loss"),     0,    100, inv=True),
         _n(payload.get("jitter"),   0,    500, inv=True),
@@ -689,7 +806,16 @@ def _extract_features(payload: dict) -> list:
         _n(bbr.get("bw"),           0,  100e6, default=0.0),
         _n(tc.get("ecn_mark"),      0,   1000, inv=True, default=1.0),
         _n(tc.get("dropped"),       0,   1000, inv=True, default=1.0),
+        # buffer bloat: rtt_max - rtt_min, lower spread = better
+        _n(rtt_spread,              0,    500, inv=True),
+        # cellular signal: RSRP -140 dBm (worst) … -60 dBm (best)
+        _n(sig.get("rsrp"),      -140,   -60),
+        # cellular signal: SINR -20 dB (worst) … 30 dB (best)
+        _n(sig.get("sinr"),       -20,    30),
+        # clean baseline RTT from BBR
+        _n(bbr.get("min_rtt"),      0,   2000, inv=True),
     ]
+    return static + _extract_trend_features(history or [])
 
 
 # ---------------------------------------------------------------------------
@@ -711,8 +837,8 @@ try:
         def __init__(self):
             super().__init__()
             self.net = nn.Sequential(
-                nn.Linear(N_FEATURES, 16), nn.ReLU(),
-                nn.Linear(16, 8),          nn.ReLU(),
+                nn.Linear(N_FEATURES, 24), nn.ReLU(),
+                nn.Linear(24, 8),          nn.ReLU(),
                 nn.Linear(8, 1),
             )
 
@@ -847,18 +973,26 @@ def _compute_weights_heuristic(user_data: dict) -> dict:
     }
 
 
-def _compute_weights(user_data: dict, explain: bool = False) -> dict:
+def _compute_weights(user_data: dict, explain: bool = False,
+                     history_data: Optional[dict] = None) -> dict:
     """Run the scorer against current interface metrics and return weights.
 
     Interfaces with status != 'online' are masked (score = -inf → weight ≈ 0).
     When all interfaces are offline softmax produces nan; we fall back to equal
     weights so the result is always finite and JSON-serializable.
     Returns {'weights': {...}, 'scores': {...}, optionally 'features': {...}}.
+
+    *history_data* is {interface: [payload, ...]} used to compute trend features.
+    When absent or for JSON backend, trend features default to neutral (0.5).
     """
     _t0 = time.perf_counter()
     model = _get_model()
     interfaces = list(user_data.keys())
-    features = {iface: _extract_features(payload) for iface, payload in user_data.items()}
+    hist = history_data or {}
+    features = {
+        iface: _extract_features(payload, history=hist.get(iface))
+        for iface, payload in user_data.items()
+    }
 
     feat_tensor = torch.tensor(
         [features[iface] for iface in interfaces], dtype=torch.float32
@@ -1240,6 +1374,8 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         if not user_data:
             return {}
 
+        history_data: dict = {}
+
         if predict:
             predicted_data = {}
             for iface in user_data:
@@ -1247,13 +1383,18 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                                      since_seconds=max(horizon * 10, 3600), limit=50)
                 if len(hist) >= 2:
                     predicted_data[iface] = _predict_payload(hist, horizon_seconds=horizon)
+                    history_data[iface] = hist   # reuse for trend features
                 else:
                     predicted_data[iface] = user_data[iface]
             user_data = predicted_data
 
         if not _TORCH_AVAILABLE:
-            return _compute_weights_heuristic(user_data)
-        return _compute_weights(user_data, explain=explain)
+            result = _compute_weights_heuristic(user_data)
+        else:
+            result = _compute_weights(user_data, explain=explain, history_data=history_data)
+
+        smoothed = _apply_ema(target, result.get("weights", {}))
+        return {**result, "weights": smoothed}
 
     @router.post('/metrics/decision/train',
                  summary="Submit interface quality feedback to fine-tune the scorer")
