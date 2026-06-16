@@ -119,14 +119,17 @@ def _no_ts(payload: dict) -> dict:
 
 @pytest.fixture(autouse=True)
 def reset_backend():
-    """Reset backend and decision-model singletons between tests."""
+    """Reset backend, decision-model, and EMA singletons between tests."""
     orig_backend = omr_metrics._backend
     orig_model  = omr_metrics._decision_model
+    orig_ema    = dict(omr_metrics._weight_ema)
     omr_metrics._backend        = None
     omr_metrics._decision_model = None
+    omr_metrics._weight_ema     = {}
     yield
     omr_metrics._backend        = orig_backend
     omr_metrics._decision_model = orig_model
+    omr_metrics._weight_ema     = orig_ema
 
 
 @pytest.fixture
@@ -976,7 +979,7 @@ class TestGetDecision:
     def test_explain_flag_forwarded(self, user_client):
         captured = {}
 
-        def fake_compute(user_data, explain=False):
+        def fake_compute(user_data, explain=False, **kwargs):
             captured["explain"] = explain
             return self._FAKE_RESULT
 
@@ -992,7 +995,7 @@ class TestGetDecision:
     def test_explain_false_by_default(self, user_client):
         captured = {}
 
-        def fake_compute(user_data, explain=False):
+        def fake_compute(user_data, explain=False, **kwargs):
             captured["explain"] = explain
             return self._FAKE_RESULT
 
