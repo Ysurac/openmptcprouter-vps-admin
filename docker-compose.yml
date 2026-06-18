@@ -1,0 +1,159 @@
+# Usage
+# -----
+# Without PyTorch (JSON or InfluxDB backend, heuristic decision engine):
+#   docker compose --profile base up --build
+#
+# With PyTorch (adds ML scoring, CPU-only torch ~230 MB):
+#   docker compose --profile torch up --build
+#
+# Copy .env.example to .env and edit before first run.
+
+x-app-base: &app-base
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - |
+      mkdir -p /etc/openmptcprouter-vps-admin
+      python3 -c "
+      import os, json
+      url   = os.getenv('INFLUXDB_URL',    '')
+      token = os.getenv('INFLUXDB_TOKEN',  '')
+      if url and token:
+          cfg = {'influxdb': {
+              'url':    url,
+              'token':  token,
+              'org':    os.getenv('INFLUXDB_ORG',    'omr'),
+              'bucket': os.getenv('INFLUXDB_BUCKET', 'omr_metrics'),
+          }}
+          with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
+              json.dump(cfg, f)
+      "
+      exec uvicorn omr_metrics_standalone:app --host 0.0.0.0 --port 8080
+  ports:
+    - "${OMR_PORT:-8080}:8080"
+  env_file: .env
+  volumes:
+    - omr-data:/etc/openmptcprouter-vps-admin
+  restart: unless-stopped
+
+x-torch-build: &torch-build
+  build:
+    context: .
+    dockerfile_inline: |
+      FROM python:3.12-slim
+      WORKDIR /app
+      RUN pip install --no-cache-dir fastapi "uvicorn[standard]" influxdb3-python \
+            torch --index-url https://download.pytorch.org/whl/cpu
+      COPY omr_metrics.py omr_metrics_standalone.py ./
+
+services:
+
+  # -------------------------------------------------------------------------
+  # App — no PyTorch (heuristic decision engine, fast build)
+  # -------------------------------------------------------------------------
+  omr-metrics:
+    <<: *app-base
+    profiles: ["base"]
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        WORKDIR /app
+        RUN pip install --no-cache-dir fastapi "uvicorn[standard]" influxdb3-python
+        COPY omr_metrics.py omr_metrics_standalone.py ./
+    depends_on:
+      influxdb-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # App — with PyTorch CPU (ML decision engine, ~230 MB extra)
+  # -------------------------------------------------------------------------
+  omr-metrics-torch:
+    <<: [*app-base, *torch-build]
+    profiles: ["torch"]
+    depends_on:
+      influxdb-init:
+        condition: service_completed_successfully
+      torch-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # PyTorch model init — pre-initialises omr-decision-model.pt, then exits
+  # Mirrors install_omr-ai.sh step 6; imports _make_model() from omr_metrics.py
+  # directly so the architecture is always in sync.
+  # -------------------------------------------------------------------------
+  torch-init:
+    <<: *torch-build
+    profiles: ["torch"]
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        python3 -c "
+        import sys, os
+        dest = '/etc/openmptcprouter-vps-admin/omr-decision-model.pt'
+        if os.path.exists(dest):
+            print('Decision model already exists, skipping.')
+            sys.exit(0)
+        sys.path.insert(0, '/app')
+        import omr_metrics, torch
+        model = omr_metrics._make_model()
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + '.tmp'
+        torch.save(model.state_dict(), tmp)
+        os.replace(tmp, dest)
+        print('Decision model saved to ' + dest)
+        "
+    volumes:
+      - omr-data:/etc/openmptcprouter-vps-admin
+
+  # -------------------------------------------------------------------------
+  # InfluxDB 3 Core
+  # Image: https://hub.docker.com/_/influxdb  (tag 3-core)
+  # -------------------------------------------------------------------------
+  influxdb:
+    image: influxdb:3-core
+    command:
+      - serve
+      - --node-id=local
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3
+      - --bearer-token=${INFLUXDB_TOKEN:?INFLUXDB_TOKEN is required}
+      - --disable-authz=health,ping
+    ports:
+      - "${INFLUXDB_PORT:-8181}:8181"
+    volumes:
+      - influxdb-data:/var/lib/influxdb3
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8181/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # InfluxDB init — creates the database once, then exits
+  # Mirrors install_omr-ai.sh step 4: influxdb3 create database
+  # -------------------------------------------------------------------------
+  influxdb-init:
+    image: influxdb:3-core
+    restart: "no"
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        influxdb3 create database "${INFLUXDB_BUCKET:-omr_metrics}" \
+          --host "http://influxdb:8181" \
+          --token "${INFLUXDB_TOKEN}" \
+          --retention-period "${INFLUXDB_RETENTION:-30d}" 2>&1 | grep -v "already exists" || true
+        echo "Database '${INFLUXDB_BUCKET:-omr_metrics}' ready (retention: ${INFLUXDB_RETENTION:-30d})."
+    environment:
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:?INFLUXDB_TOKEN is required}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-omr_metrics}
+      INFLUXDB_RETENTION: ${INFLUXDB_RETENTION:-30d}
+
+volumes:
+  omr-data:
+  influxdb-data:
