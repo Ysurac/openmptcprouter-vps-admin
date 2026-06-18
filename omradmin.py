@@ -3383,7 +3383,7 @@ class Vpn(BaseModel):
     vpn: VPN
 
 # Set global VPN config
-@app.post('/vpn', summary="Set VPN used by the current user")
+@app.post('/vpn', summary="Set current VPN used by the current user")
 def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         #set_lastchange(10)
