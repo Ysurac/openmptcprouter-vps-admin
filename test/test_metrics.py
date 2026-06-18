@@ -593,7 +593,8 @@ class TestBackendSelection:
         ):
             backend = omr_metrics._init_backend()
         mock_cls.assert_called_once_with(
-            url="http://localhost:8086", token="tok", org="myorg", bucket="mybucket"
+            url="http://localhost:8086", token="tok", org="myorg", bucket="mybucket",
+            retention_days=60,
         )
         assert backend is mock_influx
 
@@ -607,7 +608,8 @@ class TestBackendSelection:
         ):
             omr_metrics._init_backend()
         mock_cls.assert_called_once_with(
-            url="http://localhost:8086", token="tok", org="omr", bucket="omr_metrics"
+            url="http://localhost:8086", token="tok", org="omr", bucket="omr_metrics",
+            retention_days=60,
         )
 
     def test_get_backend_caches_singleton(self):
@@ -1277,10 +1279,17 @@ class _FakeTorch:
         total = sum(exps) or 1.0
         return _FakeTensor([e / total for e in exps])
 
+    def empty(self, *dims):
+        class _ShapedTensor:
+            shape = dims
+        return _ShapedTensor()
+
     def save(self, obj, path): pass
 
     def load(self, path, map_location=None, weights_only=True):
-        return {}
+        class _W:
+            shape = (16, omr_metrics.N_FEATURES)
+        return {"net.0.weight": _W()}
 
 
 _fake_torch = _FakeTorch()
