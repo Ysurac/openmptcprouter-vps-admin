@@ -20,14 +20,58 @@
 # Requires:  pip install influxdb3-python
 # Falls back silently to JSON if the package is absent or the server is unreachable.
 #
+# Metrics endpoints
+# -----------------
+# GET  /metrics                  — latest snapshot for the current user's WAN interfaces
+# POST /metrics                  — store one interface payload (called by omr-tracker)
+# GET  /metrics/all              — all users' snapshots (admin only)
+# GET  /metrics/history          — time-series history (InfluxDB only)
+#                                  ?interface=wwan0 &since=1h &limit=500
+#
 # Decision engine
 # ---------------
-# GET  /metrics/decision       — model-assigned weight per WAN interface
-# POST /metrics/decision/train — submit quality feedback to fine-tune the model
-# POST /metrics/decision/reset — reset model to heuristic init (admin only)
+# GET  /metrics/decision         — model-assigned nexthop weight per WAN interface
+#   ?explain=true                  include per-interface feature breakdown
+#   ?predict=true &horizon=300     replace current metrics with forward extrapolations
+#                                  before scoring (horizon in seconds, default 300)
+#   ?preemptive=true (default)     fetch history to penalise interfaces whose congestion
+#                                  is rising even when current reading is still low;
+#                                  no-op with JSON backend (history unavailable)
+# POST /metrics/decision/train   — submit quality feedback to fine-tune the model
+# POST /metrics/decision/reset   — reset model to heuristic initialisation (admin only)
 #
 # Requires: pip install torch
-# Returns HTTP 501 when PyTorch is not installed.
+# Falls back to a hand-crafted heuristic scorer when PyTorch is not installed.
+# The heuristic also benefits from preemptive congestion prediction when InfluxDB
+# history is available.
+#
+# Predictive congestion handling
+# -------------------------------
+# GET  /metrics/congestion/forecast
+#   ?horizon=300  prediction horizon in seconds (30–3600, default 300 = 5 min)
+#   ?since=1h     history window used for regression (default 1 h)
+#   ?limit=100    maximum history points fetched per interface
+#
+# Returns one entry per WAN interface:
+#   current_score / current_level     — latest measured congestion (0-100, level name)
+#   predicted_score / predicted_level — extrapolated score at +horizon seconds
+#   trend                             — "rising" | "stable" | "falling"
+#   slope_per_min                     — congestion score change per minute
+#   eta_moderate_s                    — seconds until score reaches 50 (null if never)
+#   eta_high_s                        — seconds until score reaches 75 (null if never)
+#   eta_severe_s                      — seconds until score reaches 90 (null if never)
+#   confidence                        — "high" | "medium" | "low" | "none"
+#
+# Congestion levels:  none (0-24) | low (25-49) | moderate (50-74) | high (75-89) | severe (90+)
+#
+# The forecast is also used internally by the decision engine (both ML and heuristic):
+# when preemptive=true, the effective congestion score fed to the scorer is
+# max(current, predicted), so traffic is shifted away from a congested link
+# before its score fully degrades.
+#
+# Engine diagnostics
+# ------------------
+# GET  /metrics/engine           — inference/training stats + storage info (admin only)
 
 import json
 import math
@@ -268,25 +312,55 @@ class InfluxBackend:
 
     _MEASUREMENT = "interface_metrics"
 
-    def __init__(self, url: str, token: str, org: str, bucket: str):
+    def __init__(self, url: str, token: str, org: str, bucket: str,
+                 retention_days: int = 60):
         from influxdb_client_3 import InfluxDBClient3  # noqa: PLC0415
         # org is not used in InfluxDB 3; bucket becomes the database name
         self._client = InfluxDBClient3(host=url, token=token, database=bucket)
         self._bucket = bucket
+        self._url = url
+        self._token = token
+        self._retention_days = max(1, int(retention_days))
+        self._apply_retention()
+
+    def _apply_retention(self):
+        """Push the configured retention period to the InfluxDB 3 management API.
+
+        Uses POST /api/v3/configure/database (idempotent — creates or updates).
+        Logs a warning and continues if the call fails; the DB-level retention
+        set by the installer script remains as the hard floor.
+        """
+        body = json.dumps({
+            "db": self._bucket,
+            "retention_period": f"{self._retention_days}d",
+        }).encode()
+        req = urllib.request.Request(
+            self._url.rstrip("/") + "/api/v3/configure/database",
+            data=body,
+            method="POST",
+        )
+        req.add_header("Authorization", f"Token {self._token}")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                LOG.info("omr_metrics: InfluxDB retention set to %d days (HTTP %s)",
+                         self._retention_days, resp.status)
+        except Exception as exc:
+            LOG.warning("omr_metrics: could not apply InfluxDB retention policy: %s", exc)
 
     def _query(self, username: Optional[str] = None) -> dict:
         """Return {username: {interface: payload}} for the latest data point."""
         if username:
             sql = (
                 f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
-                f"WHERE time >= now() - interval '7 days' AND username = $username "
+                f"WHERE time >= now() - interval '{self._retention_days} days' AND username = $username "
                 f"ORDER BY time DESC"
             )
             params: dict = {"username": username}
         else:
             sql = (
                 f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
-                f"WHERE time >= now() - interval '7 days' "
+                f"WHERE time >= now() - interval '{self._retention_days} days' "
                 f"ORDER BY time DESC"
             )
             params = {}
@@ -499,14 +573,17 @@ def _init_backend():
         influx_cfg = config.get("influxdb") or {}
         if influx_cfg.get("url") and influx_cfg.get("token"):
             try:
+                retention_days = int(influx_cfg.get("retention_days", 60))
                 backend = InfluxBackend(
                     url=influx_cfg["url"],
                     token=influx_cfg["token"],
                     org=influx_cfg.get("org", "omr"),
                     bucket=influx_cfg.get("bucket", "omr_metrics"),
+                    retention_days=retention_days,
                 )
-                LOG.info("omr_metrics: InfluxDB backend at %s bucket=%s",
-                         influx_cfg["url"], influx_cfg.get("bucket", "omr_metrics"))
+                LOG.info("omr_metrics: InfluxDB backend at %s bucket=%s retention=%dd",
+                         influx_cfg["url"], influx_cfg.get("bucket", "omr_metrics"),
+                         retention_days)
                 return backend
             except ImportError:
                 LOG.warning("omr_metrics: influxdb3-python not installed – falling back to JSON")
@@ -586,6 +663,106 @@ _PREDICTABLE: list = [
 
 # Public name kept for backward compatibility (used in tests and the doc).
 PREDICTABLE_FIELDS: list = [path for path, _, _ in _PREDICTABLE]
+
+
+# ---------------------------------------------------------------------------
+# Congestion levels and predictive forecast
+# ---------------------------------------------------------------------------
+
+_CONGESTION_LEVELS = [
+    (90.0, "severe"),
+    (75.0, "high"),
+    (50.0, "moderate"),
+    (25.0, "low"),
+    (0.0,  "none"),
+]
+
+
+def _congestion_level(score: float) -> str:
+    for threshold, level in _CONGESTION_LEVELS:
+        if score >= threshold:
+            return level
+    return "none"
+
+
+def _predict_congestion(history: list, horizon_s: int = 300) -> dict:
+    """Return a congestion forecast dict for one interface.
+
+    Keys: current_score, current_level, predicted_score, predicted_level,
+          trend (rising|stable|falling), slope_per_min,
+          eta_moderate_s, eta_high_s, eta_severe_s (seconds to threshold, None if never),
+          confidence (high|medium|low|none).
+    """
+    timestamps: list = []
+    scores: list = []
+    for p in history:
+        ts = p.get("timestamp")
+        cong = (p.get("congestion") or {}).get("score")
+        if ts is not None and cong is not None:
+            timestamps.append(float(ts))
+            scores.append(float(cong))
+
+    now = timestamps[-1] if timestamps else time.time()
+    current_score = round(scores[-1], 1) if scores else None
+    current_level = _congestion_level(current_score) if current_score is not None else "unknown"
+
+    if len(timestamps) < 2:
+        return {
+            "current_score": current_score,
+            "current_level": current_level,
+            "predicted_score": current_score,
+            "predicted_level": current_level,
+            "trend": "stable",
+            "slope_per_min": 0.0,
+            "eta_moderate_s": None,
+            "eta_high_s": None,
+            "eta_severe_s": None,
+            "confidence": "none",
+        }
+
+    predicted_raw = _linear_predict_at(timestamps, scores, now + horizon_s)
+    predicted_score = round(max(0.0, min(100.0, predicted_raw)), 1)
+    predicted_level = _congestion_level(predicted_score)
+
+    slope = _weighted_slope(timestamps, scores)   # score / second
+    slope_per_min = round((slope or 0.0) * 60.0, 3)
+
+    if abs(slope_per_min) < 0.5:
+        trend = "stable"
+    elif slope_per_min > 0:
+        trend = "rising"
+    else:
+        trend = "falling"
+
+    def _eta(threshold: float) -> Optional[int]:
+        if not slope or slope <= 0 or current_score is None:
+            return None
+        if current_score >= threshold:
+            return 0
+        secs = (threshold - current_score) / slope
+        return round(secs) if secs <= 86400 else None
+
+    n = len(timestamps)
+    age_s = now - min(timestamps)
+    if n >= 5 and age_s >= 120:
+        confidence = "high"
+    elif n >= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "current_score": current_score,
+        "current_level": current_level,
+        "predicted_score": predicted_score,
+        "predicted_level": predicted_level,
+        "trend": trend,
+        "slope_per_min": slope_per_min,
+        "eta_moderate_s": _eta(50.0),
+        "eta_high_s": _eta(75.0),
+        "eta_severe_s": _eta(90.0),
+        "confidence": confidence,
+    }
 
 
 def _linear_predict_at(timestamps: list, values: list, target_ts: float,
@@ -752,6 +929,7 @@ FEATURE_NAMES = [
     "signal_rsrp",     # clip(rsrp + 140,              0,    80) / 80   (cellular)
     "signal_sinr",     # clip(sinr  + 20,              0,    50) / 50   (cellular)
     "inv_bbr_min_rtt", # 1 - clip(bbr.min_rtt ms,      0,  2000) / 2000 (clean RTT)
+    "inv_predicted_congestion",  # predicted congestion score at +5 min horizon
     # --- trend features (neutral 0.5 when history unavailable) ---
     "trend_latency",   # 0.5=stable, >0.5=improving, <0.5=degrading
     "trend_loss",
@@ -764,8 +942,42 @@ N_FEATURES = len(FEATURE_NAMES)
 _FEATURE_IMPORTANCES = [
     2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5,  # original 10
     1.5, 0.6, 0.7, 1.0,                                   # new static 4
+    2.0,                                                    # inv_predicted_congestion
     1.2, 1.5, 0.8, 0.8,                                   # trend 4
 ]
+
+
+def _predicted_congestion_feat(cong: dict, history: list) -> float:
+    """Return inv_predicted_congestion in [0, 1]: extrapolated score at +5 min.
+
+    Falls back to the current congestion score when history is too sparse.
+    Uses the worst (highest) of current and predicted so the penalty is conservative.
+    """
+    current_score = cong.get("score") if cong else None
+    ts_list: list = []
+    sc_list: list = []
+    for p in history:
+        ts = p.get("timestamp")
+        s = (p.get("congestion") or {}).get("score")
+        if ts is not None and s is not None:
+            ts_list.append(float(ts))
+            sc_list.append(float(s))
+
+    if len(ts_list) >= 2:
+        pred_raw = _linear_predict_at(ts_list, sc_list, ts_list[-1] + PREDICT_HALFLIFE_S)
+        if pred_raw is not None:
+            pred_score = max(0.0, min(100.0, pred_raw))
+            # Conservative: use worst of current vs predicted
+            if current_score is not None:
+                worst = max(float(current_score), pred_score)
+            else:
+                worst = pred_score
+            return max(0.0, 1.0 - worst / 100.0)
+
+    # No history — fall back to current congestion score
+    if current_score is not None:
+        return max(0.0, 1.0 - min(float(current_score), 100.0) / 100.0)
+    return 0.5   # neutral when no congestion data at all
 
 
 def _extract_features(payload: dict, history: Optional[list] = None) -> list:
@@ -814,6 +1026,8 @@ def _extract_features(payload: dict, history: Optional[list] = None) -> list:
         _n(sig.get("sinr"),       -20,    30),
         # clean baseline RTT from BBR
         _n(bbr.get("min_rtt"),      0,   2000, inv=True),
+        # predicted congestion at +5 min: use extrapolated score when history available
+        _predicted_congestion_feat(cong, history or []),
     ]
     return static + _extract_trend_features(history or [])
 
@@ -875,10 +1089,17 @@ def _get_model():
         return _decision_model
     if os.path.isfile(DECISION_MODEL_FILE):
         try:
+            state = torch.load(DECISION_MODEL_FILE, map_location="cpu", weights_only=True)
+            saved_in = state.get("net.0.weight", torch.empty(0, 0)).shape[1]
+            if saved_in != N_FEATURES:
+                LOG.warning(
+                    "omr_decision: saved model has %d input features but N_FEATURES=%d"
+                    " – reinitializing (feature set changed)",
+                    saved_in, N_FEATURES,
+                )
+                raise ValueError("feature dimension mismatch")
             m = InterfaceScorer()
-            m.load_state_dict(
-                torch.load(DECISION_MODEL_FILE, map_location="cpu", weights_only=True)
-            )
+            m.load_state_dict(state)
             m.eval()
             _decision_model = m
             _stats_update(model_loaded_at=time.time())
@@ -923,10 +1144,15 @@ def _apply_cost(raw: list, interfaces: list, user_data: dict) -> list:
     return [v / total for v in scaled]
 
 
-def _compute_weights_heuristic(user_data: dict) -> dict:
+def _compute_weights_heuristic(user_data: dict,
+                               history_data: Optional[dict] = None) -> dict:
     """Compute interface weights without PyTorch, using congestion score as the
     primary signal.  Falls back to latency and loss when congestion is absent.
     Offline interfaces (status != 'online' or no latency) get weight 1.
+
+    *history_data* is {interface: [payload, ...]}; when provided the congestion
+    score is replaced with the worst of current vs predicted (+5 min horizon) so
+    that rising congestion is penalised before it fully manifests.
     """
     _t0 = time.perf_counter()
     interfaces = list(user_data.keys())
@@ -944,7 +1170,16 @@ def _compute_weights_heuristic(user_data: dict) -> dict:
         lat   = latency                                     # ms, lower = better
 
         if cong is not None:
-            quality = max(0.0, 100.0 - float(cong)) / 100.0
+            effective_cong = float(cong)
+            hist = (history_data or {}).get(iface, [])
+            if len(hist) >= 2:
+                fc = _predict_congestion(hist, horizon_s=300)
+                pred = fc.get("predicted_score")
+                if pred is not None:
+                    # Conservative: penalise for predicted congestion even while
+                    # current reading is still low.
+                    effective_cong = max(effective_cong, pred)
+            quality = max(0.0, 100.0 - effective_cong) / 100.0
         else:
             # Derive a proxy from latency + loss when congestion is missing.
             lat_q  = max(0.0, 1.0 - min(float(lat),  2000.0) / 2000.0)
@@ -1367,6 +1602,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         explain: bool = Query(False, description="Include per-interface feature breakdown"),
         predict: bool = Query(False, description="Extrapolate metrics forward in time before scoring"),
         horizon: int = Query(300, ge=1, le=86400, description="Prediction horizon in seconds (default 300 = 5 min)"),
+        preemptive: bool = Query(True, description="Fetch history to penalise rising congestion before it peaks"),
         current_user: User = Depends(get_current_user),
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
@@ -1375,6 +1611,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             return {}
 
         history_data: dict = {}
+        has_history_backend = not isinstance(_get_backend(), JSONBackend)
 
         if predict:
             predicted_data = {}
@@ -1383,18 +1620,65 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                                      since_seconds=max(horizon * 10, 3600), limit=50)
                 if len(hist) >= 2:
                     predicted_data[iface] = _predict_payload(hist, horizon_seconds=horizon)
-                    history_data[iface] = hist   # reuse for trend features
+                    history_data[iface] = hist   # reuse for trend and congestion features
                 else:
                     predicted_data[iface] = user_data[iface]
             user_data = predicted_data
+        elif preemptive and has_history_backend:
+            # Fetch history only for congestion prediction (not full payload replacement)
+            for iface in user_data:
+                hist = _read_history(target, iface, since_seconds=3600, limit=60)
+                if hist:
+                    history_data[iface] = hist
 
         if not _TORCH_AVAILABLE:
-            result = _compute_weights_heuristic(user_data)
+            result = _compute_weights_heuristic(user_data, history_data=history_data)
         else:
             result = _compute_weights(user_data, explain=explain, history_data=history_data)
 
         smoothed = _apply_ema(target, result.get("weights", {}))
         return {**result, "weights": smoothed}
+
+    @router.get('/metrics/congestion/forecast',
+                summary="Predictive congestion forecast per WAN interface")
+    async def get_congestion_forecast(
+        horizon: int = Query(300, ge=30, le=3600,
+                             description="Prediction horizon in seconds (default 300 = 5 min)"),
+        since: str = Query("1h", description="History window: 15m 30m 1h 6h 12h 24h or seconds"),
+        limit: int = Query(100, ge=10, le=1000,
+                           description="Maximum history points per interface"),
+        username: Optional[str] = Query(None),
+        current_user: User = Depends(get_current_user),
+    ):
+        """Return a congestion forecast for every WAN interface.
+
+        Each entry contains:
+        - current_score / current_level   — latest measured congestion
+        - predicted_score / predicted_level — extrapolated score at +horizon seconds
+        - trend                           — rising | stable | falling
+        - slope_per_min                   — congestion score change per minute
+        - eta_moderate_s / eta_high_s / eta_severe_s — ETA to reach that level (null if never)
+        - confidence                      — high | medium | low | none
+
+        Requires InfluxDB backend for meaningful forecasts; works with JSON backend
+        but returns confidence="none" for all interfaces (single snapshot available).
+        """
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        user_data = _read_user(target)
+        if not user_data:
+            return {}
+
+        since_seconds = _parse_since(since)
+        result: dict = {}
+        for iface in user_data:
+            hist = _read_history(target, iface, since_seconds=since_seconds, limit=limit)
+            if not hist:
+                # JSON backend: use the single latest snapshot as a degenerate history
+                snap = user_data[iface]
+                hist = [snap] if snap.get("timestamp") is not None else []
+            result[iface] = _predict_congestion(hist, horizon_s=horizon)
+
+        return result
 
     @router.post('/metrics/decision/train',
                  summary="Submit interface quality feedback to fine-tune the scorer")
