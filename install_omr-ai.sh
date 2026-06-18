@@ -8,7 +8,7 @@ set -eu
 #   1. Installs InfluxDB 3 Core (InfluxData apt repo, fingerprint-verified)
 #   2. Writes /etc/influxdb3/influxdb3-core.conf and starts the service
 #   3. Bootstraps the admin token (first run only — token is never shown again)
-#   4. Creates the omr_metrics database with 30-day retention
+#   4. Creates the omr_metrics database with 60-day retention (configurable)
 #   5. python3-influxdb3  (apt when available, pip fallback)
 #   6. PyTorch + pre-initialised decision model  [INSTALL_AI=true]
 #      python3-torch from Debian when available, CPU-only pip wheel fallback
@@ -19,7 +19,8 @@ set -eu
 
 INFLUX_ORG="omr"              # kept for omr-admin-config.json compatibility; ignored by v3
 INFLUX_BUCKET="omr_metrics"
-INFLUX_RETENTION="30d"        # retention period (e.g. "30d", "168h"); "" = infinite
+INFLUX_RETENTION="60d"        # retention period (e.g. "60d", "30d", "168h"); "" = infinite
+INFLUX_RETENTION_DAYS=60      # must match INFLUX_RETENTION (written to omr-admin-config.json)
 INFLUX_HOST="http://127.0.0.1:65501"
 INFLUX_NODE_ID="omr-node"
 INFLUX_DATA_DIR="/var/lib/influxdb3/data"
@@ -220,15 +221,20 @@ import sys, os
 import torch
 import torch.nn as nn
 
-N_FEATURES = 10
-_FEATURE_IMPORTANCES = [2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5]
+N_FEATURES = 19
+_FEATURE_IMPORTANCES = [
+    2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5,  # original 10
+    1.5, 0.6, 0.7, 1.0,                                   # new static 4
+    2.0,                                                    # inv_predicted_congestion
+    1.2, 1.5, 0.8, 0.8,                                   # trend 4
+]
 
 class InterfaceScorer(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(N_FEATURES, 16), nn.ReLU(),
-            nn.Linear(16, 8),          nn.ReLU(),
+            nn.Linear(N_FEATURES, 24), nn.ReLU(),
+            nn.Linear(24, 8),          nn.ReLU(),
             nn.Linear(8, 1),
         )
     def forward(self, x):
@@ -277,10 +283,10 @@ log "omr-admin restarted."
 step "Updating ${OMR_CONFIG_FILE}..."
 mkdir -p "$(dirname "$OMR_CONFIG_FILE")"
 
-python3 - "$OMR_CONFIG_FILE" "$INFLUX_HOST" "$INFLUX_ORG" "$INFLUX_BUCKET" "$ADMIN_TOKEN" <<'PYEOF'
+python3 - "$OMR_CONFIG_FILE" "$INFLUX_HOST" "$INFLUX_ORG" "$INFLUX_BUCKET" "$ADMIN_TOKEN" "$INFLUX_RETENTION_DAYS" <<'PYEOF'
 import sys, json, os
 
-config_file, url, org, bucket, token = sys.argv[1:]
+config_file, url, org, bucket, token, retention_days = sys.argv[1:]
 try:
     with open(config_file) as f:
         cfg = json.load(f)
@@ -292,7 +298,10 @@ except Exception as e:
     shutil.copy2(config_file, config_file + ".bak." + str(int(time.time())))
     cfg = {}
 
-cfg["influxdb"] = {"url": url, "token": token, "org": org, "bucket": bucket}
+cfg["influxdb"] = {
+    "url": url, "token": token, "org": org, "bucket": bucket,
+    "retention_days": int(retention_days),
+}
 
 tmp = config_file + ".tmp"
 with open(tmp, "w") as f:
@@ -358,7 +367,7 @@ echo ""
 echo "  AI decision engine"
 echo "    Backend        : $(python3 -c 'import torch; print("torch", torch.__version__)' 2>/dev/null || echo "torch (installed)")"
 echo "    Model file     : /etc/openmptcprouter-vps-admin/omr-decision-model.pt"
-echo "    Architecture   : Linear(10->16)->ReLU->Linear(16->8)->ReLU->Linear(8->1)"
+echo "    Architecture   : Linear(19->24)->ReLU->Linear(24->8)->ReLU->Linear(8->1)"
 echo "    Endpoints      : GET  /metrics/decision[?explain=true]"
 echo "                     POST /metrics/decision/train"
 echo "                     POST /metrics/decision/reset  (admin)"
