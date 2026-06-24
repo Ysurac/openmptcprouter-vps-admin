@@ -3,8 +3,11 @@
 # Without PyTorch (JSON or InfluxDB backend, heuristic decision engine):
 #   docker compose --profile base up --build
 #
-# With PyTorch (adds ML scoring, CPU-only torch ~230 MB):
+# With PyTorch (adds ML scoring, CPU-only torch ~230 MB extra on python:3.12-slim):
 #   docker compose --profile torch up --build
+#
+# With PyTorch pre-built image (pytorch/pytorch base, larger image but no wheel download):
+#   docker compose --profile torch-image up --build
 #
 # Copy .env.example to .env and edit before first run.
 
@@ -18,11 +21,20 @@ x-app-base: &app-base
       url   = os.getenv('INFLUXDB_URL',    '')
       token = os.getenv('INFLUXDB_TOKEN',  '')
       if url and token:
+          retention = os.getenv('INFLUXDB_RETENTION', '60d').strip().lower()
+          retention_days = os.getenv('INFLUXDB_RETENTION_DAYS', '').strip()
+          if retention_days:
+            retention_days = int(retention_days)
+          elif retention.endswith('d') and retention[:-1].isdigit():
+            retention_days = int(retention[:-1])
+          else:
+            retention_days = 60
           cfg = {'influxdb': {
               'url':    url,
               'token':  token,
               'org':    os.getenv('INFLUXDB_ORG',    'omr'),
               'bucket': os.getenv('INFLUXDB_BUCKET', 'omr_metrics'),
+            'retention_days': retention_days,
           }}
           with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
               json.dump(cfg, f)
@@ -43,6 +55,15 @@ x-torch-build: &torch-build
       WORKDIR /app
       RUN pip install --no-cache-dir fastapi "uvicorn[standard]" influxdb3-python \
             torch --index-url https://download.pytorch.org/whl/cpu
+      COPY omr_metrics.py omr_metrics_standalone.py ./
+
+x-torch-image-build: &torch-image-build
+  build:
+    context: .
+    dockerfile_inline: |
+      FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
+      WORKDIR /app
+      RUN pip install --no-cache-dir fastapi "uvicorn[standard]" influxdb3-python
       COPY omr_metrics.py omr_metrics_standalone.py ./
 
 services:
@@ -107,6 +128,46 @@ services:
       - omr-data:/etc/openmptcprouter-vps-admin
 
   # -------------------------------------------------------------------------
+  # App — with pre-built PyTorch image (ML decision engine, larger image)
+  # -------------------------------------------------------------------------
+  omr-metrics-torch-image:
+    <<: [*app-base, *torch-image-build]
+    profiles: ["torch-image"]
+    depends_on:
+      influxdb-init:
+        condition: service_completed_successfully
+      torch-image-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # PyTorch model init — pre-built image variant
+  # -------------------------------------------------------------------------
+  torch-image-init:
+    <<: *torch-image-build
+    profiles: ["torch-image"]
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        python3 -c "
+        import sys, os
+        dest = '/etc/openmptcprouter-vps-admin/omr-decision-model.pt'
+        if os.path.exists(dest):
+            print('Decision model already exists, skipping.')
+            sys.exit(0)
+        sys.path.insert(0, '/app')
+        import omr_metrics, torch
+        model = omr_metrics._make_model()
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + '.tmp'
+        torch.save(model.state_dict(), tmp)
+        os.replace(tmp, dest)
+        print('Decision model saved to ' + dest)
+        "
+    volumes:
+      - omr-data:/etc/openmptcprouter-vps-admin
+
+  # -------------------------------------------------------------------------
   # InfluxDB 3 Core
   # Image: https://hub.docker.com/_/influxdb  (tag 3-core)
   # -------------------------------------------------------------------------
@@ -147,12 +208,12 @@ services:
         influxdb3 create database "${INFLUXDB_BUCKET:-omr_metrics}" \
           --host "http://influxdb:8181" \
           --token "${INFLUXDB_TOKEN}" \
-          --retention-period "${INFLUXDB_RETENTION:-30d}" 2>&1 | grep -v "already exists" || true
-        echo "Database '${INFLUXDB_BUCKET:-omr_metrics}' ready (retention: ${INFLUXDB_RETENTION:-30d})."
+          --retention-period "${INFLUXDB_RETENTION:-60d}" 2>&1 | grep -v "already exists" || true
+        echo "Database '${INFLUXDB_BUCKET:-omr_metrics}' ready (retention: ${INFLUXDB_RETENTION:-60d})."
     environment:
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:?INFLUXDB_TOKEN is required}
       INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-omr_metrics}
-      INFLUXDB_RETENTION: ${INFLUXDB_RETENTION:-30d}
+      INFLUXDB_RETENTION: ${INFLUXDB_RETENTION:-60d}
 
 volumes:
   omr-data:

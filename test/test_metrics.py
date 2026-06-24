@@ -2005,3 +2005,502 @@ class TestInfluxBackendHistory:
         table.to_pydict.side_effect = Exception("parse error")
         mock_client.query.return_value = table
         assert backend.read_history("alice", "wan", 3600, 100) == []
+
+
+# ===========================================================================
+# _metric_level — unit tests
+# ===========================================================================
+
+class TestMetricLevel:
+    @pytest.mark.parametrize("value,expected", [
+        (0.0,   "none"),
+        (0.05,  "none"),
+        (0.1,   "low"),
+        (0.5,   "low"),
+        (1.0,   "moderate"),
+        (4.9,   "moderate"),
+        (5.0,   "high"),
+        (14.9,  "high"),
+        (15.0,  "severe"),
+        (100.0, "severe"),
+    ])
+    def test_loss_levels(self, value, expected):
+        assert omr_metrics._metric_level(value, omr_metrics._LOSS_THRESHOLDS) == expected
+
+    @pytest.mark.parametrize("value,expected", [
+        (0.0,   "none"),
+        (4.9,   "none"),
+        (5.0,   "low"),
+        (9.9,   "low"),
+        (10.0,  "moderate"),
+        (29.9,  "moderate"),
+        (30.0,  "high"),
+        (59.9,  "high"),
+        (60.0,  "severe"),
+        (200.0, "severe"),
+    ])
+    def test_jitter_levels(self, value, expected):
+        assert omr_metrics._metric_level(value, omr_metrics._JITTER_THRESHOLDS) == expected
+
+    @pytest.mark.parametrize("value,expected", [
+        (0.0,  "none"),
+        (24.9, "none"),
+        (25.0, "low"),
+        (49.9, "low"),
+        (50.0, "moderate"),
+        (74.9, "moderate"),
+        (75.0, "high"),
+        (89.9, "high"),
+        (90.0, "severe"),
+    ])
+    def test_congestion_levels(self, value, expected):
+        assert omr_metrics._metric_level(value, omr_metrics._CONGESTION_LEVELS) == expected
+
+
+# ===========================================================================
+# _forecast_metric — unit tests
+# ===========================================================================
+
+_FM_T0 = 1_700_000_000
+
+
+def _loss_history(values: list, step: int = 30) -> list:
+    """Build a history list with loss values only."""
+    return [
+        {**_WAN, "loss": v, "timestamp": _FM_T0 + i * step}
+        for i, v in enumerate(values)
+    ]
+
+
+def _jitter_history(values: list, step: int = 30) -> list:
+    return [
+        {**_WAN, "jitter": v, "timestamp": _FM_T0 + i * step}
+        for i, v in enumerate(values)
+    ]
+
+
+class TestForecastMetric:
+    # --- empty / sparse history ---
+
+    def test_empty_history_returns_none_current(self):
+        result = omr_metrics._forecast_metric(
+            [], ("loss",), omr_metrics._LOSS_THRESHOLDS,
+        )
+        assert result["current"] is None
+        assert result["predicted"] is None
+        assert result["confidence"] == "none"
+        assert result["trend"] == "stable"
+        assert result["slope_per_min"] == 0.0
+
+    def test_single_point_returns_current_equals_predicted(self):
+        hist = _loss_history([2.5])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["current"] == pytest.approx(2.5)
+        assert result["predicted"] == pytest.approx(2.5)
+        assert result["confidence"] == "none"
+
+    def test_two_points_confidence_low(self):
+        hist = _loss_history([1.0, 2.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["confidence"] == "low"
+
+    def test_three_points_confidence_medium(self):
+        hist = _loss_history([1.0, 2.0, 3.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["confidence"] == "medium"
+
+    def test_five_points_old_enough_confidence_high(self):
+        # 5 points spanning 4 * 30 = 120 seconds → "high"
+        hist = _loss_history([1.0, 1.5, 2.0, 2.5, 3.0], step=30)
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["confidence"] == "high"
+
+    # --- current / current_level ---
+
+    def test_current_reflects_last_value(self):
+        hist = _loss_history([0.5, 1.0, 3.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["current"] == pytest.approx(3.0)
+
+    def test_current_level_matches_thresholds(self):
+        hist = _loss_history([6.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["current_level"] == "high"
+
+    # --- trend ---
+
+    def test_rising_trend_detected(self):
+        hist = _loss_history([0.1, 0.5, 1.0, 2.0, 4.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS,
+            hi_clamp=100.0, stable_slope_per_min=0.1,
+        )
+        assert result["trend"] == "rising"
+
+    def test_falling_trend_detected(self):
+        hist = _loss_history([8.0, 5.0, 3.0, 1.5, 0.5])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS,
+            hi_clamp=100.0, stable_slope_per_min=0.1,
+        )
+        assert result["trend"] == "falling"
+
+    def test_flat_series_is_stable(self):
+        hist = _loss_history([2.0, 2.0, 2.0, 2.0, 2.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS,
+            hi_clamp=100.0, stable_slope_per_min=0.1,
+        )
+        assert result["trend"] == "stable"
+
+    # --- predicted / predicted_level ---
+
+    def test_rising_loss_predicted_higher(self):
+        hist = _loss_history([0.5, 1.0, 2.0, 4.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0, horizon_s=300,
+        )
+        assert result["predicted"] > result["current"]
+
+    def test_falling_loss_predicted_lower(self):
+        hist = _loss_history([10.0, 7.0, 4.0, 2.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0, horizon_s=300,
+        )
+        assert result["predicted"] < result["current"]
+
+    def test_predicted_clamped_to_zero(self):
+        # Rapidly falling loss must not go negative
+        hist = _loss_history([5.0, 3.0, 1.0, 0.5])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0, horizon_s=3600,
+        )
+        assert result["predicted"] >= 0.0
+
+    def test_predicted_clamped_to_hi_clamp(self):
+        # Rapidly rising loss must not exceed 100 %
+        hist = _loss_history([80.0, 90.0, 99.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0, horizon_s=3600,
+        )
+        assert result["predicted"] <= 100.0
+
+    def test_no_hi_clamp_allows_unbounded_prediction(self):
+        # Jitter with no hi_clamp should be able to predict beyond any fixed cap
+        hist = _jitter_history([10.0, 30.0, 50.0, 80.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("jitter",), omr_metrics._JITTER_THRESHOLDS, hi_clamp=None, horizon_s=300,
+        )
+        # Just check no crash and result is non-negative
+        assert result["predicted"] >= 0.0
+
+    def test_predicted_level_reflects_predicted_value(self):
+        # Force a large rise so predicted lands in "severe" (≥15 %)
+        hist = _loss_history([5.0, 8.0, 12.0, 16.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0, horizon_s=300,
+        )
+        assert result["predicted_level"] == omr_metrics._metric_level(
+            result["predicted"], omr_metrics._LOSS_THRESHOLDS
+        )
+
+    # --- ETA fields ---
+
+    def test_eta_fields_present(self):
+        hist = _loss_history([0.5, 1.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert "eta_severe_s" in result
+        assert "eta_high_s" in result
+        assert "eta_moderate_s" in result
+
+    def test_eta_none_when_falling(self):
+        # Falling trend: slope ≤ 0 → ETA never reached
+        hist = _loss_history([10.0, 5.0, 2.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["eta_severe_s"] is None
+        assert result["eta_high_s"] is None
+
+    def test_eta_zero_when_already_above_threshold(self):
+        # current loss = 20 % which is already ≥ severe threshold (15 %)
+        hist = _loss_history([15.0, 18.0, 20.0])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        assert result["eta_severe_s"] == 0
+
+    def test_eta_moderate_finite_for_rising_loss(self):
+        # Rising from 0.5 % to 1 % in 90 s → must reach moderate (1 %) soon
+        hist = _loss_history([0.1, 0.3, 0.5, 0.8])
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        # moderate threshold is 1.0 %; slope is positive → finite ETA expected
+        assert result["eta_moderate_s"] is not None
+        assert result["eta_moderate_s"] >= 0
+
+    # --- nested path ---
+
+    def test_nested_path_congestion(self):
+        hist = _history_at(_WAN, [
+            {"congestion.score": 20},
+            {"congestion.score": 40},
+            {"congestion.score": 60},
+        ])
+        result = omr_metrics._forecast_metric(
+            hist, ("congestion", "score"), omr_metrics._CONGESTION_LEVELS,
+            hi_clamp=100.0, stable_slope_per_min=0.5,
+        )
+        assert result["current"] == pytest.approx(60.0)
+        assert result["trend"] == "rising"
+
+    def test_entries_without_timestamp_skipped(self):
+        # Only the two timestamped entries should feed the regression
+        hist = [
+            {**_WAN, "loss": 1.0, "timestamp": _FM_T0},
+            {**_WAN, "loss": 2.0},                      # no timestamp → skipped
+            {**_WAN, "loss": 3.0, "timestamp": _FM_T0 + 60},
+        ]
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0, horizon_s=60,
+        )
+        # With slope ≈ (3-1)/60 per second, prediction at +60 s ≈ 5
+        assert result["predicted"] > result["current"]
+
+    def test_entries_without_metric_skipped(self):
+        # Entries with missing loss field should not crash
+        hist = [
+            {**_WAN, "timestamp": _FM_T0},              # loss present (= 0.0 from _WAN)
+            {**_WAN, "loss": None, "timestamp": _FM_T0 + 30},  # no loss value
+            {**_WAN, "loss": 2.0, "timestamp": _FM_T0 + 60},
+        ]
+        result = omr_metrics._forecast_metric(
+            hist, ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+        )
+        # Should not raise, and current should be last loss value with a timestamp
+        assert result is not None
+
+
+# ===========================================================================
+# GET /metrics/quality/forecast — endpoint tests
+# ===========================================================================
+
+class TestGetQualityForecast:
+    def _get(self, client, **params):
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"/metrics/quality/forecast?{qs}" if qs else "/metrics/quality/forecast"
+        return client.get(url)
+
+    def _make_hist(self, n: int = 5, step: int = 30) -> list:
+        return [
+            {**_WAN, "timestamp": _FM_T0 + i * step,
+             "loss": 1.0 + i * 0.2,
+             "jitter": 5.0 + i * 0.5,
+             "congestion": {"score": 10 + i * 3, "level": "none"}}
+            for i in range(n)
+        ]
+
+    # --- structure ---
+
+    def test_returns_empty_when_no_metrics(self, user_client):
+        with patch.object(omr_metrics, "_read_user", return_value={}):
+            r = self._get(user_client)
+        assert r.status_code == 200
+        assert r.json() == {}
+
+    def test_returns_entry_per_interface(self, user_client):
+        hist = self._make_hist()
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+        ):
+            r = self._get(user_client)
+        assert r.status_code == 200
+        data = r.json()
+        assert set(data.keys()) == {"wan", "wan2"}
+
+    def test_each_entry_has_congestion_loss_jitter(self, user_client):
+        hist = self._make_hist()
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+        ):
+            r = self._get(user_client)
+        entry = r.json()["wan"]
+        assert "congestion" in entry
+        assert "loss" in entry
+        assert "jitter" in entry
+
+    def test_sub_objects_have_required_keys(self, user_client):
+        hist = self._make_hist()
+        required = {
+            "current", "current_level", "predicted", "predicted_level",
+            "trend", "slope_per_min", "confidence",
+            "eta_severe_s", "eta_high_s", "eta_moderate_s",
+        }
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+        ):
+            r = self._get(user_client)
+        entry = r.json()["wan"]
+        for metric in ("congestion", "loss", "jitter"):
+            missing = required - set(entry[metric].keys())
+            assert not missing, f"{metric} missing keys: {missing}"
+
+    # --- JSON backend fallback (confidence="none") ---
+
+    def test_json_backend_uses_snapshot_as_history(self, user_client):
+        # JSON backend returns [] for read_history; endpoint should fall back to snapshot
+        snap = {**_WAN, "timestamp": _FM_T0, "loss": 3.0, "jitter": 8.0}
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": snap}),
+            patch.object(omr_metrics, "_read_history", return_value=[]),
+        ):
+            r = self._get(user_client)
+        assert r.status_code == 200
+        entry = r.json()["wan"]
+        assert entry["loss"]["confidence"] == "none"
+
+    def test_json_backend_no_timestamp_returns_none_current(self, user_client):
+        # Snapshot has no timestamp → history stays empty → current=None
+        snap = {k: v for k, v in _WAN.items() if k != "timestamp"}
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": snap}),
+            patch.object(omr_metrics, "_read_history", return_value=[]),
+        ):
+            r = self._get(user_client)
+        assert r.status_code == 200
+        assert r.json()["wan"]["loss"]["current"] is None
+
+    # --- InfluxDB backend (confidence > "none") ---
+
+    def test_influxdb_backend_passes_history_to_forecast(self, user_client):
+        hist = self._make_hist(n=5)
+        captured = {}
+
+        def fake_read_history(username, iface, since_seconds, limit):
+            captured.setdefault(iface, [])
+            return hist
+
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", side_effect=fake_read_history),
+        ):
+            r = self._get(user_client)
+        assert "wan" in captured
+        assert r.json()["wan"]["loss"]["confidence"] == "high"
+
+    # --- query params ---
+
+    def test_horizon_forwarded_affects_prediction(self, user_client):
+        # Rising loss: larger horizon → larger predicted value
+        hist = self._make_hist(n=5)
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+        ):
+            r_short = self._get(user_client, horizon=60)
+            r_long  = self._get(user_client, horizon=1800)
+        pred_short = r_short.json()["wan"]["loss"]["predicted"]
+        pred_long  = r_long.json()["wan"]["loss"]["predicted"]
+        assert pred_long >= pred_short
+
+    def test_since_param_forwarded_to_read_history(self, user_client):
+        captured = {}
+
+        def fake_read_history(username, iface, since_seconds, limit):
+            captured["since"] = since_seconds
+            return self._make_hist()
+
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", side_effect=fake_read_history),
+        ):
+            self._get(user_client, since="6h")
+        assert captured["since"] == 21600
+
+    def test_limit_param_forwarded_to_read_history(self, user_client):
+        captured = {}
+
+        def fake_read_history(username, iface, since_seconds, limit):
+            captured["limit"] = limit
+            return self._make_hist()
+
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", side_effect=fake_read_history),
+        ):
+            self._get(user_client, limit=42)
+        assert captured["limit"] == 42
+
+    # --- auth ---
+
+    def test_admin_can_query_other_user(self, admin_client):
+        captured = {}
+
+        def fake_read_user(username):
+            captured["username"] = username
+            return {"wan": _WAN}
+
+        with (
+            patch.object(omr_metrics, "_read_user", side_effect=fake_read_user),
+            patch.object(omr_metrics, "_read_history", return_value=self._make_hist()),
+        ):
+            self._get(admin_client, username="openmptcprouter")
+        assert captured["username"] == "openmptcprouter"
+
+    def test_unauthenticated_returns_403(self, unauth_client):
+        r = self._get(unauth_client)
+        assert r.status_code == 403
+
+    # --- current / predicted correctness ---
+
+    def test_current_loss_matches_last_history_entry(self, user_client):
+        hist = self._make_hist(n=4)
+        last_loss = hist[-1]["loss"]
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+        ):
+            r = self._get(user_client)
+        assert r.json()["wan"]["loss"]["current"] == pytest.approx(last_loss)
+
+    def test_rising_loss_has_rising_trend(self, user_client):
+        # loss increases monotonically → trend must be "rising"
+        hist = [
+            {**_WAN, "timestamp": _FM_T0 + i * 30, "loss": float(i + 1) * 2.0}
+            for i in range(5)
+        ]
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+        ):
+            r = self._get(user_client)
+        assert r.json()["wan"]["loss"]["trend"] == "rising"
+
+    def test_congestion_current_level_name_is_string(self, user_client):
+        hist = self._make_hist()
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+        ):
+            r = self._get(user_client)
+        level = r.json()["wan"]["congestion"]["current_level"]
+        assert isinstance(level, str)
+        assert level in ("none", "low", "moderate", "high", "severe")

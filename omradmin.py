@@ -1160,20 +1160,20 @@ def remove_dsvpn(userid):
     os.remove('/etc/dsvpn/dsvpn' + str(userid) + '.key')
 
 def add_mqvpn(username, fixed_ip=None):
-    mqvpn_user_key = secrets.token_urlsafe(32)
-    mqvpn_api({'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key})
     try:
         with open('/etc/mqvpn/server.json') as f:
             mqvpn_config = json.load(f)
         users = mqvpn_config.get('users', [])
         if not any(u.get('name') == username for u in users):
+            mqvpn_user_key = secrets.token_urlsafe(32)
+            mqvpn_api({'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key})
             entry = {'name': username, 'key': mqvpn_user_key}
             if fixed_ip:
                 entry['fixed_ip'] = fixed_ip
             users.append(entry)
             mqvpn_config['users'] = users
-        with open('/etc/mqvpn/server.json', 'w') as f:
-            json.dump(mqvpn_config, f, indent=2)
+            with open('/etc/mqvpn/server.json', 'w') as f:
+                json.dump(mqvpn_config, f, indent=2)
     except Exception as e:
         LOG.debug("MQVPN add user json error (" + str(e) + ")")
 
@@ -1650,8 +1650,13 @@ def load_mptcp_bpf_schedulers():
                 for line in f:
                     line = line.strip()
                     if line.startswith('net.mptcp.mptcp_scheduler=') or line.startswith('net.mptcp.scheduler='):
-                        subprocess.run(['sysctl', '-qw', line], check=False)
-                        LOG.info('Re-applied scheduler after BPF load: ' + line)
+                        proc_path = '/proc/sys/' + line.split('=')[0].replace('.', '/')
+                        if os.path.exists(proc_path):
+                            result = subprocess.run(['sysctl', '-qw', line], check=False)
+                            if result.returncode == 0:
+                                LOG.info('Re-applied scheduler after BPF load: ' + line)
+                            else:
+                                LOG.warning('Failed to re-apply scheduler after BPF load: ' + line)
                         break
 
 

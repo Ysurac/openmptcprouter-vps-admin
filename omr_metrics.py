@@ -45,29 +45,24 @@
 # The heuristic also benefits from preemptive congestion prediction when InfluxDB
 # history is available.
 #
-# Predictive congestion handling
-# -------------------------------
-# GET  /metrics/congestion/forecast
+# Predictive quality handling
+# ----------------------------
+# GET  /metrics/quality/forecast
 #   ?horizon=300  prediction horizon in seconds (30–3600, default 300 = 5 min)
 #   ?since=1h     history window used for regression (default 1 h)
 #   ?limit=100    maximum history points fetched per interface
 #
-# Returns one entry per WAN interface:
-#   current_score / current_level     — latest measured congestion (0-100, level name)
-#   predicted_score / predicted_level — extrapolated score at +horizon seconds
-#   trend                             — "rising" | "stable" | "falling"
-#   slope_per_min                     — congestion score change per minute
-#   eta_moderate_s                    — seconds until score reaches 50 (null if never)
-#   eta_high_s                        — seconds until score reaches 75 (null if never)
-#   eta_severe_s                      — seconds until score reaches 90 (null if never)
-#   confidence                        — "high" | "medium" | "low" | "none"
+# Returns one entry per WAN interface with three sub-objects (congestion, loss, jitter)
+# each with a uniform set of keys:
+#   current / current_level     — latest measured value and severity level
+#   predicted / predicted_level — extrapolated value at +horizon seconds
+#   trend                       — "rising" | "stable" | "falling"
+#   slope_per_min               — change per minute in native units
+#   eta_severe_s / eta_high_s / eta_moderate_s — seconds to reach that severity (null if never)
+#   confidence                  — "high" | "medium" | "low" | "none"
 #
-# Congestion levels:  none (0-24) | low (25-49) | moderate (50-74) | high (75-89) | severe (90+)
-#
-# The forecast is also used internally by the decision engine (both ML and heuristic):
-# when preemptive=true, the effective congestion score fed to the scorer is
-# max(current, predicted), so traffic is shifted away from a congested link
-# before its score fully degrades.
+# Loss levels:   none (<0.1%) | low (0.1–1%) | moderate (1–5%) | high (5–15%) | severe (15%+)
+# Jitter levels: none (<5 ms) | low (5–10 ms) | moderate (10–30 ms) | high (30–60 ms) | severe (60 ms+)
 #
 # Engine diagnostics
 # ------------------
@@ -287,6 +282,26 @@ class JSONBackend:
                      since_seconds: int, limit: int):
         return [] if interface is not None else {}  # JSON backend: latest snapshot only
 
+    def user_stats(self, username: str) -> dict:
+        """Return entry count and first/last seen timestamps for a user.
+
+        JSON backend stores only the latest snapshot per interface, so
+        entry_count equals the number of known interfaces.
+        """
+        user_data = self.read_user(username)
+        if not user_data:
+            return {"entry_count": 0, "first_seen": None, "last_seen": None, "interfaces": []}
+        timestamps = [
+            p["timestamp"] for p in user_data.values()
+            if isinstance(p, dict) and p.get("timestamp") is not None
+        ]
+        return {
+            "entry_count": len(user_data),
+            "first_seen": min(timestamps) if timestamps else None,
+            "last_seen":  max(timestamps) if timestamps else None,
+            "interfaces": sorted(user_data.keys()),
+        }
+
     def write_interface(self, username: str, payload: dict):
         data = self.read_all()
         data.setdefault(username, {})[payload["interface"]] = payload
@@ -296,7 +311,7 @@ class JSONBackend:
                 json.dump(data, f, indent=4)
             os.replace(tmp, METRICS_FILE)
         except Exception as exc:
-            LOG.debug("omr_metrics JSON: write error: %s", exc)
+            LOG.error("omr_metrics JSON: write error: %s", exc)
 
 
 class InfluxBackend:
@@ -348,26 +363,30 @@ class InfluxBackend:
         except Exception as exc:
             LOG.warning("omr_metrics: could not apply InfluxDB retention policy: %s", exc)
 
+    # Window used for latest-snapshot queries (_query). Much smaller than the
+    # retention period so InfluxDB3 Core stays within its Parquet file scan limit.
+    _LATEST_WINDOW = "1 day"
+
     def _query(self, username: Optional[str] = None) -> dict:
         """Return {username: {interface: payload}} for the latest data point."""
         if username:
             sql = (
                 f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
-                f"WHERE time >= now() - interval '{self._retention_days} days' AND username = $username "
+                f"WHERE time >= now() - interval '{self._LATEST_WINDOW}' AND username = $username "
                 f"ORDER BY time DESC"
             )
             params: dict = {"username": username}
         else:
             sql = (
                 f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
-                f"WHERE time >= now() - interval '{self._retention_days} days' "
+                f"WHERE time >= now() - interval '{self._LATEST_WINDOW}' "
                 f"ORDER BY time DESC"
             )
             params = {}
         try:
             table = self._client.query(sql, query_parameters=params or None)
         except Exception as exc:
-            LOG.debug("omr_metrics InfluxDB: query error: %s", exc)
+            LOG.error("omr_metrics InfluxDB: query error: %s", exc)
             return {}
 
         result: dict = {}
@@ -388,7 +407,7 @@ class InfluxBackend:
                 except Exception:
                     pass
         except Exception as exc:
-            LOG.debug("omr_metrics InfluxDB: result parse error: %s", exc)
+            LOG.error("omr_metrics InfluxDB: result parse error: %s", exc)
         return result
 
     def read_all(self) -> dict:
@@ -475,6 +494,54 @@ class InfluxBackend:
         except Exception as exc:
             LOG.debug("omr_metrics InfluxDB history: result parse error: %s", exc)
         return result
+
+    def user_stats(self, username: str) -> dict:
+        """Return total entry count, first/last seen and interface list for a user."""
+        sql = (
+            f"SELECT COUNT(*) as entry_count, MIN(time) as first_seen, "
+            f"MAX(time) as last_seen FROM {self._MEASUREMENT} "
+            f"WHERE username = $username "
+            f"AND time >= now() - interval '{self._LATEST_WINDOW}'"
+        )
+        iface_sql = (
+            f"SELECT DISTINCT interface FROM {self._MEASUREMENT} "
+            f"WHERE username = $username "
+            f"AND time >= now() - interval '{self._LATEST_WINDOW}'"
+        )
+        params = {"username": username}
+        try:
+            table = self._client.query(sql, query_parameters=params)
+            d = table.to_pydict()
+            counts = d.get("entry_count", [None])
+            entry_count = int(counts[0]) if counts and counts[0] is not None else 0
+
+            def _ts(v):
+                if v is None:
+                    return None
+                return int(v.timestamp()) if hasattr(v, "timestamp") else int(v)
+
+            firsts = d.get("first_seen", [None])
+            lasts  = d.get("last_seen",  [None])
+            first_seen = _ts(firsts[0]) if firsts else None
+            last_seen  = _ts(lasts[0])  if lasts  else None
+        except Exception as exc:
+            LOG.error("omr_metrics InfluxDB user_stats: %s", exc)
+            entry_count, first_seen, last_seen = 0, None, None
+
+        try:
+            itable = self._client.query(iface_sql, query_parameters=params)
+            id_ = itable.to_pydict()
+            interfaces = sorted(id_.get("interface", []))
+        except Exception as exc:
+            LOG.error("omr_metrics InfluxDB user_stats interfaces: %s", exc)
+            interfaces = []
+
+        return {
+            "entry_count": entry_count,
+            "first_seen":  first_seen,
+            "last_seen":   last_seen,
+            "interfaces":  interfaces,
+        }
 
     def write_interface(self, username: str, payload: dict):
         from influxdb_client_3 import Point  # noqa: PLC0415
@@ -637,6 +704,10 @@ def _parse_since(since: str) -> int:
 
 def _read_history(username: str, interface: Optional[str], since_seconds: int, limit: int):
     return _get_backend().read_history(username, interface, since_seconds, limit)
+
+
+def _user_stats(username: str) -> dict:
+    return _get_backend().user_stats(username)
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +896,122 @@ def _weighted_slope(timestamps: list, values: list,
     num = sum(ws[i] * (ts_seq[i] - t_mean) * (vs_seq[i] - v_mean) for i in range(len(pairs)))
     den = sum(ws[i] * (ts_seq[i] - t_mean) ** 2 for i in range(len(pairs)))
     return num / den if den != 0.0 else 0.0
+
+
+_LOSS_THRESHOLDS = [
+    (15.0, "severe"),
+    (5.0,  "high"),
+    (1.0,  "moderate"),
+    (0.1,  "low"),
+    (0.0,  "none"),
+]
+
+_JITTER_THRESHOLDS = [
+    (60.0, "severe"),
+    (30.0, "high"),
+    (10.0, "moderate"),
+    (5.0,  "low"),
+    (0.0,  "none"),
+]
+
+
+def _metric_level(value: float, thresholds: list) -> str:
+    for threshold, level in thresholds:
+        if value >= threshold:
+            return level
+    return thresholds[-1][1]
+
+
+def _forecast_metric(history: list, path: tuple, thresholds: list,
+                     hi_clamp: Optional[float] = None,
+                     stable_slope_per_min: float = 0.1,
+                     horizon_s: int = 300) -> dict:
+    """Exponentially weighted linear forecast for any scalar metric.
+
+    path: tuple of keys to extract from each payload, e.g. ("loss",) or ("congestion", "score").
+    thresholds: [(threshold, level_name), ...] sorted descending.
+    hi_clamp: optional upper bound for the predicted value.
+    stable_slope_per_min: abs(slope) below this is considered "stable".
+
+    Returns current/predicted/trend/slope_per_min/eta_severe_s/eta_high_s/eta_moderate_s/confidence.
+    """
+    timestamps: list = []
+    values: list = []
+    for p in history:
+        ts = p.get("timestamp")
+        v: object = p
+        for key in path:
+            v = (v or {}).get(key) if isinstance(v, dict) else None
+        if ts is not None and v is not None:
+            timestamps.append(float(ts))
+            values.append(float(v))
+
+    now = timestamps[-1] if timestamps else time.time()
+    current = round(values[-1], 2) if values else None
+    current_level = _metric_level(current, thresholds) if current is not None else "unknown"
+
+    # ETA for severe / high / moderate levels only
+    eta_levels = [(t, n) for t, n in thresholds if n in ("severe", "high", "moderate")]
+
+    def _eta(threshold: float) -> Optional[int]:
+        if len(timestamps) < 2 or current is None:
+            return None
+        slope = _weighted_slope(timestamps, values)
+        if not slope or slope <= 0:
+            return None
+        if current >= threshold:
+            return 0
+        secs = (threshold - current) / slope
+        return round(secs) if secs <= 86400 else None
+
+    base: dict = {
+        "current":         current,
+        "current_level":   current_level,
+        "predicted":       current,
+        "predicted_level": current_level,
+        "trend":           "stable",
+        "slope_per_min":   0.0,
+        "confidence":      "none",
+    }
+    for _, n in eta_levels:
+        base[f"eta_{n}_s"] = None
+
+    if len(timestamps) < 2:
+        return base
+
+    predicted_raw = _linear_predict_at(timestamps, values, now + horizon_s)
+    if predicted_raw is not None:
+        pred = max(0.0, predicted_raw)
+        if hi_clamp is not None:
+            pred = min(hi_clamp, pred)
+        base["predicted"] = round(pred, 2)
+    base["predicted_level"] = _metric_level(base["predicted"], thresholds) \
+        if base["predicted"] is not None else "unknown"
+
+    slope = _weighted_slope(timestamps, values)
+    slope_per_min = round((slope or 0.0) * 60.0, 4)
+    base["slope_per_min"] = slope_per_min
+
+    if abs(slope_per_min) < stable_slope_per_min:
+        base["trend"] = "stable"
+    elif slope_per_min > 0:
+        base["trend"] = "rising"
+    else:
+        base["trend"] = "falling"
+
+    n_pts = len(timestamps)
+    age_s = now - min(timestamps)
+    if n_pts >= 5 and age_s >= 120:
+        base["confidence"] = "high"
+    elif n_pts >= 3:
+        base["confidence"] = "medium"
+    else:
+        base["confidence"] = "low"
+
+    for t, n in eta_levels:
+        base[f"eta_{n}_s"] = _eta(t)
+
+    return base
 
 
 def _extract_trend_features(history: list) -> list:
@@ -1570,6 +1757,21 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             raise HTTPException(status_code=403, detail="Admin only")
         return _read_all()
 
+    @router.get('/metrics/user', summary="Get current user profile and metrics DB stats")
+    async def get_user_info(
+        username: Optional[str] = Query(None),
+        current_user: User = Depends(get_current_user),
+    ):
+        """Return metrics DB statistics for the user: entry count, first/last seen
+        timestamps and known WAN interfaces.
+        With the JSON backend entry_count equals the number of interfaces
+        (only the latest snapshot per interface is stored).
+        """
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        import asyncio
+        stats = await asyncio.to_thread(_user_stats, target)
+        return {"username": target, **stats}
+
     _501_history = JSONResponse(
         status_code=501,
         content={"error": "History not available with JSON backend", "hint": "Configure InfluxDB in omr-admin-config.json"},
@@ -1639,9 +1841,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         smoothed = _apply_ema(target, result.get("weights", {}))
         return {**result, "weights": smoothed}
 
-    @router.get('/metrics/congestion/forecast',
-                summary="Predictive congestion forecast per WAN interface")
-    async def get_congestion_forecast(
+    @router.get('/metrics/quality/forecast',
+                summary="Combined quality forecast: congestion, loss and jitter per WAN interface")
+    async def get_quality_forecast(
         horizon: int = Query(300, ge=30, le=3600,
                              description="Prediction horizon in seconds (default 300 = 5 min)"),
         since: str = Query("1h", description="History window: 15m 30m 1h 6h 12h 24h or seconds"),
@@ -1650,18 +1852,14 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         username: Optional[str] = Query(None),
         current_user: User = Depends(get_current_user),
     ):
-        """Return a congestion forecast for every WAN interface.
+        """Return a combined quality forecast for every WAN interface.
 
-        Each entry contains:
-        - current_score / current_level   — latest measured congestion
-        - predicted_score / predicted_level — extrapolated score at +horizon seconds
-        - trend                           — rising | stable | falling
-        - slope_per_min                   — congestion score change per minute
-        - eta_moderate_s / eta_high_s / eta_severe_s — ETA to reach that level (null if never)
-        - confidence                      — high | medium | low | none
+        Each interface entry contains three sub-objects — congestion, loss, jitter —
+        each with: current / current_level / predicted / predicted_level /
+        trend / slope_per_min / eta_severe_s / eta_high_s / eta_moderate_s / confidence.
 
-        Requires InfluxDB backend for meaningful forecasts; works with JSON backend
-        but returns confidence="none" for all interfaces (single snapshot available).
+        Works with the JSON backend but returns confidence="none" for all metrics
+        (only a single snapshot is available).
         """
         target = username if current_user.permissions == "admin" and username else current_user.username
         user_data = _read_user(target)
@@ -1673,10 +1871,23 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         for iface in user_data:
             hist = _read_history(target, iface, since_seconds=since_seconds, limit=limit)
             if not hist:
-                # JSON backend: use the single latest snapshot as a degenerate history
                 snap = user_data[iface]
                 hist = [snap] if snap.get("timestamp") is not None else []
-            result[iface] = _predict_congestion(hist, horizon_s=horizon)
+
+            result[iface] = {
+                "congestion": _forecast_metric(
+                    hist, ("congestion", "score"), _CONGESTION_LEVELS,
+                    hi_clamp=100.0, stable_slope_per_min=0.5, horizon_s=horizon,
+                ),
+                "loss": _forecast_metric(
+                    hist, ("loss",), _LOSS_THRESHOLDS,
+                    hi_clamp=100.0, stable_slope_per_min=0.1, horizon_s=horizon,
+                ),
+                "jitter": _forecast_metric(
+                    hist, ("jitter",), _JITTER_THRESHOLDS,
+                    hi_clamp=None, stable_slope_per_min=0.5, horizon_s=horizon,
+                ),
+            }
 
         return result
 
