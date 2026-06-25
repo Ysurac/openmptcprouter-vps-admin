@@ -1,3 +1,16 @@
+omr-vps-admin (0.18+20260625) unstable; urgency=medium
+
+  * Add EMA (Exponential Moving Average) weight to metrics decision engine
+  * Add predictive congestion handling in omr_metrics
+  * Increase metrics data retention to 60 days, add configurable retention parameter
+  * Add user information to metrics
+  * Fix mqvpn user sync
+  * Add standalone mode wrapper for omr_metrics (omr_metrics_standalone.py)
+  * Add docker-compose configuration for Standalone mode
+  * Fix install_omr-ai DB IP and port (65551)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 25 Jun 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260610) unstable; urgency=medium
 
   * Add username query parameter to GET /config for admin user lookup by name

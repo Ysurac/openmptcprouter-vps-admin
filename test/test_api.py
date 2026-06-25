@@ -742,6 +742,7 @@ class TestLoadMptcpBpfSchedulers:
 
         with (
             patch("os.path.isdir", return_value=True),
+            patch("os.path.exists", return_value=True),
             patch("os.makedirs"),
             patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
             patch("subprocess.run", side_effect=_run),
@@ -766,6 +767,7 @@ class TestLoadMptcpBpfSchedulers:
 
         with (
             patch("os.path.isdir", return_value=True),
+            patch("os.path.exists", return_value=True),
             patch("os.makedirs"),
             patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
             patch("subprocess.run", side_effect=_run),

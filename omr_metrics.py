@@ -725,6 +725,8 @@ _PREDICTABLE: list = [
     (("latency",),             0.0,   None),   # ms ≥ 0
     (("loss",),                0.0,  100.0),   # % in [0, 100]
     (("jitter",),              0.0,   None),   # ms ≥ 0
+    (("rtt_min",),             0.0,   None),   # ms ≥ 0
+    (("rtt_max",),             0.0,   None),   # ms ≥ 0
     (("congestion", "score"),  0.0,  100.0),   # score in [0, 100]
     (("bandwidth",  "rx_bps"), 0.0,   None),   # bytes/s ≥ 0
     (("bandwidth",  "tx_bps"), 0.0,   None),
@@ -912,6 +914,14 @@ _JITTER_THRESHOLDS = [
     (10.0, "moderate"),
     (5.0,  "low"),
     (0.0,  "none"),
+]
+
+_RTT_THRESHOLDS = [
+    (500.0, "severe"),
+    (200.0, "high"),
+    (100.0, "moderate"),
+    (50.0,  "low"),
+    (0.0,   "none"),
 ]
 
 
@@ -1842,7 +1852,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         return {**result, "weights": smoothed}
 
     @router.get('/metrics/quality/forecast',
-                summary="Combined quality forecast: congestion, loss and jitter per WAN interface")
+                summary="Combined quality forecast: congestion, loss, jitter and RTT per WAN interface")
     async def get_quality_forecast(
         horizon: int = Query(300, ge=30, le=3600,
                              description="Prediction horizon in seconds (default 300 = 5 min)"),
@@ -1854,9 +1864,10 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
     ):
         """Return a combined quality forecast for every WAN interface.
 
-        Each interface entry contains three sub-objects — congestion, loss, jitter —
+        Each interface entry contains four sub-objects — congestion, loss, jitter, rtt —
         each with: current / current_level / predicted / predicted_level /
         trend / slope_per_min / eta_severe_s / eta_high_s / eta_moderate_s / confidence.
+        RTT levels: none (<50 ms), low (<100 ms), moderate (<200 ms), high (<500 ms), severe (≥500 ms).
 
         Works with the JSON backend but returns confidence="none" for all metrics
         (only a single snapshot is available).
@@ -1886,6 +1897,10 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                 "jitter": _forecast_metric(
                     hist, ("jitter",), _JITTER_THRESHOLDS,
                     hi_clamp=None, stable_slope_per_min=0.5, horizon_s=horizon,
+                ),
+                "rtt": _forecast_metric(
+                    hist, ("rtt_min",), _RTT_THRESHOLDS,
+                    hi_clamp=None, stable_slope_per_min=2.0, horizon_s=horizon,
                 ),
             }
 

@@ -29,9 +29,12 @@ Interface metrics (JSON)
         ▼
   Cost scaling                multiply each weight by 1/cost, renormalise
         │
+        ▼
+  EMA smoothing               blend(0.3 × new + 0.7 × previous) per interface
+        │                     (offline interfaces bypass EMA — immediate reaction)
         ├─► score  = softmax_scaled × 100   (quality %, 0–100, higher = better)
         │
-        └─► weight = max(1, round(softmax_scaled × 255))   (ip route weight, 1–255)
+        └─► weight = max(1, round(ema_smoothed × 255))   (ip route weight, 1–255)
 ```
 
 ---
@@ -179,12 +182,34 @@ both the PyTorch path and the heuristic fallback.
 
 ---
 
-## 5. Predictive congestion handling
+## 5. EMA weight smoothing
+
+To prevent rapid oscillation when two interfaces have similar quality scores, the
+final weights are passed through an **Exponential Moving Average** (EMA) before
+being returned.
+
+```
+smoothed(iface) = 0.3 × new_weight + 0.7 × previous_smoothed
+```
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `EMA_ALPHA` | 0.3 | Blend fraction for the new observation |
+| Half-life | ~60–90 s | At 30 s polling intervals |
+
+The EMA state is kept per user in memory and reset on process restart.
+An interface that goes offline **bypasses** EMA entirely — its softmax input is
+forced to `−∞` so the weight drops to the minimum immediately without waiting
+for the moving average to decay.
+
+---
+
+## 6. Predictive congestion handling
 
 The engine has two complementary mechanisms for acting on congestion trends
 *before* they fully manifest.
 
-### 5a. `inv_predicted_congestion` feature (ML model)
+### 6a. `inv_predicted_congestion` feature (ML model)
 
 Feature #14 is the **worst of the current and +5 min predicted congestion
 score**, converted to `[0, 1]` (higher = less congestion).  When the current
@@ -194,13 +219,13 @@ degradation, causing the model to reduce the interface's weight preemptively.
 It requires at least 2 timestamped history points for the interface.  Without
 history it falls back to the current `congestion.score`.
 
-### 5b. Heuristic preemptive penalty
+### 6b. Heuristic preemptive penalty
 
 The heuristic scorer (used when PyTorch is absent) now accepts history data
 and substitutes `max(current_congestion, predicted_congestion)` as the
 effective score.  This mirrors what the ML model does via the feature above.
 
-### 5c. `preemptive` query parameter
+### 6c. `preemptive` query parameter
 
 Both scorers receive history data when `?preemptive=true` (the default) is
 passed to `GET /metrics/decision`.  The engine fetches the last hour of
@@ -212,7 +237,7 @@ GET /metrics/decision                    → preemptive on (default)
 GET /metrics/decision?preemptive=false   → current snapshot only, no history fetch
 ```
 
-### 5d. Full payload extrapolation (`predict=true`)
+### 6d. Full payload extrapolation (`predict=true`)
 
 When `?predict=true` is passed, the engine replaces **all** metric fields with
 forward extrapolations before scoring (not just congestion).  This is the more
@@ -246,10 +271,11 @@ All extrapolations use exponentially weighted linear regression (half-life
 
 ---
 
-## 6. Congestion forecast endpoint
+## 7. Quality forecast endpoint
 
-`GET /metrics/congestion/forecast` returns a detailed congestion forecast for
-every WAN interface, independent of the weight decision.
+`GET /metrics/quality/forecast` returns a combined quality forecast for every
+WAN interface covering four metrics: **congestion**, **loss**, **jitter**, and
+**RTT**, independent of the weight decision.
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
@@ -257,68 +283,60 @@ every WAN interface, independent of the weight decision.
 | `since` | `1h` | — | History window: `15m` `30m` `1h` `6h` `12h` `24h` or seconds |
 | `limit` | `100` | 10–1000 | Maximum history points per interface |
 
-Response per interface:
+Each interface entry contains four sub-objects (`congestion`, `loss`, `jitter`,
+`rtt`), each with the same set of fields:
 
 | Field | Description |
 |-------|-------------|
-| `current_score` | Latest measured congestion score (0–100) |
-| `current_level` | `none` \| `low` \| `moderate` \| `high` \| `severe` |
-| `predicted_score` | Extrapolated score at +horizon seconds |
-| `predicted_level` | Congestion level at predicted score |
+| `current` / `current_level` | Latest measured value and severity level |
+| `predicted` / `predicted_level` | Extrapolated value and level at +horizon seconds |
 | `trend` | `rising` \| `stable` \| `falling` |
-| `slope_per_min` | Score change per minute (positive = worsening) |
-| `eta_moderate_s` | Seconds until score reaches 50; `null` if not trending there |
-| `eta_high_s` | Seconds until score reaches 75; `null` if not trending there |
-| `eta_severe_s` | Seconds until score reaches 90; `null` if not trending there |
+| `slope_per_min` | Change per minute in native units (positive = worsening) |
+| `eta_moderate_s` | Seconds to reach moderate severity; `null` if not trending there |
+| `eta_high_s` | Seconds to reach high severity; `null` if not trending there |
+| `eta_severe_s` | Seconds to reach severe; `null` if not trending there |
 | `confidence` | `high` (≥5 points, ≥2 min window) \| `medium` \| `low` \| `none` |
 
-Congestion levels:
+Severity levels per metric:
 
-| Level | Score range |
-|-------|-------------|
-| `none` | 0–24 |
-| `low` | 25–49 |
-| `moderate` | 50–74 |
-| `high` | 75–89 |
-| `severe` | 90–100 |
+| Metric | none | low | moderate | high | severe |
+|--------|------|-----|----------|------|--------|
+| Congestion (score) | 0–24 | 25–49 | 50–74 | 75–89 | ≥90 |
+| Loss (%) | <0.1 | 0.1–1 | 1–5 | 5–15 | ≥15 |
+| Jitter (ms) | <5 | 5–10 | 10–30 | 30–60 | ≥60 |
+| RTT (ms) | <50 | 50–100 | 100–200 | 200–500 | ≥500 |
 
 Example response:
 
 ```jsonc
 {
   "wwan0": {
-    "current_score": 28.0,
-    "current_level": "low",
-    "predicted_score": 62.0,
-    "predicted_level": "moderate",
-    "trend": "rising",
-    "slope_per_min": 5.6,
-    "eta_moderate_s": 389,
-    "eta_high_s": 836,
-    "eta_severe_s": null,
-    "confidence": "high"
-  },
-  "eth0": {
-    "current_score": 8.0,
-    "current_level": "none",
-    "predicted_score": 6.0,
-    "predicted_level": "none",
-    "trend": "stable",
-    "slope_per_min": -0.2,
-    "eta_moderate_s": null,
-    "eta_high_s": null,
-    "eta_severe_s": null,
-    "confidence": "high"
+    "congestion": {
+      "current": 28.0, "current_level": "low",
+      "predicted": 62.0, "predicted_level": "moderate",
+      "trend": "rising", "slope_per_min": 5.6,
+      "eta_moderate_s": 389, "eta_high_s": 836, "eta_severe_s": null,
+      "confidence": "high"
+    },
+    "loss": {
+      "current": 0.4, "current_level": "low",
+      "predicted": 0.6, "predicted_level": "low",
+      "trend": "stable", "slope_per_min": 0.02,
+      "eta_moderate_s": null, "eta_high_s": null, "eta_severe_s": null,
+      "confidence": "high"
+    },
+    "jitter": { ... },
+    "rtt":    { ... }
   }
 }
 ```
 
 With the JSON backend (no history), all ETAs are `null` and
-`confidence` is `"none"`.
+`confidence` is `"none"` for every metric.
 
 ---
 
-## 7. Online learning (fine-tuning)
+## 8. Online learning (fine-tuning)
 
 `POST /metrics/decision/train` runs one SGD step minimising the MSE between
 the model's current softmax output and a caller-supplied target distribution.
@@ -336,7 +354,7 @@ must be present; the call is a no-op otherwise.
 
 ---
 
-## 8. API endpoints
+## 9. API endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
@@ -346,8 +364,10 @@ must be present; the call is a no-op otherwise.
 | `GET` | `/metrics/decision?predict=true&horizon=600` | user | Predict 10 minutes ahead |
 | `GET` | `/metrics/decision?preemptive=false` | user | Skip history fetch; current snapshot only |
 | `GET` | `/metrics/decision?username=X` | admin | Decision for another user |
-| `GET` | `/metrics/congestion/forecast` | user | Per-interface congestion forecast |
-| `GET` | `/metrics/congestion/forecast?horizon=600&since=6h` | user | Longer window / horizon |
+| `GET` | `/metrics/quality/forecast` | user | Per-interface forecast: congestion, loss, jitter, RTT |
+| `GET` | `/metrics/quality/forecast?horizon=600&since=6h` | user | Longer window / horizon |
+| `GET` | `/metrics/user` | user | Metrics DB stats: entry count, first/last seen, interfaces |
+| `GET` | `/metrics/user?username=X` | admin | Stats for another user |
 | `POST` | `/metrics/decision/train` | user | Submit quality feedback |
 | `POST` | `/metrics/decision/reset` | admin | Reset model to heuristic init |
 
@@ -381,7 +401,7 @@ Adds a `"features"` block with the 19 normalised values used as model input:
 
 ---
 
-## 9. Fallback behaviour
+## 10. Fallback behaviour
 
 | Condition | Behaviour |
 |-----------|-----------|
@@ -391,9 +411,28 @@ Adds a `"features"` block with the 19 normalised values used as model input:
 | Model input size mismatch | Warning logged, fresh model used (feature set changed) |
 | No metrics stored for user | `GET /metrics/decision` returns `{}` |
 | All interfaces offline | Equal weights (128 each for 2 interfaces, min 1) |
+| EMA cold start (first call) | EMA initialised at current weights — no jump |
 | InfluxDB unavailable | Falls back to JSON file backend transparently |
 | `preemptive=true` with JSON backend | History fetch skipped; current snapshot only |
 | `predict=true` with JSON backend | Current snapshot used (no history available) |
 | `predict=true`, < 2 history points | Current snapshot used for that interface |
-| `congestion/forecast` with JSON backend | `confidence: "none"`, ETAs all `null` |
-| `congestion/forecast`, < 2 history points | `confidence: "none"` or `"low"` for that interface |
+| `quality/forecast` with JSON backend | `confidence: "none"`, ETAs all `null` for every metric |
+| `quality/forecast`, < 2 history points | `confidence: "none"` or `"low"` for that interface |
+| InfluxDB retention push fails | Warning logged; installer-set retention remains as hard floor |
+
+---
+
+## 11. InfluxDB configuration reference
+
+The `influxdb` block in `omr-admin-config.json` accepts:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `url` | — | InfluxDB 3 host URL (required to enable InfluxDB backend) |
+| `token` | — | Authentication token |
+| `org` | `"omr"` | Organisation (not used by InfluxDB 3 Core; kept for compatibility) |
+| `bucket` | `"omr_metrics"` | Database / bucket name |
+| `retention_days` | `60` | Data retention period pushed to InfluxDB at startup via `/api/v3/configure/database` |
+
+The latest-snapshot query window is fixed at **1 day** (much smaller than the
+retention period) to stay within InfluxDB 3 Core's Parquet file scan limits.
