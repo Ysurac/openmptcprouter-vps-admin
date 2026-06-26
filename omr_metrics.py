@@ -85,6 +85,13 @@ from starlette.responses import JSONResponse
 
 LOG = logging.getLogger('uvicorn.error')
 
+try:
+    import torch
+    import torch.nn as nn
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
 METRICS_FILE = '/etc/openmptcprouter-vps-admin/omr-metrics.json'
 OMR_CONFIG_FILE = '/etc/openmptcprouter-vps-admin/omr-admin-config.json'
 DECISION_MODEL_FILE = '/etc/openmptcprouter-vps-admin/omr-decision-model.pt'
@@ -107,23 +114,24 @@ _weight_ema: dict = {}   # {username: {interface: float}}
 _ema_lock = threading.Lock()
 
 
-def _apply_ema(username: str, weights: dict) -> dict:
-    """Blend *weights* (int, [1, 255]) with the per-user EMA history.
+def _apply_ema(username: str, probs: dict) -> dict:
+    """Blend float probabilities *probs* {iface: [0,1]} with the per-user EMA history.
 
-    First call for a username initialises the EMA at the current weights so
-    there is no cold-start jump.  Interfaces that disappear are evicted from
-    the EMA state automatically.
+    Operates on raw probabilities before integer conversion so that rounding
+    noise does not accumulate across iterations.  Returns a dict of floats.
+    First call initialises the EMA at the current probabilities (no cold-start
+    jump).  Interfaces that disappear are evicted automatically.
     """
-    if not weights:
-        return weights
+    if not probs:
+        return probs
     with _ema_lock:
         prev = _weight_ema.get(username, {})
         new_ema: dict = {}
-        for iface, w in weights.items():
-            p = prev.get(iface, float(w))   # no prior → start at current value
-            new_ema[iface] = EMA_ALPHA * float(w) + (1.0 - EMA_ALPHA) * p
+        for iface, p_new in probs.items():
+            p_prev = prev.get(iface, float(p_new))   # no prior → start at current
+            new_ema[iface] = EMA_ALPHA * float(p_new) + (1.0 - EMA_ALPHA) * p_prev
         _weight_ema[username] = new_ema
-    return {iface: max(1, round(v)) for iface, v in new_ema.items()}
+    return new_ema
 
 
 _stats_lock = threading.Lock()
@@ -343,25 +351,37 @@ class InfluxBackend:
     def _apply_retention(self):
         """Push the configured retention period to the InfluxDB 3 management API.
 
-        Uses POST /api/v3/configure/database (idempotent — creates or updates).
-        Logs a warning and continues if the call fails; the DB-level retention
-        set by the installer script remains as the hard floor.
+        Tries POST (create) first; on 409 Conflict (database already exists)
+        falls back to PATCH (update).  Logs a warning and continues on any
+        other error; the DB-level retention set by the installer remains as
+        the hard floor.
         """
         body = json.dumps({
             "db": self._bucket,
             "retention_period": f"{self._retention_days}d",
         }).encode()
-        req = urllib.request.Request(
-            self._url.rstrip("/") + "/api/v3/configure/database",
-            data=body,
-            method="POST",
-        )
-        req.add_header("Authorization", f"Token {self._token}")
-        req.add_header("Content-Type", "application/json")
-        try:
+        base_url = self._url.rstrip("/") + "/api/v3/configure/database"
+        headers = {
+            "Authorization": f"Token {self._token}",
+            "Content-Type": "application/json",
+        }
+
+        def _do_request(method: str):
+            req = urllib.request.Request(base_url, data=body, method=method)
+            for k, v in headers.items():
+                req.add_header(k, v)
             with urllib.request.urlopen(req, timeout=10) as resp:
-                LOG.info("omr_metrics: InfluxDB retention set to %d days (HTTP %s)",
-                         self._retention_days, resp.status)
+                return resp.status
+
+        try:
+            try:
+                status = _do_request("POST")
+            except urllib.error.HTTPError as exc:
+                if exc.code != 409:
+                    raise
+                status = _do_request("PATCH")
+            LOG.info("omr_metrics: InfluxDB retention set to %d days (HTTP %s)",
+                     self._retention_days, status)
         except Exception as exc:
             LOG.warning("omr_metrics: could not apply InfluxDB retention policy: %s", exc)
 
@@ -469,8 +489,7 @@ class InfluxBackend:
             f"SELECT time, interface, json_payload FROM {self._MEASUREMENT} "
             f"WHERE username = $username "
             f"AND time >= now() - interval '{since_seconds} seconds' "
-            f"ORDER BY time ASC "
-            f"LIMIT {int(limit)}"
+                f"ORDER BY time ASC"
         )
         try:
             table = self._client.query(sql, query_parameters={"username": username})
@@ -490,7 +509,9 @@ class InfluxBackend:
                     entry = json.loads(payload_str)
                     if "timestamp" not in entry and ts is not None:
                         entry["timestamp"] = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
-                    result.setdefault(iface, []).append(entry)
+                    entries = result.setdefault(iface, [])
+                    if len(entries) < int(limit):
+                        entries.append(entry)
                 except Exception:
                     pass
         except Exception as exc:
@@ -732,23 +753,25 @@ def _user_stats(username: str) -> dict:
 # for WAN metrics that are sampled every ~30 s.
 PREDICT_HALFLIFE_S: float = 300.0
 
-# (path, lo_clamp, hi_clamp) — path is a 1- or 2-tuple into the payload dict.
+# (path, lo_clamp, hi_clamp, halflife_s) — path is a 1- or 2-tuple into the payload.
 # Clamping keeps extrapolated values inside physically meaningful bounds.
+# halflife_s: exponential decay half-life for this metric — shorter for fast-changing
+# metrics (congestion), longer for slow-changing ones (bandwidth, signal).
 _PREDICTABLE: list = [
-    (("latency",),             0.0,   None),   # ms ≥ 0
-    (("loss",),                0.0,  100.0),   # % in [0, 100]
-    (("jitter",),              0.0,   None),   # ms ≥ 0
-    (("rtt_min",),             0.0,   None),   # ms ≥ 0
-    (("rtt_max",),             0.0,   None),   # ms ≥ 0
-    (("congestion", "score"),  0.0,  100.0),   # score in [0, 100]
-    (("bandwidth",  "rx_bps"), 0.0,   None),   # bytes/s ≥ 0
-    (("bandwidth",  "tx_bps"), 0.0,   None),
-    (("bbr",        "bw"),     0.0,   None),
-    (("signal",     "quality"),0.0,  100.0),   # % in [0, 100]
+    (("latency",),             0.0,   None,  180.0),   # ms ≥ 0
+    (("loss",),                0.0,  100.0,  180.0),   # % in [0, 100]
+    (("jitter",),              0.0,   None,  180.0),   # ms ≥ 0
+    (("rtt_min",),             0.0,   None,  180.0),   # ms ≥ 0
+    (("rtt_max",),             0.0,   None,  180.0),   # ms ≥ 0
+    (("congestion", "score"),  0.0,  100.0,  120.0),   # reacts quickly
+    (("bandwidth",  "rx_bps"), 0.0,   None,  600.0),   # slow trend
+    (("bandwidth",  "tx_bps"), 0.0,   None,  600.0),
+    (("bbr",        "bw"),     0.0,   None,  600.0),
+    (("signal",     "quality"),0.0,  100.0,  600.0),   # very slow
 ]
 
 # Public name kept for backward compatibility (used in tests and the doc).
-PREDICTABLE_FIELDS: list = [path for path, _, _ in _PREDICTABLE]
+PREDICTABLE_FIELDS: list = [path for path, _, _, _ in _PREDICTABLE]
 
 
 # ---------------------------------------------------------------------------
@@ -771,13 +794,15 @@ def _congestion_level(score: float) -> str:
     return "none"
 
 
-def _predict_congestion(history: list, horizon_s: int = 300) -> dict:
+def _predict_congestion(history: list, horizon_s: int = 300,
+                        halflife_s: float = 120.0) -> dict:
     """Return a congestion forecast dict for one interface.
 
     Keys: current_score, current_level, predicted_score, predicted_level,
           trend (rising|stable|falling), slope_per_min,
           eta_moderate_s, eta_high_s, eta_severe_s (seconds to threshold, None if never),
           confidence (high|medium|low|none).
+    halflife_s: EWL decay half-life (default 120 s — congestion is fast-changing).
     """
     timestamps: list = []
     scores: list = []
@@ -806,11 +831,12 @@ def _predict_congestion(history: list, horizon_s: int = 300) -> dict:
             "confidence": "none",
         }
 
-    predicted_raw = _linear_predict_at(timestamps, scores, now + horizon_s)
+    predicted_raw = _predict_at(timestamps, scores, now + horizon_s,
+                                halflife_s=halflife_s)
     predicted_score = round(max(0.0, min(100.0, predicted_raw)), 1)
     predicted_level = _congestion_level(predicted_score)
 
-    slope = _weighted_slope(timestamps, scores)   # score / second
+    slope = _weighted_slope(timestamps, scores, halflife_s=halflife_s)   # score / second
     slope_per_min = round((slope or 0.0) * 60.0, 3)
 
     if abs(slope_per_min) < 0.5:
@@ -892,6 +918,80 @@ def _linear_predict_at(timestamps: list, values: list, target_ts: float,
     return slope * (target_ts - t_mean) + v_mean
 
 
+# Minimum history length to engage the neural-network forecast path.
+_FORECAST_TORCH_MIN_POINTS: int = 5
+
+
+def _torch_predict_at(timestamps: list, values: list, target_ts: float,
+                      halflife_s: float = PREDICT_HALFLIFE_S) -> Optional[float]:
+    """Neural-network forecast using a small MLP with exponential sample weighting.
+
+    Trains a tiny 1→16→8→1 MLP on the (timestamp, value) history for 100 Adam
+    steps, then evaluates at *target_ts*.  Returns None when fewer than
+    _FORECAST_TORCH_MIN_POINTS valid samples are available so the caller can
+    fall back to the linear estimator.
+
+    Timestamps are normalised relative to the latest sample and *halflife_s* so
+    the optimiser operates on well-conditioned inputs regardless of metric scale.
+    The MLP can capture non-linear trends (e.g. exponential growth) that WLS
+    misses; L2 regularisation prevents wild extrapolation with short histories.
+    """
+    pairs = [
+        (float(t), float(v))
+        for t, v in zip(timestamps, values)
+        if t is not None and v is not None
+    ]
+    if len(pairs) < _FORECAST_TORCH_MIN_POINTS:
+        return None
+
+    ts_arr = [p[0] for p in pairs]
+    vs_arr = [p[1] for p in pairs]
+
+    t_ref = ts_arr[-1]
+    hl = halflife_s if halflife_s > 0 else 1.0
+    v_scale = max(abs(sum(vs_arr) / len(vs_arr)), 1e-9)
+
+    decay = math.log(2) / hl
+    t_norm = torch.tensor(
+        [(t - t_ref) / hl for t in ts_arr], dtype=torch.float32
+    ).unsqueeze(1)
+    v_norm = torch.tensor([v / v_scale for v in vs_arr], dtype=torch.float32)
+    weights = torch.tensor(
+        [math.exp(-decay * (t_ref - t)) for t in ts_arr], dtype=torch.float32
+    )
+
+    model = nn.Sequential(
+        nn.Linear(1, 16), nn.Tanh(),
+        nn.Linear(16, 8), nn.Tanh(),
+        nn.Linear(8, 1),
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+
+    for _ in range(100):
+        optimizer.zero_grad()
+        pred = model(t_norm).squeeze(1)
+        l2 = sum(p.pow(2).sum() for p in model.parameters()) * 1e-4
+        loss = (weights * (pred - v_norm).pow(2)).mean() + l2
+        loss.backward()
+        optimizer.step()
+
+    t_target = torch.tensor([[(target_ts - t_ref) / hl]], dtype=torch.float32)
+    with torch.no_grad():
+        result = model(t_target).item() * v_scale
+    return result
+
+
+def _predict_at(timestamps: list, values: list, target_ts: float,
+                halflife_s: float = PREDICT_HALFLIFE_S) -> Optional[float]:
+    """Forecast dispatcher: uses torch when available and history is sufficient,
+    otherwise falls back to exponentially weighted linear regression."""
+    if _TORCH_AVAILABLE:
+        result = _torch_predict_at(timestamps, values, target_ts, halflife_s)
+        if result is not None:
+            return result
+    return _linear_predict_at(timestamps, values, target_ts, halflife_s)
+
+
 def _weighted_slope(timestamps: list, values: list,
                     halflife_s: float = PREDICT_HALFLIFE_S) -> Optional[float]:
     """Exponentially weighted OLS slope (value/second) over (timestamp, value) pairs.
@@ -946,16 +1046,20 @@ def _metric_level(value: float, thresholds: list) -> str:
 def _forecast_metric(history: list, path: tuple, thresholds: list,
                      hi_clamp: Optional[float] = None,
                      stable_slope_per_min: float = 0.1,
-                     horizon_s: int = 300) -> dict:
+                     horizon_s: int = 300,
+                     halflife_s: Optional[float] = None) -> dict:
     """Exponentially weighted linear forecast for any scalar metric.
 
     path: tuple of keys to extract from each payload, e.g. ("loss",) or ("congestion", "score").
     thresholds: [(threshold, level_name), ...] sorted descending.
     hi_clamp: optional upper bound for the predicted value.
     stable_slope_per_min: abs(slope) below this is considered "stable".
+    halflife_s: EWL decay half-life; defaults to PREDICT_HALFLIFE_S when None.
 
     Returns current/predicted/trend/slope_per_min/eta_severe_s/eta_high_s/eta_moderate_s/confidence.
     """
+    hl = halflife_s if halflife_s is not None else PREDICT_HALFLIFE_S
+
     timestamps: list = []
     values: list = []
     for p in history:
@@ -977,7 +1081,7 @@ def _forecast_metric(history: list, path: tuple, thresholds: list,
     def _eta(threshold: float) -> Optional[int]:
         if len(timestamps) < 2 or current is None:
             return None
-        slope = _weighted_slope(timestamps, values)
+        slope = _weighted_slope(timestamps, values, halflife_s=hl)
         if not slope or slope <= 0:
             return None
         if current >= threshold:
@@ -1000,7 +1104,7 @@ def _forecast_metric(history: list, path: tuple, thresholds: list,
     if len(timestamps) < 2:
         return base
 
-    predicted_raw = _linear_predict_at(timestamps, values, now + horizon_s)
+    predicted_raw = _predict_at(timestamps, values, now + horizon_s, halflife_s=hl)
     if predicted_raw is not None:
         pred = max(0.0, predicted_raw)
         if hi_clamp is not None:
@@ -1009,7 +1113,7 @@ def _forecast_metric(history: list, path: tuple, thresholds: list,
     base["predicted_level"] = _metric_level(base["predicted"], thresholds) \
         if base["predicted"] is not None else "unknown"
 
-    slope = _weighted_slope(timestamps, values)
+    slope = _weighted_slope(timestamps, values, halflife_s=hl)
     slope_per_min = round((slope or 0.0) * 60.0, 4)
     base["slope_per_min"] = slope_per_min
 
@@ -1075,9 +1179,10 @@ def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
     exponentially weighted linear extrapolations *horizon_seconds* into the future.
 
     Each history entry must carry a 'timestamp' (Unix seconds) field; entries
-    without one are skipped for regression.  Falls back to the current value
-    when fewer than 2 timestamped points exist for a field.  Predicted values
-    are clamped to physically valid ranges (e.g. loss stays in [0, 100]).
+    without one are skipped for regression.  Predicted values are blended with
+    the current snapshot according to confidence (fewer history points → lean
+    toward current value) so that a 2-point history does not produce wild
+    extrapolations.  Clamped to physically valid ranges.
     """
     if not history:
         return {}
@@ -1085,7 +1190,7 @@ def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
     latest_ts = payload.get("timestamp") or time.time()
     target_ts = float(latest_ts) + horizon_seconds
 
-    for path, lo, hi in _PREDICTABLE:
+    for path, lo, hi, halflife in _PREDICTABLE:
         timestamps: list = []
         values: list = []
         for p in history:
@@ -1097,9 +1202,14 @@ def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
                 timestamps.append(float(ts))
                 values.append(float(v))
 
-        predicted = _linear_predict_at(timestamps, values, target_ts)
+        predicted = _predict_at(timestamps, values, target_ts, halflife_s=halflife)
         if predicted is None:
             continue
+
+        # Confidence blend: fewer points → lean toward current snapshot value.
+        n_pts = len(timestamps)
+        alpha = 1.0 if n_pts >= 5 else 0.7 if n_pts >= 3 else 0.4
+        predicted = alpha * predicted + (1.0 - alpha) * values[-1]
 
         if lo is not None:
             predicted = max(lo, predicted)
@@ -1127,10 +1237,10 @@ FEATURE_NAMES = [
     "inv_loss",        # 1 - clip(loss %,              0,   100) / 100
     "inv_jitter",      # 1 - clip(jitter ms,           0,   500) / 500
     "inv_congestion",  # 1 - clip(congestion.score,    0,   100) / 100
-    "rx_bps",          # clip(bandwidth.rx_bps,        0, 100 MB/s) / 100 MB/s
-    "tx_bps",          # clip(bandwidth.tx_bps,        0, 100 MB/s) / 100 MB/s
+    "rx_bps",          # log1p(rx_bps) / log1p(100 MB/s)  — log scale
+    "tx_bps",          # log1p(tx_bps) / log1p(100 MB/s)
     "signal",          # clip(signal.quality,          0,   100) / 100
-    "bbr_bw",          # clip(bbr.bw,                 0, 100 MB/s) / 100 MB/s
+    "bbr_bw",          # log1p(bbr.bw)  / log1p(100 MB/s)
     "inv_ecn",         # 1 - clip(tc.ecn_mark,         0,  1000) / 1000
     "inv_dropped",     # 1 - clip(tc.dropped,          0,  1000) / 1000
     "inv_rtt_spread",  # 1 - clip(rtt_max-rtt_min ms,  0,   500) / 500  (buffer bloat)
@@ -1138,6 +1248,8 @@ FEATURE_NAMES = [
     "signal_sinr",     # clip(sinr  + 20,              0,    50) / 50   (cellular)
     "inv_bbr_min_rtt", # 1 - clip(bbr.min_rtt ms,      0,  2000) / 2000 (clean RTT)
     "inv_predicted_congestion",  # predicted congestion score at +5 min horizon
+    "staleness",       # 1.0=fresh (<5 min old), 0.0=stale (≥5 min)
+    "inv_latency_std", # 1 - clip(latency std over history, 0, 500 ms) / 500
     # --- trend features (neutral 0.5 when history unavailable) ---
     "trend_latency",   # 0.5=stable, >0.5=improving, <0.5=degrading
     "trend_loss",
@@ -1146,11 +1258,12 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
-# Per-feature importance priors used to seed the first hidden neuron.
+# Per-feature importance priors used to seed all first-layer neurons.
 _FEATURE_IMPORTANCES = [
     2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5,  # original 10
     1.5, 0.6, 0.7, 1.0,                                   # new static 4
     2.0,                                                    # inv_predicted_congestion
+    1.8, 1.0,                                              # staleness, inv_latency_std
     1.2, 1.5, 0.8, 0.8,                                   # trend 4
 ]
 
@@ -1172,7 +1285,8 @@ def _predicted_congestion_feat(cong: dict, history: list) -> float:
             sc_list.append(float(s))
 
     if len(ts_list) >= 2:
-        pred_raw = _linear_predict_at(ts_list, sc_list, ts_list[-1] + PREDICT_HALFLIFE_S)
+        pred_raw = _linear_predict_at(ts_list, sc_list, ts_list[-1] + PREDICT_HALFLIFE_S,
+                                      halflife_s=120.0)
         if pred_raw is not None:
             pred_score = max(0.0, min(100.0, pred_raw))
             # Conservative: use worst of current vs predicted
@@ -1188,11 +1302,49 @@ def _predicted_congestion_feat(cong: dict, history: list) -> float:
     return 0.5   # neutral when no congestion data at all
 
 
+_LOG_BW_MAX = math.log1p(100e6)   # log1p(100 MB/s) — denominator for log-bw features
+
+
+def _log_bw(bps) -> float:
+    """Log-normalize bytes/s: log1p(bps) / log1p(100 MB/s) → [0, 1].
+
+    Provides good discrimination across the full range from 1 Mbps to 100 Mbps,
+    unlike linear normalization which compresses slow links near 0.
+    """
+    if bps is None:
+        return 0.0
+    return math.log1p(max(0.0, float(bps))) / _LOG_BW_MAX
+
+
+def _staleness_feat(payload: dict, max_age_s: float = 300.0) -> float:
+    """Return 1.0 when the snapshot is fresh, decaying to 0.0 at max_age_s."""
+    ts = payload.get("timestamp")
+    if ts is None:
+        return 0.5   # unknown age — neutral
+    age_s = max(0.0, time.time() - float(ts))
+    return max(0.0, 1.0 - age_s / max_age_s)
+
+
+def _latency_std_feat(history: list) -> float:
+    """Return inv_latency_std: 1 - clip(population std of latency, 0, 500 ms) / 500.
+
+    A stable-latency link (low std) scores near 1.0; a jittery link (high std)
+    scores near 0.0.  Falls back to 0.5 (neutral) when history is too sparse.
+    """
+    vals = [float(p["latency"]) for p in history if p.get("latency") is not None]
+    if len(vals) < 2:
+        return 0.5
+    mean = sum(vals) / len(vals)
+    std = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+    return max(0.0, 1.0 - min(std, 500.0) / 500.0)
+
+
 def _extract_features(payload: dict, history: Optional[list] = None) -> list:
     """Return an N_FEATURES list of floats in [0, 1] where higher = better.
 
     Missing values fall back to a neutral 0.5 (or 0.0 / 1.0 where noted).
-    Trend features (last 4) are computed from *history* when provided; otherwise 0.5.
+    Bandwidth features use log normalization (better discrimination for slow links).
+    Trend/std features (last 6) are computed from *history* when provided; else 0.5.
     """
     def _n(v, lo, hi, inv=False, default=0.5):
         if v is None:
@@ -1220,10 +1372,10 @@ def _extract_features(payload: dict, history: Optional[list] = None) -> list:
         _n(payload.get("loss"),     0,    100, inv=True),
         _n(payload.get("jitter"),   0,    500, inv=True),
         _n(cong.get("score"),       0,    100, inv=True),
-        _n(bw.get("rx_bps"),        0,  100e6, default=0.0),
-        _n(bw.get("tx_bps"),        0,  100e6, default=0.0),
+        _log_bw(bw.get("rx_bps")),           # log-scale, 0.0 when missing
+        _log_bw(bw.get("tx_bps")),
         _n(sig.get("quality"),      0,    100, default=0.5),
-        _n(bbr.get("bw"),           0,  100e6, default=0.0),
+        _log_bw(bbr.get("bw")),
         _n(tc.get("ecn_mark"),      0,   1000, inv=True, default=1.0),
         _n(tc.get("dropped"),       0,   1000, inv=True, default=1.0),
         # buffer bloat: rtt_max - rtt_min, lower spread = better
@@ -1236,6 +1388,10 @@ def _extract_features(payload: dict, history: Optional[list] = None) -> list:
         _n(bbr.get("min_rtt"),      0,   2000, inv=True),
         # predicted congestion at +5 min: use extrapolated score when history available
         _predicted_congestion_feat(cong, history or []),
+        # metric freshness: stale data should not drive routing decisions
+        _staleness_feat(payload),
+        # latency stability: low std = predictable link quality
+        _latency_std_feat(history or []),
     ]
     return static + _extract_trend_features(history or [])
 
@@ -1244,50 +1400,53 @@ def _extract_features(payload: dict, history: Optional[list] = None) -> list:
 # Decision engine — PyTorch model (optional, graceful 501 when absent)
 # ---------------------------------------------------------------------------
 
-try:
-    import torch
-    import torch.nn as nn
-    _TORCH_AVAILABLE = True
-
+if _TORCH_AVAILABLE:
     class InterfaceScorer(nn.Module):
         """2-hidden-layer MLP scoring WAN interfaces from their feature vectors.
 
         Input:  (n_interfaces, N_FEATURES) — all features in [0, 1], higher = better
         Output: (n_interfaces,) unnormalized scores
         Apply softmax externally across the interface dimension to get weights.
+        Dropout(0.1) regularizes against overfitting on sparse user feedback.
         """
         def __init__(self):
             super().__init__()
             self.net = nn.Sequential(
-                nn.Linear(N_FEATURES, 24), nn.ReLU(),
-                nn.Linear(24, 8),          nn.ReLU(),
-                nn.Linear(8, 1),
+                nn.Linear(N_FEATURES, 32), nn.ReLU(), nn.Dropout(0.1),
+                nn.Linear(32, 16),         nn.ReLU(), nn.Dropout(0.1),
+                nn.Linear(16, 1),
             )
 
         def forward(self, x: "torch.Tensor") -> "torch.Tensor":
             return self.net(x).squeeze(-1)
 
-except ImportError:
-    _TORCH_AVAILABLE = False
-
 _decision_model = None
 _model_lock = threading.RLock()
+_optimizer = None   # persistent Adam; reset when model is reset
 
 
 def _make_model():
-    """Create a fresh InterfaceScorer with heuristic-informed initial weights."""
+    """Create a fresh InterfaceScorer with heuristic-informed initial weights.
+
+    All 32 neurons of the first layer are seeded with noisy variants of the
+    feature-importance vector so that multiple neurons start near the prior
+    rather than only the first one.
+    """
     model = InterfaceScorer()
     imp = torch.tensor(_FEATURE_IMPORTANCES, dtype=torch.float32)
     imp = imp / imp.norm()
     with torch.no_grad():
-        # Prime the first hidden neuron to approximate the hand-crafted score.
-        nn.init.xavier_uniform_(model.net[0].weight)
-        model.net[0].weight.data[0] = imp
+        n_hidden = model.net[0].weight.shape[0]
+        for i in range(n_hidden):
+            noise = torch.randn_like(imp) * 0.15
+            row = imp + noise
+            model.net[0].weight.data[i] = row / row.norm().clamp(min=1e-6)
         model.net[0].bias.data.zero_()
-        nn.init.xavier_uniform_(model.net[2].weight)
-        model.net[2].bias.data.zero_()
-        nn.init.xavier_uniform_(model.net[4].weight)
-        model.net[4].bias.data.zero_()
+        # net[1]=ReLU net[2]=Dropout net[3]=Linear(32,16) net[4]=ReLU net[5]=Dropout net[6]=Linear(16,1)
+        nn.init.xavier_uniform_(model.net[3].weight)
+        model.net[3].bias.data.zero_()
+        nn.init.xavier_uniform_(model.net[6].weight)
+        model.net[6].bias.data.zero_()
     model.eval()
     return model
 
@@ -1356,13 +1515,16 @@ def _apply_cost(raw: list, interfaces: list, user_data: dict) -> list:
 
 def _compute_weights_heuristic(user_data: dict,
                                history_data: Optional[dict] = None) -> dict:
-    """Compute interface weights without PyTorch, using congestion score as the
-    primary signal.  Falls back to latency and loss when congestion is absent.
-    Offline interfaces (status != 'online' or no latency) get weight 1.
+    """Compute interface weights without PyTorch using all available signals.
 
-    *history_data* is {interface: [payload, ...]}; when provided the congestion
-    score is replaced with the worst of current vs predicted (+5 min horizon) so
-    that rising congestion is penalised before it fully manifests.
+    Scoring (when online): weighted blend of congestion, latency, loss, jitter,
+    signal quality, and ECN marks.  When congestion is available it dominates
+    (60 %); otherwise latency + loss carry more weight.  Offline interfaces
+    score 0.  Congestion is replaced with the worst of current vs predicted
+    (+5 min) when history is available.
+
+    Returns {"probs": {...floats...}, "scores": {...}} for consistency with
+    _compute_weights so the route applies EMA and int conversion uniformly.
     """
     _t0 = time.perf_counter()
     interfaces = list(user_data.keys())
@@ -1375,9 +1537,18 @@ def _compute_weights_heuristic(user_data: dict,
             raw.append(0.0)
             continue
 
-        cong  = (p.get("congestion") or {}).get("score")   # 0-100, lower = better
-        loss  = p.get("loss")                               # %, lower = better
-        lat   = latency                                     # ms, lower = better
+        lat   = float(latency)
+        loss  = p.get("loss")
+        jitter = p.get("jitter")
+        sig_q = (p.get("signal") or {}).get("quality")
+        ecn   = (p.get("tc") or {}).get("ecn_mark")
+        cong  = (p.get("congestion") or {}).get("score")
+
+        lat_q    = max(0.0, 1.0 - min(lat, 2000.0) / 2000.0)
+        loss_q   = max(0.0, 1.0 - min(float(loss),   100.0) / 100.0) if loss   is not None else 0.5
+        jitter_q = max(0.0, 1.0 - min(float(jitter), 500.0) / 500.0) if jitter is not None else 0.5
+        signal_q = min(float(sig_q), 100.0) / 100.0                   if sig_q  is not None else 0.5
+        ecn_q    = max(0.0, 1.0 - min(float(ecn), 1000.0) / 1000.0)  if ecn    is not None else 1.0
 
         if cong is not None:
             effective_cong = float(cong)
@@ -1386,15 +1557,13 @@ def _compute_weights_heuristic(user_data: dict,
                 fc = _predict_congestion(hist, horizon_s=300)
                 pred = fc.get("predicted_score")
                 if pred is not None:
-                    # Conservative: penalise for predicted congestion even while
-                    # current reading is still low.
                     effective_cong = max(effective_cong, pred)
-            quality = max(0.0, 100.0 - effective_cong) / 100.0
+            cong_q = max(0.0, 100.0 - effective_cong) / 100.0
+            quality = (0.55 * cong_q + 0.15 * lat_q + 0.10 * loss_q
+                       + 0.10 * jitter_q + 0.05 * signal_q + 0.05 * ecn_q)
         else:
-            # Derive a proxy from latency + loss when congestion is missing.
-            lat_q  = max(0.0, 1.0 - min(float(lat),  2000.0) / 2000.0)
-            loss_q = max(0.0, 1.0 - min(float(loss),  100.0) / 100.0) if loss is not None else 0.5
-            quality = (lat_q + loss_q) / 2.0
+            quality = (0.35 * lat_q + 0.28 * loss_q + 0.20 * jitter_q
+                       + 0.10 * signal_q + 0.07 * ecn_q)
 
         raw.append(quality)
 
@@ -1404,10 +1573,9 @@ def _compute_weights_heuristic(user_data: dict,
     _stats_inc("heuristic_count", "heuristic_total_ms", elapsed_ms)
     _stats_update(last_heuristic_ms=round(elapsed_ms, 3))
 
-    n = len(interfaces)
     return {
-        "weights": {iface: max(1, round(raw[i] * n * 100)) for i, iface in enumerate(interfaces)},
-        "scores":  {iface: round(raw[i] * 100, 2)          for i, iface in enumerate(interfaces)},
+        "probs":  {iface: raw[i]               for i, iface in enumerate(interfaces)},
+        "scores": {iface: round(raw[i] * 100, 2) for i, iface in enumerate(interfaces)},
     }
 
 
@@ -1456,18 +1624,16 @@ def _compute_weights(user_data: dict, explain: bool = False,
 
     raw_weights = _apply_cost(raw_weights, interfaces, user_data)
 
-    # Weights: integers [1, 255] for ip route nexthop weight (higher = higher priority).
-    # Scores:  softmax × 100, rounded to 2 dp — quality percentage [0, 100].
-    int_weights = [max(1, round(w * 255)) for w in raw_weights]
-    scores_pct  = [round(w * 100, 2) for w in raw_weights]
+    scores_pct = [round(w * 100, 2) for w in raw_weights]
 
     elapsed_ms = (time.perf_counter() - _t0) * 1000.0
     _stats_inc("inference_count", "inference_total_ms", elapsed_ms)
     _stats_update(last_inference_ms=round(elapsed_ms, 3))
 
+    # Return raw probabilities so the route can EMA them before int conversion.
     result: dict = {
-        "weights": {iface: int_weights[i] for i, iface in enumerate(interfaces)},
-        "scores":  {iface: scores_pct[i]  for i, iface in enumerate(interfaces)},
+        "probs":  {iface: raw_weights[i]  for i, iface in enumerate(interfaces)},
+        "scores": {iface: scores_pct[i]   for i, iface in enumerate(interfaces)},
     }
     if explain:
         result["features"] = {
@@ -1477,35 +1643,50 @@ def _compute_weights(user_data: dict, explain: bool = False,
     return result
 
 
-def _train_step(user_data: dict, target_weights: dict, lr: float) -> float:
-    """One SGD step minimising MSE between predicted and target weights.
+def _train_step(user_data: dict, target_weights: dict, lr: float,
+                history_data: Optional[dict] = None) -> float:
+    """One Adam step minimising KL-divergence between predicted and target distributions.
 
-    Returns the scalar loss value. Saves the model after training.
+    KL-divergence is the correct loss for softmax outputs against a probability
+    target.  The optimizer is persistent across calls so Adam's moment estimates
+    accumulate over multiple feedback rounds.  Returns the scalar loss value.
     At least two interfaces are required; returns 0.0 otherwise.
     """
+    global _optimizer
     interfaces = list(user_data.keys())
     if len(interfaces) < 2:
         return 0.0
 
     _t0 = time.perf_counter()
-    features = {iface: _extract_features(payload) for iface, payload in user_data.items()}
+    hist = history_data or {}
+    features = {
+        iface: _extract_features(payload, history=hist.get(iface))
+        for iface, payload in user_data.items()
+    }
     feat_tensor_data = [features[iface] for iface in interfaces]
     target_data = [float(target_weights.get(iface, 0.0)) for iface in interfaces]
+    if any((not math.isfinite(v)) or v < 0.0 for v in target_data):
+        raise ValueError("Target weights must be finite and non-negative")
 
     with _model_lock:
         model = _get_model()
+        if _optimizer is None:
+            _optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        # Apply user-supplied lr as a clipped one-shot override.
+        for pg in _optimizer.param_groups:
+            pg["lr"] = max(1e-5, min(0.05, float(lr)))
         feat_tensor = torch.tensor(feat_tensor_data, dtype=torch.float32)
         target = torch.tensor(target_data, dtype=torch.float32)
         total = target.sum()
-        if total > 0:
-            target = target / total
+        if total <= 0:
+            raise ValueError("Target weights must assign positive mass to at least one interface")
+        target = target / total
         model.train()
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
-        optimizer.zero_grad()
-        pred = torch.softmax(model(feat_tensor), dim=0)
-        loss = torch.nn.functional.mse_loss(pred, target)
+        _optimizer.zero_grad()
+        log_pred = torch.log_softmax(model(feat_tensor), dim=0)
+        loss = torch.nn.functional.kl_div(log_pred, target, reduction="batchmean")
         loss.backward()
-        optimizer.step()
+        _optimizer.step()
         model.eval()
         loss_val = float(loss)
 
@@ -1729,6 +1910,27 @@ def _engine_diagnostics() -> dict:
     }
 
 
+def _validate_feedback_weights(user_data: dict, weights: Dict[str, float]) -> dict:
+    """Validate free-form training weights against known interfaces.
+
+    Accepts partial mappings but requires at least one known interface to carry
+    a strictly positive finite weight.
+    """
+    target_weights: dict = {}
+    total = 0.0
+    for iface in user_data:
+        value = float(weights.get(iface, 0.0))
+        if not math.isfinite(value):
+            raise ValueError(f"Invalid weight for interface: {iface}")
+        if value < 0.0:
+            raise ValueError(f"Negative weight not allowed for interface: {iface}")
+        target_weights[iface] = value
+        total += value
+    if total <= 0.0:
+        raise ValueError("Provide at least one positive weight for a known interface")
+    return target_weights
+
+
 # ---------------------------------------------------------------------------
 # Router factory — avoids circular imports with omradmin.py
 # ---------------------------------------------------------------------------
@@ -1856,8 +2058,11 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         else:
             result = _compute_weights(user_data, explain=explain, history_data=history_data)
 
-        smoothed = _apply_ema(target, result.get("weights", {}))
-        return {**result, "weights": smoothed}
+        # EMA on raw probabilities (floats) then convert to [1, 255] integers.
+        smoothed_probs = _apply_ema(target, result.get("probs", {}))
+        int_weights = {iface: max(1, round(p * 255)) for iface, p in smoothed_probs.items()}
+        output = {k: v for k, v in result.items() if k != "probs"}
+        return {**output, "weights": int_weights}
 
     @router.get('/metrics/quality/forecast',
                 summary="Combined quality forecast: congestion, loss, jitter and RTT per WAN interface")
@@ -1900,18 +2105,22 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                 "congestion": _forecast_metric(
                     hist, ("congestion", "score"), _CONGESTION_LEVELS,
                     hi_clamp=100.0, stable_slope_per_min=0.5, horizon_s=horizon,
+                    halflife_s=120.0,   # congestion reacts quickly
                 ),
                 "loss": _forecast_metric(
                     hist, ("loss",), _LOSS_THRESHOLDS,
                     hi_clamp=100.0, stable_slope_per_min=0.1, horizon_s=horizon,
+                    halflife_s=180.0,
                 ),
                 "jitter": _forecast_metric(
                     hist, ("jitter",), _JITTER_THRESHOLDS,
                     hi_clamp=None, stable_slope_per_min=0.5, horizon_s=horizon,
+                    halflife_s=180.0,
                 ),
                 "rtt": _forecast_metric(
                     hist, ("rtt_min",), _RTT_THRESHOLDS,
                     hi_clamp=None, stable_slope_per_min=2.0, horizon_s=horizon,
+                    halflife_s=180.0,
                 ),
             }
 
@@ -1927,7 +2136,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         if not _TORCH_AVAILABLE:
             return _501
         from fastapi import HTTPException
-        target = username if current_user.permissions == "admin" and username else current_user.username
+        if current_user.permissions != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        target = username if username else current_user.username
         user_data = _read_user(target)
         if not user_data:
             raise HTTPException(status_code=404, detail="No metrics stored for this user")
@@ -1943,13 +2154,28 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                 for iface in user_data
             }
         elif feedback.weights:
-            target_weights = {
-                iface: float(feedback.weights.get(iface, 0.0)) for iface in user_data
-            }
+            try:
+                target_weights = _validate_feedback_weights(user_data, feedback.weights)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         else:
             raise HTTPException(status_code=422, detail="Provide 'best_interface' or 'weights'")
 
-        loss = _train_step(user_data, target_weights, feedback.learning_rate)
+        history_data: dict = {}
+        if not isinstance(_get_backend(), JSONBackend):
+            async def _hfetch(iface):
+                return iface, await asyncio.to_thread(_read_history, target, iface, 3600, 60)
+
+            for iface, hist in await asyncio.gather(*[_hfetch(i) for i in user_data]):
+                if hist:
+                    history_data[iface] = hist
+
+        loss = _train_step(
+            user_data,
+            target_weights,
+            feedback.learning_rate,
+            history_data=history_data,
+        )
         _save_model(_get_model())
         return {"result": "ok", "loss": round(loss, 6)}
 
@@ -1961,9 +2187,10 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         from fastapi import HTTPException
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        global _decision_model
+        global _decision_model, _optimizer
         with _model_lock:
             _decision_model = _make_model()
+            _optimizer = None   # force a fresh Adam for the new model
             _save_model(_decision_model)
         with _stats_lock:
             _engine_stats["model_resets"] += 1

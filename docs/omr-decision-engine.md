@@ -12,7 +12,7 @@ Higher weight = more traffic sent through that gateway.
 Interface metrics (JSON)
         │
         ▼
-  [optional] Predictive extrapolation   linear regression → future snapshot
+  [optional] Predictive extrapolation   MLP (torch) or linear regression → future snapshot
         │   (predict=true)
         ▼
   Feature extraction          19 floats in [0, 1], higher = better
@@ -261,8 +261,17 @@ Non-numeric and non-listed fields (status, device, IP…) are preserved from
 the latest snapshot.  If fewer than 2 timestamped points exist for an
 interface, its current snapshot is used unchanged.
 
-All extrapolations use exponentially weighted linear regression (half-life
-300 s) and are clamped to physically valid ranges (e.g. loss stays in [0, 100]).
+When PyTorch is installed and at least 5 timestamped history points are
+available for an interface, extrapolations use a small neural network
+(MLP: Linear(1→16)→Tanh→Linear(16→8)→Tanh→Linear(8→1)) trained online on the
+history window with exponential sample weighting (half-life per metric).
+This path can capture non-linear trends that linear regression misses.
+
+When PyTorch is absent, or for interfaces with fewer than 5 points, extrapolations
+fall back to **exponentially weighted linear regression** (half-life 300 s).
+
+All extrapolated values are clamped to physically valid ranges (e.g. loss stays
+in [0, 100]).
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
@@ -276,6 +285,19 @@ All extrapolations use exponentially weighted linear regression (half-life
 `GET /metrics/quality/forecast` returns a combined quality forecast for every
 WAN interface covering four metrics: **congestion**, **loss**, **jitter**, and
 **RTT**, independent of the weight decision.
+
+### Forecast backend
+
+| Condition | Method |
+|-----------|--------|
+| PyTorch installed, ≥ 5 history points | MLP trained online on the history window (can capture curves) |
+| PyTorch installed, < 5 history points | Exponentially weighted linear regression (fallback) |
+| PyTorch not installed | Exponentially weighted linear regression |
+
+The MLP is a fresh 1→16→8→1 network trained for 100 Adam steps each call, with
+exponential sample weighting (half-life per metric) and L2 regularisation to
+prevent wild extrapolation.  Predictions from both methods are clamped to
+physically valid ranges and labelled with a `confidence` level.
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
@@ -418,6 +440,8 @@ Adds a `"features"` block with the 19 normalised values used as model input:
 | `predict=true`, < 2 history points | Current snapshot used for that interface |
 | `quality/forecast` with JSON backend | `confidence: "none"`, ETAs all `null` for every metric |
 | `quality/forecast`, < 2 history points | `confidence: "none"` or `"low"` for that interface |
+| `quality/forecast`, PyTorch not installed | Linear regression used for all extrapolations |
+| `quality/forecast`, < 5 history points per interface | MLP path bypassed; linear regression used |
 | InfluxDB retention push fails | Warning logged; installer-set retention remains as hard floor |
 
 ---

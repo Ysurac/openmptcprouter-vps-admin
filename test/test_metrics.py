@@ -690,9 +690,11 @@ class TestExtractFeatures:
         assert abs(feats[omr_metrics.FEATURE_NAMES.index("signal")] - 0.8) < 1e-6
 
     def test_bbr_bw_normalized(self):
+        import math
         payload = {**_WAN, "bbr": {**_WAN["bbr"], "bw": 50_000_000}}
         feats = omr_metrics._extract_features(payload)
-        assert abs(feats[omr_metrics.FEATURE_NAMES.index("bbr_bw")] - 0.5) < 1e-6
+        expected = math.log1p(50_000_000) / math.log1p(100e6)
+        assert abs(feats[omr_metrics.FEATURE_NAMES.index("bbr_bw")] - expected) < 1e-6
 
     def test_ecn_mark_inverted(self):
         payload = {**_WAN, "tc": {**_WAN["tc"], "ecn_mark": 1000}}
@@ -902,21 +904,21 @@ class TestCostFactor:
         user_data = {"wan": wan, "wan2": wan2}
         # Both interfaces are identical except for cost — wan should win.
         result = omr_metrics._compute_weights_heuristic(user_data)
-        assert result["weights"]["wan"] > result["weights"]["wan2"]
+        assert result["probs"]["wan"] > result["probs"]["wan2"]
 
     def test_equal_costs_do_not_change_relative_order(self):
         wan  = {**_WAN,  "cost": 10}
         wan2 = {**_WAN2, "cost": 10}
         result_with    = omr_metrics._compute_weights_heuristic({"wan": wan,  "wan2": wan2})
         result_without = omr_metrics._compute_weights_heuristic({"wan": _WAN, "wan2": _WAN2})
-        assert result_with["weights"]["wan"] == result_without["weights"]["wan"]
+        assert result_with["probs"]["wan"] == result_without["probs"]["wan"]
 
     def test_cost_zero_treated_as_no_cost(self):
         # cost=0 must not cause division by zero — falls back to neutral factor.
         result = omr_metrics._compute_weights_heuristic(
             {"wan": {**_WAN, "cost": 0}, "wan2": _WAN2}
         )
-        assert "wan" in result["weights"]
+        assert "wan" in result["probs"]
 
 
 # ===========================================================================
@@ -931,8 +933,8 @@ class TestGetDecision:
     """
 
     _FAKE_RESULT = {
-        "weights": {"wan": 0.7, "wan2": 0.3},
-        "scores":  {"wan": 1.5, "wan2": 0.2},
+        "probs":  {"wan": 0.7, "wan2": 0.3},
+        "scores": {"wan": 1.5, "wan2": 0.2},
     }
 
     def test_uses_heuristic_when_torch_not_available(self, user_client):
@@ -1042,24 +1044,30 @@ class TestTrainDecision:
             url += "?" + "&".join(f"{k}={v}" for k, v in query.items())
         return client.post(url, json=body)
 
-    def test_returns_501_when_torch_not_available(self, user_client):
-        r = self._post(user_client, {"best_interface": "wan"})
+    def test_returns_501_when_torch_not_available(self, admin_client):
+        r = self._post(admin_client, {"best_interface": "wan"})
         assert r.status_code == 501
 
-    def test_returns_404_when_no_metrics(self, user_client):
+    def test_non_admin_returns_403(self, user_client):
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", True):
+            r = self._post(user_client, {"best_interface": "wan"})
+        assert r.status_code == 403
+
+    def test_returns_404_when_no_metrics(self, admin_client):
         with (
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_read_user", return_value={}),
         ):
-            r = self._post(user_client, {"best_interface": "wan"})
+            r = self._post(admin_client, {"best_interface": "wan"})
         assert r.status_code == 404
 
-    def test_train_with_best_interface(self, user_client):
+    def test_train_with_best_interface(self, admin_client):
         captured = {}
 
-        def fake_train(user_data, target_weights, lr):
+        def fake_train(user_data, target_weights, lr, history_data=None):
             captured["target"] = target_weights
             captured["lr"] = lr
+            captured["history_data"] = history_data
             return 0.05
 
         with (
@@ -1069,18 +1077,20 @@ class TestTrainDecision:
             patch.object(omr_metrics, "_get_model", return_value=MagicMock()),
             patch.object(omr_metrics, "_save_model"),
         ):
-            r = self._post(user_client, {"best_interface": "wan"})
+            r = self._post(admin_client, {"best_interface": "wan"})
 
         assert r.status_code == 200
         assert r.json()["result"] == "ok"
         assert captured["target"]["wan"] == 1.0
         assert captured["target"]["wan2"] == 0.0
+        assert captured["history_data"] == {}
 
-    def test_train_with_free_form_weights(self, user_client):
+    def test_train_with_free_form_weights(self, admin_client):
         captured = {}
 
-        def fake_train(user_data, target_weights, lr):
+        def fake_train(user_data, target_weights, lr, history_data=None):
             captured["target"] = target_weights
+            captured["history_data"] = history_data
             return 0.03
 
         with (
@@ -1090,16 +1100,71 @@ class TestTrainDecision:
             patch.object(omr_metrics, "_get_model", return_value=MagicMock()),
             patch.object(omr_metrics, "_save_model"),
         ):
-            r = self._post(user_client, {"weights": {"wan": 0.8, "wan2": 0.2}})
+            r = self._post(admin_client, {"weights": {"wan": 0.8, "wan2": 0.2}})
 
         assert r.status_code == 200
         assert captured["target"]["wan"] == 0.8
         assert captured["target"]["wan2"] == 0.2
+        assert captured["history_data"] == {}
 
-    def test_custom_learning_rate_forwarded(self, user_client):
+    def test_train_fetches_history_for_feature_alignment(self, admin_client):
+        captured = {}
+        hist = _history_at(_WAN, [{"latency": 25.0}] * 3)
+
+        def fake_train(user_data, target_weights, lr, history_data=None):
+            captured["history_data"] = history_data
+            return 0.01
+
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+            patch.object(omr_metrics, "_read_history", return_value=hist) as mock_hist,
+            patch.object(omr_metrics, "_get_backend",
+                         return_value=MagicMock(spec=omr_metrics.InfluxBackend)),
+            patch.object(omr_metrics, "_train_step", side_effect=fake_train),
+            patch.object(omr_metrics, "_get_model", return_value=MagicMock()),
+            patch.object(omr_metrics, "_save_model"),
+        ):
+            r = self._post(admin_client, {"best_interface": "wan"})
+
+        assert r.status_code == 200
+        assert mock_hist.call_count == 2
+        assert captured["history_data"] == {"wan": hist, "wan2": hist}
+
+    def test_negative_free_form_weight_returns_422(self, admin_client):
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+        ):
+            r = self._post(admin_client, {"weights": {"wan": -0.1, "wan2": 1.1}})
+
+        assert r.status_code == 422
+        assert "Negative weight" in r.json()["detail"]
+
+    def test_zero_sum_free_form_weights_returns_422(self, admin_client):
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+        ):
+            r = self._post(admin_client, {"weights": {"wan": 0.0, "wan2": 0.0}})
+
+        assert r.status_code == 422
+        assert "positive weight" in r.json()["detail"]
+
+    def test_unknown_only_free_form_weights_returns_422(self, admin_client):
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+        ):
+            r = self._post(admin_client, {"weights": {"doesnotexist": 1.0}})
+
+        assert r.status_code == 422
+        assert "known interface" in r.json()["detail"]
+
+    def test_custom_learning_rate_forwarded(self, admin_client):
         captured = {}
 
-        def fake_train(user_data, target_weights, lr):
+        def fake_train(user_data, target_weights, lr, history_data=None):
             captured["lr"] = lr
             return 0.0
 
@@ -1110,27 +1175,27 @@ class TestTrainDecision:
             patch.object(omr_metrics, "_get_model", return_value=MagicMock()),
             patch.object(omr_metrics, "_save_model"),
         ):
-            self._post(user_client, {"best_interface": "wan", "learning_rate": 0.005})
+            self._post(admin_client, {"best_interface": "wan", "learning_rate": 0.005})
 
         assert captured["lr"] == 0.005
 
-    def test_unknown_best_interface_returns_422(self, user_client):
+    def test_unknown_best_interface_returns_422(self, admin_client):
         with (
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
         ):
-            r = self._post(user_client, {"best_interface": "doesnotexist"})
+            r = self._post(admin_client, {"best_interface": "doesnotexist"})
         assert r.status_code == 422
 
-    def test_no_feedback_field_returns_422(self, user_client):
+    def test_no_feedback_field_returns_422(self, admin_client):
         with (
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
         ):
-            r = self._post(user_client, {})
+            r = self._post(admin_client, {})
         assert r.status_code == 422
 
-    def test_loss_included_in_response(self, user_client):
+    def test_loss_included_in_response(self, admin_client):
         with (
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
@@ -1138,10 +1203,10 @@ class TestTrainDecision:
             patch.object(omr_metrics, "_get_model", return_value=MagicMock()),
             patch.object(omr_metrics, "_save_model"),
         ):
-            r = self._post(user_client, {"best_interface": "wan"})
+            r = self._post(admin_client, {"best_interface": "wan"})
         assert r.json()["loss"] == 0.123456
 
-    def test_model_saved_after_training(self, user_client):
+    def test_model_saved_after_training(self, admin_client):
         with (
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
@@ -1149,7 +1214,7 @@ class TestTrainDecision:
             patch.object(omr_metrics, "_get_model", return_value=MagicMock()),
             patch.object(omr_metrics, "_save_model") as mock_save,
         ):
-            self._post(user_client, {"best_interface": "wan"})
+            self._post(admin_client, {"best_interface": "wan"})
         mock_save.assert_called_once()
 
     def test_unauthenticated_returns_403(self, unauth_client):
@@ -1208,6 +1273,10 @@ class _FakeTensor:
     def __setitem__(self, i, v):  self._data[i] = float(v)
     def __iter__(self):           return (_FakeTensor([v]) for v in self._data)
     def __gt__(self, other):      return self._data[0] > float(other)
+    def __ge__(self, other):      return self._data[0] >= float(other)
+    def __lt__(self, other):      return self._data[0] < float(other)
+    def __le__(self, other):      return self._data[0] <= float(other)
+    def __eq__(self, other):      return self._data[0] == float(other)
     def __truediv__(self, other): return _FakeTensor([v / float(other) for v in self._data])
 
     def sum(self):   return _FakeTensor([sum(self._data)])
@@ -1225,13 +1294,22 @@ class _Fake2DTensor:
 
 
 class _FakeSGD:
-    def __init__(self, params, lr=0.01): pass
+    def __init__(self, params, lr=0.01):
+        self.param_groups = [{"lr": lr}]
+    def zero_grad(self): pass
+    def step(self): pass
+
+
+class _FakeAdam:
+    def __init__(self, params, lr=1e-3):
+        self.param_groups = [{"lr": lr}]
     def zero_grad(self): pass
     def step(self): pass
 
 
 class _FakeOptim:
-    SGD = _FakeSGD
+    SGD  = _FakeSGD
+    Adam = _FakeAdam
 
 
 def _fake_mse_loss(pred, target):
@@ -1242,8 +1320,17 @@ def _fake_mse_loss(pred, target):
     return _FakeTensor([mse])
 
 
+def _fake_kl_div(log_input, target, reduction="batchmean"):
+    n = len(log_input)
+    li = [float(log_input[i]) for i in range(n)]
+    td = [float(target[i]) for i in range(n)]
+    kl = sum(t * (math.log(max(t, 1e-10)) - p) for t, p in zip(td, li))
+    return _FakeTensor([kl / max(n, 1)])
+
+
 class _FakeFunctional:
     mse_loss = staticmethod(_fake_mse_loss)
+    kl_div   = staticmethod(_fake_kl_div)
 
 
 class _FakeInit:
@@ -1271,6 +1358,13 @@ class _FakeTorch:
         def _noop():
             yield
         return _noop()
+
+    def log_softmax(self, tensor, dim=0):
+        data = [float(tensor[i]) for i in range(len(tensor))]
+        max_v = max(data) if data else 0.0
+        exps = [math.exp(v - max_v) for v in data]
+        total = sum(exps) or 1.0
+        return _FakeTensor([math.log(max(e / total, 1e-10)) for e in exps])
 
     def softmax(self, tensor, dim=0):
         data = [float(tensor[i]) for i in range(len(tensor))]
@@ -1323,6 +1417,7 @@ def torch_env():
     with (
         patch.dict(omr_metrics.__dict__, {"torch": _fake_torch}),
         patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+        patch.object(omr_metrics, "_optimizer", None),
     ):
         yield _fake_torch
 
@@ -1336,16 +1431,16 @@ class TestComputeWeights:
         model = _FakeModel(scores=[2.0, 1.0])
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights({"wan": _WAN, "wan2": _WAN2})
-        assert "weights" in result
+        assert "probs" in result
         assert "scores" in result
 
     def test_weights_are_positive_integers(self, torch_env):
         model = _FakeModel(scores=[3.0, 1.0])
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights({"wan": _WAN, "wan2": _WAN2})
-        for w in result["weights"].values():
-            assert isinstance(w, int)
-            assert w >= 1
+        for p in result["probs"].values():
+            assert isinstance(p, float)
+            assert 0.0 <= p <= 1.0
 
     def test_scores_sum_to_100(self, torch_env):
         model = _FakeModel(scores=[3.0, 1.0])
@@ -1359,38 +1454,38 @@ class TestComputeWeights:
         data = {"eth0": _WAN, "lte0": _MODEM_WAN, "wlan0": _WIFI_WAN}
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights(data)
-        assert set(result["weights"].keys()) == {"eth0", "lte0", "wlan0"}
-        assert set(result["scores"].keys())  == {"eth0", "lte0", "wlan0"}
+        assert set(result["probs"].keys()) == {"eth0", "lte0", "wlan0"}
+        assert set(result["scores"].keys()) == {"eth0", "lte0", "wlan0"}
 
     def test_higher_raw_score_yields_higher_weight(self, torch_env):
-        # wan gets score 5.0, wan2 gets 1.0 → wan's weight must be larger
+        # wan gets score 5.0, wan2 gets 1.0 → wan's prob must be larger
         model = _FakeModel(scores=[5.0, 1.0])
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights({"wan": _WAN, "wan2": _WAN2})
-        assert result["weights"]["wan"] > result["weights"]["wan2"]
+        assert result["probs"]["wan"] > result["probs"]["wan2"]
 
     def test_offline_interface_gets_minimum_weight(self, torch_env):
         offline = {**_WAN2, "status": "offline"}
         model = _FakeModel(scores=[1.0, 1.0])
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights({"wan": _WAN, "wan2": offline})
-        # Offline interface is masked to -inf → softmax ≈ 0 → max(1, 0) = 1
-        assert result["weights"]["wan2"] == 1
-        assert result["weights"]["wan"]  > result["weights"]["wan2"]
+        # Offline interface is masked to -inf → softmax ≈ 0 → prob ≈ 0.0
+        assert result["probs"]["wan2"] < 0.01
+        assert result["probs"]["wan"]  > result["probs"]["wan2"]
 
     def test_online_status_not_masked(self, torch_env):
         model = _FakeModel(scores=[1.0, 1.0])
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights({"wan": _WAN, "wan2": _WAN2})
-        assert result["weights"]["wan"]  > 0.0
-        assert result["weights"]["wan2"] > 0.0
+        assert result["probs"]["wan"]  > 0.0
+        assert result["probs"]["wan2"] > 0.0
 
     def test_none_status_not_masked(self, torch_env):
         no_status = {**_WAN, "status": None}
         model = _FakeModel(scores=[1.0, 1.0])
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights({"wan": no_status, "wan2": _WAN2})
-        assert result["weights"]["wan"] > 0.0
+        assert result["probs"]["wan"] > 0.0
 
     def test_explain_includes_all_feature_names(self, torch_env):
         model = _FakeModel(scores=[1.0])
@@ -1413,15 +1508,15 @@ class TestComputeWeights:
             assert v == round(v, 4)
 
     def test_single_interface_gets_maximum_weight(self, torch_env):
-        # Single interface: softmax([x]) = [1.0] → max(1, round(1.0 * 255)) = 255
+        # Single online interface: softmax([x]) = [1.0] → prob = 1.0
         model = _FakeModel(scores=[2.5])
         with patch.object(omr_metrics, "_get_model", return_value=model):
             result = omr_metrics._compute_weights({"wan": _WAN})
-        assert result["weights"]["wan"] == 255
+        assert abs(result["probs"]["wan"] - 1.0) < 0.01
 
     def test_all_offline_weights_are_zero(self, torch_env):
         """When every interface is offline the softmax of -inf values is NaN;
-        the implementation should not crash and weights are effectively 0."""
+        the implementation should not crash and probs are effectively 0."""
         data = {
             "wan":  {**_WAN,  "status": "offline"},
             "wan2": {**_WAN2, "status": "offline"},
@@ -1430,7 +1525,7 @@ class TestComputeWeights:
         with patch.object(omr_metrics, "_get_model", return_value=model):
             # Should not raise
             result = omr_metrics._compute_weights(data)
-        assert "weights" in result
+        assert "probs" in result
 
 
 # ===========================================================================
@@ -1484,13 +1579,39 @@ class TestTrainStep:
             )
         assert abs(loss_norm - loss_unnorm) < 1e-9
 
-    def test_zero_target_sum_does_not_crash(self, torch_env):
+    def test_zero_target_sum_raises_value_error(self, torch_env):
         model = _FakeModel(scores=[1.0, 0.5])
         with patch.object(omr_metrics, "_get_model", return_value=model):
-            loss = omr_metrics._train_step(
-                {"wan": _WAN, "wan2": _WAN2}, {"wan": 0.0, "wan2": 0.0}, lr=0.01
+            with pytest.raises(ValueError, match="positive mass"):
+                omr_metrics._train_step(
+                    {"wan": _WAN, "wan2": _WAN2}, {"wan": 0.0, "wan2": 0.0}, lr=0.01
+                )
+
+    def test_history_forwarded_to_feature_extraction(self, torch_env):
+        model = _FakeModel(scores=[1.0, 0.5])
+        history_data = {
+            "wan": _history_at(_WAN, [{"latency": 20.0}] * 3),
+            "wan2": _history_at(_WAN2, [{"latency": 30.0}] * 3),
+        }
+        captured = {}
+
+        def fake_extract(payload, history=None):
+            captured[payload["interface"]] = history
+            return [0.5] * omr_metrics.N_FEATURES
+
+        with (
+            patch.object(omr_metrics, "_get_model", return_value=model),
+            patch.object(omr_metrics, "_extract_features", side_effect=fake_extract),
+        ):
+            omr_metrics._train_step(
+                {"wan": _WAN, "wan2": _WAN2},
+                {"wan": 1.0, "wan2": 0.0},
+                lr=0.01,
+                history_data=history_data,
             )
-        assert isinstance(loss, float)
+
+        assert captured["wan"] == history_data["wan"]
+        assert captured["wan2"] == history_data["wan2"]
 
     def test_model_toggled_train_then_eval(self, torch_env):
         model = _FakeModel(scores=[1.0, 0.5])
@@ -1706,76 +1827,77 @@ _H_NO_CONG = {**_WAN,  "congestion": None}
 class TestComputeWeightsHeuristic:
     def test_returns_weights_and_scores_keys(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0})
-        assert "weights" in result
+        assert "probs" in result
         assert "scores" in result
 
     def test_interface_keys_match_input(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_CONG50})
-        assert set(result["weights"].keys()) == {"wan", "wan2"}
-        assert set(result["scores"].keys())  == {"wan", "wan2"}
+        assert set(result["probs"].keys()) == {"wan", "wan2"}
+        assert set(result["scores"].keys()) == {"wan", "wan2"}
 
     def test_equal_congestion_gives_equal_weights(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_CONG0})
-        assert result["weights"]["wan"] == result["weights"]["wan2"]
+        assert result["probs"]["wan"] == result["probs"]["wan2"]
 
-    def test_equal_interfaces_get_weight_100(self):
+    def test_equal_interfaces_get_equal_probs(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_CONG0})
-        assert result["weights"]["wan"] == 100
-        assert result["weights"]["wan2"] == 100
+        assert abs(result["probs"]["wan"] - result["probs"]["wan2"]) < 1e-9
 
-    def test_single_interface_gets_weight_100(self):
+    def test_single_interface_gets_high_prob(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0})
-        assert result["weights"]["wan"] == 100
+        assert result["probs"]["wan"] > 0.5
 
     def test_lower_congestion_gives_higher_weight(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_CONG50})
-        assert result["weights"]["wan"] > result["weights"]["wan2"]
+        assert result["probs"]["wan"] > result["probs"]["wan2"]
 
-    def test_offline_interface_gets_weight_1(self):
+    def test_offline_interface_gets_zero_prob(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_OFFLINE})
-        assert result["weights"]["wan2"] == 1
+        assert result["probs"]["wan2"] == 0.0
 
     def test_no_latency_treated_as_offline(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_NO_LAT})
-        assert result["weights"]["wan2"] == 1
+        assert result["probs"]["wan2"] == 0.0
 
     def test_all_offline_gives_equal_fallback(self):
         offline1 = {**_WAN,  "status": "offline"}
         offline2 = {**_WAN2, "status": "offline"}
         result = omr_metrics._compute_weights_heuristic({"wan": offline1, "wan2": offline2})
-        assert result["weights"]["wan"] == result["weights"]["wan2"]
+        assert result["probs"]["wan"] == result["probs"]["wan2"]
 
-    def test_congestion_100_treated_as_offline(self):
+    def test_congestion_100_gives_lower_prob(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_CONG100})
-        # congestion=100 → quality=0.0 → weight=max(1,0)=1
-        assert result["weights"]["wan2"] == 1
+        # cong=100 → cong_q=0; other signals (latency, loss, jitter) still contribute
+        # so prob > 0 but significantly lower than cong=0
+        assert result["probs"]["wan"] > result["probs"]["wan2"]
+        assert result["probs"]["wan2"] < 0.4
 
     def test_no_congestion_falls_back_to_latency_loss(self):
-        # No congestion field; latency and loss should still produce a valid weight.
+        # No congestion field; latency and loss should still produce a valid prob.
         result = omr_metrics._compute_weights_heuristic({"wan": _H_NO_CONG, "wan2": _H_CONG0})
-        assert result["weights"]["wan"] >= 1
-        assert result["weights"]["wan2"] >= 1
+        assert result["probs"]["wan"] >= 0.0
+        assert result["probs"]["wan2"] >= 0.0
 
-    def test_scores_are_percentages_summing_to_100(self):
+    def test_scores_are_quality_percentages(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_CONG50})
-        total = sum(result["scores"].values())
-        assert abs(total - 100.0) < 0.1
+        for s in result["scores"].values():
+            assert 0.0 <= s <= 100.0
 
-    def test_all_weights_are_positive_integers(self):
+    def test_all_probs_are_valid_floats(self):
         result = omr_metrics._compute_weights_heuristic(
             {"wan": _H_CONG0, "wan2": _H_CONG50, "lte": _H_OFFLINE}
         )
-        for w in result["weights"].values():
-            assert isinstance(w, int)
-            assert w >= 1
+        for p in result["probs"].values():
+            assert isinstance(p, float)
+            assert 0.0 <= p <= 1.0
 
     def test_three_interfaces_all_online(self):
         third = {**_WAN, "interface": "lte0", "congestion": {"score": 20, "level": "low"}}
         result = omr_metrics._compute_weights_heuristic(
             {"wan": _H_CONG0, "wan2": _H_CONG50, "lte0": third}
         )
-        assert len(result["weights"]) == 3
-        assert result["weights"]["wan"] > result["weights"]["wan2"] > 0
+        assert len(result["probs"]) == 3
+        assert result["probs"]["wan"] > result["probs"]["wan2"] > 0
 
 
 # ===========================================================================
@@ -1944,6 +2066,20 @@ class TestInfluxBackendHistory:
         }
         return table
 
+    def _fake_all_table(self, rows):
+        """rows: list of (ts, interface, json_str) tuples."""
+        class _Ts:
+            def __init__(self, v): self._v = v
+            def timestamp(self): return self._v
+
+        table = MagicMock()
+        table.to_pydict.return_value = {
+            "time":         [_Ts(ts) for ts, _, _ in rows],
+            "interface":    [iface    for _, iface, _ in rows],
+            "json_payload": [js       for _, _, js in rows],
+        }
+        return table
+
     def test_returns_empty_list_on_query_error(self):
         backend, mock_client = self._make_backend()
         mock_client.query.side_effect = Exception("connection refused")
@@ -2005,6 +2141,23 @@ class TestInfluxBackendHistory:
         table.to_pydict.side_effect = Exception("parse error")
         mock_client.query.return_value = table
         assert backend.read_history("alice", "wan", 3600, 100) == []
+
+    def test_all_interfaces_limit_applies_per_interface(self):
+        backend, mock_client = self._make_backend()
+        rows = [
+            (1_700_000_000, "wan", json.dumps({**_WAN, "timestamp": 1_700_000_000})),
+            (1_700_000_030, "wan2", json.dumps({**_WAN2, "timestamp": 1_700_000_030})),
+            (1_700_000_060, "wan", json.dumps({**_WAN, "timestamp": 1_700_000_060})),
+            (1_700_000_090, "wan2", json.dumps({**_WAN2, "timestamp": 1_700_000_090})),
+            (1_700_000_120, "wan", json.dumps({**_WAN, "timestamp": 1_700_000_120})),
+        ]
+        mock_client.query.return_value = self._fake_all_table(rows)
+
+        result = backend.read_history("alice", None, 3600, 2)
+
+        assert list(result.keys()) == ["wan", "wan2"]
+        assert [entry["timestamp"] for entry in result["wan"]] == [1_700_000_000, 1_700_000_060]
+        assert [entry["timestamp"] for entry in result["wan2"]] == [1_700_000_030, 1_700_000_090]
 
 
 # ===========================================================================
@@ -2504,3 +2657,239 @@ class TestGetQualityForecast:
         level = r.json()["wan"]["congestion"]["current_level"]
         assert isinstance(level, str)
         assert level in ("none", "low", "moderate", "high", "severe")
+
+
+# ===========================================================================
+# _torch_predict_at — unit tests
+# ===========================================================================
+
+_TORCH_SKIP = pytest.mark.skipif(
+    not omr_metrics._TORCH_AVAILABLE,
+    reason="PyTorch not installed",
+)
+
+_TP_T0 = 1_700_000_000
+
+
+def _tp_history(values, step=30):
+    """Return (timestamps, values) lists spaced *step* seconds apart."""
+    ts = [float(_TP_T0 + i * step) for i in range(len(values))]
+    return ts, list(values)
+
+
+class TestTorchPredictAt:
+    def test_returns_none_for_fewer_than_min_points(self):
+        ts, vs = _tp_history([10.0, 20.0, 30.0])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 120))
+        assert result is None
+
+    def test_returns_none_when_all_values_filtered_to_too_few(self):
+        ts, _ = _tp_history([None] * 6)
+        vs = [None] * 6
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 180))
+        assert result is None
+
+    @_TORCH_SKIP
+    def test_returns_float_for_sufficient_history(self):
+        ts, vs = _tp_history([10.0, 12.0, 14.0, 16.0, 18.0, 20.0])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 180))
+        assert isinstance(result, float)
+        assert math.isfinite(result)
+
+    @_TORCH_SKIP
+    def test_rising_trend_predicts_above_last_value(self):
+        ts, vs = _tp_history([5.0, 10.0, 15.0, 20.0, 25.0, 30.0])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 180))
+        assert result > vs[-1]
+
+    @_TORCH_SKIP
+    def test_falling_trend_predicts_below_last_value(self):
+        ts, vs = _tp_history([30.0, 25.0, 20.0, 15.0, 10.0, 5.0])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 180))
+        assert result < vs[-1]
+
+    @_TORCH_SKIP
+    def test_flat_series_stays_near_constant(self):
+        ts, vs = _tp_history([7.0] * 8)
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 300))
+        assert abs(result - 7.0) < 2.0
+
+    @_TORCH_SKIP
+    def test_result_is_finite_for_noisy_data(self):
+        ts, vs = _tp_history([1.0, 50.0, 3.0, 48.0, 2.0, 49.0, 1.0, 50.0])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 300))
+        assert math.isfinite(result)
+
+    @_TORCH_SKIP
+    def test_none_values_skipped(self):
+        ts = [float(_TP_T0 + i * 30) for i in range(8)]
+        vs = [None, 5.0, None, 10.0, 15.0, 20.0, None, 25.0]
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 240))
+        assert result is not None
+        assert math.isfinite(result)
+
+    @_TORCH_SKIP
+    def test_halflife_zero_does_not_raise(self):
+        ts, vs = _tp_history([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + 180), halflife_s=0.0)
+        assert math.isfinite(result)
+
+    @_TORCH_SKIP
+    def test_exactly_min_points_is_accepted(self):
+        n = omr_metrics._FORECAST_TORCH_MIN_POINTS
+        ts, vs = _tp_history([float(i * 5) for i in range(n)])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + n * 30))
+        assert result is not None
+
+    @_TORCH_SKIP
+    def test_one_below_min_points_returns_none(self):
+        n = omr_metrics._FORECAST_TORCH_MIN_POINTS - 1
+        ts, vs = _tp_history([float(i * 5) for i in range(n)])
+        result = omr_metrics._torch_predict_at(ts, vs, float(_TP_T0 + n * 30))
+        assert result is None
+
+
+# ===========================================================================
+# _predict_at — dispatch unit tests
+# ===========================================================================
+
+class TestPredictAt:
+    def test_torch_unavailable_delegates_to_linear(self):
+        ts, vs = _tp_history([10.0, 20.0, 30.0])
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", False):
+            result = omr_metrics._predict_at(ts, vs, float(_TP_T0 + 90))
+        expected = omr_metrics._linear_predict_at(ts, vs, float(_TP_T0 + 90))
+        assert result == pytest.approx(expected)
+
+    def test_torch_path_invoked_when_available_and_enough_points(self):
+        ts, vs = _tp_history([float(i * 5) for i in range(6)])
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_predict_at", return_value=99.0) as mock_tp,
+        ):
+            result = omr_metrics._predict_at(ts, vs, float(_TP_T0 + 180))
+        assert result == 99.0
+        mock_tp.assert_called_once()
+
+    def test_falls_back_to_linear_when_torch_returns_none(self):
+        ts, vs = _tp_history([10.0, 20.0, 30.0])
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_predict_at", return_value=None),
+        ):
+            result = omr_metrics._predict_at(ts, vs, float(_TP_T0 + 90))
+        expected = omr_metrics._linear_predict_at(ts, vs, float(_TP_T0 + 90))
+        assert result == pytest.approx(expected)
+
+    def test_empty_returns_none(self):
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", False):
+            assert omr_metrics._predict_at([], [], float(_TP_T0 + 90)) is None
+
+    def test_single_point_returns_that_value(self):
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", False):
+            result = omr_metrics._predict_at([float(_TP_T0)], [7.0], float(_TP_T0 + 300))
+        assert result == pytest.approx(7.0)
+
+    def test_halflife_forwarded_to_torch_predict(self):
+        ts, vs = _tp_history([float(i) for i in range(6)])
+        captured = {}
+
+        def _capture(timestamps, values, target_ts, halflife_s):
+            captured["halflife_s"] = halflife_s
+            return 42.0
+
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_predict_at", side_effect=_capture),
+        ):
+            omr_metrics._predict_at(ts, vs, float(_TP_T0 + 180), halflife_s=77.0)
+        assert captured["halflife_s"] == 77.0
+
+    def test_short_series_skips_torch_even_when_available(self):
+        # < _FORECAST_TORCH_MIN_POINTS valid points → torch returns None → linear used
+        ts, vs = _tp_history([1.0, 2.0])
+        linear_result = omr_metrics._linear_predict_at(ts, vs, float(_TP_T0 + 60))
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", True):
+            result = omr_metrics._predict_at(ts, vs, float(_TP_T0 + 60))
+        assert result == pytest.approx(linear_result)
+
+    def test_halflife_forwarded_to_linear_when_torch_unavailable(self):
+        ts, vs = _tp_history([10.0, 20.0, 30.0])
+        expected = omr_metrics._linear_predict_at(ts, vs, float(_TP_T0 + 90), halflife_s=60.0)
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", False):
+            result = omr_metrics._predict_at(ts, vs, float(_TP_T0 + 90), halflife_s=60.0)
+        assert result == pytest.approx(expected)
+
+
+# ===========================================================================
+# Forecast dispatch — verify forecast functions use _predict_at
+# ===========================================================================
+
+class TestForecastDispatch:
+    """Verify that the three forecast functions delegate to _predict_at
+    (not _linear_predict_at directly) so the torch path is reachable."""
+
+    def _rising_loss_hist(self, n=6):
+        return [
+            {**_WAN, "timestamp": float(_TP_T0 + i * 30), "loss": float(i + 1)}
+            for i in range(n)
+        ]
+
+    def _rising_cong_hist(self, n=6):
+        return [
+            {**_WAN, "timestamp": float(_TP_T0 + i * 30),
+             "congestion": {"score": float(i * 10), "level": "none"}}
+            for i in range(n)
+        ]
+
+    def test_forecast_metric_calls_predict_at(self):
+        hist = self._rising_loss_hist()
+        with patch.object(omr_metrics, "_predict_at", wraps=omr_metrics._predict_at) as mock_pa:
+            omr_metrics._forecast_metric(hist, ("loss",), [(15.0, "severe")], hi_clamp=100.0)
+        mock_pa.assert_called()
+
+    def test_predict_congestion_calls_predict_at(self):
+        hist = self._rising_cong_hist()
+        with patch.object(omr_metrics, "_predict_at", wraps=omr_metrics._predict_at) as mock_pa:
+            omr_metrics._predict_congestion(hist)
+        mock_pa.assert_called()
+
+    def test_predict_payload_calls_predict_at(self):
+        hist = _history_at(_WAN, [{"latency": float(i * 5)} for i in range(6)])
+        with patch.object(omr_metrics, "_predict_at", wraps=omr_metrics._predict_at) as mock_pa:
+            omr_metrics._predict_payload(hist, horizon_seconds=60)
+        mock_pa.assert_called()
+
+    def test_forecast_metric_torch_result_used_as_predicted(self):
+        hist = self._rising_loss_hist()
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_predict_at", return_value=12.5),
+        ):
+            result = omr_metrics._forecast_metric(
+                hist, ("loss",), [(15.0, "severe"), (5.0, "high"), (1.0, "moderate")],
+                hi_clamp=100.0,
+            )
+        assert result["predicted"] == pytest.approx(12.5)
+
+    def test_predict_congestion_torch_result_used_as_predicted_score(self):
+        hist = self._rising_cong_hist()
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_predict_at", return_value=65.0),
+        ):
+            result = omr_metrics._predict_congestion(hist)
+        assert result["predicted_score"] == pytest.approx(65.0)
+
+    def test_no_linear_predict_at_called_when_torch_available_and_enough_points(self):
+        hist = self._rising_loss_hist()
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_predict_at", return_value=8.0),
+            patch.object(omr_metrics, "_linear_predict_at",
+                         wraps=omr_metrics._linear_predict_at) as mock_lin,
+        ):
+            omr_metrics._forecast_metric(
+                hist, ("loss",), [(15.0, "severe")], hi_clamp=100.0,
+            )
+        mock_lin.assert_not_called()
