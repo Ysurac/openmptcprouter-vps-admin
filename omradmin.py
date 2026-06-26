@@ -1652,11 +1652,16 @@ def load_mptcp_bpf_schedulers():
                     if line.startswith('net.mptcp.mptcp_scheduler=') or line.startswith('net.mptcp.scheduler='):
                         proc_path = '/proc/sys/' + line.split('=')[0].replace('.', '/')
                         if os.path.exists(proc_path):
-                            result = subprocess.run(['sysctl', '-qw', line], check=False)
-                            if result.returncode == 0:
-                                LOG.info('Re-applied scheduler after BPF load: ' + line)
+                            # Retry briefly: the BPF struct_ops may not be visible to the
+                            # MPTCP scheduler lookup immediately after bpftool register.
+                            for attempt in range(5):
+                                result = subprocess.run(['sysctl', '-qw', line], check=False, capture_output=True)
+                                if result.returncode == 0:
+                                    LOG.info('Re-applied scheduler after BPF load: ' + line)
+                                    break
+                                time.sleep(0.1 * (2 ** attempt))
                             else:
-                                LOG.warning('Failed to re-apply scheduler after BPF load: ' + line)
+                                LOG.warning('Failed to re-apply scheduler after BPF load: ' + line + ' — ' + result.stderr.strip())
                         break
 
 
