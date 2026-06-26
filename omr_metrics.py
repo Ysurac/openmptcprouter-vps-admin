@@ -68,6 +68,7 @@
 # ------------------
 # GET  /metrics/engine           — inference/training stats + storage info (admin only)
 
+import asyncio
 import json
 import math
 import os
@@ -336,7 +337,8 @@ class InfluxBackend:
         self._url = url
         self._token = token
         self._retention_days = max(1, int(retention_days))
-        self._apply_retention()
+        threading.Thread(target=self._apply_retention, daemon=True,
+                         name="omr-influx-retention").start()
 
     def _apply_retention(self):
         """Push the configured retention period to the InfluxDB 3 management API.
@@ -630,13 +632,22 @@ class InfluxBackend:
 # ---------------------------------------------------------------------------
 
 _backend: Optional[object] = None
+_backend_lock = threading.Lock()
 
 
 def _init_backend():
     """Read omr-admin-config.json and return the appropriate backend."""
+    global EMA_ALPHA
     try:
         with open(OMR_CONFIG_FILE) as f:
             config = json.load(f)
+        ema_alpha = config.get("ema_alpha")
+        if ema_alpha is not None:
+            try:
+                EMA_ALPHA = max(0.01, min(1.0, float(ema_alpha)))
+                LOG.info("omr_metrics: EMA_ALPHA=%.2f (from config)", EMA_ALPHA)
+            except (TypeError, ValueError):
+                pass
         influx_cfg = config.get("influxdb") or {}
         if influx_cfg.get("url") and influx_cfg.get("token"):
             try:
@@ -666,7 +677,9 @@ def _init_backend():
 def _get_backend():
     global _backend
     if _backend is None:
-        _backend = _init_backend()
+        with _backend_lock:
+            if _backend is None:
+                _backend = _init_backend()
     return _backend
 
 
@@ -686,7 +699,7 @@ def _write_interface(username: str, payload: dict):
 _SINCE_PRESETS: dict = {
     "15m": 900,    "30m": 1800,
     "1h":  3600,   "6h":  21600,  "12h": 43200,
-    "24h": 86400,  "2d":  172800, "7d":  604800,
+    "1d":  86400,  "24h": 86400,  "2d":  172800, "7d":  604800,
     "30d": 2592000,
 }
 
@@ -838,6 +851,25 @@ def _predict_congestion(history: list, horizon_s: int = 300) -> dict:
     }
 
 
+def _wls_params(ts_seq: tuple, vs_seq: tuple,
+                halflife_s: float = PREDICT_HALFLIFE_S) -> tuple:
+    """Exponentially weighted OLS on pre-validated sequences (len >= 2).
+
+    Returns (slope, t_mean, v_mean).  Internal helper; callers must filter
+    None values and ensure at least 2 points before calling.
+    """
+    t_max = max(ts_seq)
+    decay = math.log(2) / halflife_s if halflife_s > 0 else 0.0
+    ws = [math.exp(-decay * (t_max - ti)) for ti in ts_seq]
+    w_sum = sum(ws)
+    t_mean = sum(w * t for w, t in zip(ws, ts_seq)) / w_sum
+    v_mean = sum(w * v for w, v in zip(ws, vs_seq)) / w_sum
+    num = sum(ws[i] * (ts_seq[i] - t_mean) * (vs_seq[i] - v_mean) for i in range(len(ts_seq)))
+    den = sum(ws[i] * (ts_seq[i] - t_mean) ** 2 for i in range(len(ts_seq)))
+    slope = num / den if den != 0.0 else 0.0
+    return slope, t_mean, v_mean
+
+
 def _linear_predict_at(timestamps: list, values: list, target_ts: float,
                        halflife_s: float = PREDICT_HALFLIFE_S) -> Optional[float]:
     """Exponentially weighted linear regression on (Unix-seconds, value) pairs.
@@ -855,22 +887,8 @@ def _linear_predict_at(timestamps: list, values: list, target_ts: float,
     ]
     if len(pairs) < 2:
         return pairs[-1][1] if pairs else None
-
     ts_seq, vs_seq = zip(*pairs)
-    t_max = max(ts_seq)
-    decay = math.log(2) / halflife_s if halflife_s > 0 else 0.0
-    ws = [math.exp(-decay * (t_max - ti)) for ti in ts_seq]
-
-    w_sum = sum(ws)
-    t_mean = sum(w * t for w, t in zip(ws, ts_seq)) / w_sum
-    v_mean = sum(w * v for w, v in zip(ws, vs_seq)) / w_sum
-
-    num = sum(ws[i] * (ts_seq[i] - t_mean) * (vs_seq[i] - v_mean) for i in range(len(pairs)))
-    den = sum(ws[i] * (ts_seq[i] - t_mean) ** 2 for i in range(len(pairs)))
-
-    if den == 0.0:
-        return v_mean
-    slope = num / den
+    slope, t_mean, v_mean = _wls_params(ts_seq, vs_seq, halflife_s)
     return slope * (target_ts - t_mean) + v_mean
 
 
@@ -889,15 +907,8 @@ def _weighted_slope(timestamps: list, values: list,
     if len(pairs) < 2:
         return None
     ts_seq, vs_seq = zip(*pairs)
-    t_max = max(ts_seq)
-    decay = math.log(2) / halflife_s if halflife_s > 0 else 0.0
-    ws = [math.exp(-decay * (t_max - ti)) for ti in ts_seq]
-    w_sum = sum(ws)
-    t_mean = sum(w * t for w, t in zip(ws, ts_seq)) / w_sum
-    v_mean = sum(w * v for w, v in zip(ws, vs_seq)) / w_sum
-    num = sum(ws[i] * (ts_seq[i] - t_mean) * (vs_seq[i] - v_mean) for i in range(len(pairs)))
-    den = sum(ws[i] * (ts_seq[i] - t_mean) ** 2 for i in range(len(pairs)))
-    return num / den if den != 0.0 else 0.0
+    slope, _, _ = _wls_params(ts_seq, vs_seq, halflife_s)
+    return slope
 
 
 _LOSS_THRESHOLDS = [
@@ -1260,6 +1271,7 @@ except ImportError:
     _TORCH_AVAILABLE = False
 
 _decision_model = None
+_model_lock = threading.RLock()
 
 
 def _make_model():
@@ -1282,31 +1294,32 @@ def _make_model():
 
 def _get_model():
     global _decision_model
-    if _decision_model is not None:
-        return _decision_model
-    if os.path.isfile(DECISION_MODEL_FILE):
-        try:
-            state = torch.load(DECISION_MODEL_FILE, map_location="cpu", weights_only=True)
-            saved_in = state.get("net.0.weight", torch.empty(0, 0)).shape[1]
-            if saved_in != N_FEATURES:
-                LOG.warning(
-                    "omr_decision: saved model has %d input features but N_FEATURES=%d"
-                    " – reinitializing (feature set changed)",
-                    saved_in, N_FEATURES,
-                )
-                raise ValueError("feature dimension mismatch")
-            m = InterfaceScorer()
-            m.load_state_dict(state)
-            m.eval()
-            _decision_model = m
-            _stats_update(model_loaded_at=time.time())
-            LOG.info("omr_decision: loaded model from %s", DECISION_MODEL_FILE)
+    with _model_lock:
+        if _decision_model is not None:
             return _decision_model
-        except Exception as exc:
-            LOG.warning("omr_decision: cannot load model (%s) – reinitializing", exc)
-    _decision_model = _make_model()
-    _stats_update(model_loaded_at=time.time())
-    return _decision_model
+        if os.path.isfile(DECISION_MODEL_FILE):
+            try:
+                state = torch.load(DECISION_MODEL_FILE, map_location="cpu", weights_only=True)
+                saved_in = state.get("net.0.weight", torch.empty(0, 0)).shape[1]
+                if saved_in != N_FEATURES:
+                    LOG.warning(
+                        "omr_decision: saved model has %d input features but N_FEATURES=%d"
+                        " – reinitializing (feature set changed)",
+                        saved_in, N_FEATURES,
+                    )
+                    raise ValueError("feature dimension mismatch")
+                m = InterfaceScorer()
+                m.load_state_dict(state)
+                m.eval()
+                _decision_model = m
+                _stats_update(model_loaded_at=time.time())
+                LOG.info("omr_decision: loaded model from %s", DECISION_MODEL_FILE)
+                return _decision_model
+            except Exception as exc:
+                LOG.warning("omr_decision: cannot load model (%s) – reinitializing", exc)
+        _decision_model = _make_model()
+        _stats_update(model_loaded_at=time.time())
+        return _decision_model
 
 
 def _save_model(model):
@@ -1387,13 +1400,6 @@ def _compute_weights_heuristic(user_data: dict,
 
     raw = _apply_cost(raw, interfaces, user_data)
 
-    total = sum(raw)
-    if total == 0.0:
-        eq = 1.0 / len(interfaces) if interfaces else 1.0
-        raw = [eq] * len(interfaces)
-    else:
-        raw = [v / total for v in raw]
-
     elapsed_ms = (time.perf_counter() - _t0) * 1000.0
     _stats_inc("heuristic_count", "heuristic_total_ms", elapsed_ms)
     _stats_update(last_heuristic_ms=round(elapsed_ms, 3))
@@ -1418,7 +1424,6 @@ def _compute_weights(user_data: dict, explain: bool = False,
     When absent or for JSON backend, trend features default to neutral (0.5).
     """
     _t0 = time.perf_counter()
-    model = _get_model()
     interfaces = list(user_data.keys())
     hist = history_data or {}
     features = {
@@ -1426,23 +1431,24 @@ def _compute_weights(user_data: dict, explain: bool = False,
         for iface, payload in user_data.items()
     }
 
-    feat_tensor = torch.tensor(
-        [features[iface] for iface in interfaces], dtype=torch.float32
-    )
+    with _model_lock:
+        model = _get_model()
+        feat_tensor = torch.tensor(
+            [features[iface] for iface in interfaces], dtype=torch.float32
+        )
+        with torch.no_grad():
+            scores = model(feat_tensor)
+            for idx, iface in enumerate(interfaces):
+                p      = user_data[iface]
+                status  = p.get("status")
+                latency = p.get("latency")
+                # Treat as down when: status is not "online", status is "ERROR",
+                # or latency is null (check failed / interface unreachable).
+                if (status and status != "online") or latency is None:
+                    scores[idx] = float("-inf")
+            weights = torch.softmax(scores, dim=0)
+        raw_weights = [float(weights[i]) for i in range(len(interfaces))]
 
-    with torch.no_grad():
-        scores = model(feat_tensor)
-        for idx, iface in enumerate(interfaces):
-            p      = user_data[iface]
-            status  = p.get("status")
-            latency = p.get("latency")
-            # Treat as down when: status is not "online", status is "ERROR",
-            # or latency is null (check failed / interface unreachable).
-            if (status and status != "online") or latency is None:
-                scores[idx] = float("-inf")
-        weights = torch.softmax(scores, dim=0)
-
-    raw_weights = [float(weights[i]) for i in range(len(interfaces))]
     # All-offline edge case: softmax(-inf, …) → 0/0 → nan; use equal fallback.
     if any(math.isnan(w) for w in raw_weights):
         eq = 1.0 / len(interfaces) if interfaces else 1.0
@@ -1482,29 +1488,27 @@ def _train_step(user_data: dict, target_weights: dict, lr: float) -> float:
         return 0.0
 
     _t0 = time.perf_counter()
-    model = _get_model()
     features = {iface: _extract_features(payload) for iface, payload in user_data.items()}
-    feat_tensor = torch.tensor(
-        [features[iface] for iface in interfaces], dtype=torch.float32
-    )
-    target = torch.tensor(
-        [float(target_weights.get(iface, 0.0)) for iface in interfaces],
-        dtype=torch.float32,
-    )
-    total = target.sum()
-    if total > 0:
-        target = target / total
+    feat_tensor_data = [features[iface] for iface in interfaces]
+    target_data = [float(target_weights.get(iface, 0.0)) for iface in interfaces]
 
-    model.train()
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
-    optimizer.zero_grad()
-    pred = torch.softmax(model(feat_tensor), dim=0)
-    loss = torch.nn.functional.mse_loss(pred, target)
-    loss.backward()
-    optimizer.step()
-    model.eval()
+    with _model_lock:
+        model = _get_model()
+        feat_tensor = torch.tensor(feat_tensor_data, dtype=torch.float32)
+        target = torch.tensor(target_data, dtype=torch.float32)
+        total = target.sum()
+        if total > 0:
+            target = target / total
+        model.train()
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+        optimizer.zero_grad()
+        pred = torch.softmax(model(feat_tensor), dim=0)
+        loss = torch.nn.functional.mse_loss(pred, target)
+        loss.backward()
+        optimizer.step()
+        model.eval()
+        loss_val = float(loss)
 
-    loss_val = float(loss)
     elapsed_ms = (time.perf_counter() - _t0) * 1000.0
     with _stats_lock:
         _engine_stats["training_count"] += 1
@@ -1826,10 +1830,13 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         has_history_backend = not isinstance(_get_backend(), JSONBackend)
 
         if predict:
+            async def _pfetch(iface):
+                h = await asyncio.to_thread(_read_history, target, iface,
+                                            max(horizon * 10, 3600), 50)
+                return iface, h
+
             predicted_data = {}
-            for iface in user_data:
-                hist = _read_history(target, iface,
-                                     since_seconds=max(horizon * 10, 3600), limit=50)
+            for iface, hist in await asyncio.gather(*[_pfetch(i) for i in user_data]):
                 if len(hist) >= 2:
                     predicted_data[iface] = _predict_payload(hist, horizon_seconds=horizon)
                     history_data[iface] = hist   # reuse for trend and congestion features
@@ -1837,9 +1844,10 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                     predicted_data[iface] = user_data[iface]
             user_data = predicted_data
         elif preemptive and has_history_backend:
-            # Fetch history only for congestion prediction (not full payload replacement)
-            for iface in user_data:
-                hist = _read_history(target, iface, since_seconds=3600, limit=60)
+            async def _hfetch(iface):
+                return iface, await asyncio.to_thread(_read_history, target, iface, 3600, 60)
+
+            for iface, hist in await asyncio.gather(*[_hfetch(i) for i in user_data]):
                 if hist:
                     history_data[iface] = hist
 
@@ -1878,13 +1886,16 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             return {}
 
         since_seconds = _parse_since(since)
-        result: dict = {}
-        for iface in user_data:
-            hist = _read_history(target, iface, since_seconds=since_seconds, limit=limit)
-            if not hist:
-                snap = user_data[iface]
-                hist = [snap] if snap.get("timestamp") is not None else []
 
+        async def _qfetch(iface):
+            h = await asyncio.to_thread(_read_history, target, iface, since_seconds, limit)
+            if not h:
+                snap = user_data[iface]
+                h = [snap] if snap.get("timestamp") is not None else []
+            return iface, h
+
+        result: dict = {}
+        for iface, hist in await asyncio.gather(*[_qfetch(i) for i in user_data]):
             result[iface] = {
                 "congestion": _forecast_metric(
                     hist, ("congestion", "score"), _CONGESTION_LEVELS,
@@ -1951,8 +1962,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         global _decision_model
-        _decision_model = _make_model()
-        _save_model(_decision_model)
+        with _model_lock:
+            _decision_model = _make_model()
+            _save_model(_decision_model)
         with _stats_lock:
             _engine_stats["model_resets"] += 1
             _engine_stats["model_loaded_at"] = time.time()
