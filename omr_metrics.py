@@ -1233,7 +1233,7 @@ def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
 # Each feature is in [0, 1] with higher = better.
 FEATURE_NAMES = [
     # --- static features (current snapshot) ---
-    "inv_latency",     # 1 - clip(latency ms,          0,  2000) / 2000
+    "inv_latency",     # 1 - clip(latency ms,          0,   500) / 500
     "inv_loss",        # 1 - clip(loss %,              0,   100) / 100
     "inv_jitter",      # 1 - clip(jitter ms,           0,   500) / 500
     "inv_congestion",  # 1 - clip(congestion.score,    0,   100) / 100
@@ -1260,11 +1260,11 @@ N_FEATURES = len(FEATURE_NAMES)
 
 # Per-feature importance priors used to seed all first-layer neurons.
 _FEATURE_IMPORTANCES = [
-    2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5,  # original 10
+    4.0, 2.5, 1.5, 1.2, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5,  # original 10  (inv_latency raised to 4.0)
     1.5, 0.6, 0.7, 1.0,                                   # new static 4
-    2.0,                                                    # inv_predicted_congestion
+    1.5,                                                    # inv_predicted_congestion
     1.8, 1.0,                                              # staleness, inv_latency_std
-    1.2, 1.5, 0.8, 0.8,                                   # trend 4
+    2.0, 1.5, 0.8, 0.8,                                   # trend 4  (trend_latency raised to 2.0)
 ]
 
 
@@ -1368,7 +1368,7 @@ def _extract_features(payload: dict, history: Optional[list] = None) -> list:
     )
 
     static = [
-        _n(payload.get("latency"),  0,   2000, inv=True),
+        _n(payload.get("latency"),  0,    500, inv=True),
         _n(payload.get("loss"),     0,    100, inv=True),
         _n(payload.get("jitter"),   0,    500, inv=True),
         _n(cong.get("score"),       0,    100, inv=True),
@@ -1544,7 +1544,7 @@ def _compute_weights_heuristic(user_data: dict,
         ecn   = (p.get("tc") or {}).get("ecn_mark")
         cong  = (p.get("congestion") or {}).get("score")
 
-        lat_q    = max(0.0, 1.0 - min(lat, 2000.0) / 2000.0)
+        lat_q    = max(0.0, 1.0 - min(lat, 500.0) / 500.0)
         loss_q   = max(0.0, 1.0 - min(float(loss),   100.0) / 100.0) if loss   is not None else 0.5
         jitter_q = max(0.0, 1.0 - min(float(jitter), 500.0) / 500.0) if jitter is not None else 0.5
         signal_q = min(float(sig_q), 100.0) / 100.0                   if sig_q  is not None else 0.5
@@ -1559,11 +1559,11 @@ def _compute_weights_heuristic(user_data: dict,
                 if pred is not None:
                     effective_cong = max(effective_cong, pred)
             cong_q = max(0.0, 100.0 - effective_cong) / 100.0
-            quality = (0.55 * cong_q + 0.15 * lat_q + 0.10 * loss_q
+            quality = (0.35 * lat_q + 0.30 * cong_q + 0.15 * loss_q
                        + 0.10 * jitter_q + 0.05 * signal_q + 0.05 * ecn_q)
         else:
-            quality = (0.35 * lat_q + 0.28 * loss_q + 0.20 * jitter_q
-                       + 0.10 * signal_q + 0.07 * ecn_q)
+            quality = (0.50 * lat_q + 0.22 * loss_q + 0.15 * jitter_q
+                       + 0.07 * signal_q + 0.06 * ecn_q)
 
         raw.append(quality)
 

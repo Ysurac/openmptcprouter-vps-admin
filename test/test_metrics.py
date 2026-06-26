@@ -1870,7 +1870,7 @@ class TestComputeWeightsHeuristic:
         # cong=100 → cong_q=0; other signals (latency, loss, jitter) still contribute
         # so prob > 0 but significantly lower than cong=0
         assert result["probs"]["wan"] > result["probs"]["wan2"]
-        assert result["probs"]["wan2"] < 0.4
+        assert result["probs"]["wan2"] < 0.45
 
     def test_no_congestion_falls_back_to_latency_loss(self):
         # No congestion field; latency and loss should still produce a valid prob.

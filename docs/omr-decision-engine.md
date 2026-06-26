@@ -49,7 +49,7 @@ outlier cannot distort the others.
 
 | # | Name | Formula | Missing default |
 |---|------|----------|-----------------|
-| 0 | `inv_latency` | `1 − clip(latency ms, 0, 2000) / 2000` | 0.5 |
+| 0 | `inv_latency` | `1 − clip(latency ms, 0, 500) / 500` | 0.5 |
 | 1 | `inv_loss` | `1 − clip(loss %, 0, 100) / 100` | 0.5 |
 | 2 | `inv_jitter` | `1 − clip(jitter ms, 0, 500) / 500` | 0.5 |
 | 3 | `inv_congestion` | `1 − clip(congestion.score, 0, 100) / 100` | 0.5 |
@@ -97,16 +97,16 @@ model already approximates sensible heuristic behaviour:
 
 | Feature | Prior importance |
 |---------|-----------------|
-| `inv_loss` | 3.0 (highest) |
-| `inv_latency` | 2.0 |
-| `inv_predicted_congestion` | 2.0 |
+| `inv_latency` | 4.0 (highest) |
+| `inv_loss` | 2.5 |
+| `trend_latency` | 2.0 |
+| `inv_predicted_congestion` | 1.5 |
 | `inv_rtt_spread` | 1.5 |
 | `inv_jitter` | 1.5 |
-| `inv_congestion` | 1.5 |
+| `inv_congestion` | 1.2 |
 | `trend_loss` | 1.5 |
 | `rx_bps` / `tx_bps` | 1.0 each |
 | `inv_bbr_min_rtt` | 1.0 |
-| `trend_latency` | 1.2 |
 | `bbr_bw` | 0.8 |
 | `trend_rx_bps` / `trend_jitter` | 0.8 each |
 | `inv_ecn` / `inv_dropped` | 0.5 each |
