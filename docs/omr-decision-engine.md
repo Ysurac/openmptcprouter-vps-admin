@@ -358,7 +358,59 @@ With the JSON backend (no history), all ETAs are `null` and
 
 ---
 
-## 8. Online learning (fine-tuning)
+## 8. Prometheus scrape endpoint
+
+`GET /metrics/prometheus` returns all users' latest WAN metrics in
+[Prometheus text format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/).
+Admin authentication is required (pass the bearer token in the `Authorization` header).
+
+Prometheus scrape config example:
+
+```yaml
+scrape_configs:
+  - job_name: openmptcprouter
+    scheme: https
+    authorization:
+      credentials: <admin-token>
+    static_configs:
+      - targets: ['your-vps:443']
+    metrics_path: /metrics/prometheus
+```
+
+Exposed metrics (all gauges, labelled `username` and `interface`):
+
+| Metric | Description |
+|--------|-------------|
+| `omr_interface_online` | 1 = online, 0 = offline/error |
+| `omr_latency_ms` | Latency in ms |
+| `omr_loss_percent` | Packet loss in % |
+| `omr_jitter_ms` | Jitter in ms |
+| `omr_rtt_min_ms` / `omr_rtt_max_ms` | Min/max RTT in ms |
+| `omr_rx_bps` / `omr_tx_bps` | Throughput in bytes/s |
+| `omr_congestion_score` | Congestion score 0–100 |
+| `omr_signal_quality` | Signal quality in % (cellular/wifi) |
+| `omr_bbr_bw_bps` | BBR bandwidth estimate in bytes/s |
+| `omr_data_age_seconds` | Age of the latest sample in seconds |
+
+Example output:
+
+```
+# HELP omr_interface_online 1 if the WAN interface is online 0 otherwise
+# TYPE omr_interface_online gauge
+omr_interface_online{username="alice",interface="wan"} 1
+omr_interface_online{username="alice",interface="wwan0"} 1
+# HELP omr_latency_ms WAN interface latency in milliseconds
+# TYPE omr_latency_ms gauge
+omr_latency_ms{username="alice",interface="wan"} 18.4
+omr_latency_ms{username="alice",interface="wwan0"} 42.1
+```
+
+Fields absent from a payload (e.g. `signal_quality` on a wired interface) are
+silently omitted — no `NaN` lines are emitted.
+
+---
+
+## 9. Online learning (fine-tuning)
 
 `POST /metrics/decision/train` runs one SGD step minimising the MSE between
 the model's current softmax output and a caller-supplied target distribution.
@@ -376,10 +428,11 @@ must be present; the call is a no-op otherwise.
 
 ---
 
-## 9. API endpoints
+## 10. API endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
+| `GET` | `/metrics/prometheus` | admin | All users' WAN metrics in Prometheus text format |
 | `GET` | `/metrics/decision` | user | Current weights |
 | `GET` | `/metrics/decision?explain=true` | user | Weights + raw scores + per-feature breakdown |
 | `GET` | `/metrics/decision?predict=true` | user | Weights based on extrapolated future metrics |
@@ -423,7 +476,7 @@ Adds a `"features"` block with the 19 normalised values used as model input:
 
 ---
 
-## 10. Fallback behaviour
+## 11. Fallback behaviour
 
 | Condition | Behaviour |
 |-----------|-----------|
@@ -446,7 +499,7 @@ Adds a `"features"` block with the 19 normalised values used as model input:
 
 ---
 
-## 11. InfluxDB configuration reference
+## 12. InfluxDB configuration reference
 
 The `influxdb` block in `omr-admin-config.json` accepts:
 

@@ -25,6 +25,7 @@
 # GET  /metrics                  — latest snapshot for the current user's WAN interfaces
 # POST /metrics                  — store one interface payload (called by omr-tracker)
 # GET  /metrics/all              — all users' snapshots (admin only)
+# GET  /metrics/prometheus       — all users' metrics in Prometheus text format (admin only)
 # GET  /metrics/history          — time-series history (InfluxDB only)
 #                                  ?interface=wwan0 &since=1h &limit=500
 #
@@ -1932,6 +1933,93 @@ def _validate_feedback_weights(user_data: dict, weights: Dict[str, float]) -> di
 
 
 # ---------------------------------------------------------------------------
+# Prometheus text-format serialiser
+# ---------------------------------------------------------------------------
+
+def _to_prometheus_text(all_data: dict) -> str:
+    """Serialise {username: {interface: payload}} to Prometheus text format 0.0.4.
+
+    Only gauge metrics are emitted (all WAN metrics are instantaneous snapshots).
+    Missing fields are silently omitted so sparse payloads produce no NaN lines.
+    """
+    now = time.time()
+
+    # (metric_name, help_string, list_of_(labels_str, value))
+    _metrics: list = [
+        ("omr_interface_online",
+         "1 if the WAN interface is online 0 otherwise", []),
+        ("omr_latency_ms",
+         "WAN interface latency in milliseconds", []),
+        ("omr_loss_percent",
+         "WAN interface packet loss in percent", []),
+        ("omr_jitter_ms",
+         "WAN interface jitter in milliseconds", []),
+        ("omr_rtt_min_ms",
+         "WAN interface minimum RTT in milliseconds", []),
+        ("omr_rtt_max_ms",
+         "WAN interface maximum RTT in milliseconds", []),
+        ("omr_rx_bps",
+         "WAN interface receive throughput in bytes per second", []),
+        ("omr_tx_bps",
+         "WAN interface transmit throughput in bytes per second", []),
+        ("omr_congestion_score",
+         "WAN interface congestion score 0 to 100", []),
+        ("omr_signal_quality",
+         "WAN interface signal quality in percent", []),
+        ("omr_bbr_bw_bps",
+         "WAN interface BBR bandwidth estimate in bytes per second", []),
+        ("omr_data_age_seconds",
+         "Seconds since the latest WAN interface sample was recorded", []),
+    ]
+    (_, _, online_s), (_, _, lat_s), (_, _, loss_s), (_, _, jitter_s), \
+    (_, _, rtt_min_s), (_, _, rtt_max_s), (_, _, rx_s), (_, _, tx_s), \
+    (_, _, cong_s), (_, _, sig_s), (_, _, bbr_s), (_, _, age_s) = _metrics
+
+    for username, ifaces in all_data.items():
+        for iface, p in ifaces.items():
+            lbl = f'username="{username}",interface="{iface}"'
+            status = p.get("status")
+            online_s.append((lbl, 0 if (status and status != "online") else 1))
+            ts = p.get("timestamp")
+            if ts is not None:
+                age_s.append((lbl, round(now - float(ts), 1)))
+            for key, store in (
+                ("latency",  lat_s),
+                ("loss",     loss_s),
+                ("jitter",   jitter_s),
+                ("rtt_min",  rtt_min_s),
+                ("rtt_max",  rtt_max_s),
+            ):
+                v = p.get(key)
+                if v is not None:
+                    store.append((lbl, v))
+            bw = p.get("bandwidth") or {}
+            if bw.get("rx_bps") is not None:
+                rx_s.append((lbl, bw["rx_bps"]))
+            if bw.get("tx_bps") is not None:
+                tx_s.append((lbl, bw["tx_bps"]))
+            cong = p.get("congestion") or {}
+            if cong.get("score") is not None:
+                cong_s.append((lbl, cong["score"]))
+            sig = p.get("signal") or {}
+            if sig.get("quality") is not None:
+                sig_s.append((lbl, sig["quality"]))
+            bbr = p.get("bbr") or {}
+            if bbr.get("bw") is not None:
+                bbr_s.append((lbl, bbr["bw"]))
+
+    lines: list = []
+    for name, help_text, samples in _metrics:
+        if not samples:
+            continue
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} gauge")
+        for lbl, val in samples:
+            lines.append(f"{name}{{{lbl}}} {val}")
+    return "\n".join(lines) + "\n" if lines else "# no data\n"
+
+
+# ---------------------------------------------------------------------------
 # Router factory — avoids circular imports with omradmin.py
 # ---------------------------------------------------------------------------
 
@@ -2196,6 +2284,21 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             _engine_stats["model_resets"] += 1
             _engine_stats["model_loaded_at"] = time.time()
         return {"result": "ok"}
+
+    # ---- Prometheus scrape endpoint -----------------------------------------
+
+    @router.get('/metrics/prometheus',
+                summary="All WAN metrics in Prometheus text format (admin only)")
+    async def get_prometheus_metrics(current_user: User = Depends(get_current_user)):
+        from fastapi import HTTPException
+        from starlette.responses import PlainTextResponse
+        if current_user.permissions != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        all_data = await asyncio.to_thread(_read_all)
+        return PlainTextResponse(
+            content=_to_prometheus_text(all_data),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     # ---- engine diagnostics endpoint ----------------------------------------
 

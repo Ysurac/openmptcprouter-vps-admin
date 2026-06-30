@@ -368,6 +368,168 @@ class TestGetAllMetrics:
 
 
 # ===========================================================================
+# GET /metrics/prometheus
+# ===========================================================================
+
+class TestGetPrometheusMetrics:
+    _STORE = {"openmptcprouter": {"wan": _WAN, "wwan0": _MODEM_WAN}}
+
+    def test_admin_gets_200(self, admin_client):
+        with patch.object(omr_metrics, "_read_all", return_value=self._STORE):
+            r = admin_client.get("/metrics/prometheus")
+        assert r.status_code == 200
+
+    def test_non_admin_gets_403(self, user_client):
+        with patch.object(omr_metrics, "_read_all", return_value=self._STORE):
+            r = user_client.get("/metrics/prometheus")
+        assert r.status_code == 403
+
+    def test_unauthenticated_returns_403(self, unauth_client):
+        r = unauth_client.get("/metrics/prometheus")
+        assert r.status_code == 403
+
+    def test_content_type_is_prometheus(self, admin_client):
+        with patch.object(omr_metrics, "_read_all", return_value=self._STORE):
+            r = admin_client.get("/metrics/prometheus")
+        assert "text/plain" in r.headers["content-type"]
+        assert "0.0.4" in r.headers["content-type"]
+
+    def test_empty_store_returns_no_data_comment(self, admin_client):
+        with patch.object(omr_metrics, "_read_all", return_value={}):
+            r = admin_client.get("/metrics/prometheus")
+        assert r.status_code == 200
+        assert "# no data" in r.text
+
+    def test_response_contains_interface_online_metric(self, admin_client):
+        with patch.object(omr_metrics, "_read_all", return_value=self._STORE):
+            r = admin_client.get("/metrics/prometheus")
+        assert "omr_interface_online" in r.text
+
+    def test_response_contains_latency_metric(self, admin_client):
+        with patch.object(omr_metrics, "_read_all", return_value=self._STORE):
+            r = admin_client.get("/metrics/prometheus")
+        assert "omr_latency_ms" in r.text
+
+    def test_labels_include_username_and_interface(self, admin_client):
+        with patch.object(omr_metrics, "_read_all", return_value=self._STORE):
+            r = admin_client.get("/metrics/prometheus")
+        assert 'username="openmptcprouter"' in r.text
+        assert 'interface="wan"' in r.text
+
+    def test_each_metric_has_help_and_type_lines(self, admin_client):
+        with patch.object(omr_metrics, "_read_all", return_value=self._STORE):
+            r = admin_client.get("/metrics/prometheus")
+        assert "# HELP omr_latency_ms" in r.text
+        assert "# TYPE omr_latency_ms gauge" in r.text
+
+
+# ===========================================================================
+# _to_prometheus_text — unit tests
+# ===========================================================================
+
+class TestToPrometheusText:
+    def _make_store(self, **iface_overrides):
+        return {"user1": {"wan": {**_WAN, **iface_overrides}}}
+
+    def test_empty_store_returns_no_data_comment(self):
+        assert omr_metrics._to_prometheus_text({}) == "# no data\n"
+
+    def test_online_interface_emits_1(self):
+        text = omr_metrics._to_prometheus_text(self._make_store())
+        line = next(l for l in text.splitlines()
+                    if "omr_interface_online" in l and not l.startswith("#"))
+        assert line.endswith(" 1")
+
+    def test_offline_interface_emits_0(self):
+        text = omr_metrics._to_prometheus_text(
+            self._make_store(status="offline"))
+        line = next(l for l in text.splitlines()
+                    if "omr_interface_online" in l and not l.startswith("#"))
+        assert line.endswith(" 0")
+
+    def test_error_status_emits_0(self):
+        text = omr_metrics._to_prometheus_text(
+            self._make_store(status="ERROR"))
+        line = next(l for l in text.splitlines()
+                    if "omr_interface_online" in l and not l.startswith("#"))
+        assert line.endswith(" 0")
+
+    def test_latency_value_present(self):
+        text = omr_metrics._to_prometheus_text(self._make_store(latency=42.5))
+        assert "omr_latency_ms" in text
+        assert "42.5" in text
+
+    def test_null_latency_omitted(self):
+        text = omr_metrics._to_prometheus_text(self._make_store(latency=None))
+        assert "omr_latency_ms" not in text
+
+    def test_loss_value_present(self):
+        text = omr_metrics._to_prometheus_text(self._make_store(loss=1.5))
+        assert "omr_loss_percent" in text
+        assert "1.5" in text
+
+    def test_congestion_score_present(self):
+        store = {"u": {"wan": {**_WAN, "congestion": {"score": 55, "level": "moderate"}}}}
+        text = omr_metrics._to_prometheus_text(store)
+        assert "omr_congestion_score" in text
+        assert "55" in text
+
+    def test_signal_quality_present_for_modem(self):
+        store = {"u": {"wwan0": _MODEM_WAN}}
+        text = omr_metrics._to_prometheus_text(store)
+        assert "omr_signal_quality" in text
+
+    def test_signal_quality_absent_for_wired(self):
+        store = {"u": {"wan": {**_WAN, "signal": {**_WAN["signal"], "quality": None}}}}
+        text = omr_metrics._to_prometheus_text(store)
+        assert "omr_signal_quality" not in text
+
+    def test_bbr_bw_present_for_bbr_interface(self):
+        store = {"u": {"wan": _BBR_WAN}}
+        text = omr_metrics._to_prometheus_text(store)
+        assert "omr_bbr_bw_bps" in text
+
+    def test_bandwidth_rx_tx_present(self):
+        text = omr_metrics._to_prometheus_text(self._make_store())
+        assert "omr_rx_bps" in text
+        assert "omr_tx_bps" in text
+
+    def test_data_age_present_when_timestamp_set(self):
+        text = omr_metrics._to_prometheus_text(self._make_store())
+        assert "omr_data_age_seconds" in text
+
+    def test_data_age_absent_when_no_timestamp(self):
+        store = {"u": {"wan": {k: v for k, v in _WAN.items() if k != "timestamp"}}}
+        text = omr_metrics._to_prometheus_text(store)
+        assert "omr_data_age_seconds" not in text
+
+    def test_multiple_users_and_interfaces(self):
+        store = {
+            "alice": {"wan": _WAN, "wwan0": _MODEM_WAN},
+            "bob":   {"wan": _WAN2},
+        }
+        text = omr_metrics._to_prometheus_text(store)
+        assert 'username="alice"' in text
+        assert 'username="bob"' in text
+        assert 'interface="wwan0"' in text
+
+    def test_each_metric_block_has_help_and_type(self):
+        text = omr_metrics._to_prometheus_text(self._make_store())
+        for name in ("omr_interface_online", "omr_latency_ms", "omr_loss_percent"):
+            assert f"# HELP {name}" in text
+            assert f"# TYPE {name} gauge" in text
+
+    def test_output_ends_with_newline(self):
+        text = omr_metrics._to_prometheus_text(self._make_store())
+        assert text.endswith("\n")
+
+    def test_rtt_min_and_max_present(self):
+        text = omr_metrics._to_prometheus_text(self._make_store())
+        assert "omr_rtt_min_ms" in text
+        assert "omr_rtt_max_ms" in text
+
+
+# ===========================================================================
 # JSONBackend unit tests
 # ===========================================================================
 
