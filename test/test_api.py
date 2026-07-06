@@ -1058,6 +1058,114 @@ class TestMqvpn:
         assert mqvpn.get("key") == MQVPN_CONFIG["users"][0]["key"]
         assert mqvpn.get("key") != MQVPN_CONFIG["auth_key"]
 
+    def test_reorder_written_to_config(self, user_client):
+        """POST /mqvpn with reorder must persist the reorder object."""
+        capture = io.StringIO()
+        capture.close = lambda: None
+
+        def _capture_open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json" and "w" in str(mode):
+                return capture
+            return _mock_open(path, mode, *args, **kwargs)
+
+        payload = {**self._PAYLOAD, "reorder": {"enabled": "on", "max_wait_ms": 50, "cap_packets": 512}}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_capture_open),
+        ):
+            r = user_client.post("/mqvpn", json=payload)
+        assert r.json()["result"] == "done"
+        capture.seek(0)
+        written = json.loads(capture.read())
+        assert written["reorder"] == {"enabled": "on", "max_wait_ms": 50, "cap_packets": 512}
+
+    def test_reorder_rules_written_to_config(self, user_client):
+        """POST /mqvpn with reorder_rules must persist the rules list."""
+        capture = io.StringIO()
+        capture.close = lambda: None
+
+        def _capture_open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json" and "w" in str(mode):
+                return capture
+            return _mock_open(path, mode, *args, **kwargs)
+
+        rules = [{"proto": "udp", "port": 443, "profile": "fiber_lte"}, {"proto": "udp", "port": 53, "profile": "default_udp"}]
+        payload = {**self._PAYLOAD, "reorder_rules": rules}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_capture_open),
+        ):
+            r = user_client.post("/mqvpn", json=payload)
+        assert r.json()["result"] == "done"
+        capture.seek(0)
+        written = json.loads(capture.read())
+        assert written["reorder_rules"] == rules
+
+    def test_reorder_omitted_preserves_existing(self, user_client):
+        """POST /mqvpn without reorder must leave the existing reorder block unchanged."""
+        capture = io.StringIO()
+        capture.close = lambda: None
+
+        def _capture_open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json" and "w" in str(mode):
+                return capture
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_capture_open),
+        ):
+            r = user_client.post("/mqvpn", json=self._PAYLOAD)
+        assert r.json()["result"] == "done"
+        capture.seek(0)
+        written = json.loads(capture.read())
+        assert written["reorder"] == MQVPN_CONFIG["reorder"]
+        assert written["reorder_rules"] == MQVPN_CONFIG["reorder_rules"]
+
+    def test_invalid_reorder_enabled_returns_422(self, user_client):
+        """enabled must be one of off/on/auto."""
+        payload = {**self._PAYLOAD, "reorder": {"enabled": "yes", "max_wait_ms": 30, "cap_packets": 1024}}
+        r = user_client.post("/mqvpn", json=payload)
+        assert r.status_code == 422
+
+    def test_config_returns_reorder(self, user_client):
+        """GET /config must include the reorder object from server.json."""
+        with patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        mqvpn = r.json().get("mqvpn", {})
+        assert mqvpn.get("reorder") == MQVPN_CONFIG["reorder"]
+
+    def test_config_returns_reorder_rules(self, user_client):
+        """GET /config must include the reorder_rules list from server.json."""
+        with patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        mqvpn = r.json().get("mqvpn", {})
+        assert mqvpn.get("reorder_rules") == MQVPN_CONFIG["reorder_rules"]
+
+    def test_config_reorder_defaults_when_absent(self, user_client):
+        """GET /config must return safe defaults when reorder is absent from server.json."""
+        cfg_without_reorder = {k: v for k, v in MQVPN_CONFIG.items() if k not in ("reorder", "reorder_rules")}
+
+        def _open_no_reorder(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json":
+                return io.StringIO(json.dumps(cfg_without_reorder))
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("builtins.open", side_effect=_open_no_reorder),
+        ):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        mqvpn = r.json().get("mqvpn", {})
+        reorder = mqvpn.get("reorder", {})
+        assert reorder.get("enabled") == "off"
+        assert reorder.get("max_wait_ms") == 30
+        assert reorder.get("cap_packets") == 1024
+        assert mqvpn.get("reorder_rules") == []
+
 
 class TestOpenVpn:
     _PAYLOAD = {"port": 65301, "cipher": "AES-256-GCM"}

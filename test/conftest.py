@@ -85,6 +85,10 @@ MQVPN_CONFIG = {
     "max_clients": 64,
     "scheduler": "wlb",
     "cc": "bbr2",
+    "reorder": {"enabled": "off", "max_wait_ms": 30, "cap_packets": 1024},
+    "reorder_rules": [
+        {"proto": "udp", "port": 443, "profile": "fiber_lte"},
+    ],
 }
 _MQVPN_CONFIG_JSON = json.dumps(MQVPN_CONFIG)
 
