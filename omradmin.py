@@ -424,6 +424,57 @@ def modif_config_user(user, changes):
     else:
         LOG.debug("No real changes in modif_config_user")
 
+def get_vxlan_config(username, userid):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    user_config = omr_config_data['users'][0].get(username, {})
+    vxlan_config = user_config.get('vxlan') or {}
+    return {
+        'enabled': bool(vxlan_config.get('enabled', False)),
+        'vni': vxlan_config.get('vni', userid + 1),
+        'port': vxlan_config.get('port', 4789),
+        'localip': vxlan_config.get('localip', '10.255.249.' + str(userid * 4 + 1) + '/30'),
+        'remoteip': vxlan_config.get('remoteip', '10.255.249.' + str(userid * 4 + 2) + '/30'),
+        'localip6': vxlan_config.get('localip6', 'fd00::b0' + hex(userid)[2:] + ':1/126'),
+        'remoteip6': vxlan_config.get('remoteip6', 'fd00::b0' + hex(userid)[2:] + ':2/126'),
+        'mtu': vxlan_config.get('mtu', 1380)
+    }
+
+def write_vxlan_conf(username, userid):
+    vxlan_config = get_vxlan_config(username, userid)
+    vxlan_file = '/etc/openmptcprouter-vps-admin/omr-vxlan/user' + str(userid)
+    if not vxlan_config['enabled']:
+        if os.path.isfile(vxlan_file):
+            subprocess.run(["systemctl", "-q", "stop", f"omr-vxlan@user{userid}"], check=False)
+            subprocess.run(["systemctl", "-q", "disable", f"omr-vxlan@user{userid}"], check=False)
+            os.remove(vxlan_file)
+        return
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    user_config = omr_config_data['users'][0].get(username, {})
+    underlay_localip = user_config.get('vpnlocalip', '')
+    underlay_remoteip = user_config.get('vpnremoteip', '')
+    if not underlay_localip or not underlay_remoteip:
+        LOG.debug("No VPN IPs known for user %s, vxlan config not written", username)
+        return
+    if os.path.isfile(vxlan_file):
+        initial_md5 = hashlib.md5(file_as_bytes(open(vxlan_file, 'rb'))).hexdigest()
+    else:
+        initial_md5 = ''
+    os.makedirs('/etc/openmptcprouter-vps-admin/omr-vxlan', exist_ok=True)
+    with open(vxlan_file, 'w+') as n:
+        n.write('VNI=' + str(vxlan_config['vni']) + "\n")
+        n.write('PORT=' + str(vxlan_config['port']) + "\n")
+        n.write('LOCALIP=' + underlay_localip.split('/')[0] + "\n")
+        n.write('REMOTEIP=' + underlay_remoteip.split('/')[0] + "\n")
+        n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
+        n.write('LOCALTUNIP6=' + vxlan_config['localip6'] + "\n")
+        n.write('MTU=' + str(vxlan_config['mtu']) + "\n")
+    final_md5 = hashlib.md5(file_as_bytes(open(vxlan_file, 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        subprocess.run(["systemctl", "-q", "enable", f"omr-vxlan@user{userid}"], check=False)
+        subprocess.run(["systemctl", "-q", "restart", f"omr-vxlan@user{userid}"], check=False)
+
 def add_ss_user(port, key, userid=0, ip=''):
     try:
         f_ss = open('/etc/shadowsocks-libev/manager.json')
@@ -2645,7 +2696,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'vxlan': get_vxlan_config(username, userid), 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -3413,6 +3464,44 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
+class Vxlan(BaseModel):
+    enable: bool = True
+    vni: Optional[int] = None
+    port: Optional[int] = None
+    localip: Optional[str] = None
+    remoteip: Optional[str] = None
+    localip6: Optional[str] = None
+    remoteip6: Optional[str] = None
+    mtu: Optional[int] = None
+
+# Set VXLAN L2 tunnel over the VPN
+@app.post('/vxlan', summary="Set VXLAN L2 tunnel over the VPN for the current user")
+def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'vxlan'}
+    userid = current_user.userid
+    if userid is None:
+        userid = 0
+    vxlan_user_config = {'enabled': vxlanconfig.enable}
+    if vxlanconfig.vni is not None:
+        vxlan_user_config['vni'] = vxlanconfig.vni
+    if vxlanconfig.port is not None:
+        vxlan_user_config['port'] = vxlanconfig.port
+    if vxlanconfig.localip:
+        vxlan_user_config['localip'] = vxlanconfig.localip
+    if vxlanconfig.remoteip:
+        vxlan_user_config['remoteip'] = vxlanconfig.remoteip
+    if vxlanconfig.localip6:
+        vxlan_user_config['localip6'] = vxlanconfig.localip6
+    if vxlanconfig.remoteip6:
+        vxlan_user_config['remoteip6'] = vxlanconfig.remoteip6
+    if vxlanconfig.mtu is not None:
+        vxlan_user_config['mtu'] = vxlanconfig.mtu
+    LOG.debug("modif_config_user for vxlan setting")
+    modif_config_user(current_user.username, {'vxlan': vxlan_user_config})
+    write_vxlan_conf(current_user.username, userid)
+    return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(current_user.username, userid)}
+
 class PROXY(str, Enum):
     v2ray = "v2ray"
     v2rayvless = "v2ray-vless"
@@ -3990,6 +4079,9 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         if initial_md5 != final_md5:
             subprocess.run(["systemctl", "-q", "restart", f"omr6in4@user{userid}"], check=False)
             #set_lastchange()
+
+    if 'vxlan' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vxlan']:
+        write_vxlan_conf(current_user.username, userid)
 
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
