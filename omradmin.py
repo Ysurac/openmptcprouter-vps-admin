@@ -1706,7 +1706,7 @@ def load_mptcp_bpf_schedulers():
                             # Retry briefly: the BPF struct_ops may not be visible to the
                             # MPTCP scheduler lookup immediately after bpftool register.
                             for attempt in range(5):
-                                result = subprocess.run(['sysctl', '-qw', line], check=False, capture_output=True)
+                                result = subprocess.run(['sysctl', '-qw', line], check=False, capture_output=True, text=True)
                                 if result.returncode == 0:
                                     LOG.info('Re-applied scheduler after BPF load: ' + line)
                                     break
@@ -3190,7 +3190,9 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
         xray_config['inbounds'] = [ib for ib in xray_config['inbounds'] if ib.get('tag') != 'omrin-vless-reality']
     for inbounds in xray_config['inbounds']:
         if inbounds.get('tag') == 'omrin-shadowsocks-tunnel':
-            inbounds['settings']['method'] = params.ss_method
+            # An empty method makes the config invalid and xray fails to start
+            if params.ss_method:
+                inbounds['settings']['method'] = params.ss_method
         if 'streamSettings' in inbounds:
             inbounds['streamSettings']['network'] = params.transport
 
@@ -3753,7 +3755,9 @@ def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/mqvpn/server.json', 'rb'))).hexdigest()
     with open('/etc/mqvpn/server.json') as f:
         mqvpn_cfg = json.load(f)
-    host_part = mqvpn_cfg.get('listen', '0.0.0.0:443').rsplit(':', 1)[0]
+    mqvpn_listen = mqvpn_cfg.get('listen', '0.0.0.0:443')
+    host_part = mqvpn_listen.rsplit(':', 1)[0]
+    old_port = mqvpn_listen.rsplit(':', 1)[-1]
     mqvpn_cfg['auth_key'] = params.key
     mqvpn_cfg['scheduler'] = params.scheduler
     mqvpn_cfg['listen'] = host_part + ':' + str(params.port)
@@ -3769,6 +3773,11 @@ def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_
     with open('/etc/mqvpn/server.json', 'w') as f:
         json.dump(mqvpn_cfg, f, indent=4)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/mqvpn/server.json', 'rb'))).hexdigest()
+    if str(params.port) != old_port:
+        shorewall_add_port(current_user, str(params.port), 'udp', 'mqvpn')
+        shorewall6_add_port(current_user, str(params.port), 'udp', 'mqvpn')
+        shorewall_del_port(current_user.username, old_port, 'udp', 'mqvpn')
+        shorewall6_del_port(current_user.username, old_port, 'udp', 'mqvpn')
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", "mqvpn"], check=False)
         #set_lastchange()

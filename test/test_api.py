@@ -1023,6 +1023,42 @@ class TestMqvpn:
         r = user_client.post("/mqvpn", json={**self._PAYLOAD, "port": 99999})
         assert r.status_code == 422
 
+    def test_port_change_updates_firewall(self, user_client):
+        """Changing the port must open the new port and close the old one (v4+v6)."""
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port") as add4,
+            patch("omr_admin.shorewall6_add_port") as add6,
+            patch("omr_admin.shorewall_del_port") as del4,
+            patch("omr_admin.shorewall6_del_port") as del6,
+        ):
+            # fixture listen is 0.0.0.0:443 → move to 65443
+            r = user_client.post("/mqvpn", json={**self._PAYLOAD, "port": 65443})
+        assert r.json()["result"] == "done"
+        add4.assert_called_once()
+        add6.assert_called_once()
+        del4.assert_called_once()
+        del6.assert_called_once()
+        assert add4.call_args[0][1:] == ("65443", "udp", "mqvpn")
+        assert del4.call_args[0][1:] == ("443", "udp", "mqvpn")
+
+    def test_same_port_does_not_touch_firewall(self, user_client):
+        """No firewall changes when the port stays the same."""
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port") as add4,
+            patch("omr_admin.shorewall6_add_port") as add6,
+            patch("omr_admin.shorewall_del_port") as del4,
+            patch("omr_admin.shorewall6_del_port") as del6,
+        ):
+            # fixture listen is 0.0.0.0:443 → payload port is also 443
+            r = user_client.post("/mqvpn", json=self._PAYLOAD)
+        assert r.json()["result"] == "done"
+        add4.assert_not_called()
+        add6.assert_not_called()
+        del4.assert_not_called()
+        del6.assert_not_called()
+
     def test_config_fields_are_updated(self, user_client):
         """auth_key and scheduler must be written into the JSON config."""
         capture = io.StringIO()
