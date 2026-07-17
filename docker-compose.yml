@@ -24,17 +24,17 @@ x-app-base: &app-base
           retention = os.getenv('INFLUXDB_RETENTION', '60d').strip().lower()
           retention_days = os.getenv('INFLUXDB_RETENTION_DAYS', '').strip()
           if retention_days:
-            retention_days = int(retention_days)
+              retention_days = int(retention_days)
           elif retention.endswith('d') and retention[:-1].isdigit():
-            retention_days = int(retention[:-1])
+              retention_days = int(retention[:-1])
           else:
-            retention_days = 60
+              retention_days = 60
           cfg = {'influxdb': {
               'url':    url,
               'token':  token,
               'org':    os.getenv('INFLUXDB_ORG',    'omr'),
               'bucket': os.getenv('INFLUXDB_BUCKET', 'omr_metrics'),
-            'retention_days': retention_days,
+              'retention_days': retention_days,
           }}
           with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
               json.dump(cfg, f)
@@ -171,6 +171,29 @@ services:
   # InfluxDB 3 Core
   # Image: https://hub.docker.com/_/influxdb  (tag 3-core)
   # -------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # Admin token init — writes the offline admin token file consumed by
+  # `influxdb3 serve --admin-token-file` on first start, then exits.
+  # InfluxDB only reads the file while no admin token exists yet: changing
+  # INFLUXDB_TOKEN afterwards requires `influxdb3 create token --admin
+  # --regenerate` or wiping the influxdb-data volume.
+  # -------------------------------------------------------------------------
+  influxdb-token-init:
+    image: influxdb:3-core
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        printf '{"token": "%s", "name": "admin", "expiry_millis": 4102444800000}' \
+          "$$INFLUXDB_TOKEN" > /var/lib/influxdb3/admin-token.json
+        chown influxdb3: /var/lib/influxdb3/admin-token.json 2>/dev/null || true
+        chmod 600 /var/lib/influxdb3/admin-token.json
+        echo "Admin token file ready."
+    environment:
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:?INFLUXDB_TOKEN is required}
+    volumes:
+      - influxdb-data:/var/lib/influxdb3
+
   influxdb:
     image: influxdb:3-core
     command:
@@ -178,10 +201,15 @@ services:
       - --node-id=local
       - --object-store=file
       - --data-dir=/var/lib/influxdb3
-      - --bearer-token=${INFLUXDB_TOKEN:?INFLUXDB_TOKEN is required}
+      - --admin-token-file=/var/lib/influxdb3/admin-token.json
       - --disable-authz=health,ping
+    depends_on:
+      influxdb-token-init:
+        condition: service_completed_successfully
     ports:
-      - "${INFLUXDB_PORT:-8181}:8181"
+      # Bound to localhost by default: only the app container needs InfluxDB,
+      # via the compose network. Set INFLUXDB_BIND=0.0.0.0 to expose it.
+      - "${INFLUXDB_BIND:-127.0.0.1}:${INFLUXDB_PORT:-8181}:8181"
     volumes:
       - influxdb-data:/var/lib/influxdb3
     healthcheck:
@@ -205,11 +233,13 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        influxdb3 create database "${INFLUXDB_BUCKET:-omr_metrics}" \
+        out=$$(influxdb3 create database "$$INFLUXDB_BUCKET" \
           --host "http://influxdb:8181" \
-          --token "${INFLUXDB_TOKEN}" \
-          --retention-period "${INFLUXDB_RETENTION:-60d}" 2>&1 | grep -v "already exists" || true
-        echo "Database '${INFLUXDB_BUCKET:-omr_metrics}' ready (retention: ${INFLUXDB_RETENTION:-60d})."
+          --token "$$INFLUXDB_TOKEN" \
+          --retention-period "$$INFLUXDB_RETENTION" 2>&1) || {
+            echo "$$out" | grep -qi "already exists" || { echo "$$out" >&2; exit 1; }
+          }
+        echo "Database '$$INFLUXDB_BUCKET' ready (retention: $$INFLUXDB_RETENTION)."
     environment:
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:?INFLUXDB_TOKEN is required}
       INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-omr_metrics}
