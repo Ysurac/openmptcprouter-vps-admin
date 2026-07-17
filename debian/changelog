@@ -1,3 +1,18 @@
+omr-vps-admin (0.18+20260717) unstable; urgency=medium
+
+  * Add VXLAN support: POST /vxlan endpoint to set up a VXLAN L2 tunnel over the VPN, config exposed in /config
+  * Add MQVPN packet reorder support: reorder settings (off/on/auto, max_wait_ms, cap_packets) and per-port reorder rules
+  * Add Prometheus exporter for metrics: GET /metrics/prometheus returns all users' WAN metrics in Prometheus text format (admin only)
+  * Use neural network for metrics forecast: small MLP with exponential sample weighting replaces linear regression when enough history is available
+  * Add RTT to metrics forecast
+  * Give latency higher priority in the decision engine: raise inv_latency and trend_latency weights, tighten latency normalization from 2000ms to 500ms
+  * Update MQVPN firewall rules on port change so any port (e.g. 443) can be used
+  * Fix xray failing to start when an empty shadowsocks method was written to its config
+  * Fix log error on BPF scheduler load: retry sysctl with backoff and report stderr on failure
+  * Fix bugs, remove duplicate and unused code in omr_metrics
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 17 Jul 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260625) unstable; urgency=medium
 
   * Add EMA (Exponential Moving Average) weight to metrics decision engine
