@@ -119,17 +119,21 @@ def _no_ts(payload: dict) -> dict:
 
 @pytest.fixture(autouse=True)
 def reset_backend():
-    """Reset backend, decision-model, and EMA singletons between tests."""
+    """Reset backend, decision-model, EMA and auto-learning state between tests."""
     orig_backend = omr_metrics._backend
     orig_model  = omr_metrics._decision_model
     orig_ema    = dict(omr_metrics._weight_ema)
     omr_metrics._backend        = None
     omr_metrics._decision_model = None
     omr_metrics._weight_ema     = {}
+    omr_metrics._auto_cfg_cache = {"ts": 0.0, "cfg": None}
+    omr_metrics._auto_bad_streak = 0
     yield
     omr_metrics._backend        = orig_backend
     omr_metrics._decision_model = orig_model
     omr_metrics._weight_ema     = orig_ema
+    omr_metrics._auto_cfg_cache = {"ts": 0.0, "cfg": None}
+    omr_metrics._auto_bad_streak = 0
 
 
 @pytest.fixture
@@ -3055,3 +3059,399 @@ class TestForecastDispatch:
                 hist, ("loss",), [(15.0, "severe")], hi_clamp=100.0,
             )
         mock_lin.assert_not_called()
+
+
+# ===========================================================================
+# Online auto-learning
+# ===========================================================================
+
+def _auto_hist(base, n=10, status="online", **overrides):
+    """Return n timestamped samples derived from *base*, 30 s apart."""
+    out = []
+    for i in range(n):
+        p = {**base, "status": status, "timestamp": 1_700_000_000 + i * 30}
+        p.update(overrides)
+        out.append(p)
+    return out
+
+
+def _auto_config_open(auto_block):
+    """Patch builtins.open so _auto_cfg reads a config with *auto_block*."""
+    payload = json.dumps({"auto_learning": auto_block})
+    m = MagicMock()
+    m.return_value.__enter__.return_value.read.return_value = payload
+    return patch("builtins.open", m)
+
+
+class TestAutoCfg:
+    def test_defaults_when_block_missing(self):
+        cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["enabled"] is True   # auto-learning is on by default
+        assert cfg["interval"] == 300
+        assert cfg["learning_rate"] == pytest.approx(1e-4)
+        assert cfg["window"] == 900
+        assert cfg["min_points"] == 5
+        assert cfg["sharpen"] == pytest.approx(4.0)
+        assert cfg["exploration"] == pytest.approx(0.0)
+
+    def test_values_read_from_config(self):
+        with _auto_config_open({"enabled": True, "interval": 600,
+                                "learning_rate": 0.001, "exploration": 0.2}):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["enabled"] is True
+        assert cfg["interval"] == 600
+        assert cfg["learning_rate"] == pytest.approx(0.001)
+        assert cfg["exploration"] == pytest.approx(0.2)
+
+    def test_values_are_clamped(self):
+        with _auto_config_open({"interval": 5, "learning_rate": 10.0,
+                                "exploration": 0.99, "sharpen": 100}):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["interval"] == 60
+        assert cfg["learning_rate"] == pytest.approx(0.05)
+        assert cfg["exploration"] == pytest.approx(0.5)
+        assert cfg["sharpen"] == pytest.approx(16.0)
+
+    def test_invalid_value_falls_back_to_default(self):
+        with _auto_config_open({"interval": "soon"}):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["interval"] == 300
+
+    def test_enabled_string_false_is_false(self):
+        with _auto_config_open({"enabled": "false"}):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["enabled"] is False
+
+    def test_enabled_string_true_is_true(self):
+        with _auto_config_open({"enabled": "true"}):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["enabled"] is True
+
+    def test_cache_avoids_reread_within_ttl(self):
+        with _auto_config_open({"interval": 600}):
+            first = omr_metrics._auto_cfg(force=True)
+        with _auto_config_open({"interval": 1200}):
+            second = omr_metrics._auto_cfg()
+        assert first["interval"] == 600
+        assert second["interval"] == 600  # cached value, file not re-read
+
+
+class TestAutoReward:
+    def test_none_with_too_few_samples(self):
+        hist = _auto_hist(_WAN, n=3)
+        assert omr_metrics._auto_reward(hist, min_points=5) is None
+
+    def test_clean_link_scores_high(self):
+        hist = _auto_hist(_WAN, n=10, loss=0.0, jitter=1.0)
+        reward = omr_metrics._auto_reward(hist)
+        assert reward is not None and reward > 0.8
+
+    def test_lossy_link_scores_below_clean_link(self):
+        clean = omr_metrics._auto_reward(_auto_hist(_WAN, n=10, loss=0.0))
+        lossy = omr_metrics._auto_reward(_auto_hist(_WAN, n=10, loss=15.0))
+        assert lossy < clean
+
+    def test_all_offline_returns_zero(self):
+        hist = _auto_hist(_WAN, n=10, status="offline")
+        assert omr_metrics._auto_reward(hist) == 0.0
+
+    def test_null_latency_counts_as_unreachable(self):
+        hist = _auto_hist(_WAN, n=10, latency=None)
+        assert omr_metrics._auto_reward(hist) == 0.0
+
+    def test_partial_availability_scales_reward(self):
+        full = _auto_hist(_WAN, n=10)
+        half = _auto_hist(_WAN, n=5) + _auto_hist(_WAN, n=5, status="offline")
+        r_full = omr_metrics._auto_reward(full)
+        r_half = omr_metrics._auto_reward(half)
+        assert r_half == pytest.approx(r_full * 0.5)
+
+    def test_prefers_bbr_min_rtt_over_loaded_latency(self):
+        # Same (bad) latency; the link exposing a clean BBR min_rtt must win.
+        no_bbr = _auto_hist(_WAN, n=10, latency=450.0, rtt_min=None,
+                            bbr={**_WAN["bbr"], "min_rtt": None})
+        with_bbr = _auto_hist(_WAN, n=10, latency=450.0, rtt_min=None,
+                              bbr={**_WAN["bbr"], "min_rtt": 20.0})
+        assert omr_metrics._auto_reward(with_bbr) > omr_metrics._auto_reward(no_bbr)
+
+    def test_reward_bounded_zero_one(self):
+        hist = _auto_hist(_WAN, n=10, loss=100.0, jitter=500.0, latency=2000.0)
+        reward = omr_metrics._auto_reward(hist)
+        assert 0.0 <= reward <= 1.0
+
+
+class TestAutoTargets:
+    def test_sharpening_amplifies_contrast(self):
+        targets = omr_metrics._auto_targets({"a": 0.9, "b": 0.8}, sharpen=4.0)
+        assert targets["a"] / targets["b"] == pytest.approx((0.9 / 0.8) ** 4)
+
+    def test_all_zero_returns_none(self):
+        assert omr_metrics._auto_targets({"a": 0.0, "b": 0.0}) is None
+
+    def test_negative_reward_clamped_to_zero(self):
+        targets = omr_metrics._auto_targets({"a": -1.0, "b": 0.5})
+        assert targets["a"] == 0.0
+        assert targets["b"] > 0.0
+
+
+class TestAutoWatchdog:
+    def _resets(self):
+        return omr_metrics._engine_stats["auto_resets"]
+
+    def test_good_loss_keeps_model(self):
+        with patch.object(omr_metrics, "_make_model") as mk:
+            omr_metrics._auto_watchdog(0.05)
+        mk.assert_not_called()
+
+    def test_three_divergent_losses_reset_model(self):
+        before = self._resets()
+        with (
+            patch.object(omr_metrics, "_make_model", return_value=_FakeModel()) as mk,
+            patch.object(omr_metrics, "_save_model"),
+        ):
+            for _ in range(3):
+                omr_metrics._auto_watchdog(float("inf"))
+        mk.assert_called_once()
+        assert self._resets() == before + 1
+        assert omr_metrics._auto_bad_streak == 0
+
+    def test_good_loss_resets_streak(self):
+        with (
+            patch.object(omr_metrics, "_make_model", return_value=_FakeModel()) as mk,
+            patch.object(omr_metrics, "_save_model"),
+        ):
+            omr_metrics._auto_watchdog(100.0)
+            omr_metrics._auto_watchdog(100.0)
+            omr_metrics._auto_watchdog(0.01)     # streak broken
+            omr_metrics._auto_watchdog(100.0)
+            omr_metrics._auto_watchdog(100.0)
+        mk.assert_not_called()
+
+
+class TestAutoLearnRound:
+    _CFG = {**omr_metrics._AUTO_DEFAULTS, "enabled": True}
+
+    def test_noop_without_torch(self):
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", False):
+            summary = omr_metrics._auto_learn_round(self._CFG)
+        assert summary == {"trained": 0, "skipped": 0}
+
+    def test_noop_with_json_backend(self, torch_env):
+        omr_metrics._backend = omr_metrics.JSONBackend()
+        with patch.object(omr_metrics, "_read_all") as ra:
+            summary = omr_metrics._auto_learn_round(self._CFG)
+        ra.assert_not_called()
+        assert summary["trained"] == 0
+
+    def _influx_env(self):
+        """Patch a non-JSON backend so the round proceeds."""
+        omr_metrics._backend = MagicMock()   # not a JSONBackend instance
+        return contextlib.nullcontext()
+
+    def test_trains_user_with_clean_and_lossy_links(self, torch_env):
+        self._influx_env()
+        hists = {
+            "wan":  _auto_hist(_WAN,  n=10, loss=0.0),
+            "wan2": _auto_hist(_WAN2, n=10, loss=15.0),
+        }
+        with (
+            patch.object(omr_metrics, "_read_all",
+                         return_value={"user1": {"wan": _WAN, "wan2": _WAN2}}),
+            patch.object(omr_metrics, "_read_history",
+                         side_effect=lambda u, i, s, l: hists[i]),
+            patch.object(omr_metrics, "_train_step", return_value=0.05) as ts,
+            patch.object(omr_metrics, "_get_model", return_value=_FakeModel()),
+            patch.object(omr_metrics, "_save_model") as sm,
+        ):
+            summary = omr_metrics._auto_learn_round(self._CFG)
+
+        assert summary == {"trained": 1, "skipped": 0}
+        ts.assert_called_once()
+        _, targets, lr = ts.call_args[0]
+        assert targets["wan"] > targets["wan2"]   # clean link gets more mass
+        assert lr == pytest.approx(self._CFG["learning_rate"])
+        sm.assert_called_once()
+
+    def test_skips_user_with_single_interface(self, torch_env):
+        self._influx_env()
+        with (
+            patch.object(omr_metrics, "_read_all",
+                         return_value={"user1": {"wan": _WAN}}),
+            patch.object(omr_metrics, "_train_step") as ts,
+        ):
+            summary = omr_metrics._auto_learn_round(self._CFG)
+        ts.assert_not_called()
+        assert summary == {"trained": 0, "skipped": 1}
+
+    def test_interface_without_history_is_excluded(self, torch_env):
+        self._influx_env()
+        hists = {
+            "wan":  _auto_hist(_WAN, n=10),
+            "wan2": [],   # no history yet → cannot be labelled
+        }
+        with (
+            patch.object(omr_metrics, "_read_all",
+                         return_value={"user1": {"wan": _WAN, "wan2": _WAN2}}),
+            patch.object(omr_metrics, "_read_history",
+                         side_effect=lambda u, i, s, l: hists[i]),
+            patch.object(omr_metrics, "_train_step") as ts,
+        ):
+            summary = omr_metrics._auto_learn_round(self._CFG)
+        ts.assert_not_called()   # only one labelled interface left → skip
+        assert summary == {"trained": 0, "skipped": 1}
+
+    def test_train_step_error_does_not_break_round(self, torch_env):
+        self._influx_env()
+        hists = {
+            "wan":  _auto_hist(_WAN,  n=10),
+            "wan2": _auto_hist(_WAN2, n=10),
+        }
+        with (
+            patch.object(omr_metrics, "_read_all",
+                         return_value={"user1": {"wan": _WAN, "wan2": _WAN2}}),
+            patch.object(omr_metrics, "_read_history",
+                         side_effect=lambda u, i, s, l: hists[i]),
+            patch.object(omr_metrics, "_train_step", side_effect=RuntimeError("boom")),
+        ):
+            summary = omr_metrics._auto_learn_round(self._CFG)
+        assert summary == {"trained": 0, "skipped": 1}
+
+    def test_round_updates_stats(self, torch_env):
+        self._influx_env()
+        before = omr_metrics._engine_stats["auto_rounds"]
+        with patch.object(omr_metrics, "_read_all", return_value={}):
+            omr_metrics._auto_learn_round(self._CFG)
+        assert omr_metrics._engine_stats["auto_rounds"] == before + 1
+        assert omr_metrics._engine_stats["last_auto_round_at"] is not None
+
+
+class TestMaybeExplore:
+    _ON_CFG = {**omr_metrics._AUTO_DEFAULTS, "enabled": True,
+               "exploration": 1.0, "exploration_scale": 0.15}
+
+    def test_no_exploration_by_default(self):
+        # enabled defaults to True but exploration defaults to 0.0 → no-op
+        probs = {"wan": 0.7, "wan2": 0.3}
+        assert omr_metrics._maybe_explore(probs) is probs
+
+    def test_enabled_returns_normalized_distribution(self):
+        with patch.object(omr_metrics, "_auto_cfg", return_value=self._ON_CFG):
+            result = omr_metrics._maybe_explore({"wan": 0.7, "wan2": 0.3})
+        assert set(result) == {"wan", "wan2"}
+        assert sum(result.values()) == pytest.approx(1.0)
+        assert all(v >= 0.0 for v in result.values())
+
+    def test_enabled_increments_exploration_counter(self):
+        before = omr_metrics._engine_stats["exploration_count"]
+        with patch.object(omr_metrics, "_auto_cfg", return_value=self._ON_CFG):
+            omr_metrics._maybe_explore({"wan": 0.7, "wan2": 0.3})
+        assert omr_metrics._engine_stats["exploration_count"] == before + 1
+
+    def test_single_interface_never_perturbed(self):
+        probs = {"wan": 1.0}
+        with patch.object(omr_metrics, "_auto_cfg", return_value=self._ON_CFG):
+            assert omr_metrics._maybe_explore(probs) is probs
+
+
+class TestEngineDiagnosticsAutoSection:
+    def test_engine_endpoint_reports_auto_learning_block(self, admin_client):
+        resp = admin_client.get("/metrics/engine")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "auto_learning" in body
+        assert body["auto_learning"]["enabled"] is True   # on by default
+        assert body["auto_learning"]["task_running"] is False
+        assert body["auto_learning"]["torch_available"] is False
+        assert "history_backend" in body["auto_learning"]
+        assert "auto_rounds" in body["runtime"]
+
+
+class TestAutoLearningEndpoint:
+    _URL = "/metrics/decision/auto"
+
+    def test_get_status_admin(self, admin_client):
+        resp = admin_client.get(self._URL)
+        assert resp.status_code == 200
+        block = resp.json()["auto_learning"]
+        assert block["enabled"] is True
+        assert block["task_running"] is False
+        assert block["torch_available"] is False
+
+    def test_get_status_non_admin_403(self, user_client):
+        assert user_client.get(self._URL).status_code == 403
+
+    def test_post_non_admin_403(self, user_client):
+        resp = user_client.post(self._URL, json={"enabled": False})
+        assert resp.status_code == 403
+
+    def test_unauthenticated_403(self, unauth_client):
+        assert unauth_client.get(self._URL).status_code == 403
+        assert unauth_client.post(self._URL, json={"enabled": False}).status_code == 403
+
+    def test_disable_applies_at_runtime(self, admin_client):
+        resp = admin_client.post(self._URL, json={"enabled": False})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["result"] == "ok"
+        assert body["auto_learning"]["enabled"] is False
+        # A later status read reflects the runtime toggle
+        status = admin_client.get(self._URL).json()
+        assert status["auto_learning"]["enabled"] is False
+
+    def test_reenable_after_disable(self, admin_client):
+        admin_client.post(self._URL, json={"enabled": False})
+        resp = admin_client.post(self._URL, json={"enabled": True})
+        assert resp.json()["auto_learning"]["enabled"] is True
+
+    def test_persisted_true_when_config_writable(self, admin_client):
+        with patch("os.replace") as repl:
+            resp = admin_client.post(self._URL, json={"enabled": False})
+        assert resp.json()["persisted"] is True
+        repl.assert_called_once()
+
+    def test_persist_failure_still_toggles(self, admin_client):
+        # Default test env discards writes and os.replace fails on the missing
+        # tmp file → persistence fails but the runtime toggle must still apply.
+        resp = admin_client.post(self._URL, json={"enabled": False})
+        assert resp.status_code == 200
+        assert resp.json()["persisted"] is False
+        assert resp.json()["auto_learning"]["enabled"] is False
+
+    def test_enable_starts_background_task(self, admin_client):
+        with patch.object(omr_metrics, "start_auto_learning") as sal:
+            admin_client.post(self._URL, json={"enabled": True})
+        sal.assert_called_once()
+
+    def test_disable_does_not_start_task(self, admin_client):
+        with patch.object(omr_metrics, "start_auto_learning") as sal:
+            admin_client.post(self._URL, json={"enabled": False})
+        sal.assert_not_called()
+
+    def test_missing_enabled_field_422(self, admin_client):
+        assert admin_client.post(self._URL, json={}).status_code == 422
+
+    def test_written_config_preserves_other_keys(self, admin_client):
+        # Capture what _auto_set_enabled writes and check it merges instead of
+        # clobbering the rest of the admin config.
+        written = {}
+
+        def fake_replace(src, dst):
+            written["called"] = True
+
+        captured = []
+        real_dump = json.dump
+
+        def capture_dump(obj, f, **kw):
+            captured.append(obj)
+            return real_dump(obj, f, **kw)
+
+        with (
+            patch("os.replace", side_effect=fake_replace),
+            patch("json.dump", side_effect=capture_dump),
+        ):
+            admin_client.post(self._URL, json={"enabled": False})
+
+        cfg = captured[-1]
+        assert cfg["auto_learning"]["enabled"] is False
+        assert "users" in cfg          # pre-existing config keys kept
+        assert "port" in cfg

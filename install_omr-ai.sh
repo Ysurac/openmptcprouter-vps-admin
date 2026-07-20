@@ -303,6 +303,20 @@ cfg["influxdb"] = {
     "retention_days": int(retention_days),
 }
 
+# Closed-loop auto-learning of the decision model: enabled by default,
+# toggleable at runtime via POST /metrics/decision/auto; never overwrite an
+# existing tuned block.
+cfg.setdefault("auto_learning", {
+    "enabled": True,
+    "interval": 300,
+    "learning_rate": 0.0001,
+    "window": 900,
+    "min_points": 5,
+    "sharpen": 4.0,
+    "exploration": 0.0,
+    "exploration_scale": 0.15,
+})
+
 tmp = config_file + ".tmp"
 with open(tmp, "w") as f:
     json.dump(cfg, f, indent=4)
@@ -371,5 +385,7 @@ echo "    Architecture   : Linear(19->24)->ReLU->Linear(24->8)->ReLU->Linear(8->
 echo "    Endpoints      : GET  /metrics/decision[?explain=true]"
 echo "                     POST /metrics/decision/train"
 echo "                     POST /metrics/decision/reset  (admin)"
+echo "    Auto-learning  : enabled (toggle with POST /metrics/decision/auto"
+echo "                     or auto_learning.enabled in ${OMR_CONFIG_FILE})"
 fi
 echo "================================================================"

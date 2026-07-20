@@ -18,6 +18,7 @@
 
 import os
 import argparse
+import contextlib
 import secrets
 import logging
 from typing import Optional
@@ -69,10 +70,18 @@ async def get_current_active_user(
     return current_user
 
 
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    omr_metrics.start_auto_learning()
+    yield
+    omr_metrics.stop_auto_learning()
+
+
 app = FastAPI(
     title="OMR Metrics (standalone)",
     description="omr_metrics decision engine and storage, running without omradmin.py",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 _THE_USER = User(username=_USER, permissions="admin")

@@ -1,3 +1,16 @@
+omr-vps-admin (0.18+20260720) unstable; urgency=medium
+
+  * Add closed-loop online auto-learning to the decision engine: periodically labels each user's interfaces from observed load-independent link quality (loss, BBR min_rtt, jitter, availability) and fine-tunes the model without human feedback
+  * Add GET/POST /metrics/decision/auto to check status and enable/disable auto-learning at runtime, persisted to omr-admin-config.json
+  * Add watchdog resetting the model to its heuristic initialisation after repeated divergent training losses
+  * Add optional exploration: occasionally perturb a decision so the model observes counterfactuals
+  * Add VLESS Reverse Proxy client support in xray config (xray 26+ tunnel bridge), exposed as reverse_key in xray config output
+  * Fix xray VLESS Reality failing to start with an empty/placeholder private key by regenerating the x25519 key pair
+  * Add transport to xray config output
+  * Add auto_learning defaults to install_omr-ai.sh and document the new endpoints and config block
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 20 Jul 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260717) unstable; urgency=medium
 
   * Add VXLAN support: POST /vxlan endpoint to set up a VXLAN L2 tunnel over the VPN, config exposed in /config

@@ -13,6 +13,8 @@ Strategy
 """
 
 import builtins
+import asyncio
+import contextlib
 import importlib.util
 import io
 import json
@@ -20,11 +22,11 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timedelta
+from urllib.parse import urlencode, urlsplit
 from unittest.mock import MagicMock, patch
 
 import jwt
 import pytest
-from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Mock configuration (mirrors omr-admin-config.json)
@@ -161,6 +163,139 @@ finally:
 
 app = omr_admin.app
 
+
+@contextlib.asynccontextmanager
+async def _test_lifespan(app):
+    yield
+
+
+app.router.lifespan_context = _test_lifespan
+
+
+class _ASGIResponse:
+    def __init__(self, status_code: int, headers: list, content: bytes):
+        self.status_code = status_code
+        self.headers = {
+            k.decode("latin1").lower(): v.decode("latin1")
+            for k, v in headers
+        }
+        self.content = content
+        self.text = content.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class _ResponseComplete(Exception):
+    pass
+
+
+class _ASGITestClient:
+    """Small sync client for tests, avoiding TestClient's blocking portal."""
+
+    def __init__(self, app, raise_server_exceptions: bool = False):
+        self._app = app
+        self._raise_server_exceptions = raise_server_exceptions
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def request(self, method, url, **kwargs):
+        async def _request():
+            body = b""
+            headers = [
+                (k.lower().encode("latin1"), str(v).encode("latin1"))
+                for k, v in (kwargs.get("headers") or {}).items()
+            ]
+            if "json" in kwargs:
+                body = json.dumps(kwargs["json"]).encode()
+                headers.append((b"content-type", b"application/json"))
+            elif "data" in kwargs:
+                data = kwargs["data"]
+                body = urlencode(data).encode() if isinstance(data, dict) else data
+                headers.append((b"content-type", b"application/x-www-form-urlencoded"))
+            elif "content" in kwargs:
+                body = kwargs["content"]
+                if isinstance(body, str):
+                    body = body.encode()
+
+            parts = urlsplit(url)
+            query = parts.query
+            params = kwargs.get("params")
+            if params:
+                extra = urlencode(params, doseq=True)
+                query = f"{query}&{extra}" if query else extra
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": method,
+                "scheme": parts.scheme or "http",
+                "path": parts.path or "/",
+                "raw_path": (parts.path or "/").encode(),
+                "query_string": query.encode(),
+                "headers": headers,
+                "client": ("testclient", 50000),
+                "server": ("testserver", 80),
+                "root_path": "",
+                "extensions": {},
+            }
+            sent_request = False
+            status = 500
+            response_headers = []
+            chunks = []
+
+            async def receive():
+                nonlocal sent_request
+                if sent_request:
+                    return {"type": "http.disconnect"}
+                sent_request = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def send(message):
+                nonlocal status, response_headers
+                if message["type"] == "http.response.start":
+                    status = message["status"]
+                    response_headers = message.get("headers", [])
+                elif message["type"] == "http.response.body":
+                    chunks.append(message.get("body", b""))
+                    if not message.get("more_body", False):
+                        raise _ResponseComplete
+
+            try:
+                await asyncio.wait_for(self._app(scope, receive, send), 0.2)
+            except _ResponseComplete:
+                pass
+            except asyncio.TimeoutError:
+                if not chunks:
+                    raise
+            except Exception:
+                if self._raise_server_exceptions:
+                    raise
+                status = 500
+                response_headers = [(b"content-type", b"text/plain; charset=utf-8")]
+                chunks = [b"Internal Server Error"]
+            return _ASGIResponse(status, response_headers, b"".join(chunks))
+
+        return asyncio.run(_request())
+
+    def get(self, url, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self.request("PUT", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self.request("DELETE", url, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Shared user objects (used in dependency overrides)
 # ---------------------------------------------------------------------------
@@ -254,14 +389,14 @@ def patch_env():
 @pytest.fixture
 def unauth_client():
     """No authentication – used to verify 403 on protected endpoints."""
-    yield TestClient(app, raise_server_exceptions=False)
+    yield _ASGITestClient(app, raise_server_exceptions=False)
 
 
 @pytest.fixture
 def admin_client():
     """Admin user injected via dependency override."""
     app.dependency_overrides[omr_admin.get_current_user] = lambda: ADMIN_USER
-    yield TestClient(app, raise_server_exceptions=False)
+    yield _ASGITestClient(app, raise_server_exceptions=False)
     app.dependency_overrides.pop(omr_admin.get_current_user, None)
 
 
@@ -269,7 +404,7 @@ def admin_client():
 def user_client():
     """Read-write user injected via dependency override."""
     app.dependency_overrides[omr_admin.get_current_user] = lambda: RW_USER
-    yield TestClient(app, raise_server_exceptions=False)
+    yield _ASGITestClient(app, raise_server_exceptions=False)
     app.dependency_overrides.pop(omr_admin.get_current_user, None)
 
 
@@ -277,5 +412,5 @@ def user_client():
 def ro_client():
     """Read-only user injected via dependency override."""
     app.dependency_overrides[omr_admin.get_current_user] = lambda: RO_USER
-    yield TestClient(app, raise_server_exceptions=False)
+    yield _ASGITestClient(app, raise_server_exceptions=False)
     app.dependency_overrides.pop(omr_admin.get_current_user, None)

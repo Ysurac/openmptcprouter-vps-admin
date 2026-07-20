@@ -1720,7 +1720,19 @@ def load_mptcp_bpf_schedulers():
 async def _lifespan(app):
     load_mptcp_bpf_schedulers()
     sync_ss_go_users()
+    # Optional omr_metrics module: start the background auto-learning loop
+    # (no-op unless enabled in config with PyTorch + InfluxDB available).
+    try:
+        import omr_metrics as _omr_metrics
+        _omr_metrics.start_auto_learning()
+    except ImportError:
+        _omr_metrics = None
+    except Exception as e:
+        LOG.warning("omr_metrics auto-learning start failed: " + str(e))
+        _omr_metrics = None
     yield
+    if _omr_metrics is not None:
+        _omr_metrics.stop_auto_learning()
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, title="OpenMPTCProuter Server API", lifespan=_lifespan)
@@ -2477,7 +2489,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
                     _vr = json.load(_f)
                 xray_vless_reality_public_key = next((ib.get('streamSettings', {}).get('realitySettings', {}).get('publicKey', '') for ib in _vr['inbounds'] if ib.get('tag') == 'omrin-vless-reality'), '')
             vless_reality = any(ib.get('tag') == 'omrin-vless-reality' for ib in _xr['inbounds'])
-            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key, 'ss_method': xray_ss_method, 'transport': xray_transport }
+            xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality': vless_reality, 'vless_reality_key': xray_vless_reality_public_key, 'ss_method': xray_ss_method, 'transport': xray_transport, 'reverse_key': xray_reverse_client_id(_xr) }
             LOG.debug("modif_config_user for xray")
             modif_config_user(username, {'xray': xray_conf})
         else:
@@ -3168,6 +3180,65 @@ class Xrayconfig(BaseModel):
     ss_method: str = "2022-blake3-aes-256-gcm"
     transport: XRAYTRANSPORT = Query("tcp", title="Choose transport")
 
+def xray_reverse_client_id(xray_config):
+    """Return the uuid of the VLESS Reverse Proxy client (tag OMRLan) in omrin-tunnel, or ''."""
+    for ib in xray_config.get('inbounds', []):
+        if ib.get('tag') == 'omrin-tunnel':
+            for c in ib.get('settings', {}).get('clients', []):
+                if c.get('reverse', {}).get('tag') == 'OMRLan':
+                    return c.get('id', '')
+    return ''
+
+def xray_ensure_reverse_client(xray_config):
+    """VLESS Reverse Proxy (replaces legacy reverse on xray 26+): make sure
+    omrin-tunnel carries the dedicated reverse client the router bridge uses for
+    VPS->LAN port forwarding. Returns its uuid ('' if the inbound is missing)."""
+    existing = xray_reverse_client_id(xray_config)
+    if existing:
+        return existing
+    for ib in xray_config.get('inbounds', []):
+        if ib.get('tag') == 'omrin-tunnel':
+            new_id = str(uuid.uuid4())
+            ib.setdefault('settings', {}).setdefault('clients', []).append(
+                {'id': new_id, 'level': 0, 'email': 'omr-reverse', 'reverse': {'tag': 'OMRLan'}})
+            return new_id
+    return ''
+
+def xray_fix_reality_keys():
+    """Regenerate the x25519 pair in xray-vless-reality.json when privateKey is
+    empty or a leftover placeholder (older installers parsed the new
+    "xray x25519" output wrong): xray refuses to start on an empty privateKey.
+    Returns the reality inbound from the file, or None."""
+    if not os.path.isfile('/etc/xray/xray-vless-reality.json'):
+        return None
+    with open('/etc/xray/xray-vless-reality.json') as f:
+        vr_config = json.load(f)
+    inbound = next((ib for ib in vr_config.get('inbounds', []) if ib.get('tag') == 'omrin-vless-reality'), None)
+    if inbound is None:
+        return None
+    rs = inbound.get('streamSettings', {}).get('realitySettings', {})
+    priv = rs.get('privateKey', '')
+    if priv and priv != 'XRAY_X25519_PRIVATE_KEY':
+        return inbound
+    # output format depends on xray version:
+    #   old: "Private key: xxx" / "Public key: yyy"
+    #   26+: "PrivateKey: xxx" / "Password (PublicKey): yyy"
+    result = subprocess.run(['/usr/bin/xray', 'x25519'], capture_output=True, text=True, check=False)
+    new_priv = new_pub = ''
+    for line in (result.stdout or '').splitlines():
+        if 'Private' in line:
+            new_priv = line.split()[-1]
+        elif 'Public' in line:
+            new_pub = line.split()[-1]
+    if not new_priv or not new_pub:
+        LOG.error("Unable to generate x25519 keys for VLESS Reality")
+        return inbound
+    rs['privateKey'] = new_priv
+    rs['publicKey'] = new_pub
+    with open('/etc/xray/xray-vless-reality.json', 'w') as f:
+        json.dump(vr_config, f, indent=4)
+    return inbound
+
 @app.post('/xray', summary="Set xray settings")
 def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
@@ -3182,12 +3253,20 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     xray_config = json.loads(_initial_bytes)
 
     chk_vless_reality = any(ib.get('tag') == 'omrin-vless-reality' for ib in xray_config['inbounds'])
+    xray_reverse_key = xray_ensure_reverse_client(xray_config)
+    vr_inbound = xray_fix_reality_keys() if params.vless_reality else None
     if params.vless_reality and not chk_vless_reality:
-        with open('/etc/xray/xray-vless-reality.json') as f:
-            vless_reality_config = json.load(f)
-        xray_config['inbounds'].append(vless_reality_config['inbounds'][0])
+        if vr_inbound is not None:
+            xray_config['inbounds'].append(vr_inbound)
     elif not params.vless_reality and chk_vless_reality:
         xray_config['inbounds'] = [ib for ib in xray_config['inbounds'] if ib.get('tag') != 'omrin-vless-reality']
+    if vr_inbound is not None and chk_vless_reality:
+        # keep an already-merged reality inbound in sync with the (possibly healed) key pair
+        vr_rs = vr_inbound.get('streamSettings', {}).get('realitySettings', {})
+        for ib in xray_config['inbounds']:
+            if ib.get('tag') == 'omrin-vless-reality':
+                ib.setdefault('streamSettings', {}).setdefault('realitySettings', {}).update(
+                    {'privateKey': vr_rs.get('privateKey', ''), 'publicKey': vr_rs.get('publicKey', '')})
     for inbounds in xray_config['inbounds']:
         if inbounds.get('tag') == 'omrin-shadowsocks-tunnel':
             # An empty method makes the config invalid and xray fails to start
@@ -3217,7 +3296,7 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
         with open('/etc/xray/xray-vless-reality.json') as f:
             _vr = json.load(f)
         xray_vless_reality_public_key = next((ib.get('streamSettings', {}).get('realitySettings', {}).get('publicKey', '') for ib in _vr['inbounds'] if ib.get('tag') == 'omrin-vless-reality'), '')
-    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method }
+    xray_conf = { 'key': xray_key, 'port': xray_port, 'sskey': xray_ss_key, 'vless_reality_key': xray_vless_reality_public_key, 'vless_reality': vless_reality, 'ss_method': params.ss_method, 'transport': params.transport, 'reverse_key': xray_reverse_key }
     LOG.debug("modif_config_user for xray conf")
     modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:

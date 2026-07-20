@@ -46,6 +46,38 @@
 # The heuristic also benefits from preemptive congestion prediction when InfluxDB
 # history is available.
 #
+# Online auto-learning (closed-loop, no human feedback)
+# -----------------------------------------------------
+# A background task periodically labels each user's WAN interfaces from the
+# *observed* quality over the last window (contextual-bandit style: the reward
+# is built from load-independent signals — loss, BBR min_rtt, jitter,
+# availability — so that traffic steered by the model does not fake its own
+# reward) and runs one fine-tuning step on the scorer.  A watchdog resets the
+# model to its heuristic initialisation after repeated divergent losses.
+#
+# Enabled by default (requires PyTorch AND the InfluxDB backend — silently
+# idle otherwise).  Runtime control:
+#
+# GET  /metrics/decision/auto    — auto-learning status (admin only)
+# POST /metrics/decision/auto    — enable/disable: {"enabled": true|false}
+#                                  (admin only; persisted to the config file)
+#
+# Tuning via the "auto_learning" block of omr-admin-config.json:
+#
+#   "auto_learning": {
+#     "enabled": true,
+#     "interval": 300,           seconds between training rounds
+#     "learning_rate": 0.0001,   per-round Adam learning rate
+#     "window": 900,             history window used to compute rewards (s)
+#     "min_points": 5,           samples required per interface to participate
+#     "sharpen": 4.0,            reward^sharpen contrast on the target weights
+#     "exploration": 0.0,        probability a /metrics/decision reply is perturbed
+#     "exploration_scale": 0.15  log-normal sigma of the perturbation
+#   }
+#
+# Config changes are picked up within ~60 s without restarting the service.
+# Round counters are reported by GET /metrics/engine (auto_* keys).
+#
 # Predictive quality handling
 # ----------------------------
 # GET  /metrics/quality/forecast
@@ -74,6 +106,7 @@ import json
 import math
 import os
 import logging
+import random
 import threading
 import time
 import urllib.request
@@ -154,6 +187,14 @@ _engine_stats: dict = {
     # model lifecycle
     "model_resets": 0,
     "model_loaded_at": None,   # Unix timestamp of last load/init
+    # online auto-learning
+    "auto_rounds": 0,           # completed background training rounds
+    "auto_train_count": 0,      # individual auto training steps (per user)
+    "auto_skipped": 0,          # users skipped (not enough interfaces/history)
+    "last_auto_round_at": None,
+    "last_auto_loss": None,
+    "auto_resets": 0,           # watchdog-triggered model resets
+    "exploration_count": 0,     # decisions perturbed for exploration
 }
 
 
@@ -266,6 +307,11 @@ class DecisionFeedback(BaseModel):
     best_interface: Optional[str] = None   # shorthand: 1.0 for this iface, 0.0 rest
     weights: Optional[Dict[str, float]] = None  # free-form {iface: weight}
     learning_rate: float = 0.01
+
+
+class AutoLearningToggle(BaseModel):
+    """Enable or disable the background online auto-learning loop."""
+    enabled: bool
 
 
 # ---------------------------------------------------------------------------
@@ -1702,6 +1748,346 @@ def _train_step(user_data: dict, target_weights: dict, lr: float,
 
 
 # ---------------------------------------------------------------------------
+# Online auto-learning — closed-loop training from observed link quality
+# ---------------------------------------------------------------------------
+
+_AUTO_DEFAULTS: dict = {
+    "enabled": True,
+    "interval": 300,            # seconds between training rounds
+    "learning_rate": 1e-4,      # deliberately small: many rounds, slow drift
+    "window": 900,              # reward window (s) — 15 min of ~30 s samples
+    "min_points": 5,            # samples required per interface
+    "sharpen": 4.0,             # reward^sharpen — contrast on flat rewards
+    "exploration": 0.0,         # probability of perturbing one decision
+    "exploration_scale": 0.15,  # log-normal sigma of the perturbation
+}
+
+# Watchdog: after this many consecutive non-finite or divergent losses the
+# model is reset to its heuristic initialisation.
+_AUTO_MAX_LOSS: float = 5.0
+_AUTO_BAD_STREAK_LIMIT: int = 3
+_auto_bad_streak: int = 0
+
+_AUTO_CFG_TTL: float = 60.0
+_auto_cfg_cache: dict = {"ts": 0.0, "cfg": None}
+
+# Per-interface history points fetched per round (window / 30 s poll ≈ 30).
+_AUTO_HISTORY_LIMIT: int = 240
+
+
+def _auto_cfg(force: bool = False) -> dict:
+    """Return the sanitised auto_learning config block (cached for 60 s)."""
+    now = time.time()
+    cached = _auto_cfg_cache["cfg"]
+    if not force and cached is not None and now - _auto_cfg_cache["ts"] < _AUTO_CFG_TTL:
+        return cached
+
+    raw: dict = {}
+    try:
+        with open(OMR_CONFIG_FILE) as f:
+            raw = json.load(f).get("auto_learning") or {}
+    except Exception as exc:
+        LOG.debug("omr_auto: config read: %s", exc)
+
+    def _num(key, lo, hi, cast=float):
+        try:
+            return max(lo, min(hi, cast(raw.get(key, _AUTO_DEFAULTS[key]))))
+        except (TypeError, ValueError):
+            return _AUTO_DEFAULTS[key]
+
+    def _bool(key):
+        v = raw.get(key, _AUTO_DEFAULTS[key])
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
+
+    cfg = {
+        "enabled":           _bool("enabled"),
+        "interval":          _num("interval",          60,   86400, int),
+        "learning_rate":     _num("learning_rate",     1e-6, 0.05),
+        "window":            _num("window",            120,  86400, int),
+        "min_points":        _num("min_points",        2,    1000,  int),
+        "sharpen":           _num("sharpen",           1.0,  16.0),
+        "exploration":       _num("exploration",       0.0,  0.5),
+        "exploration_scale": _num("exploration_scale", 0.01, 1.0),
+    }
+    _auto_cfg_cache["ts"] = now
+    _auto_cfg_cache["cfg"] = cfg
+    return cfg
+
+
+def _auto_reward(history: list, min_points: int = 5) -> Optional[float]:
+    """Observed quality of one interface over a history window → [0, 1].
+
+    Built from load-independent signals only (loss, BBR min_rtt fallback
+    rtt_min, jitter) so that steering traffic toward an interface does not
+    mechanically degrade its own reward (feedback-loop confounding).  The
+    result is scaled by availability: the fraction of samples where the
+    interface was online and reachable.  Missing metrics fall back to the
+    usual neutral 0.5.  Returns None with fewer than *min_points* samples
+    (interface excluded from this training round).
+    """
+    samples = [p for p in history if isinstance(p, dict)]
+    if len(samples) < min_points:
+        return None
+
+    online = [
+        p for p in samples
+        if not (p.get("status") and p.get("status") != "online")
+        and p.get("latency") is not None
+    ]
+    availability = len(online) / len(samples)
+    if not online:
+        return 0.0
+
+    def _mean(values: list) -> Optional[float]:
+        vals = [float(v) for v in values if v is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    loss_m   = _mean([p.get("loss") for p in online])
+    jitter_m = _mean([p.get("jitter") for p in online])
+    rtt_m    = _mean([
+        (p.get("bbr") or {}).get("min_rtt")
+        if (p.get("bbr") or {}).get("min_rtt") is not None
+        else (p.get("rtt_min") if p.get("rtt_min") is not None else p.get("latency"))
+        for p in online
+    ])
+
+    # Tighter clamps than the feature extractor: 15 %+ loss / 60 ms+ jitter are
+    # already "severe", so the reward must separate links well below that.
+    loss_q   = max(0.0, 1.0 - min(loss_m,  20.0)  / 20.0)  if loss_m   is not None else 0.5
+    rtt_q    = max(0.0, 1.0 - min(rtt_m,   500.0) / 500.0) if rtt_m    is not None else 0.5
+    jitter_q = max(0.0, 1.0 - min(jitter_m, 100.0) / 100.0) if jitter_m is not None else 0.5
+
+    return availability * (0.40 * loss_q + 0.35 * rtt_q + 0.25 * jitter_q)
+
+
+def _auto_targets(rewards: dict, sharpen: float = 4.0) -> Optional[dict]:
+    """Turn per-interface rewards into a training target distribution.
+
+    Applies a power sharpening (reward^sharpen) so that two decent links with
+    close rewards still produce a non-flat target; _train_step normalises.
+    Returns None when no interface earned a positive reward.
+    """
+    targets = {iface: max(0.0, float(r)) ** sharpen for iface, r in rewards.items()}
+    if sum(targets.values()) <= 0.0:
+        return None
+    return targets
+
+
+def _auto_watchdog(loss: float):
+    """Reset the model after repeated divergent/non-finite training losses."""
+    global _auto_bad_streak, _decision_model, _optimizer
+    if math.isfinite(loss) and loss <= _AUTO_MAX_LOSS:
+        _auto_bad_streak = 0
+        return
+    _auto_bad_streak += 1
+    if _auto_bad_streak < _AUTO_BAD_STREAK_LIMIT:
+        return
+    LOG.warning("omr_auto: watchdog reset after %d divergent losses (last=%.4f)",
+                _auto_bad_streak, loss)
+    with _model_lock:
+        _decision_model = _make_model()
+        _optimizer = None
+        _save_model(_decision_model)
+    with _stats_lock:
+        _engine_stats["auto_resets"] += 1
+        _engine_stats["model_resets"] += 1
+        _engine_stats["model_loaded_at"] = time.time()
+    _auto_bad_streak = 0
+
+
+def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
+    """One background training round over every user with stored metrics.
+
+    For each user: fetch per-interface history over the reward window, compute
+    observed rewards, and run one fine-tuning step against the sharpened
+    reward distribution.  Returns a summary dict (also folded into stats).
+    Silently does nothing without PyTorch or with the JSON backend.
+    """
+    cfg = cfg or _auto_cfg()
+    summary = {"trained": 0, "skipped": 0}
+    if not _TORCH_AVAILABLE or isinstance(_get_backend(), JSONBackend):
+        return summary
+
+    all_data = _read_all()
+    for username, user_data in all_data.items():
+        if not isinstance(user_data, dict) or len(user_data) < 2:
+            summary["skipped"] += 1
+            continue
+
+        rewards: dict = {}
+        history_data: dict = {}
+        for iface in user_data:
+            hist = _read_history(username, iface, cfg["window"], _AUTO_HISTORY_LIMIT)
+            reward = _auto_reward(hist, min_points=cfg["min_points"])
+            if reward is not None:
+                rewards[iface] = reward
+                history_data[iface] = hist
+
+        targets = _auto_targets(rewards, sharpen=cfg["sharpen"]) if len(rewards) >= 2 else None
+        if targets is None:
+            summary["skipped"] += 1
+            continue
+
+        sub_data = {iface: user_data[iface] for iface in rewards}
+        try:
+            loss = _train_step(sub_data, targets, cfg["learning_rate"],
+                               history_data=history_data)
+        except Exception as exc:
+            LOG.warning("omr_auto: training step failed for %s: %s", username, exc)
+            summary["skipped"] += 1
+            continue
+        _auto_watchdog(loss)
+        summary["trained"] += 1
+        with _stats_lock:
+            _engine_stats["auto_train_count"] += 1
+            _engine_stats["last_auto_loss"] = round(loss, 6)
+
+    if summary["trained"]:
+        with _model_lock:
+            _save_model(_get_model())
+    with _stats_lock:
+        _engine_stats["auto_rounds"] += 1
+        _engine_stats["auto_skipped"] += summary["skipped"]
+        _engine_stats["last_auto_round_at"] = time.time()
+    LOG.debug("omr_auto: round done — trained=%d skipped=%d",
+              summary["trained"], summary["skipped"])
+    return summary
+
+
+_auto_task = None   # asyncio.Task of the background loop, None when not running
+
+
+async def _auto_learn_loop():
+    """Background loop: sleep interval, then run one round when enabled.
+
+    The config is re-read every iteration so 'enabled' and tuning parameters
+    take effect within one interval, without restarting the service.
+    """
+    LOG.info("omr_auto: background auto-learning loop started")
+    while True:
+        cfg = _auto_cfg()
+        await asyncio.sleep(cfg["interval"])
+        if not cfg["enabled"]:
+            continue
+        try:
+            await asyncio.to_thread(_auto_learn_round, cfg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.warning("omr_auto: round failed: %s", exc)
+
+
+def start_auto_learning():
+    """Start the background auto-learning task (call from an async context).
+
+    Returns the asyncio.Task, or None when PyTorch is unavailable.  The loop
+    itself is a no-op while auto_learning.enabled is false or the backend has
+    no history (JSON), so starting it unconditionally is cheap.
+    """
+    global _auto_task
+    if not _TORCH_AVAILABLE:
+        LOG.debug("omr_auto: PyTorch not installed — auto-learning unavailable")
+        return None
+    if _auto_task is not None and not _auto_task.done():
+        return _auto_task
+    cfg = _auto_cfg(force=True)
+    LOG.info("omr_auto: auto-learning %s (interval=%ds lr=%g window=%ds)",
+             "ENABLED" if cfg["enabled"] else "disabled (config)",
+             cfg["interval"], cfg["learning_rate"], cfg["window"])
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        LOG.warning("omr_auto: no running event loop — auto-learning not started")
+        return None
+    _auto_task = loop.create_task(_auto_learn_loop())
+    return _auto_task
+
+
+def stop_auto_learning():
+    """Cancel the background auto-learning task if it is running."""
+    global _auto_task
+    if _auto_task is not None:
+        _auto_task.cancel()
+        _auto_task = None
+
+
+def _auto_set_enabled(enabled: bool) -> bool:
+    """Toggle auto-learning at runtime and persist it to the admin config.
+
+    The in-memory config cache is updated immediately so the change takes
+    effect on the next loop iteration even when the config file cannot be
+    written (read-only filesystem, missing file); in that degraded case the
+    toggle lasts until the next process restart and a warning is logged.
+    Returns True when the config file was successfully updated.
+    """
+    persisted = False
+    try:
+        try:
+            with open(OMR_CONFIG_FILE) as f:
+                cfg_file = json.load(f)
+        except FileNotFoundError:
+            cfg_file = {}
+        block = cfg_file.get("auto_learning") or {}
+        block["enabled"] = bool(enabled)
+        cfg_file["auto_learning"] = block
+        tmp = OMR_CONFIG_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(cfg_file, f, indent=4)
+        os.replace(tmp, OMR_CONFIG_FILE)
+        persisted = True
+    except Exception as exc:
+        LOG.warning("omr_auto: could not persist auto_learning.enabled=%s: %s",
+                    enabled, exc)
+
+    cfg = _auto_cfg(force=True)
+    cfg["enabled"] = bool(enabled)   # runtime effect even if persistence failed
+    _auto_cfg_cache["cfg"] = cfg
+    _auto_cfg_cache["ts"] = time.time()
+    LOG.info("omr_auto: auto-learning %s via API (persisted=%s)",
+             "enabled" if enabled else "disabled", persisted)
+    return persisted
+
+
+def _auto_status() -> dict:
+    """Current auto-learning status block for the API/diagnostics."""
+    return {
+        **_auto_cfg(),
+        "task_running": _auto_task is not None and not _auto_task.done(),
+        "torch_available": _TORCH_AVAILABLE,
+        "history_backend": not isinstance(_get_backend(), JSONBackend),
+    }
+
+
+def _maybe_explore(probs: dict) -> dict:
+    """Occasionally perturb the decision so the model observes counterfactuals.
+
+    With probability auto_learning.exploration, each interface probability is
+    multiplied by a log-normal factor (sigma = exploration_scale) and the
+    distribution renormalised.  Applied after EMA smoothing and never fed back
+    into the EMA state, so a perturbed decision does not bias later ones.
+    No-op when auto-learning or exploration is disabled.
+    """
+    cfg = _auto_cfg()
+    eps = cfg["exploration"]
+    if not cfg["enabled"] or eps <= 0.0 or len(probs) < 2 or random.random() >= eps:
+        return probs
+    noisy = {
+        iface: max(0.0, float(p)) * math.exp(random.gauss(0.0, cfg["exploration_scale"]))
+        for iface, p in probs.items()
+    }
+    total = sum(noisy.values())
+    if total <= 0.0:
+        return probs
+    with _stats_lock:
+        _engine_stats["exploration_count"] += 1
+    return {iface: v / total for iface, v in noisy.items()}
+
+
+# ---------------------------------------------------------------------------
 # Engine diagnostics helpers
 # ---------------------------------------------------------------------------
 
@@ -1908,6 +2294,7 @@ def _engine_diagnostics() -> dict:
         "model":   _model_meta(),
         "runtime": stats,
         "storage": _backend_meta(),
+        "auto_learning": _auto_status(),
     }
 
 
@@ -2147,7 +2534,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             result = _compute_weights(user_data, explain=explain, history_data=history_data)
 
         # EMA on raw probabilities (floats) then convert to [1, 255] integers.
-        smoothed_probs = _apply_ema(target, result.get("probs", {}))
+        # Exploration (when auto-learning is on) perturbs after EMA so the
+        # deviation is actually expressed, without polluting the EMA state.
+        smoothed_probs = _maybe_explore(_apply_ema(target, result.get("probs", {})))
         int_weights = {iface: max(1, round(p * 255)) for iface, p in smoothed_probs.items()}
         output = {k: v for k, v in result.items() if k != "probs"}
         return {**output, "weights": int_weights}
@@ -2284,6 +2673,39 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             _engine_stats["model_resets"] += 1
             _engine_stats["model_loaded_at"] = time.time()
         return {"result": "ok"}
+
+    @router.get('/metrics/decision/auto',
+                summary="Online auto-learning status (admin only)")
+    async def get_auto_learning(current_user: User = Depends(get_current_user)):
+        from fastapi import HTTPException
+        if current_user.permissions != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        return {"auto_learning": _auto_status()}
+
+    @router.post('/metrics/decision/auto',
+                 summary="Enable or disable online auto-learning (admin only)")
+    async def set_auto_learning(
+        toggle: AutoLearningToggle,
+        current_user: User = Depends(get_current_active_user),
+    ):
+        """Toggle the closed-loop auto-learning at runtime.
+
+        The choice is persisted to omr-admin-config.json (survives restarts)
+        and applied immediately.  Enabling also (re)starts the background task
+        when possible; disabling leaves the task idling so a later enable is
+        instant — the loop trains nothing while disabled.
+        """
+        from fastapi import HTTPException
+        if current_user.permissions != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        persisted = await asyncio.to_thread(_auto_set_enabled, toggle.enabled)
+        if toggle.enabled:
+            start_auto_learning()
+        return {
+            "result": "ok",
+            "persisted": persisted,
+            "auto_learning": _auto_status(),
+        }
 
     # ---- Prometheus scrape endpoint -----------------------------------------
 

@@ -426,6 +426,73 @@ the model's current softmax output and a caller-supplied target distribution.
 The model is saved to disk after every training step.  At least two interfaces
 must be present; the call is a no-op otherwise.
 
+### Automatic online learning (closed loop)
+
+Instead of waiting for explicit feedback, the engine can label interfaces
+itself from what actually happened on the links.  A background task wakes up
+every `interval` seconds and, for each user:
+
+1. Fetches the last `window` seconds of history per interface (InfluxDB).
+2. Computes an observed reward in `[0, 1]` per interface from
+   **load-independent** signals, so that steering traffic toward an interface
+   does not mechanically degrade its own reward:
+
+   ```
+   reward = availability × (0.40·loss_q + 0.35·rtt_q + 0.25·jitter_q)
+
+   availability = fraction of samples online and reachable
+   loss_q       = 1 − clip(mean loss %, 0, 20) / 20
+   rtt_q        = 1 − clip(mean bbr.min_rtt (fallback rtt_min, latency), 0, 500) / 500
+   jitter_q     = 1 − clip(mean jitter ms, 0, 100) / 100
+   ```
+
+3. Sharpens the rewards (`reward^sharpen`) into a target distribution and runs
+   one fine-tuning step (same KL/Adam path as manual training) at a small
+   learning rate.
+
+Interfaces with fewer than `min_points` samples are excluded from the round;
+a user needs at least two labelled interfaces to train.  A **watchdog** resets
+the model to its heuristic initialisation after 3 consecutive non-finite or
+divergent (> 5.0) losses.
+
+Optional **exploration**: with probability `exploration`, one
+`GET /metrics/decision` reply is perturbed by a log-normal factor
+(`exploration_scale` sigma) after EMA smoothing, so the model occasionally
+observes counterfactuals.  The perturbation is never fed back into the EMA
+state.
+
+**Enabled by default** (requires PyTorch **and** the InfluxDB backend — the
+loop silently idles otherwise).  Toggle it at runtime, persisted across
+restarts:
+
+```
+GET  /metrics/decision/auto                  → status (admin only)
+POST /metrics/decision/auto {"enabled": false}   disable
+POST /metrics/decision/auto {"enabled": true}    enable
+```
+
+Disabling leaves the background task idling (nothing is trained) so a later
+enable is instant.  Tuning (`omr-admin-config.json`, changes picked up within
+~60 s):
+
+```jsonc
+"auto_learning": {
+    "enabled": true,
+    "interval": 300,            // seconds between training rounds
+    "learning_rate": 0.0001,    // per-round Adam learning rate
+    "window": 900,              // reward window in seconds
+    "min_points": 5,            // samples required per interface
+    "sharpen": 4.0,             // reward^sharpen target contrast
+    "exploration": 0.0,         // probability of perturbing a decision
+    "exploration_scale": 0.15   // log-normal sigma of the perturbation
+}
+```
+
+Progress is reported by `GET /metrics/engine`: `auto_rounds`,
+`auto_train_count`, `auto_skipped`, `last_auto_round_at`, `last_auto_loss`,
+`auto_resets`, `exploration_count` in `runtime`, plus the resolved
+configuration and `task_running` flag in `auto_learning`.
+
 ---
 
 ## 10. API endpoints
@@ -445,6 +512,8 @@ must be present; the call is a no-op otherwise.
 | `GET` | `/metrics/user?username=X` | admin | Stats for another user |
 | `POST` | `/metrics/decision/train` | user | Submit quality feedback |
 | `POST` | `/metrics/decision/reset` | admin | Reset model to heuristic init |
+| `GET` | `/metrics/decision/auto` | admin | Online auto-learning status |
+| `POST` | `/metrics/decision/auto` | admin | Enable/disable auto-learning (`{"enabled": bool}`) |
 
 ### GET /metrics/decision
 
