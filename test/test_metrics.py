@@ -532,6 +532,13 @@ class TestToPrometheusText:
         assert "omr_rtt_min_ms" in text
         assert "omr_rtt_max_ms" in text
 
+    def test_anomaly_metric_present_for_stale_sample(self):
+        store = {"u": {"wan": {**_WAN, "timestamp": 1}}}
+        with patch.object(omr_metrics.time, "time", return_value=1_000):
+            text = omr_metrics._to_prometheus_text(store)
+        assert "omr_interface_anomaly" in text
+        assert 'anomaly="stale_metrics"' in text
+
 
 # ===========================================================================
 # JSONBackend unit tests
@@ -610,6 +617,29 @@ class TestJSONBackend:
             result = backend.read_user("alice")
         assert "wan" in result
         assert "wan2" in result
+
+    def test_write_interface_uses_backend_lock(self, tmp_path):
+        metrics_file = tmp_path / "omr-metrics.json"
+        backend = omr_metrics.JSONBackend()
+        events = []
+
+        class _LockSpy:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("exit")
+
+        with (
+            patch("builtins.open", new=_REAL_OPEN),
+            patch("os.replace", new=_REAL_REPLACE),
+            patch("os.path.isfile", wraps=os.path.isfile),
+            patch.object(omr_metrics, "METRICS_FILE", str(metrics_file)),
+            patch.object(omr_metrics.JSONBackend, "_lock", _LockSpy()),
+        ):
+            backend.write_interface("alice", _WAN)
+
+        assert events == ["enter", "exit"]
 
 
 # ===========================================================================
@@ -1050,6 +1080,250 @@ class TestPredictDecisionEndpoint:
 
 
 # ===========================================================================
+# DSCP traffic-class routing (pure Python — no torch required)
+# ===========================================================================
+
+class TestDscpClassTable:
+    """Sanity checks on the _DSCP_CLASSES profile table itself."""
+
+    def test_keys_are_unique(self):
+        keys = [c[0] for c in omr_metrics._DSCP_CLASSES]
+        assert len(keys) == len(set(keys))
+
+    def test_dscp_values_are_unique_across_classes(self):
+        seen = set()
+        for _, dscp_values, *_ in omr_metrics._DSCP_CLASSES:
+            for v in dscp_values:
+                assert v not in seen, f"DSCP value {v} used by more than one class"
+                seen.add(v)
+
+    def test_every_dscp_value_in_valid_range(self):
+        for _, dscp_values, *_ in omr_metrics._DSCP_CLASSES:
+            for v in dscp_values:
+                assert 0 <= v <= 63
+
+    def test_profile_feature_names_are_known(self):
+        for key, _, _, profile, _ in omr_metrics._DSCP_CLASSES:
+            for name in profile:
+                assert name in omr_metrics.FEATURE_NAMES, f"{key}: unknown feature {name}"
+
+    def test_profile_weights_are_positive(self):
+        for key, _, _, profile, _ in omr_metrics._DSCP_CLASSES:
+            for name, w in profile.items():
+                assert w > 0, f"{key}.{name} weight must be positive"
+
+    def test_horizons_are_positive(self):
+        for key, _, _, _, horizon_s in omr_metrics._DSCP_CLASSES:
+            assert horizon_s > 0, key
+
+    def test_feature_index_covers_all_feature_names(self):
+        assert set(omr_metrics._FEATURE_INDEX) == set(omr_metrics.FEATURE_NAMES)
+
+
+class TestDscpClassWeights:
+    """Tests for _dscp_class_weights: per-class formula + model blend + forecast."""
+
+    # Low-latency/low-bandwidth vs. high-latency/high-bandwidth interface pair.
+    _LOW_LAT  = {**_WAN,  "latency": 15.0, "loss": 0.0, "jitter": 2.0,
+                 "bandwidth": {"rx_bps": 1_000_000, "tx_bps": 500_000}}
+    _HIGH_BW  = {**_WAN2, "latency": 80.0, "loss": 1.0, "jitter": 20.0,
+                 "bandwidth": {"rx_bps": 50_000_000, "tx_bps": 25_000_000}}
+
+    def _user_data(self):
+        return {"wan": self._LOW_LAT, "wan2": self._HIGH_BW}
+
+    def test_returns_entry_per_class(self):
+        result = omr_metrics._dscp_class_weights(self._user_data(), {}, {"wan": 0.5, "wan2": 0.5})
+        assert set(result) == {c[0] for c in omr_metrics._DSCP_CLASSES}
+
+    def test_entry_shape(self):
+        result = omr_metrics._dscp_class_weights(self._user_data(), {}, {"wan": 0.5, "wan2": 0.5})
+        entry = result["ef"]
+        assert set(entry) == {"dscp", "label", "horizon_s", "weights", "scores",
+                               "best_interface", "ranking"}
+        assert entry["dscp"] == [46]
+        assert set(entry["weights"]) == {"wan", "wan2"}
+        assert set(entry["ranking"]) == {"wan", "wan2"}
+        assert entry["best_interface"] == entry["ranking"][0]
+
+    def test_weights_are_ints_in_valid_nexthop_range(self):
+        result = omr_metrics._dscp_class_weights(self._user_data(), {}, {"wan": 0.5, "wan2": 0.5})
+        for entry in result.values():
+            for w in entry["weights"].values():
+                assert isinstance(w, int)
+                assert 1 <= w <= 255
+
+    def test_latency_sensitive_class_prefers_low_latency_interface(self):
+        # Neutral model input so the class formula alone drives the outcome.
+        result = omr_metrics._dscp_class_weights(self._user_data(), {}, {"wan": 0.5, "wan2": 0.5})
+        for key in ("ef", "cs3", "cs6"):
+            assert result[key]["best_interface"] == "wan", key
+
+    def test_throughput_class_prefers_high_bandwidth_interface(self):
+        result = omr_metrics._dscp_class_weights(self._user_data(), {}, {"wan": 0.5, "wan2": 0.5})
+        for key in ("cs1", "af11"):
+            assert result[key]["best_interface"] == "wan2", key
+
+    def test_offline_interface_scores_minimum_weight(self):
+        user_data = {
+            "wan":  self._LOW_LAT,
+            "wan2": {**self._HIGH_BW, "status": "offline"},
+        }
+        result = omr_metrics._dscp_class_weights(user_data, {}, {"wan": 1.0, "wan2": 0.0})
+        for entry in result.values():
+            assert entry["weights"]["wan2"] == 1
+            assert entry["best_interface"] == "wan"
+
+    def test_missing_latency_treated_as_offline(self):
+        user_data = {
+            "wan":  self._LOW_LAT,
+            "wan2": {**self._HIGH_BW, "latency": None},
+        }
+        result = omr_metrics._dscp_class_weights(user_data, {}, {"wan": 1.0, "wan2": 0.0})
+        assert result["cs1"]["best_interface"] == "wan"
+
+    def test_model_blend_shifts_score_toward_model_probability(self):
+        # Same two interfaces, only model_probs differ — bulk class (cs1) would
+        # normally favor "wan2" on the formula alone; a strong model preference
+        # for "wan" should pull its blended score up.
+        user_data = self._user_data()
+        neutral = omr_metrics._dscp_class_weights(user_data, {}, {"wan": 0.5, "wan2": 0.5})
+        biased  = omr_metrics._dscp_class_weights(user_data, {}, {"wan": 0.95, "wan2": 0.05})
+        assert biased["cs1"]["scores"]["wan"] > neutral["cs1"]["scores"]["wan"]
+
+    def test_zero_blend_ignores_model_probs_entirely(self):
+        user_data = self._user_data()
+        with patch.object(omr_metrics, "_DSCP_MODEL_BLEND", 0.0):
+            ignored = omr_metrics._dscp_class_weights(user_data, {}, {"wan": 1.0, "wan2": 0.0})
+            baseline = omr_metrics._dscp_class_weights(user_data, {}, {"wan": 0.0, "wan2": 1.0})
+        assert ignored["cs1"]["weights"] == baseline["cs1"]["weights"]
+
+    def test_uses_class_specific_forecast_horizon(self):
+        hist = _history_at(self._LOW_LAT, [{"latency": 15.0}, {"latency": 20.0}, {"latency": 25.0}])
+        history_data = {"wan": hist, "wan2": []}
+        captured_horizons = []
+        real_predict = omr_metrics._predict_payload
+
+        def spy(history, horizon_seconds=300):
+            captured_horizons.append(horizon_seconds)
+            return real_predict(history, horizon_seconds=horizon_seconds)
+
+        with patch.object(omr_metrics, "_predict_payload", side_effect=spy):
+            omr_metrics._dscp_class_weights(self._user_data(), history_data, {"wan": 0.5, "wan2": 0.5})
+
+        expected_horizons = sorted({c[4] for c in omr_metrics._DSCP_CLASSES})
+        assert sorted(set(captured_horizons)) == expected_horizons
+
+    def test_short_history_falls_back_to_current_snapshot(self):
+        # Fewer than 2 points: _predict_payload must not be called for that interface.
+        history_data = {"wan": [self._LOW_LAT], "wan2": []}
+        with patch.object(omr_metrics, "_predict_payload") as mock_predict:
+            omr_metrics._dscp_class_weights(self._user_data(), history_data, {"wan": 0.5, "wan2": 0.5})
+        mock_predict.assert_not_called()
+
+    def test_rising_latency_history_degrades_latency_sensitive_class(self):
+        flat   = _history_at(self._LOW_LAT, [{"latency": 15.0}] * 5)
+        rising = _history_at(self._LOW_LAT, [{"latency": 15.0}, {"latency": 40.0}, {"latency": 90.0}])
+        user_data = self._user_data()
+        model_probs = {"wan": 0.5, "wan2": 0.5}
+
+        flat_result   = omr_metrics._dscp_class_weights(
+            user_data, {"wan": flat, "wan2": []}, model_probs)
+        rising_result = omr_metrics._dscp_class_weights(
+            user_data, {"wan": rising, "wan2": []}, model_probs)
+
+        assert rising_result["ef"]["scores"]["wan"] < flat_result["ef"]["scores"]["wan"]
+
+
+class TestDscpByInterface:
+    def test_empty_input_returns_empty(self):
+        assert omr_metrics._dscp_by_interface({}) == {}
+
+    def test_groups_classes_by_best_interface(self):
+        dscp_classes = {
+            "ef":  {"best_interface": "wan"},
+            "cs1": {"best_interface": "wan2"},
+            "cs0": {"best_interface": "wan"},
+        }
+        result = omr_metrics._dscp_by_interface(dscp_classes)
+        assert result == {"wan": ["ef", "cs0"], "wan2": ["cs1"]}
+
+    def test_class_without_best_interface_is_skipped(self):
+        dscp_classes = {"ef": {"best_interface": None}}
+        assert omr_metrics._dscp_by_interface(dscp_classes) == {}
+
+
+# ===========================================================================
+# GET /metrics/decision?dscp=true
+# ===========================================================================
+
+class TestGetDecisionDscpEndpoint:
+    _FAKE_RESULT = {
+        "probs":  {"wan": 0.7, "wan2": 0.3},
+        "scores": {"wan": 70.0, "wan2": 30.0},
+    }
+
+    def test_omitted_by_default(self, user_client):
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+            patch.object(omr_metrics, "_compute_weights", return_value=self._FAKE_RESULT),
+        ):
+            r = user_client.get("/metrics/decision")
+        data = r.json()
+        assert "dscp_classes" not in data
+        assert "dscp_by_interface" not in data
+
+    def test_included_when_requested(self, user_client):
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+            patch.object(omr_metrics, "_compute_weights", return_value=self._FAKE_RESULT),
+        ):
+            r = user_client.get("/metrics/decision?dscp=true")
+        assert r.status_code == 200
+        data = r.json()
+        assert set(data["dscp_classes"]) == {c[0] for c in omr_metrics._DSCP_CLASSES}
+        assert isinstance(data["dscp_by_interface"], dict)
+
+    def test_uses_probs_from_main_computation_for_blend(self, user_client):
+        captured = {}
+        real_dscp = omr_metrics._dscp_class_weights
+
+        def spy(user_data, history_data, model_probs):
+            captured["model_probs"] = model_probs
+            return real_dscp(user_data, history_data, model_probs)
+
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+            patch.object(omr_metrics, "_compute_weights", return_value=self._FAKE_RESULT),
+            patch.object(omr_metrics, "_dscp_class_weights", side_effect=spy),
+        ):
+            user_client.get("/metrics/decision?dscp=true")
+        assert captured["model_probs"] == self._FAKE_RESULT["probs"]
+
+    def test_works_with_heuristic_fallback_when_torch_unavailable(self, user_client):
+        fake_result = {"probs": {"wan": 1.0}, "scores": {"wan": 100.0}}
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_compute_weights_heuristic", return_value=fake_result),
+        ):
+            r = user_client.get("/metrics/decision?dscp=true")
+        assert r.status_code == 200
+        assert "dscp_classes" in r.json()
+
+    def test_no_metrics_returns_empty_without_error(self, user_client):
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={}),
+        ):
+            r = user_client.get("/metrics/decision?dscp=true")
+        assert r.status_code == 200
+        assert r.json() == {}
+
+
+# ===========================================================================
 # Cost factor (pure Python — no torch required)
 # ===========================================================================
 
@@ -1145,6 +1419,36 @@ class TestGetDecision:
         assert "weights" in data
         assert "scores" in data
         assert set(data["weights"].keys()) == {"wan", "wan2"}
+
+    def test_returns_confidence_and_anomalies(self, user_client):
+        fresh = {**_WAN, "timestamp": 2_000}
+        hist = _history_at(fresh, [{"loss": 0.0}] * 5)
+        with (
+            patch.object(omr_metrics.time, "time", return_value=2_200),
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_get_backend", return_value=MagicMock()),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": fresh}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_compute_weights", return_value={"probs": {"wan": 1.0}, "scores": {"wan": 100.0}}),
+        ):
+            r = user_client.get("/metrics/decision")
+        data = r.json()
+        assert data["confidence"]["wan"] == "high"
+        assert data["anomalies"]["wan"] == []
+
+    def test_decision_flags_rising_loss(self, user_client):
+        fresh = {**_WAN, "timestamp": 2_000, "loss": 4.0}
+        hist = _history_at(fresh, [{"loss": 0.1}, {"loss": 1.0}, {"loss": 2.5}, {"loss": 4.0}])
+        with (
+            patch.object(omr_metrics.time, "time", return_value=2_060),
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_get_backend", return_value=MagicMock()),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": fresh}),
+            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_compute_weights", return_value={"probs": {"wan": 1.0}, "scores": {"wan": 100.0}}),
+        ):
+            r = user_client.get("/metrics/decision")
+        assert "rising_loss" in r.json()["anomalies"]["wan"]
 
     def test_explain_flag_forwarded(self, user_client):
         captured = {}
@@ -2324,6 +2628,16 @@ class TestInfluxBackendHistory:
         assert list(result.keys()) == ["wan", "wan2"]
         assert [entry["timestamp"] for entry in result["wan"]] == [1_700_000_000, 1_700_000_060]
         assert [entry["timestamp"] for entry in result["wan2"]] == [1_700_000_030, 1_700_000_090]
+
+    def test_all_interfaces_query_limits_inside_sql(self):
+        backend, mock_client = self._make_backend()
+        mock_client.query.return_value = self._fake_all_table([])
+        backend.read_history("alice", None, 3600, 7)
+        sql = mock_client.query.call_args.args[0]
+        assert "ROW_NUMBER() OVER (PARTITION BY interface" in sql
+        assert "ORDER BY time DESC" in sql
+        assert ") AS ranked WHERE rn <= 7" in sql
+        assert "WHERE rn <= 7" in sql
 
 
 # ===========================================================================

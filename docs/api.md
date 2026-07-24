@@ -171,3 +171,10 @@ learning engine.
 | GET/POST | `/metrics/decision/auto` | Get/set the auto-learning state |
 | GET | `/metrics/prometheus` | Prometheus-format metrics export |
 | GET | `/metrics/engine` | Decision engine status |
+
+`/metrics` adds lightweight latest-snapshot `confidence` and `anomalies` fields
+per interface. `/metrics/decision` also returns per-interface `confidence` and
+`anomalies`; with InfluxDB history enabled those flags can include trend-based
+conditions such as rising loss, rising jitter, rising congestion, flapping, and
+gateway changes. `/metrics/prometheus` exposes current anomaly flags as
+`omr_interface_anomaly{username,interface,anomaly}` gauges.

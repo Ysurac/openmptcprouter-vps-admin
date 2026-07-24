@@ -281,7 +281,11 @@ class _ASGITestClient:
                 chunks = [b"Internal Server Error"]
             return _ASGIResponse(status, response_headers, b"".join(chunks))
 
-        return asyncio.run(_request())
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_request())
+        finally:
+            loop.close()
 
     def get(self, url, **kwargs):
         return self.request("GET", url, **kwargs)

@@ -38,6 +38,15 @@ def _isfile_for(*paths):
     return _side_effect
 
 
+def _mock_config_json(config_json):
+    def _open(path, mode="r", *args, **kwargs):
+        if str(path) == "/etc/openmptcprouter-vps-admin/omr-admin-config.json":
+            return io.StringIO(config_json)
+        return _mock_open(path, mode, *args, **kwargs)
+
+    return _open
+
+
 # ===========================================================================
 # Public / unauthenticated endpoints
 # ===========================================================================
@@ -122,6 +131,29 @@ class TestToken:
             data={"username": "ghost", "password": "anything"},
         )
         assert r.status_code == 400
+
+    def test_disabled_user_cannot_get_token(self, unauth_client):
+        disabled_config = json.loads(json.dumps(MOCK_CONFIG))
+        disabled_config["users"][0]["openmptcprouter"]["disabled"] = True
+
+        with patch("builtins.open", side_effect=_mock_config_json(json.dumps(disabled_config))):
+            r = unauth_client.post(
+                "/token",
+                data={"username": "openmptcprouter", "password": "userpassword"},
+            )
+
+        assert r.status_code == 400
+        assert r.json()["detail"] == "Inactive user"
+
+    def test_disabled_bearer_token_is_rejected(self, unauth_client):
+        disabled_config = json.loads(json.dumps(MOCK_CONFIG))
+        disabled_config["users"][0]["openmptcprouter"]["disabled"] = True
+
+        with patch("builtins.open", side_effect=_mock_config_json(json.dumps(disabled_config))):
+            r = unauth_client.get("/status", headers=user_headers())
+
+        assert r.status_code == 400
+        assert r.json()["detail"] == "Inactive user"
 
     def test_missing_password_returns_422(self, unauth_client):
         r = unauth_client.post("/token", data={"username": "admin"})
@@ -1494,6 +1526,10 @@ class TestRemoveUser:
         r = admin_client.post("/remove_user", json={"username": "ghost"})
         assert r.json()["result"] == "error"
 
+    def test_username_with_crlf_returns_422(self, admin_client):
+        r = admin_client.post("/remove_user", json={"username": "readonly\r\nstatus"})
+        assert r.status_code == 422
+
     def test_can_remove_existing_user(self, admin_client):
         r = admin_client.post("/remove_user", json={"username": "readonly"})
         assert r.json()["result"] == "done"
@@ -1656,8 +1692,11 @@ class TestAddUserResponseFields:
         # Regression: old code used string concat to build JSON; quotes in
         # username would produce invalid JSON and raise an exception.
         r = admin_client.post("/add_user", json={**self._PAYLOAD, "username": 'user"inject'})
-        # Should not 500 — either 200 (accepted) or 422 (validation rejects it)
-        assert r.status_code in (200, 422)
+        assert r.status_code == 422
+
+    def test_username_with_path_traversal_returns_422(self, admin_client):
+        r = admin_client.post("/add_user", json={**self._PAYLOAD, "username": "../evil"})
+        assert r.status_code == 422
 
     def test_add_user_calls_shadowsocks_when_installed(self, admin_client):
         ss_calls = []

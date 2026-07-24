@@ -82,6 +82,7 @@ logging.getLogger('uvicorn.access').addFilter(_MetricsAccessFilter())
 PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
+USERNAME_PATTERN = r'^[A-Za-z0-9_.-]{1,256}$'
 
 # Get main net interface
 IFACE = None
@@ -1570,6 +1571,9 @@ def authenticate_user(fake_db, username: str, password: str):
         return False
     return user
 
+def inactive_user_exception():
+    return HTTPException(status_code=400, detail="Inactive user")
+
 class Token(BaseModel):
     access_token: str = None
     token_type: str = None
@@ -1821,11 +1825,13 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     if user is None:
         LOG.debug("user is none")
         raise credentials_exception
+    if user.disabled:
+        raise inactive_user_exception()
     return user
 
 async def get_current_active_user(current_user: User = Depends(get_current_user)):
     if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        raise inactive_user_exception()
     return current_user
 
 try:
@@ -1852,6 +1858,8 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     if not user:
         LOG.debug("Incorrect username or password")
         raise HTTPException(status_code=400, detail="Incorrect username or password")
+    if user.disabled:
+        raise inactive_user_exception()
 
     # Identity can be any data that is json serializable
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -1884,6 +1892,8 @@ async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
         user = authenticate_user(fake_users_db, username, password)
         if not user:
             raise HTTPException(status_code=400, detail="Incorrect email or password")
+        if user.disabled:
+            raise inactive_user_exception()
 
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
@@ -4316,7 +4326,7 @@ class permissions(str, Enum):
     admin = "admin"
 
 class NewUser(BaseModel):
-    username: str = Query(..., title="Username")
+    username: str = Query(..., pattern=USERNAME_PATTERN, title="Username")
     permission: permissions = Query("ro", title="permission of the user")
     vpn: VPN = Query("mqvpn", title="default VPN for the user")
     proxy: PROXY = Query("shadowsocks-rust", title="default Proxy for the user")
@@ -4455,7 +4465,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     #    fake_users_db = omr_config_data['users'][0]
 
 class ExistingUser(BaseModel):
-    username: str = Query(..., title="Username")
+    username: str = Query(..., pattern=USERNAME_PATTERN, title="Username")
     note: list = []
 
 @app.post('/add_user_note', summary="Add a note to an user")
@@ -4467,7 +4477,7 @@ def add_user_note(*, params: ExistingUser, current_user: User = Depends(get_curr
 
 
 class RemoveUser(BaseModel):
-    username: str
+    username: str = Query(..., pattern=USERNAME_PATTERN)
 
 @app.post('/remove_user', summary="Remove an user")
 def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user), request: Request):
@@ -4546,7 +4556,7 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     return {'result': 'done', 'reason': 'user removed', 'route': 'remove_user'}
 
 class ModifyUser(BaseModel):
-    username: str = Query(..., title="Username")
+    username: str = Query(..., pattern=USERNAME_PATTERN, title="Username")
     user_password: Optional[str] = Query(None, title="New password for the user")
     disabled: Optional[bool] = Query(None, title="Disable or enable the user")
     vpn: Optional[VPN] = Query(None, title="VPN for the user")

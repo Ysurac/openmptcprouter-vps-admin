@@ -1,3 +1,14 @@
+omr-vps-admin (0.18+20260724) unstable; urgency=medium
+
+  * Add DSCP traffic-class routing: GET /metrics/decision?dscp=true scores every WAN interface against standard DSCP classes (voice, video, bulk, ...) with per-class forecast horizon and returns a routing recommendation per class
+  * Add per-interface decision confidence and anomaly flags to /metrics, /metrics/decision and Prometheus export (offline, unreachable, stale_metrics, high_loss, high_jitter, high_congestion, flapping, gateway_changed, rising_loss, rising_jitter, rising_congestion)
+  * Limit all-interface InfluxDB history queries per interface in SQL, and serialize JSON backend writes with a lock
+  * Enforce a username validation pattern on user-management endpoints (add_user, add_user_note, remove_user, modify_user)
+  * Reject login and token issuance for disabled users instead of only blocking them after authentication
+  * Document DSCP routing, confidence/anomaly fields and updated feature vector in docs/omr-decision-engine.md and docs/api.md
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 24 Jul 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260720) unstable; urgency=medium
 
   * Add closed-loop online auto-learning to the decision engine: periodically labels each user's interfaces from observed load-independent link quality (loss, BBR min_rtt, jitter, availability) and fine-tunes the model without human feedback

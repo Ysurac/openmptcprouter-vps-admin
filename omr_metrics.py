@@ -38,6 +38,17 @@
 #   ?preemptive=true (default)     fetch history to penalise interfaces whose congestion
 #                                  is rising even when current reading is still low;
 #                                  no-op with JSON backend (history unavailable)
+#   ?dscp=true                     also score every interface against a table of
+#                                  standard DSCP traffic classes (voice, video,
+#                                  bulk, …) — adds "dscp_classes" (per-class weights
+#                                  + best_interface + ranking) and "dscp_by_interface"
+#                                  (interface → DSCP classes it is best suited for)
+#                                  to the response. Each class blends its own
+#                                  hand-tuned feature weights with the trained
+#                                  model's/heuristic's global score, and forecasts
+#                                  metrics at a class-specific horizon (short for
+#                                  real-time classes like voice, long for bulk)
+#                                  when history is available. See _DSCP_CLASSES.
 # POST /metrics/decision/train   — submit quality feedback to fine-tune the model
 # POST /metrics/decision/reset   — reset model to heuristic initialisation (admin only)
 #
@@ -321,6 +332,8 @@ class AutoLearningToggle(BaseModel):
 class JSONBackend:
     """Stores the latest interface metrics per user in a single JSON file."""
 
+    _lock = threading.Lock()
+
     def read_all(self) -> dict:
         if not os.path.isfile(METRICS_FILE):
             return {}
@@ -359,15 +372,16 @@ class JSONBackend:
         }
 
     def write_interface(self, username: str, payload: dict):
-        data = self.read_all()
-        data.setdefault(username, {})[payload["interface"]] = payload
-        tmp = METRICS_FILE + '.tmp'
-        try:
-            with open(tmp, 'w') as f:
-                json.dump(data, f, indent=4)
-            os.replace(tmp, METRICS_FILE)
-        except Exception as exc:
-            LOG.error("omr_metrics JSON: write error: %s", exc)
+        with self._lock:
+            data = self.read_all()
+            data.setdefault(username, {})[payload["interface"]] = payload
+            tmp = METRICS_FILE + '.tmp'
+            try:
+                with open(tmp, 'w') as f:
+                    json.dump(data, f, indent=4)
+                os.replace(tmp, METRICS_FILE)
+            except Exception as exc:
+                LOG.error("omr_metrics JSON: write error: %s", exc)
 
 
 class InfluxBackend:
@@ -533,10 +547,14 @@ class InfluxBackend:
 
     def _read_history_all(self, username: str, since_seconds: int, limit: int) -> dict:
         sql = (
-            f"SELECT time, interface, json_payload FROM {self._MEASUREMENT} "
+            "SELECT time, interface, json_payload FROM ("
+            f"SELECT time, interface, json_payload, "
+            f"ROW_NUMBER() OVER (PARTITION BY interface ORDER BY time DESC) AS rn "
+            f"FROM {self._MEASUREMENT} "
             f"WHERE username = $username "
-            f"AND time >= now() - interval '{since_seconds} seconds' "
-                f"ORDER BY time ASC"
+            f"AND time >= now() - interval '{since_seconds} seconds'"
+            f") AS ranked WHERE rn <= {int(limit)} "
+            f"ORDER BY interface ASC, time ASC"
         )
         try:
             table = self._client.query(sql, query_parameters={"username": username})
@@ -1441,6 +1459,284 @@ def _extract_features(payload: dict, history: Optional[list] = None) -> list:
         _latency_std_feat(history or []),
     ]
     return static + _extract_trend_features(history or [])
+
+
+def _is_interface_down(payload: dict) -> bool:
+    """Return True when an interface should not be trusted for routing."""
+    status = payload.get("status")
+    return (status is not None and status != "online") or payload.get("latency") is None
+
+
+def _valid_history(history: Optional[list]) -> list:
+    return [p for p in (history or []) if isinstance(p, dict)]
+
+
+def _history_span_s(history: list) -> float:
+    ts = []
+    for p in history:
+        value = _as_float(p.get("timestamp"))
+        if value is not None:
+            ts.append(value)
+    return max(ts) - min(ts) if len(ts) >= 2 else 0.0
+
+
+def _snapshot_age_s(payload: dict) -> Optional[float]:
+    ts = payload.get("timestamp")
+    if ts is None:
+        return None
+    try:
+        return max(0.0, time.time() - float(ts))
+    except (TypeError, ValueError):
+        return None
+
+
+def _decision_confidence(payload: dict, history: Optional[list] = None) -> str:
+    """Confidence in a routing decision for one interface.
+
+    This reflects data quality, not link quality: fresh data with enough history
+    scores high even when the link itself is poor. Down/unreachable interfaces
+    are "none" because their route weight is effectively a failover placeholder.
+    """
+    if _is_interface_down(payload):
+        return "none"
+    age_s = _snapshot_age_s(payload)
+    if age_s is None or age_s > 900:
+        return "none"
+
+    hist = _valid_history(history)
+    missing = sum(
+        1 for key in ("latency", "loss", "jitter", "rtt_min")
+        if payload.get(key) is None
+    )
+    if age_s > 300 or missing >= 3:
+        return "low"
+    if len(hist) >= 5 and _history_span_s(hist) >= 120 and missing == 0:
+        return "high"
+    if len(hist) >= 3 and missing <= 1:
+        return "medium"
+    return "low"
+
+
+def _nested_value(payload: dict, path: tuple):
+    cur = payload
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _as_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_slope_per_min(history: list, path: tuple,
+                           halflife_s: float = 180.0) -> Optional[float]:
+    timestamps: list = []
+    values: list = []
+    for p in history:
+        ts = _as_float(p.get("timestamp"))
+        value = _as_float(_nested_value(p, path))
+        if ts is not None and value is not None:
+            timestamps.append(ts)
+            values.append(value)
+    if len(timestamps) < 2:
+        return None
+    slope = _weighted_slope(timestamps, values, halflife_s=halflife_s)
+    return slope * 60.0 if slope is not None else None
+
+
+def _interface_anomalies(payload: dict, history: Optional[list] = None) -> list:
+    """Return compact machine-readable anomaly flags for an interface."""
+    flags: list = []
+    status = payload.get("status")
+    if status and status != "online":
+        flags.append("offline")
+    if payload.get("latency") is None:
+        flags.append("unreachable")
+
+    age_s = _snapshot_age_s(payload)
+    if age_s is None or age_s > 300:
+        flags.append("stale_metrics")
+
+    loss = payload.get("loss")
+    jitter = payload.get("jitter")
+    cong = (payload.get("congestion") or {}).get("score")
+    loss_f = _as_float(loss)
+    jitter_f = _as_float(jitter)
+    cong_f = _as_float(cong)
+    if loss_f is not None and loss_f >= 5.0:
+        flags.append("high_loss")
+    if jitter_f is not None and jitter_f >= 30.0:
+        flags.append("high_jitter")
+    if cong_f is not None and cong_f >= 75.0:
+        flags.append("high_congestion")
+
+    hist = _valid_history(history)
+    if hist:
+        states = [
+            not _is_interface_down(p)
+            for p in hist
+            if p.get("status") is not None or p.get("latency") is not None
+        ]
+        changes = sum(1 for prev, cur in zip(states, states[1:]) if prev != cur)
+        if changes >= 2:
+            flags.append("flapping")
+
+        gateways = [
+            (p.get("gateway"), p.get("gateway6"))
+            for p in hist
+            if p.get("gateway") or p.get("gateway6")
+        ]
+        current_gw = (payload.get("gateway"), payload.get("gateway6"))
+        if gateways and current_gw != gateways[-1] and (current_gw[0] or current_gw[1]):
+            flags.append("gateway_changed")
+
+        slope_loss = _history_slope_per_min(hist, ("loss",))
+        slope_jitter = _history_slope_per_min(hist, ("jitter",))
+        slope_cong = _history_slope_per_min(hist, ("congestion", "score"), halflife_s=120.0)
+        if slope_loss is not None and slope_loss >= 0.25:
+            flags.append("rising_loss")
+        if slope_jitter is not None and slope_jitter >= 2.0:
+            flags.append("rising_jitter")
+        if slope_cong is not None and slope_cong >= 2.0:
+            flags.append("rising_congestion")
+
+    return sorted(set(flags))
+
+
+def _interface_insights(user_data: dict, history_data: Optional[dict] = None) -> dict:
+    hist = history_data or {}
+    return {
+        iface: {
+            "confidence": _decision_confidence(payload, hist.get(iface)),
+            "anomalies": _interface_anomalies(payload, hist.get(iface)),
+        }
+        for iface, payload in user_data.items()
+    }
+
+
+def _with_interface_insights(user_data: dict, history_data: Optional[dict] = None) -> dict:
+    insights = _interface_insights(user_data, history_data)
+    return {
+        iface: {**payload, **insights.get(iface, {})}
+        for iface, payload in user_data.items()
+    }
+
+
+# ---------------------------------------------------------------------------
+# Decision engine — DSCP traffic-class routing (pure Python, no torch required)
+# ---------------------------------------------------------------------------
+
+# (key, dscp_values, label, {feature_name: importance}, horizon_s) — feature_name
+# must be one of FEATURE_NAMES.  Each class re-weights the same [0,1] feature
+# vectors used by the learned model with hand-tuned priorities for that traffic
+# type, so results are available immediately and don't depend on training data.
+# Omitted features get weight 0 for that class.  horizon_s is how far ahead
+# _dscp_class_weights forecasts metrics before scoring: short for latency-
+# sensitive/real-time classes (react to a spike seconds away), long for bulk
+# traffic (smooth over a longer trend rather than chase noise).
+_DSCP_CLASSES: list = [
+    ("ef",   (46,),         "Voice (EF)",
+     {"inv_latency": 3.0, "inv_jitter": 3.0, "inv_loss": 2.0,
+      "inv_bbr_min_rtt": 1.5, "inv_rtt_spread": 1.0, "inv_congestion": 1.0,
+      "inv_predicted_congestion": 1.0}, 20),
+    ("cs5",  (40,),         "Video conferencing (CS5)",
+     {"inv_latency": 2.5, "inv_jitter": 2.5, "inv_loss": 1.5,
+      "inv_bbr_min_rtt": 1.0, "rx_bps": 1.0, "tx_bps": 1.0}, 30),
+    ("af41", (34, 36, 38),  "Streaming video (AF4x)",
+     {"rx_bps": 2.0, "bbr_bw": 1.5, "inv_loss": 2.0, "inv_latency": 1.0, "tx_bps": 0.5}, 120),
+    ("af31", (26, 28, 30),  "Broadcast video (AF3x)",
+     {"rx_bps": 1.5, "bbr_bw": 1.0, "inv_loss": 1.5, "inv_latency": 1.5, "inv_jitter": 1.0}, 120),
+    ("cs3",  (24,),         "Signaling (CS3)",
+     {"inv_latency": 2.0, "inv_loss": 1.5, "inv_congestion": 1.0}, 30),
+    ("af21", (18, 20, 22),  "Low-latency data (AF2x)",
+     {"inv_latency": 1.5, "inv_loss": 1.0, "rx_bps": 0.5, "inv_congestion": 0.5}, 180),
+    ("af11", (10, 12, 14),  "High-throughput data (AF1x)",
+     {"rx_bps": 2.0, "tx_bps": 2.0, "bbr_bw": 1.5, "inv_loss": 1.0}, 300),
+    ("cs1",  (8,),          "Bulk / scavenger (CS1)",
+     {"rx_bps": 3.0, "tx_bps": 2.0, "bbr_bw": 2.0}, 600),
+    ("cs0",  (0,),          "Best effort (default)",
+     {"inv_latency": 1.5, "inv_loss": 1.0, "inv_jitter": 0.7,
+      "inv_congestion": 1.0, "rx_bps": 0.5, "tx_bps": 0.5}, 300),
+    ("cs6",  (48, 56),      "Network control (CS6/CS7)",
+     {"inv_latency": 2.0, "inv_loss": 2.0, "inv_congestion": 1.5}, 20),
+]
+
+_FEATURE_INDEX: dict = {name: i for i, name in enumerate(FEATURE_NAMES)}
+
+# Weight given to the trained model's/heuristic's global probability when
+# blending it into each class's formula score (0 = pure formula, 1 = pure model).
+_DSCP_MODEL_BLEND: float = 0.3
+
+
+def _dscp_class_weights(user_data: dict, history_data: dict, model_probs: dict) -> dict:
+    """Score every online WAN interface against each DSCP class profile in _DSCP_CLASSES.
+
+    For each class: forecast that interface's metrics *horizon_s* seconds ahead
+    (falls back to the current snapshot when history has fewer than 2 points),
+    extract features from the forecast, and combine them with the class's
+    importance weights.  The formula score is then blended with *model_probs*
+    (the trained model's or heuristic's already cost-adjusted, offline-masked
+    probability distribution from the main /metrics/decision computation) at
+    _DSCP_MODEL_BLEND, so DSCP scoring benefits from whatever the model has
+    learned while staying anchored to the class's own priorities.  Offline
+    interfaces (or missing latency) score 0, matching the masking rule used
+    elsewhere.  Costed and (re)normalised the same way as the heuristic scorer
+    so weights stay comparable and usable directly as nexthop weights.
+
+    Returns {class_key: {dscp, label, horizon_s, weights, scores, best_interface, ranking}}.
+    """
+    interfaces = list(user_data.keys())
+    result: dict = {}
+    for key, dscp_values, label, profile, horizon_s in _DSCP_CLASSES:
+        raw: list = []
+        for iface in interfaces:
+            p = user_data[iface]
+            status, latency = p.get("status"), p.get("latency")
+            if (status and status != "online") or latency is None:
+                raw.append(0.0)
+                continue
+            hist = history_data.get(iface) or []
+            fpayload = _predict_payload(hist, horizon_seconds=horizon_s) if len(hist) >= 2 else p
+            feat = _extract_features(fpayload, history=hist)
+            raw.append(max(0.0, sum(w * feat[_FEATURE_INDEX[name]] for name, w in profile.items())))
+
+        raw = _apply_cost(raw, interfaces, user_data)
+
+        blended = [
+            (1.0 - _DSCP_MODEL_BLEND) * raw[i] + _DSCP_MODEL_BLEND * model_probs.get(iface, raw[i])
+            for i, iface in enumerate(interfaces)
+        ]
+        total = sum(blended)
+        blended = [v / total for v in blended] if total > 0 else raw
+
+        ranking = [iface for iface, _ in sorted(zip(interfaces, blended), key=lambda x: x[1], reverse=True)]
+
+        result[key] = {
+            "dscp": list(dscp_values),
+            "label": label,
+            "horizon_s": horizon_s,
+            "weights": {iface: max(1, round(blended[i] * 255)) for i, iface in enumerate(interfaces)},
+            "scores": {iface: round(blended[i] * 100, 2) for i, iface in enumerate(interfaces)},
+            "best_interface": ranking[0] if ranking else None,
+            "ranking": ranking,
+        }
+    return result
+
+
+def _dscp_by_interface(dscp_classes: dict) -> dict:
+    """Invert _dscp_class_weights output: {interface: [class_key, ...]} for every
+    class that interface is the best-suited (rank 1) route for."""
+    by_iface: dict = {}
+    for key, info in dscp_classes.items():
+        best = info.get("best_interface")
+        if best:
+            by_iface.setdefault(best, []).append(key)
+    return by_iface
 
 
 # ---------------------------------------------------------------------------
@@ -2357,10 +2653,13 @@ def _to_prometheus_text(all_data: dict) -> str:
          "WAN interface BBR bandwidth estimate in bytes per second", []),
         ("omr_data_age_seconds",
          "Seconds since the latest WAN interface sample was recorded", []),
+        ("omr_interface_anomaly",
+         "WAN interface anomaly flag, labelled by anomaly name", []),
     ]
     (_, _, online_s), (_, _, lat_s), (_, _, loss_s), (_, _, jitter_s), \
     (_, _, rtt_min_s), (_, _, rtt_max_s), (_, _, rx_s), (_, _, tx_s), \
-    (_, _, cong_s), (_, _, sig_s), (_, _, bbr_s), (_, _, age_s) = _metrics
+    (_, _, cong_s), (_, _, sig_s), (_, _, bbr_s), (_, _, age_s), \
+    (_, _, anomaly_s) = _metrics
 
     for username, ifaces in all_data.items():
         for iface, p in ifaces.items():
@@ -2394,6 +2693,8 @@ def _to_prometheus_text(all_data: dict) -> str:
             bbr = p.get("bbr") or {}
             if bbr.get("bw") is not None:
                 bbr_s.append((lbl, bbr["bw"]))
+            for anomaly in _interface_anomalies(p):
+                anomaly_s.append((f'{lbl},anomaly="{anomaly}"', 1))
 
     lines: list = []
     for name, help_text, samples in _metrics:
@@ -2424,6 +2725,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
         user_data = _read_user(target)
+        user_data = _with_interface_insights(user_data)
         if interface:
             return user_data.get(interface, {})
         return user_data
@@ -2459,8 +2761,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         (only the latest snapshot per interface is stored).
         """
         target = username if current_user.permissions == "admin" and username else current_user.username
-        import asyncio
-        stats = await asyncio.to_thread(_user_stats, target)
+        stats = _user_stats(target)
         return {"username": target, **stats}
 
     _501_history = JSONResponse(
@@ -2496,6 +2797,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         predict: bool = Query(False, description="Extrapolate metrics forward in time before scoring"),
         horizon: int = Query(300, ge=1, le=86400, description="Prediction horizon in seconds (default 300 = 5 min)"),
         preemptive: bool = Query(True, description="Fetch history to penalise rising congestion before it peaks"),
+        dscp: bool = Query(False, description="Include per-DSCP-traffic-class interface weighting (dscp_classes, dscp_by_interface)"),
         current_user: User = Depends(get_current_user),
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
@@ -2507,13 +2809,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         has_history_backend = not isinstance(_get_backend(), JSONBackend)
 
         if predict:
-            async def _pfetch(iface):
-                h = await asyncio.to_thread(_read_history, target, iface,
-                                            max(horizon * 10, 3600), 50)
-                return iface, h
-
             predicted_data = {}
-            for iface, hist in await asyncio.gather(*[_pfetch(i) for i in user_data]):
+            for iface in user_data:
+                hist = _read_history(target, iface, max(horizon * 10, 3600), 50)
                 if len(hist) >= 2:
                     predicted_data[iface] = _predict_payload(hist, horizon_seconds=horizon)
                     history_data[iface] = hist   # reuse for trend and congestion features
@@ -2521,10 +2819,8 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                     predicted_data[iface] = user_data[iface]
             user_data = predicted_data
         elif preemptive and has_history_backend:
-            async def _hfetch(iface):
-                return iface, await asyncio.to_thread(_read_history, target, iface, 3600, 60)
-
-            for iface, hist in await asyncio.gather(*[_hfetch(i) for i in user_data]):
+            for iface in user_data:
+                hist = _read_history(target, iface, 3600, 60)
                 if hist:
                     history_data[iface] = hist
 
@@ -2539,7 +2835,19 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         smoothed_probs = _maybe_explore(_apply_ema(target, result.get("probs", {})))
         int_weights = {iface: max(1, round(p * 255)) for iface, p in smoothed_probs.items()}
         output = {k: v for k, v in result.items() if k != "probs"}
-        return {**output, "weights": int_weights}
+
+        if dscp:
+            dscp_classes = _dscp_class_weights(user_data, history_data or {}, result.get("probs", {}))
+            output["dscp_classes"] = dscp_classes
+            output["dscp_by_interface"] = _dscp_by_interface(dscp_classes)
+
+        insights = _interface_insights(user_data, history_data)
+        return {
+            **output,
+            "weights": int_weights,
+            "confidence": {iface: data["confidence"] for iface, data in insights.items()},
+            "anomalies": {iface: data["anomalies"] for iface, data in insights.items()},
+        }
 
     @router.get('/metrics/quality/forecast',
                 summary="Combined quality forecast: congestion, loss, jitter and RTT per WAN interface")
@@ -2569,15 +2877,15 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
         since_seconds = _parse_since(since)
 
-        async def _qfetch(iface):
-            h = await asyncio.to_thread(_read_history, target, iface, since_seconds, limit)
+        def _qfetch(iface):
+            h = _read_history(target, iface, since_seconds, limit)
             if not h:
                 snap = user_data[iface]
                 h = [snap] if snap.get("timestamp") is not None else []
             return iface, h
 
         result: dict = {}
-        for iface, hist in await asyncio.gather(*[_qfetch(i) for i in user_data]):
+        for iface, hist in [_qfetch(i) for i in user_data]:
             result[iface] = {
                 "congestion": _forecast_metric(
                     hist, ("congestion", "score"), _CONGESTION_LEVELS,
@@ -2640,10 +2948,8 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
         history_data: dict = {}
         if not isinstance(_get_backend(), JSONBackend):
-            async def _hfetch(iface):
-                return iface, await asyncio.to_thread(_read_history, target, iface, 3600, 60)
-
-            for iface, hist in await asyncio.gather(*[_hfetch(i) for i in user_data]):
+            for iface in user_data:
+                hist = _read_history(target, iface, 3600, 60)
                 if hist:
                     history_data[iface] = hist
 
@@ -2698,7 +3004,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         from fastapi import HTTPException
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        persisted = await asyncio.to_thread(_auto_set_enabled, toggle.enabled)
+        persisted = _auto_set_enabled(toggle.enabled)
         if toggle.enabled:
             start_auto_learning()
         return {
@@ -2716,7 +3022,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         from starlette.responses import PlainTextResponse
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        all_data = await asyncio.to_thread(_read_all)
+        all_data = _read_all()
         return PlainTextResponse(
             content=_to_prometheus_text(all_data),
             media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -2730,7 +3036,6 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         from fastapi import HTTPException
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        import asyncio
-        return await asyncio.to_thread(_engine_diagnostics)
+        return _engine_diagnostics()
 
     return router

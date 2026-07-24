@@ -15,10 +15,10 @@ Interface metrics (JSON)
   [optional] Predictive extrapolation   MLP (torch) or linear regression → future snapshot
         │   (predict=true)
         ▼
-  Feature extraction          19 floats in [0, 1], higher = better
+  Feature extraction          21 floats in [0, 1], higher = better
         │                     includes trend features and predicted congestion
         ▼
-  InterfaceScorer (MLP)       Linear(19→24)→ReLU→Linear(24→8)→ReLU→Linear(8→1)
+  InterfaceScorer (MLP)       Linear(21→32)→ReLU→Dropout→Linear(32→16)→ReLU→Dropout→Linear(16→1)
         │
         ▼
   Offline masking             offline interface → softmax input forced to −∞
@@ -37,11 +37,16 @@ Interface metrics (JSON)
         └─► weight = max(1, round(ema_smoothed × 255))   (ip route weight, 1–255)
 ```
 
+In addition to this base per-interface weight, `?dscp=true` scores every
+interface against a table of standard DSCP traffic classes (voice, video,
+bulk, …) and returns a routing recommendation per class — see
+[§7 DSCP traffic-class routing](#7-dscp-traffic-class-routing).
+
 ---
 
 ## 1. Feature extraction
 
-Each interface payload is mapped to 19 normalised features.
+Each interface payload is mapped to 21 normalised features.
 All values are clamped to their stated range before normalisation so one
 outlier cannot distort the others.
 
@@ -64,15 +69,17 @@ outlier cannot distort the others.
 | 12 | `signal_sinr` | `clip(sinr + 20, 0, 50) / 50` — LTE SINR (−20…30 dB) | 0.5 |
 | 13 | `inv_bbr_min_rtt` | `1 − clip(bbr.min_rtt ms, 0, 2000) / 2000` | 0.5 |
 | 14 | `inv_predicted_congestion` | worst of current and +5 min predicted congestion score | 0.5 |
+| 15 | `staleness` | `1 − clip(age of snapshot, 0, 300 s) / 300` — 1.0 = fresh, 0.0 = ≥5 min old | 0.5 |
+| 16 | `inv_latency_std` | `1 − clip(population std of latency over history, 0, 500 ms) / 500` | 0.5 |
 
 ### Trend features (require InfluxDB history; neutral 0.5 when unavailable)
 
 | # | Name | Description |
 |---|------|-------------|
-| 15 | `trend_latency` | `>0.5` = improving (falling latency), `<0.5` = degrading |
-| 16 | `trend_loss` | `>0.5` = improving (falling loss) |
-| 17 | `trend_rx_bps` | `>0.5` = improving (rising throughput) |
-| 18 | `trend_jitter` | `>0.5` = improving (falling jitter) |
+| 17 | `trend_latency` | `>0.5` = improving (falling latency), `<0.5` = degrading |
+| 18 | `trend_loss` | `>0.5` = improving (falling loss) |
+| 19 | `trend_rx_bps` | `>0.5` = improving (rising throughput) |
+| 20 | `trend_jitter` | `>0.5` = improving (falling jitter) |
 
 `inv_*` features are inverted so that higher always means better.  Missing
 numeric fields use the default listed above (0.5 = neutral, 0.0 = worst, 1.0 = best).
@@ -85,12 +92,15 @@ recent samples dominate over older ones.
 ## 2. Neural network (InterfaceScorer)
 
 ```
-Input  (n_interfaces × 19)
-  └─ Linear(19 → 24) + ReLU
-       └─ Linear(24 → 8) + ReLU
-            └─ Linear(8 → 1)
+Input  (n_interfaces × 21)
+  └─ Linear(21 → 32) + ReLU + Dropout(0.1)
+       └─ Linear(32 → 16) + ReLU + Dropout(0.1)
+            └─ Linear(16 → 1)
 Output (n_interfaces,)  — unnormalised score per interface
 ```
+
+Dropout(0.1) regularises against overfitting on sparse user feedback; it is
+disabled automatically during inference (`model.eval()`).
 
 The first hidden neuron is pre-seeded with importance priors so the untrained
 model already approximates sensible heuristic behaviour:
@@ -100,6 +110,7 @@ model already approximates sensible heuristic behaviour:
 | `inv_latency` | 4.0 (highest) |
 | `inv_loss` | 2.5 |
 | `trend_latency` | 2.0 |
+| `staleness` | 1.8 |
 | `inv_predicted_congestion` | 1.5 |
 | `inv_rtt_spread` | 1.5 |
 | `inv_jitter` | 1.5 |
@@ -107,6 +118,7 @@ model already approximates sensible heuristic behaviour:
 | `trend_loss` | 1.5 |
 | `rx_bps` / `tx_bps` | 1.0 each |
 | `inv_bbr_min_rtt` | 1.0 |
+| `inv_latency_std` | 1.0 |
 | `bbr_bw` | 0.8 |
 | `trend_rx_bps` / `trend_jitter` | 0.8 each |
 | `inv_ecn` / `inv_dropped` | 0.5 each |
@@ -231,6 +243,9 @@ Both scorers receive history data when `?preemptive=true` (the default) is
 passed to `GET /metrics/decision`.  The engine fetches the last hour of
 history per interface from InfluxDB and uses it for both predictive congestion
 and trend features.  This is a no-op with the JSON backend (no history).
+All-interface history queries are limited per interface in SQL before rows are
+returned, so large multi-router deployments do not fetch an unbounded history
+window only to trim it in Python.
 
 ```
 GET /metrics/decision                    → preemptive on (default)
@@ -280,7 +295,104 @@ in [0, 100]).
 
 ---
 
-## 7. Quality forecast endpoint
+## 7. DSCP traffic-class routing
+
+`GET /metrics/decision?dscp=true` scores every WAN interface against a table
+of standard DSCP traffic classes (voice, video, bulk, …) in addition to the
+regular per-interface weight, and returns a routing recommendation per class —
+useful for policy routing / `tc filter` rules that steer marked traffic (e.g.
+VoIP tagged EF) to whichever WAN best suits that traffic type, independently
+of the single best-effort weight distribution.
+
+### 7a. Class profiles (`_DSCP_CLASSES`)
+
+Each class defines: the DSCP codepoint(s) it covers, a label, a set of
+feature importances (a subset of the §1 feature vector — no separate feature
+extraction), and its own forecast horizon.
+
+| Class | DSCP | Label | Priorities | Horizon |
+|-------|------|-------|-----------|---------|
+| `ef` | 46 | Voice (EF) | latency, jitter, loss, clean RTT | 20 s |
+| `cs5` | 40 | Video conferencing (CS5) | latency, jitter, loss, some bandwidth | 30 s |
+| `af41` | 34, 36, 38 | Streaming video (AF4x) | bandwidth, loss | 120 s |
+| `af31` | 26, 28, 30 | Broadcast video (AF3x) | bandwidth, loss, latency | 120 s |
+| `cs3` | 24 | Signaling (CS3) | latency, loss, congestion | 30 s |
+| `af21` | 18, 20, 22 | Low-latency data (AF2x) | latency, loss | 180 s |
+| `af11` | 10, 12, 14 | High-throughput data (AF1x) | bandwidth | 300 s |
+| `cs1` | 8 | Bulk / scavenger (CS1) | bandwidth only | 600 s |
+| `cs0` | 0 | Best effort (default) | balanced — same shape as the heuristic scorer | 300 s |
+| `cs6` | 48, 56 | Network control (CS6/CS7) | latency, loss, congestion | 20 s |
+
+Short horizons on real-time classes (voice, signaling, control) make them
+react to a spike seconds away; the long horizon on bulk/scavenger smooths
+over a longer trend instead of chasing noise.
+
+### 7b. Per-class scoring
+
+For each class and each online interface, `_dscp_class_weights`:
+
+1. **Forecasts** — with ≥ 2 history points, metrics are extrapolated the
+   class's own `horizon_s` seconds ahead (the same `_predict_payload`
+   machinery as §6d, just with a per-class horizon instead of the
+   request-level one) before feature extraction; otherwise the current
+   snapshot is used unchanged.
+2. **Formula score** — `raw = Σ (importance × feature)` over the class's
+   profile, using the same [0, 1] feature vectors as §1.
+3. **Cost scaling** — the same `1 / cost` penalty as the main decision (§4).
+4. **Model blend** — combined with the main decision's already-computed
+   probability distribution (the trained model's output, or the heuristic
+   scorer's when PyTorch is unavailable):
+
+   ```
+   blended(iface) = (1 − 0.3) × class_formula(iface) + 0.3 × model_prob(iface)
+   ```
+
+   `_DSCP_MODEL_BLEND = 0.3` (0 = ignore the model entirely, 1 = ignore the
+   class profile entirely). This lets DSCP scoring benefit from whatever the
+   model has learned globally while staying anchored to the class's own
+   priorities.
+5. **Weight** — the same `max(1, round(normalised × 255))` conversion as the
+   main decision, so each class's `weights` can be used directly.
+
+Offline interfaces (or missing `latency`) score 0 for every class, matching
+the masking rule in §3.
+
+### 7c. Response shape
+
+```jsonc
+{
+  "weights": { "eth0": 209, "wwan0": 46 },
+  "scores":  { "eth0": 82.0, "wwan0": 18.0 },
+  "dscp_classes": {
+    "ef": {
+      "dscp": [46], "label": "Voice (EF)", "horizon_s": 20,
+      "weights": { "eth0": 230, "wwan0": 25 },
+      "scores":  { "eth0": 90.2, "wwan0": 9.8 },
+      "best_interface": "eth0",
+      "ranking": ["eth0", "wwan0"]
+    },
+    "cs1": {
+      "dscp": [8], "label": "Bulk / scavenger (CS1)", "horizon_s": 600,
+      "weights": { "eth0": 90, "wwan0": 165 },
+      "scores":  { "eth0": 35.3, "wwan0": 64.7 },
+      "best_interface": "wwan0",
+      "ranking": ["wwan0", "eth0"]
+    }
+    // ... one entry per class in _DSCP_CLASSES
+  },
+  "dscp_by_interface": {
+    "eth0":  ["ef", "cs5", "cs3", "af21", "cs0", "cs6"],
+    "wwan0": ["af41", "af31", "af11", "cs1"]
+  }
+}
+```
+
+`dscp_by_interface` inverts `dscp_classes`, grouping classes by the
+interface that is their rank-1 (best) route.
+
+---
+
+## 8. Quality forecast endpoint
 
 `GET /metrics/quality/forecast` returns a combined quality forecast for every
 WAN interface covering four metrics: **congestion**, **loss**, **jitter**, and
@@ -358,7 +470,7 @@ With the JSON backend (no history), all ETAs are `null` and
 
 ---
 
-## 8. Prometheus scrape endpoint
+## 9. Prometheus scrape endpoint
 
 `GET /metrics/prometheus` returns all users' latest WAN metrics in
 [Prometheus text format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/).
@@ -391,6 +503,7 @@ Exposed metrics (all gauges, labelled `username` and `interface`):
 | `omr_signal_quality` | Signal quality in % (cellular/wifi) |
 | `omr_bbr_bw_bps` | BBR bandwidth estimate in bytes/s |
 | `omr_data_age_seconds` | Age of the latest sample in seconds |
+| `omr_interface_anomaly{anomaly="..."}` | 1 when a latest-snapshot anomaly is present |
 
 Example output:
 
@@ -410,7 +523,7 @@ silently omitted — no `NaN` lines are emitted.
 
 ---
 
-## 9. Online learning (fine-tuning)
+## 10. Online learning (fine-tuning)
 
 `POST /metrics/decision/train` runs one SGD step minimising the MSE between
 the model's current softmax output and a caller-supplied target distribution.
@@ -495,7 +608,7 @@ configuration and `task_running` flag in `auto_learning`.
 
 ---
 
-## 10. API endpoints
+## 11. API endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
@@ -505,6 +618,7 @@ configuration and `task_running` flag in `auto_learning`.
 | `GET` | `/metrics/decision?predict=true` | user | Weights based on extrapolated future metrics |
 | `GET` | `/metrics/decision?predict=true&horizon=600` | user | Predict 10 minutes ahead |
 | `GET` | `/metrics/decision?preemptive=false` | user | Skip history fetch; current snapshot only |
+| `GET` | `/metrics/decision?dscp=true` | user | Adds `dscp_classes` + `dscp_by_interface` (§7) |
 | `GET` | `/metrics/decision?username=X` | admin | Decision for another user |
 | `GET` | `/metrics/quality/forecast` | user | Per-interface forecast: congestion, loss, jitter, RTT |
 | `GET` | `/metrics/quality/forecast?horizon=600&since=6h` | user | Longer window / horizon |
@@ -520,7 +634,9 @@ configuration and `task_running` flag in `auto_learning`.
 ```jsonc
 {
   "weights": { "eth0": 209, "wwan0": 46 },
-  "scores":  { "eth0": 82.0, "wwan0": 18.0 }
+  "scores":  { "eth0": 82.0, "wwan0": 18.0 },
+  "confidence": { "eth0": "high", "wwan0": "medium" },
+  "anomalies": { "eth0": [], "wwan0": ["rising_loss"] }
 }
 ```
 
@@ -528,9 +644,18 @@ configuration and `task_running` flag in `auto_learning`.
 
 `scores` are quality percentages in [0, 100]; an offline interface scores ≈ 0.
 
+`confidence` describes data quality for the decision (`high`, `medium`, `low`,
+`none`) based on freshness, history depth, missing fields, and reachability.
+
+`anomalies` is a per-interface list of compact flags. Current-snapshot flags can
+include `offline`, `unreachable`, `stale_metrics`, `high_loss`, `high_jitter`,
+and `high_congestion`. When InfluxDB history is available, decision responses
+can also include `flapping`, `gateway_changed`, `rising_loss`, `rising_jitter`,
+and `rising_congestion`.
+
 ### GET /metrics/decision?explain=true
 
-Adds a `"features"` block with the 19 normalised values used as model input:
+Adds a `"features"` block with the 21 normalised values used as model input:
 
 ```jsonc
 {
@@ -543,9 +668,14 @@ Adds a `"features"` block with the 19 normalised values used as model input:
 }
 ```
 
+### GET /metrics/decision?dscp=true
+
+Adds `"dscp_classes"` and `"dscp_by_interface"` — see
+[§7c Response shape](#7c-response-shape) for the full example.
+
 ---
 
-## 11. Fallback behaviour
+## 12. Fallback behaviour
 
 | Condition | Behaviour |
 |-----------|-----------|
@@ -565,10 +695,12 @@ Adds a `"features"` block with the 19 normalised values used as model input:
 | `quality/forecast`, PyTorch not installed | Linear regression used for all extrapolations |
 | `quality/forecast`, < 5 history points per interface | MLP path bypassed; linear regression used |
 | InfluxDB retention push fails | Warning logged; installer-set retention remains as hard floor |
+| `dscp=true`, < 2 history points for an interface | That interface's class forecast falls back to the current snapshot |
+| `dscp=true` with JSON backend / PyTorch not installed | Still works — class formula runs on current-snapshot features, blended with the heuristic scorer's probabilities |
 
 ---
 
-## 12. InfluxDB configuration reference
+## 13. InfluxDB configuration reference
 
 The `influxdb` block in `omr-admin-config.json` accepts:
 
