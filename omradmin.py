@@ -430,8 +430,12 @@ def get_vxlan_config(username, userid):
         omr_config_data = json.load(f)
     user_config = omr_config_data['users'][0].get(username, {})
     vxlan_config = user_config.get('vxlan') or {}
+    mode = vxlan_config.get('mode', 'l3')
+    if mode not in ('l2', 'l3'):
+        mode = 'l3'
     return {
         'enabled': bool(vxlan_config.get('enabled', False)),
+        'mode': mode,
         'vni': vxlan_config.get('vni', userid + 1),
         'port': vxlan_config.get('port', 4789),
         'localip': vxlan_config.get('localip', '10.255.249.' + str(userid * 4 + 1) + '/30'),
@@ -468,8 +472,14 @@ def write_vxlan_conf(username, userid):
         n.write('PORT=' + str(vxlan_config['port']) + "\n")
         n.write('LOCALIP=' + underlay_localip.split('/')[0] + "\n")
         n.write('REMOTEIP=' + underlay_remoteip.split('/')[0] + "\n")
-        n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
-        n.write('LOCALTUNIP6=' + vxlan_config['localip6'] + "\n")
+        n.write('MODE=' + vxlan_config['mode'] + "\n")
+        if vxlan_config['mode'] == 'l2':
+            # Bridge name is derived from the VNI so every client sharing that
+            # VNI lands on the same server-side bridge (shared L2 segment)
+            n.write('BRIDGE=br-vxlan' + str(vxlan_config['vni']) + "\n")
+        else:
+            n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
+            n.write('LOCALTUNIP6=' + vxlan_config['localip6'] + "\n")
         n.write('MTU=' + str(vxlan_config['mtu']) + "\n")
     final_md5 = hashlib.md5(file_as_bytes(open(vxlan_file, 'rb'))).hexdigest()
     if initial_md5 != final_md5:
@@ -3557,6 +3567,7 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
 
 class Vxlan(BaseModel):
     enable: bool = True
+    mode: Optional[str] = None
     vni: Optional[int] = None
     port: Optional[int] = None
     localip: Optional[str] = None
@@ -3565,33 +3576,110 @@ class Vxlan(BaseModel):
     remoteip6: Optional[str] = None
     mtu: Optional[int] = None
 
-# Set VXLAN L2 tunnel over the VPN
-@app.post('/vxlan', summary="Set VXLAN L2 tunnel over the VPN for the current user")
+def _vxlan_vni_map(exclude_username=None):
+    """Return {username: vni} for every user carrying a userid, admin or not.
+
+    Used to flag VNI collisions before assigning one: two users sharing a
+    VNI in L2 mode land on the same server-side bridge, merging their LANs.
+    """
+    data = read_omr_config()
+    vnis = {}
+    if not data or 'users' not in data:
+        return vnis
+    for username, ucfg in data['users'][0].items():
+        if username == exclude_username:
+            continue
+        try:
+            userid = int(ucfg.get('userid'))
+        except (TypeError, ValueError):
+            continue
+        vnis[username] = get_vxlan_config(username, userid)['vni']
+    return vnis
+
+def _merge_vxlan_config(username, userid, **overrides):
+    """Merge overrides onto the user's current vxlan config (modif_config_user
+    replaces the whole 'vxlan' key rather than deep-merging it, so callers
+    must pass the full desired dict or previously set fields, VNI included,
+    get silently wiped on the next partial update)."""
+    merged = get_vxlan_config(username, userid)
+    merged.update({k: v for k, v in overrides.items() if v is not None})
+    return merged
+
+# Set VXLAN tunnel over the VPN, either routed (L3) or bridged into the LAN (L2)
+@app.post('/vxlan', summary="Set VXLAN tunnel over the VPN for the current user")
 def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'vxlan'}
     userid = current_user.userid
     if userid is None:
         userid = 0
-    vxlan_user_config = {'enabled': vxlanconfig.enable}
-    if vxlanconfig.vni is not None:
-        vxlan_user_config['vni'] = vxlanconfig.vni
-    if vxlanconfig.port is not None:
-        vxlan_user_config['port'] = vxlanconfig.port
-    if vxlanconfig.localip:
-        vxlan_user_config['localip'] = vxlanconfig.localip
-    if vxlanconfig.remoteip:
-        vxlan_user_config['remoteip'] = vxlanconfig.remoteip
-    if vxlanconfig.localip6:
-        vxlan_user_config['localip6'] = vxlanconfig.localip6
-    if vxlanconfig.remoteip6:
-        vxlan_user_config['remoteip6'] = vxlanconfig.remoteip6
-    if vxlanconfig.mtu is not None:
-        vxlan_user_config['mtu'] = vxlanconfig.mtu
+    if vxlanconfig.vni is not None and current_user.permissions != "admin":
+        return {'result': 'permission', 'reason': 'VNI is admin-assigned, ask your administrator', 'route': 'vxlan'}
+    mode = vxlanconfig.mode if vxlanconfig.mode in ('l2', 'l3') else None
+    vxlan_user_config = _merge_vxlan_config(
+        current_user.username, userid,
+        enabled=vxlanconfig.enable, mode=mode, vni=vxlanconfig.vni,
+        port=vxlanconfig.port, localip=vxlanconfig.localip or None,
+        remoteip=vxlanconfig.remoteip or None, localip6=vxlanconfig.localip6 or None,
+        remoteip6=vxlanconfig.remoteip6 or None, mtu=vxlanconfig.mtu
+    )
     LOG.debug("modif_config_user for vxlan setting")
     modif_config_user(current_user.username, {'vxlan': vxlan_user_config})
     write_vxlan_conf(current_user.username, userid)
     return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(current_user.username, userid)}
+
+@app.get('/vxlan_vnis', summary="Admin: list every user's VXLAN VNI assignment")
+def vxlan_vnis(current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'vxlan_vnis'}
+    data = read_omr_config()
+    if not data or 'users' not in data:
+        return {'result': 'error', 'reason': 'Config file not readable', 'route': 'vxlan_vnis'}
+    users = {}
+    for username, ucfg in data['users'][0].items():
+        try:
+            userid = int(ucfg.get('userid'))
+        except (TypeError, ValueError):
+            continue
+        cfg = get_vxlan_config(username, userid)
+        users[username] = {'userid': userid, 'enabled': cfg['enabled'], 'mode': cfg['mode'], 'vni': cfg['vni']}
+    return {'result': 'done', 'users': users}
+
+class VxlanUser(BaseModel):
+    username: str = Query(..., pattern=USERNAME_PATTERN, title="Username")
+    vni: Optional[int] = None
+    mode: Optional[str] = None
+    enable: Optional[bool] = None
+    force: bool = False
+
+@app.post('/vxlan_user', summary="Admin: assign a user's VXLAN VNI, mode or enabled state")
+def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get_current_user)):
+    if not current_user.permissions == "admin":
+        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'vxlan_user'}
+    data = read_omr_config()
+    if not data or 'users' not in data or params.username not in data['users'][0]:
+        return {'result': 'error', 'reason': 'User not found', 'route': 'vxlan_user'}
+    try:
+        userid = int(data['users'][0][params.username].get('userid'))
+    except (TypeError, ValueError):
+        return {'result': 'error', 'reason': 'User has no userid', 'route': 'vxlan_user'}
+    if params.mode is not None and params.mode not in ('l2', 'l3'):
+        return {'result': 'error', 'reason': 'mode must be l2 or l3', 'route': 'vxlan_user'}
+    if params.vni is not None and not params.force:
+        conflicts = [u for u, v in _vxlan_vni_map(exclude_username=params.username).items() if v == params.vni]
+        if conflicts:
+            return {
+                'result': 'conflict',
+                'reason': 'VNI ' + str(params.vni) + ' already used by: ' + ', '.join(sorted(conflicts))
+                          + ' (pass force=true to merge them into the same L2 segment on purpose)',
+                'route': 'vxlan_user'
+            }
+    vxlan_user_config = _merge_vxlan_config(params.username, userid, vni=params.vni, mode=params.mode)
+    if params.enable is not None:
+        vxlan_user_config['enabled'] = params.enable
+    modif_config_user(params.username, {'vxlan': vxlan_user_config})
+    write_vxlan_conf(params.username, userid)
+    return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(params.username, userid), 'route': 'vxlan_user'}
 
 class PROXY(str, Enum):
     v2ray = "v2ray"

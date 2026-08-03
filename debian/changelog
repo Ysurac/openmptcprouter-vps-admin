@@ -1,3 +1,14 @@
+omr-vps-admin (0.18+20260803) unstable; urgency=medium
+
+  * Add VXLAN L2 mode: bridge clients sharing a VNI into the same server-side LAN segment (br-vxlan<vni>) instead of only routed L3 point-to-point tunnels
+  * Add GET /vxlan_vnis (admin) to list every user's VNI/mode/enabled state
+  * Add POST /vxlan_user (admin) to assign a user's VNI, mode or enabled state, rejecting a VNI already used by another user unless force is passed to merge them deliberately
+  * Restrict non-admin users from setting their own VNI (admin-assigned only)
+  * Fix /vxlan partial updates wiping previously set fields instead of merging onto the existing config
+  * Document the VXLAN L2 mode and new admin endpoints in docs/api.md
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 03 Aug 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260724) unstable; urgency=medium
 
   * Add DSCP traffic-class routing: GET /metrics/decision?dscp=true scores every WAN interface against standard DSCP classes (voice, video, bulk, ...) with per-class forecast horizon and returns a routing recommendation per class

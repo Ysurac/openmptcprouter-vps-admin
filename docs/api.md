@@ -104,7 +104,9 @@ Configuration endpoints return a JSON object of the form:
 | POST | `/openvpn` | `OpenVPN` | OpenVPN TCP port and cipher |
 | POST | `/softethervpn` | `SoftEtherVPN` | SoftEther cipher and password |
 | POST | `/wireguard` | `WireGuard` | Replace the WireGuard peer list (`[{ip, key}]`) |
-| POST | `/vxlan` | `Vxlan` | VXLAN L2 tunnel over the VPN: enable, VNI, port, local/remote IPv4+IPv6, MTU |
+| POST | `/vxlan` | `Vxlan` | VXLAN tunnel over the VPN: enable, mode (`l3` routed P2P, default, or `l2` bridged — clients sharing a VNI land on the same server-side bridge), VNI, port, local/remote IPv4+IPv6, MTU. Non-admin users may not set `vni` (admin-assigned only, see below) |
+| GET | `/vxlan_vnis` | — | Admin only: list every user's VNI/mode/enabled state, to review assignments and spot collisions before assigning one |
+| POST | `/vxlan_user` | `VxlanUser` | Admin only: assign a specific user's VNI, mode or enabled state. Rejects a VNI already used by another user unless `force: true` is passed to deliberately merge them into the same L2 segment |
 | POST | `/vpnips` | `VPNips` | Set the user's VPN local/remote IPs (RFC1918 IPv4, optional IPv6/ULA) |
 
 Port changes automatically update the Shorewall rules and restart the matching
