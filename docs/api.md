@@ -101,6 +101,8 @@ Configuration endpoints return a JSON object of the form:
 | POST | `/mlvpn` | `MLVPN` | MLVPN password, timeout, reorder buffer, loss tolerance, cleartext |
 | POST | `/mqvpn` | `MQVPN` | MQVPN key, scheduler, port (default 443), FEC (xor/reed_solomon/…), reinjection, congestion control (bbr2/bbr/cubic/…), reorder profile and per-port reorder rules |
 | POST | `/mqvpn_user` | `MQVPNUser` | Admin only: set or clear a fixed IP for an MQVPN user |
+| POST | `/mqvpn_dscp` | `MQVPNDscpParams` | Sync the current user's per-WAN DSCP class assignments (`pins: [{iface, dscp: [...]}]`) into MQVPN's per-path `dscp_mask`, pushed live over the control socket and persisted in `/etc/mqvpn/server.json`'s `path_policy` so it survives a restart/reconnect; warns if MQVPN isn't installed |
+| POST | `/mqvpn_weight` | `MQVPNWeightParams` | Sync the current user's per-WAN weights (`weights: [{iface, weight}]`) into MQVPN's per-path `weight`, same live + persisted push as `/mqvpn_dscp`; warns if MQVPN isn't installed |
 | POST | `/openvpn` | `OpenVPN` | OpenVPN TCP port and cipher |
 | POST | `/softethervpn` | `SoftEtherVPN` | SoftEther cipher and password |
 | POST | `/wireguard` | `WireGuard` | Replace the WireGuard peer list (`[{ip, key}]`) |
@@ -127,6 +129,9 @@ systemd service when the on-disk configuration actually changed (MD5 comparison)
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
 | POST | `/mptcp` | `MPTCPparams` | Server MPTCP settings: checksum, path manager, scheduler, syn retries, congestion control, and protocol-version specific knobs |
+| POST | `/mptcp_dscp` | `MPTCPDscpParams` | Sync the router's per-WAN DSCP pins (`pins: [{dscp, remote_id}]`) into bpf_dscp's `dscp_remote_id` map via `mptcp-scheduler-dscp.sh`; keyed by MPTCP remote endpoint id since every subflow shares one local IP on the VPS. Warns if `mptcp-dscp-manager` isn't installed |
+| POST | `/mptcp_weight` | `MPTCPWeightParams` | Sync the router's per-WAN weights (`weights: [{remote_id, weight}]`) into bpf_weight(_rr)'s `weight_remote_id` map via `mptcp-scheduler-weight.sh`, cleaning up remote ids dropped since the previous sync. Warns if `mptcp-weight-manager` isn't installed |
+| POST | `/dscp_classify` | `DscpClassifyParams` | Mirror the router's destination→DSCP classification (`entries: [{dscp, cidr}]`) into per-class/family ipsets plus an idempotent Shorewall mangle block, so the VPS's own outbound traffic to a proxied destination carries the same DSCP as the router→VPS leg. Warns if `ipset` isn't installed |
 | POST | `/bypass` | `ByPass` | IPs to bypass (direct out via `intf` instead of the tunnel) |
 | POST | `/wan` | `Wanips` | Router WAN IPs (written to the Shadowsocks ACL white list) |
 | POST | `/lan` | `Lanips` | Current user LAN subnets (also updates OpenVPN iroutes when client2client is enabled) |

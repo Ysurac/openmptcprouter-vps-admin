@@ -3534,6 +3534,237 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
+# Set bpf_dscp DSCP-to-WAN pins (server/VPS side: dscp_remote_id map).
+#
+# The router pins a DSCP class to a WAN by local endpoint IP
+# (dscp_iface); on the VPS every subflow shares the same local IP, so
+# the equivalent pin instead keys on the MPTCP remote endpoint id the
+# router assigned to that WAN (dscp_remote_id) -- see
+# mptcp-bpf-dscp/debian/README.Debian. This route is what closes the
+# "no automated sync... copy the number over manually" gap that doc
+# used to describe: the router's openmptcprouter-vps init script calls
+# this whenever network.<iface>.mptcp_dscp changes (see
+# mptcp-dscp-manager's 041-multipath-dscp tracker hook).
+DSCP_CLASSES = (
+    'cs0', 'cs1', 'cs2', 'cs3', 'cs4', 'cs5', 'cs6', 'cs7', 'le',
+    'af11', 'af12', 'af13', 'af21', 'af22', 'af23',
+    'af31', 'af32', 'af33', 'af41', 'af42', 'af43', 'ef',
+)
+
+class DscpPin(BaseModel):
+    dscp: str
+    remote_id: int
+
+class MPTCPDscpParams(BaseModel):
+    pins: List[DscpPin] = []
+
+@app.post('/mptcp_dscp', summary="Sync router DSCP-to-WAN pins into the server's bpf_dscp remote_id map")
+def mptcp_dscp(*, params: MPTCPDscpParams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mptcp_dscp'}
+    script = '/usr/sbin/mptcp-scheduler-dscp.sh'
+    if not path.exists(script):
+        return {'result': 'warning', 'reason': 'mptcp-dscp-manager not installed', 'route': 'mptcp_dscp'}
+    desired = {}
+    for pin in params.pins:
+        if pin.dscp not in DSCP_CLASSES or not (0 <= pin.remote_id <= 255):
+            return {'result': 'error', 'reason': f'Invalid pin {pin.dscp!r}/{pin.remote_id!r}', 'route': 'mptcp_dscp'}
+        desired[pin.dscp] = pin.remote_id
+    # Converge every known class to the desired state in one pass, rather
+    # than tracking previous state server-side: cheap (bpftool map
+    # update/delete are near-instant) and self-healing if a previous push
+    # was ever interrupted partway through.
+    for dscp in DSCP_CLASSES:
+        if dscp in desired:
+            subprocess.run([script, 'set', dscp, 'id', str(desired[dscp])], check=False)
+        else:
+            subprocess.run([script, 'del', dscp], check=False)
+    return {'result': 'done', 'reason': 'changes applied'}
+
+# Set bpf_weight/bpf_weight_rr per-WAN weights (server/VPS side:
+# weight_remote_id map, shared by both schedulers).
+#
+# The router weights a WAN by local endpoint IP (endpoint_weights); on
+# the VPS every subflow shares the same local IP, so the equivalent
+# weight instead keys on the MPTCP remote endpoint id the router
+# assigned to that WAN (weight_remote_id) -- same split as bpf_dscp's
+# dscp_iface/dscp_remote_id above. Unlike DSCP classes (a small fixed
+# set), remote ids have no fixed enumeration, so a small state file
+# tracks what was pushed last time to know what to clean up.
+MPTCP_WEIGHT_STATE_FILE = '/etc/openmptcprouter-vps-admin/.mptcp_weight_remote_ids'
+
+class WeightPin(BaseModel):
+    remote_id: int
+    weight: int
+
+class MPTCPWeightParams(BaseModel):
+    weights: List[WeightPin] = []
+
+@app.post('/mptcp_weight', summary="Sync router per-WAN weights into the server's weight_remote_id map")
+def mptcp_weight(*, params: MPTCPWeightParams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mptcp_weight'}
+    script = '/usr/sbin/mptcp-scheduler-weight.sh'
+    if not path.exists(script):
+        return {'result': 'warning', 'reason': 'mptcp-weight-manager not installed', 'route': 'mptcp_weight'}
+    desired = {}
+    for pin in params.weights:
+        if not (0 <= pin.remote_id <= 255) or pin.weight <= 0:
+            return {'result': 'error', 'reason': f'Invalid weight pin {pin.remote_id!r}/{pin.weight!r}', 'route': 'mptcp_weight'}
+        desired[pin.remote_id] = pin.weight
+    for remote_id, weight in desired.items():
+        subprocess.run([script, 'set', 'id', str(remote_id), str(weight)], check=False)
+    previous_ids = set()
+    if path.exists(MPTCP_WEIGHT_STATE_FILE):
+        with open(MPTCP_WEIGHT_STATE_FILE) as f:
+            previous_ids = {int(x) for x in f.read().split() if x.isdigit()}
+    for stale_id in previous_ids - set(desired.keys()):
+        subprocess.run([script, 'del', 'id', str(stale_id)], check=False)
+    with open(MPTCP_WEIGHT_STATE_FILE, 'w') as f:
+        f.write(' '.join(str(i) for i in sorted(desired.keys())))
+    return {'result': 'done', 'reason': 'changes applied'}
+
+# Mark the VPS's own outbound traffic to a synced set of destinations with a
+# DSCP class, mirroring the router's own omr-dscp/omr-dscp-nft
+# classification (see openmptcprouter-vps's _set_dscp_classify_vps). Lets
+# e.g. ssserver's connection to a proxied session's real destination carry
+# the same DSCP as the router->VPS leg for that same session (see
+# shadowsocks-rust's 001/002-*.patch), without the DSCP bits themselves
+# needing to survive the router->VPS hop on the wire -- both ends just
+# independently classify the same destination the same way.
+#
+# One ipset per class+family holds the current destination CIDRs, atomically
+# refreshed (created-then-swapped, so there's no window where it's
+# empty/partial) on every sync. One Shorewall *mangle* line per class+family
+# marks packets whose destination is in that class's set -- written once,
+# idempotently (rewritten from scratch by filtering our own marker lines
+# out first, so re-running never accumulates duplicates); only the ipset
+# *contents* change on subsequent syncs, not this file, so in the common
+# case a sync is just `ipset swap` calls with no Shorewall reload at all.
+#
+# `mangle`, not the older `tcrules`: live-checked against this VPS's actual
+# /usr/share/shorewall/Shorewall/Tc.pm (Shorewall 5.2.8) -- tcrules is no
+# longer read directly ("The tcrules file is no longer supported -- use
+# '$product update' to convert $fn to an equivalent 'mangle' file"). Row
+# layout, ACTION value and DSCP-column value were all live-verified with
+# `shorewall check`/`shorewall6 check` against this VPS -- see
+# _dscp_classify_mangle_line for the exact column positions (one column
+# more for IPv6 -- an extra HEADERS column IPv4 rows don't have). The
+# ACTION column must be a real target (`CONTINUE`, not `-`); the DSCP
+# column is a *bare* class name matched against Shorewall's own %dscpmap
+# in Chains.pm's do_dscp() (`CS4`, not the `DSCP(CS4)` inline-action-style
+# syntax that's valid elsewhere, e.g. the rules file's ACTION column, but
+# not here).
+DSCP_CLASSIFY_IPSET_PREFIX = 'omr_dscp_classify_'
+DSCP_CLASSIFY_MANGLE_BEGIN = '# BEGIN OMR DSCP classify (autogenerated, do not edit -- see /dscp_classify)'
+DSCP_CLASSIFY_MANGLE_END = '# END OMR DSCP classify'
+# Deliberately narrower than DSCP_CLASSES above (which also has 'le' and the
+# af* classes, for mptcp_dscp's bpf-pin use case): Shorewall's own %dscpmap
+# in Chains.pm has no 'LE' entry, so converging every DSCP_CLASSES member to
+# a mangle row unconditionally would write a row Shorewall itself rejects
+# (confirmed live) the moment that class has ever been synced -- restrict
+# to the classes omr-dscp/omr-dscp-nft actually produce (see their
+# _add_dscp_domains_rules loops), all of which are valid %dscpmap keys.
+DSCP_CLASSIFY_CLASSES = ('cs0', 'cs1', 'cs2', 'cs3', 'cs4', 'cs5', 'cs6', 'cs7', 'ef')
+
+class DscpClassifyEntry(BaseModel):
+    dscp: str
+    cidr: str
+
+class DscpClassifyParams(BaseModel):
+    entries: List[DscpClassifyEntry] = []
+
+def _dscp_classify_ipset_name(dscp, family):
+    return f'{DSCP_CLASSIFY_IPSET_PREFIX}{dscp}_{family}'
+
+def _refresh_dscp_classify_ipset(name, family, cidrs):
+    hash_family = 'inet6' if family == 6 else 'inet'
+    tmp_name = f'{name}_tmp'
+    # Both sets must exist (even if empty) before `ipset swap`, which requires
+    # matching types and fails outright if either side is missing.
+    subprocess.run(['ipset', 'destroy', tmp_name], check=False)
+    subprocess.run(['ipset', 'create', tmp_name, 'hash:net', 'family', hash_family], check=False)
+    for cidr in cidrs:
+        subprocess.run(['ipset', 'add', tmp_name, cidr, '-exist'], check=False)
+    subprocess.run(['ipset', 'create', name, 'hash:net', 'family', hash_family, '-exist'], check=False)
+    subprocess.run(['ipset', 'swap', tmp_name, name], check=False)
+    subprocess.run(['ipset', 'destroy', tmp_name], check=False)
+
+def _dscp_classify_mangle_line(dscp, family, setname):
+    # Live-verified against this VPS's real Shorewall 5.2.8, including confirming the actual
+    # DSCP byte on the wire with tcpdump (not just `shorewall check` syntax acceptance) -- two
+    # earlier attempts both passed `shorewall check` but did NOT work:
+    #  1. ACTION='-', DSCP column='CS4': "Invalid ACTION (-)" -- '-' isn't a valid ACTION.
+    #  2. ACTION='CONTINUE', DSCP column='CS4' (bare class name, matching Chains.pm's %dscpmap):
+    #     passed `shorewall check`, reloaded fine, but outbound packets stayed at tos 0x0. The
+    #     trailing DSCP column feeds Chains.pm's do_dscp(), which builds a `-m dscp --dscp`
+    #     *match* clause (only matches packets that ALREADY carry that DSCP) -- it cannot set it.
+    # The actual setter is the parameterized ACTION verb `DSCP(CLASS)` in the ACTION column
+    # itself (Rules.pm's %synonym-like target hash lists DSCP alongside MARK/TTL/TOS/etc as a
+    # recognized parameterized action) -- confirmed live: outbound ICMP to a classified
+    # destination showed tos 0x80 (CS4) only after switching to this form. With ACTION carrying
+    # the real verb, Shorewall accepts fewer trailing columns than the full mark-based row
+    # (14 total for IPv4, 15 for IPv6, vs. 15/16 for a plain numeric mark) -- verified by
+    # `awk -F'\t' '{print NF}'` against the exact accepted line, not assumed from the column-name
+    # table alone.
+    filler = ['-'] * (12 if family == 6 else 11)
+    cols = [f'DSCP({dscp.upper()})', '-', f'+{setname}', *filler]
+    return '\t'.join(cols) + '\n'
+
+def _ensure_dscp_classify_mangle(family):
+    mangle_path = '/etc/shorewall/mangle' if family == 4 else '/etc/shorewall6/mangle'
+    service = 'shorewall' if family == 4 else 'shorewall6'
+    if not os.path.isfile(mangle_path):
+        open(mangle_path, 'a').close()
+    initial_md5 = hashlib.md5(file_as_bytes(open(mangle_path, 'rb'))).hexdigest()
+    fd, tmpfile = mkstemp()
+    with open(mangle_path, 'r') as f, open(tmpfile, 'a+') as n:
+        skipping = False
+        for line in f:
+            stripped = line.rstrip('\n')
+            if stripped == DSCP_CLASSIFY_MANGLE_BEGIN:
+                skipping = True
+                continue
+            if stripped == DSCP_CLASSIFY_MANGLE_END:
+                skipping = False
+                continue
+            if not skipping:
+                n.write(line)
+        n.write(DSCP_CLASSIFY_MANGLE_BEGIN + '\n')
+        for dscp in DSCP_CLASSIFY_CLASSES:
+            setname = _dscp_classify_ipset_name(dscp, family)
+            n.write(_dscp_classify_mangle_line(dscp, family, setname))
+        n.write(DSCP_CLASSIFY_MANGLE_END + '\n')
+    os.close(fd)
+    move(tmpfile, mangle_path)
+    final_md5 = hashlib.md5(file_as_bytes(open(mangle_path, 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        subprocess.run(["systemctl", "-q", "reload", service], check=False)
+
+@app.post('/dscp_classify', summary="Sync router destination->DSCP classification into VPS ipset+mangle marking")
+def dscp_classify(*, params: DscpClassifyParams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'dscp_classify'}
+    try:
+        subprocess.run(['ipset', 'version'], check=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return {'result': 'warning', 'reason': 'ipset not installed', 'route': 'dscp_classify'}
+    by_class = {dscp: {4: [], 6: []} for dscp in DSCP_CLASSIFY_CLASSES}
+    for entry in params.entries:
+        if entry.dscp not in DSCP_CLASSIFY_CLASSES:
+            return {'result': 'error', 'reason': f'Invalid dscp {entry.dscp!r}', 'route': 'dscp_classify'}
+        try:
+            net = ipaddress.ip_network(entry.cidr, strict=False)
+        except ValueError:
+            return {'result': 'error', 'reason': f'Invalid cidr {entry.cidr!r}', 'route': 'dscp_classify'}
+        by_class[entry.dscp][net.version].append(str(net))
+    for dscp in DSCP_CLASSIFY_CLASSES:
+        for family in (4, 6):
+            _refresh_dscp_classify_ipset(_dscp_classify_ipset_name(dscp, family), family, by_class[dscp][family])
+    _ensure_dscp_classify_mangle(4)
+    _ensure_dscp_classify_mangle(6)
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'dscp_classify'}
+
 class VPN(str, Enum):
     openvpn = "openvpn"
     openvpnbonding = "openvpn_bonding"
@@ -3988,6 +4219,165 @@ def mqvpn_user_set_config(*, params: MQVPNUser, current_user: User = Depends(get
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", "mqvpn"], check=False)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_user'}
+
+# Set per-path DSCP class assignment / per-path weight for MQVPN, mirroring
+# /mptcp_dscp and /mptcp_weight above. Each pin is pushed two ways:
+#
+#   1. Live, via MQVPN's control socket (mqvpn_api(), the same one
+#      add_mqvpn()/remove_mqvpn() already use) -- takes effect immediately
+#      for a user that's already connected, no restart, no disruption to
+#      other sessions. A no-op ("user not found") if that user has no
+#      active session right now -- surfaced as a warning, not queued.
+#   2. Persisted into /etc/mqvpn/server.json's "path_policy" array (added
+#      alongside this endpoint -- see mqvpn's src/config.c/mqvpn_server.c),
+#      keyed by (user, iface) same as the live call. mqvpn reads this once
+#      at startup and re-applies it the first time that user's connection
+#      announces a PATH_LABEL for the matching iface -- so it survives an
+#      `mqvpn` restart and a client reconnect, unlike a control-socket-only
+#      push. Deliberately does NOT trigger a restart itself (unlike
+#      /mqvpn's and /mqvpn_user's config writes): the live push above
+#      already covers "now", and forcing every other connected user's
+#      session to drop for a single-user weight/dscp tweak would be a poor
+#      trade -- the persisted copy just sits ready for whenever a restart
+#      next happens for some other reason (upgrade, crash, an unrelated
+#      config change).
+#
+# server.json's path_policy list is also the single source of truth for
+# "what's currently pinned for this user", used to converge each sync (an
+# iface dropped from the request gets its field cleared both live and in
+# the persisted entry) -- no separate state file needed.
+#
+# dscp_mask is a bitmap of DSCP codepoints (bit N set = codepoint N is
+# carried on that path), so -- unlike bpf_dscp's one-class-per-remote_id --
+# a single path can be pinned to more than one class at once; a class with
+# no path carrying it just falls back to plain MinRTT (see mqvpn's
+# include/libmqvpn.h mqvpn_path_desc_t.dscp_mask doc comment).
+DSCP_CODEPOINTS = {
+    'cs0': 0, 'cs1': 8, 'cs2': 16, 'cs3': 24, 'cs4': 32, 'cs5': 40, 'cs6': 48, 'cs7': 56,
+    'le': 1,
+    'af11': 10, 'af12': 12, 'af13': 14,
+    'af21': 18, 'af22': 20, 'af23': 22,
+    'af31': 26, 'af32': 28, 'af33': 30,
+    'af41': 34, 'af42': 36, 'af43': 38,
+    'ef': 46,
+}
+MQVPN_PATH_LABEL_IFACE_MAX = 15  # mqvpn's src/mqvpn_path_label.h iface cap
+
+def _mqvpn_path_policy_ifaces_with(policy, username, field):
+    """ifaces in server.json's path_policy list that currently have `field` set for username."""
+    return {e['iface'] for e in policy
+            if e.get('user') == username and e.get('iface') and field in e}
+
+def _mqvpn_path_policy_set(policy, username, iface, field, value):
+    """Set path_policy[username,iface][field] = value, creating the entry if needed."""
+    for e in policy:
+        if e.get('user') == username and e.get('iface') == iface:
+            e[field] = value
+            return
+    policy.append({'user': username, 'iface': iface, field: value})
+
+def _mqvpn_path_policy_clear(policy, username, iface, field):
+    """Remove path_policy[username,iface][field]; drop the entry if it has no fields left
+    (mqvpn's parser drops an entry with neither weight nor dscp_mask anyway)."""
+    for i, e in enumerate(policy):
+        if e.get('user') == username and e.get('iface') == iface:
+            e.pop(field, None)
+            if 'weight' not in e and 'dscp_mask' not in e:
+                policy.pop(i)
+            return
+
+class MQVPNDscpPin(BaseModel):
+    iface: str
+    dscp: List[str] = []
+
+class MQVPNDscpParams(BaseModel):
+    pins: List[MQVPNDscpPin] = []
+
+@app.post('/mqvpn_dscp', summary="Sync router per-WAN DSCP class assignments into MQVPN's per-path dscp_mask (live + persisted)")
+def mqvpn_dscp(*, params: MQVPNDscpParams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mqvpn_dscp'}
+    if not os.path.isfile('/etc/mqvpn/server.json'):
+        return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn_dscp'}
+    desired = {}
+    for pin in params.pins:
+        if not pin.iface or len(pin.iface) > MQVPN_PATH_LABEL_IFACE_MAX:
+            return {'result': 'error', 'reason': f'Invalid iface {pin.iface!r}', 'route': 'mqvpn_dscp'}
+        mask = 0
+        for dscp in pin.dscp:
+            if dscp not in DSCP_CLASSES:
+                return {'result': 'error', 'reason': f'Invalid dscp class {dscp!r}', 'route': 'mqvpn_dscp'}
+            mask |= 1 << DSCP_CODEPOINTS[dscp]
+        desired[pin.iface] = mask
+    username = current_user.username
+    with open('/etc/mqvpn/server.json') as f:
+        mqvpn_cfg = json.load(f)
+    policy = mqvpn_cfg.setdefault('path_policy', [])
+    initial_policy = json.dumps(policy, sort_keys=True)
+    previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'dscp_mask')
+    warnings = []
+    for iface in previous_ifaces - set(desired.keys()):
+        resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': 0})
+        if not resp.get('ok'):
+            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+        _mqvpn_path_policy_clear(policy, username, iface, 'dscp_mask')
+    for iface, mask in desired.items():
+        resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': mask})
+        if not resp.get('ok'):
+            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+        _mqvpn_path_policy_set(policy, username, iface, 'dscp_mask', mask)
+    if json.dumps(policy, sort_keys=True) != initial_policy:
+        with open('/etc/mqvpn/server.json', 'w') as f:
+            json.dump(mqvpn_cfg, f, indent=4)
+    if warnings:
+        return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_dscp'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_dscp'}
+
+class MQVPNWeightPin(BaseModel):
+    iface: str
+    weight: int
+
+class MQVPNWeightParams(BaseModel):
+    weights: List[MQVPNWeightPin] = []
+
+@app.post('/mqvpn_weight', summary="Sync router per-WAN weights into MQVPN's per-path weight (live + persisted)")
+def mqvpn_weight(*, params: MQVPNWeightParams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mqvpn_weight'}
+    if not os.path.isfile('/etc/mqvpn/server.json'):
+        return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn_weight'}
+    desired = {}
+    for pin in params.weights:
+        if not pin.iface or len(pin.iface) > MQVPN_PATH_LABEL_IFACE_MAX:
+            return {'result': 'error', 'reason': f'Invalid iface {pin.iface!r}', 'route': 'mqvpn_weight'}
+        if not (0 <= pin.weight <= 65535):
+            return {'result': 'error', 'reason': f'Invalid weight {pin.weight!r}', 'route': 'mqvpn_weight'}
+        desired[pin.iface] = pin.weight
+    username = current_user.username
+    with open('/etc/mqvpn/server.json') as f:
+        mqvpn_cfg = json.load(f)
+    policy = mqvpn_cfg.setdefault('path_policy', [])
+    initial_policy = json.dumps(policy, sort_keys=True)
+    previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'weight')
+    warnings = []
+    for iface in previous_ifaces - set(desired.keys()):
+        # 0 resets to the scheduler's default weight (1) -- see mqvpn's
+        # src/path_entry_internal.h path_entry_t.weight doc comment.
+        resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': 0})
+        if not resp.get('ok'):
+            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+        _mqvpn_path_policy_clear(policy, username, iface, 'weight')
+    for iface, weight in desired.items():
+        resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': weight})
+        if not resp.get('ok'):
+            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+        _mqvpn_path_policy_set(policy, username, iface, 'weight', weight)
+    if json.dumps(policy, sort_keys=True) != initial_policy:
+        with open('/etc/mqvpn/server.json', 'w') as f:
+            json.dump(mqvpn_cfg, f, indent=4)
+    if warnings:
+        return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_weight'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_weight'}
 
 
 # Set OpenVPN config

@@ -1,3 +1,14 @@
+omr-vps-admin (0.18+20260813) unstable; urgency=medium
+
+  * Add POST /mptcp_dscp to sync the router's per-WAN DSCP pins into bpf_dscp's dscp_remote_id map, keyed by MPTCP remote endpoint id since every subflow shares one local IP on the VPS
+  * Add POST /mptcp_weight to sync the router's per-WAN weights into bpf_weight(_rr)'s weight_remote_id map the same way, cleaning up remote ids dropped since the previous sync
+  * Add POST /dscp_classify to mirror the router's destination->DSCP classification into per-class/family ipsets plus an idempotent Shorewall mangle block, so the VPS's own outbound traffic to a proxied destination carries the same DSCP as the router->VPS leg
+  * Add POST /mqvpn_dscp and POST /mqvpn_weight, the MQVPN analogues of /mptcp_dscp and /mptcp_weight: per-path dscp_mask/weight pushed live over the control socket and persisted in server.json's path_policy so they survive a restart/reconnect
+  * Document the new DSCP/weight sync endpoints in docs/api.md
+  * Add unit tests for the new endpoints (test/test_dscp_sync.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 13 Aug 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260803) unstable; urgency=medium
 
   * Add VXLAN L2 mode: bridge clients sharing a VNI into the same server-side LAN segment (br-vxlan<vni>) instead of only routed L3 point-to-point tunnels
