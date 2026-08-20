@@ -578,6 +578,26 @@ class TestMPTCP:
         r = user_client.post("/mptcp", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
 
+    def test_blank_v1_fields_from_unset_uci_do_not_422(self, user_client):
+        # Regression for issue #4350: the router's _set_mptcp_vps quotes every
+        # value from `uci -q get network.globals.mptcp_*`, so a v1-only knob
+        # whose uci option is still unset is posted as "" rather than
+        # omitted. That must fall back to its documented default (0), not a
+        # raw FastAPI 422.
+        payload = {**self._PAYLOAD, "close_timeout": "", "pm_type": "",
+                   "stale_loss_cnt": "", "syn_retrans_before_tcp_fallback": ""}
+        r = user_client.post("/mptcp", json=payload)
+        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+
+    def test_blank_syn_retries_falls_back_to_invalid_parameters(self, user_client):
+        # syn_retries has no default (required, non-zero) -- blank should
+        # reach the route's own "Invalid parameters" check, not a 422.
+        payload = {**self._PAYLOAD, "syn_retries": ""}
+        r = user_client.post("/mptcp", json=payload)
+        assert r.status_code == 200
+        assert r.json()["result"] == "error"
+
 
 class TestMPTCPV0Scheduler:
     """v0 (out-of-tree) kernel: net.mptcp.mptcp_scheduler sysctl path."""

@@ -56,7 +56,7 @@ from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.models import SecurityBase as SecurityBaseModel
 from fastapi.responses import FileResponse
-from pydantic import BaseModel # pylint: disable=E0611
+from pydantic import BaseModel, field_validator # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse, StreamingResponse
 #from starlette.requests import Request
@@ -3446,6 +3446,27 @@ class MPTCPparams(BaseModel):
     pm_type: int = 0
     stale_loss_cnt: int = 0
     syn_retrans_before_tcp_fallback: int = 0
+
+    # The router (openmptcprouter-vps's _set_mptcp_vps) builds this JSON body
+    # from `uci -q get network.globals.mptcp_*`, quoting every value as a
+    # shell string; for the v1-only knobs (close_timeout, pm_type,
+    # stale_loss_cnt, syn_retrans_before_tcp_fallback) that uci option is
+    # often still unset (never touched by the user, or a router that
+    # predates them), so the router posts e.g. "close_timeout": "" rather
+    # than omitting the key. Pydantic rejects "" for an int field outright,
+    # which surfaces to the router as a bare FastAPI 422 instead of this
+    # route's own {'result': 'error', ...} contract -- see issue #4350.
+    # Coercing blank to 0 here restores each field's documented default and
+    # lets the route's existing "not <field>" checks handle it normally.
+    @field_validator(
+        'syn_retries', 'version', 'close_timeout', 'pm_type',
+        'stale_loss_cnt', 'syn_retrans_before_tcp_fallback', mode='before'
+    )
+    @classmethod
+    def _blank_str_to_zero(cls, v):
+        if isinstance(v, str) and v.strip() == '':
+            return 0
+        return v
 
 @app.post('/mptcp', summary="Modify MPTCP configuration of the server")
 def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)):
