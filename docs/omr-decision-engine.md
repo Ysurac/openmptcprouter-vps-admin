@@ -568,6 +568,13 @@ a user needs at least two labelled interfaces to train.  A **watchdog** resets
 the model to its heuristic initialisation after 3 consecutive non-finite or
 divergent (> 5.0) losses.
 
+Before running a round, the loop also checks `/proc/meminfo`'s
+`MemAvailable`; if it is below `min_available_mb` the round is skipped
+entirely (no training pass is started, so no memory is allocated for it) —
+a guard against triggering PyTorch training on small/memory-constrained
+VPS instances. Re-checked every `interval`, so rounds resume automatically
+once memory frees up, with no restart needed.
+
 Optional **exploration**: with probability `exploration`, one
 `GET /metrics/decision` reply is perturbed by a log-normal factor
 (`exploration_scale` sigma) after EMA smoothing, so the model occasionally
@@ -597,7 +604,8 @@ enable is instant.  Tuning (`omr-admin-config.json`, changes picked up within
     "min_points": 5,            // samples required per interface
     "sharpen": 4.0,             // reward^sharpen target contrast
     "exploration": 0.0,         // probability of perturbing a decision
-    "exploration_scale": 0.15   // log-normal sigma of the perturbation
+    "exploration_scale": 0.15,  // log-normal sigma of the perturbation
+    "min_available_mb": 512     // skip the round if free RAM is below this
 }
 ```
 
@@ -694,7 +702,7 @@ Adds `"dscp_classes"` and `"dscp_by_interface"` — see
 | `quality/forecast`, < 2 history points | `confidence: "none"` or `"low"` for that interface |
 | `quality/forecast`, PyTorch not installed | Linear regression used for all extrapolations |
 | `quality/forecast`, < 5 history points per interface | MLP path bypassed; linear regression used |
-| InfluxDB retention push fails | Warning logged; installer-set retention remains as hard floor |
+| InfluxDB retention push fails | Retried with exponential backoff (5 attempts, absorbs InfluxDB 3 still starting up after boot); warning logged and installer-set retention remains as hard floor if all attempts fail |
 | `dscp=true`, < 2 history points for an interface | That interface's class forecast falls back to the current snapshot |
 | `dscp=true` with JSON backend / PyTorch not installed | Still works — class formula runs on current-snapshot features, blended with the heuristic scorer's probabilities |
 

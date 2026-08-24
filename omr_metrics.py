@@ -409,13 +409,22 @@ class InfluxBackend:
         threading.Thread(target=self._apply_retention, daemon=True,
                          name="omr-influx-retention").start()
 
+    # Retries absorb InfluxDB3 still starting up right after boot (no
+    # systemd ordering guarantees it's ready before omr-admin), where the
+    # first call can otherwise hang until the urlopen timeout and never
+    # get a second chance.
+    _RETENTION_MAX_ATTEMPTS = 5
+    _RETENTION_BACKOFF_BASE = 5  # seconds; doubles each retry, capped below
+    _RETENTION_BACKOFF_CAP = 60  # seconds
+
     def _apply_retention(self):
         """Push the configured retention period to the InfluxDB 3 management API.
 
         Tries POST (create) first; on 409 Conflict (database already exists)
-        falls back to PATCH (update).  Logs a warning and continues on any
-        other error; the DB-level retention set by the installer remains as
-        the hard floor.
+        falls back to PATCH (update).  Retries with backoff on failure since
+        InfluxDB3 may still be starting up; logs a warning and gives up after
+        the last attempt, leaving the DB-level retention set by the installer
+        as the hard floor.
         """
         body = json.dumps({
             "db": self._bucket,
@@ -434,17 +443,30 @@ class InfluxBackend:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.status
 
-        try:
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self._RETENTION_MAX_ATTEMPTS + 1):
             try:
-                status = _do_request("POST")
-            except urllib.error.HTTPError as exc:
-                if exc.code != 409:
-                    raise
-                status = _do_request("PATCH")
-            LOG.info("omr_metrics: InfluxDB retention set to %d days (HTTP %s)",
-                     self._retention_days, status)
-        except Exception as exc:
-            LOG.warning("omr_metrics: could not apply InfluxDB retention policy: %s", exc)
+                try:
+                    status = _do_request("POST")
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 409:
+                        raise
+                    status = _do_request("PATCH")
+                LOG.info("omr_metrics: InfluxDB retention set to %d days (HTTP %s)",
+                         self._retention_days, status)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < self._RETENTION_MAX_ATTEMPTS:
+                    delay = min(self._RETENTION_BACKOFF_BASE * (2 ** (attempt - 1)),
+                                self._RETENTION_BACKOFF_CAP)
+                    LOG.debug("omr_metrics: InfluxDB retention attempt %d/%d failed (%s), "
+                              "retrying in %ds", attempt, self._RETENTION_MAX_ATTEMPTS,
+                              exc, delay)
+                    time.sleep(delay)
+
+        LOG.warning("omr_metrics: could not apply InfluxDB retention policy after %d attempts: %s",
+                    self._RETENTION_MAX_ATTEMPTS, last_exc)
 
     # Window used for latest-snapshot queries (_query). Much smaller than the
     # retention period so InfluxDB3 Core stays within its Parquet file scan limit.
@@ -2056,6 +2078,7 @@ _AUTO_DEFAULTS: dict = {
     "sharpen": 4.0,             # reward^sharpen — contrast on flat rewards
     "exploration": 0.0,         # probability of perturbing one decision
     "exploration_scale": 0.15,  # log-normal sigma of the perturbation
+    "min_available_mb": 512,    # skip the round if less RAM than this is free (small VPS guard)
 }
 
 # Watchdog: after this many consecutive non-finite or divergent losses the
@@ -2108,10 +2131,29 @@ def _auto_cfg(force: bool = False) -> dict:
         "sharpen":           _num("sharpen",           1.0,  16.0),
         "exploration":       _num("exploration",       0.0,  0.5),
         "exploration_scale": _num("exploration_scale", 0.01, 1.0),
+        "min_available_mb":  _num("min_available_mb",  0,    1_000_000, int),
     }
     _auto_cfg_cache["ts"] = now
     _auto_cfg_cache["cfg"] = cfg
     return cfg
+
+
+def _available_memory_mb() -> Optional[float]:
+    """Currently available system memory in MiB, or None if it can't be read.
+
+    Uses /proc/meminfo's MemAvailable (kernel-estimated, accounts for
+    reclaimable cache) rather than MemFree, which underestimates what's
+    actually usable. Linux-only; returns None elsewhere so the caller treats
+    the check as "unknown" and does not block on it.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception as exc:
+        LOG.debug("omr_auto: could not read /proc/meminfo: %s", exc)
+    return None
 
 
 def _auto_reward(history: list, min_points: int = 5) -> Optional[float]:
@@ -2261,13 +2303,22 @@ async def _auto_learn_loop():
     """Background loop: sleep interval, then run one round when enabled.
 
     The config is re-read every iteration so 'enabled' and tuning parameters
-    take effect within one interval, without restarting the service.
+    take effect within one interval, without restarting the service. Also
+    skips the round — rather than starting a training pass PyTorch would
+    need real memory for — when available RAM is below min_available_mb;
+    this is re-checked every interval, so a round resumes automatically once
+    memory frees up, without needing a restart.
     """
     LOG.info("omr_auto: background auto-learning loop started")
     while True:
         cfg = _auto_cfg()
         await asyncio.sleep(cfg["interval"])
         if not cfg["enabled"]:
+            continue
+        available_mb = _available_memory_mb()
+        if available_mb is not None and available_mb < cfg["min_available_mb"]:
+            LOG.info("omr_auto: skipping round — %.0f MB available < %.0f MB required",
+                      available_mb, cfg["min_available_mb"])
             continue
         try:
             await asyncio.to_thread(_auto_learn_round, cfg)
@@ -2291,9 +2342,9 @@ def start_auto_learning():
     if _auto_task is not None and not _auto_task.done():
         return _auto_task
     cfg = _auto_cfg(force=True)
-    LOG.info("omr_auto: auto-learning %s (interval=%ds lr=%g window=%ds)",
+    LOG.info("omr_auto: auto-learning %s (interval=%ds lr=%g window=%ds min_available_mb=%d)",
              "ENABLED" if cfg["enabled"] else "disabled (config)",
-             cfg["interval"], cfg["learning_rate"], cfg["window"])
+             cfg["interval"], cfg["learning_rate"], cfg["window"], cfg["min_available_mb"])
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -2724,7 +2775,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         current_user: User = Depends(get_current_user),
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
-        user_data = _read_user(target)
+        user_data = await asyncio.to_thread(_read_user, target)
         user_data = _with_interface_insights(user_data)
         if interface:
             return user_data.get(interface, {})
@@ -2740,7 +2791,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         payload = metrics.model_dump()
         if payload.get('timestamp') is None:
             payload['timestamp'] = int(time.time())
-        _write_interface(target, payload)
+        await asyncio.to_thread(_write_interface, target, payload)
         return {'result': 'ok'}
 
     @router.get('/metrics/all', summary="Get stored metrics for all users (admin only)")
@@ -2748,7 +2799,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         if current_user.permissions != "admin":
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Admin only")
-        return _read_all()
+        return await asyncio.to_thread(_read_all)
 
     @router.get('/metrics/user', summary="Get current user profile and metrics DB stats")
     async def get_user_info(
@@ -2761,7 +2812,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         (only the latest snapshot per interface is stored).
         """
         target = username if current_user.permissions == "admin" and username else current_user.username
-        stats = _user_stats(target)
+        stats = await asyncio.to_thread(_user_stats, target)
         return {"username": target, **stats}
 
     _501_history = JSONResponse(
@@ -2781,7 +2832,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             return _501_history
         target = username if current_user.permissions == "admin" and username else current_user.username
         since_seconds = _parse_since(since)
-        return _read_history(target, interface, since_seconds, limit)
+        return await asyncio.to_thread(_read_history, target, interface, since_seconds, limit)
 
     # ---- decision endpoints -----------------------------------------------
 
@@ -2801,7 +2852,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         current_user: User = Depends(get_current_user),
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
-        user_data = _read_user(target)
+        user_data = await asyncio.to_thread(_read_user, target)
         if not user_data:
             return {}
 
@@ -2809,20 +2860,27 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         has_history_backend = not isinstance(_get_backend(), JSONBackend)
 
         if predict:
-            predicted_data = {}
-            for iface in user_data:
-                hist = _read_history(target, iface, max(horizon * 10, 3600), 50)
-                if len(hist) >= 2:
-                    predicted_data[iface] = _predict_payload(hist, horizon_seconds=horizon)
-                    history_data[iface] = hist   # reuse for trend and congestion features
-                else:
-                    predicted_data[iface] = user_data[iface]
-            user_data = predicted_data
+            def _fetch_predicted():
+                predicted = {}
+                hist_by_iface = {}
+                for iface in user_data:
+                    hist = _read_history(target, iface, max(horizon * 10, 3600), 50)
+                    if len(hist) >= 2:
+                        predicted[iface] = _predict_payload(hist, horizon_seconds=horizon)
+                        hist_by_iface[iface] = hist   # reuse for trend and congestion features
+                    else:
+                        predicted[iface] = user_data[iface]
+                return predicted, hist_by_iface
+            user_data, history_data = await asyncio.to_thread(_fetch_predicted)
         elif preemptive and has_history_backend:
-            for iface in user_data:
-                hist = _read_history(target, iface, 3600, 60)
-                if hist:
-                    history_data[iface] = hist
+            def _fetch_preemptive():
+                hist_by_iface = {}
+                for iface in user_data:
+                    hist = _read_history(target, iface, 3600, 60)
+                    if hist:
+                        hist_by_iface[iface] = hist
+                return hist_by_iface
+            history_data = await asyncio.to_thread(_fetch_preemptive)
 
         if not _TORCH_AVAILABLE:
             result = _compute_weights_heuristic(user_data, history_data=history_data)
@@ -2871,7 +2929,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         (only a single snapshot is available).
         """
         target = username if current_user.permissions == "admin" and username else current_user.username
-        user_data = _read_user(target)
+        user_data = await asyncio.to_thread(_read_user, target)
         if not user_data:
             return {}
 
@@ -2885,7 +2943,8 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             return iface, h
 
         result: dict = {}
-        for iface, hist in [_qfetch(i) for i in user_data]:
+        fetched = await asyncio.to_thread(lambda: [_qfetch(i) for i in user_data])
+        for iface, hist in fetched:
             result[iface] = {
                 "congestion": _forecast_metric(
                     hist, ("congestion", "score"), _CONGESTION_LEVELS,
@@ -2924,7 +2983,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         target = username if username else current_user.username
-        user_data = _read_user(target)
+        user_data = await asyncio.to_thread(_read_user, target)
         if not user_data:
             raise HTTPException(status_code=404, detail="No metrics stored for this user")
 
@@ -2948,10 +3007,14 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
         history_data: dict = {}
         if not isinstance(_get_backend(), JSONBackend):
-            for iface in user_data:
-                hist = _read_history(target, iface, 3600, 60)
-                if hist:
-                    history_data[iface] = hist
+            def _fetch_history():
+                hd = {}
+                for iface in user_data:
+                    hist = _read_history(target, iface, 3600, 60)
+                    if hist:
+                        hd[iface] = hist
+                return hd
+            history_data = await asyncio.to_thread(_fetch_history)
 
         loss = _train_step(
             user_data,
@@ -3022,7 +3085,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         from starlette.responses import PlainTextResponse
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        all_data = _read_all()
+        all_data = await asyncio.to_thread(_read_all)
         return PlainTextResponse(
             content=_to_prometheus_text(all_data),
             media_type="text/plain; version=0.0.4; charset=utf-8",
