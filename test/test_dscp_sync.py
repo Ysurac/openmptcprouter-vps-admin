@@ -342,6 +342,94 @@ class TestDscpClassifyEndpoint:
         assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
         assert all(c.args[2] == [] for c in refresh.call_args_list)
 
+    def test_success_persists_entries_for_resync(self, user_client):
+        """The router's push must survive an omr-admin restart (e.g. the
+        nftables reload a VPS update triggers) via omr-admin-config.json,
+        not just get applied live -- see _nft_resync_dscp_classify()."""
+        with (
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_ensure_dscp_sets"),
+            patch("omr_admin._nft_refresh_dscp_set"),
+            patch("omr_admin._nft_sync_dscp_mark"),
+            patch("omr_admin.set_global_param") as set_param,
+        ):
+            user_client.post(
+                "/dscp_classify",
+                json={"entries": [{"dscp": "cs4", "cidr": "10.0.0.5/24"}]},
+            )
+        set_param.assert_called_once_with(
+            "dscp_classify", [{"dscp": "cs4", "cidr": "10.0.0.5/24"}]
+        )
+
+    def test_invalid_entry_persists_nothing(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin.set_global_param") as set_param,
+        ):
+            user_client.post(
+                "/dscp_classify",
+                json={"entries": [{"dscp": "af11", "cidr": "10.0.0.0/24"}]},
+            )
+        set_param.assert_not_called()
+
+
+# ===========================================================================
+# _nft_resync_dscp_classify / _dscp_classify_by_class -- replaying the
+# router's last push after an nftables restart (e.g. a VPS update) empties
+# the sets, independent of the router ever re-pushing on its own.
+# ===========================================================================
+
+
+class TestNftResyncDscpClassify:
+    def test_replays_persisted_entries_per_class_and_family(self):
+        config = {"dscp_classify": [
+            {"dscp": "cs4", "cidr": "10.0.0.5/24"},  # host bits set
+            {"dscp": "cs4", "cidr": "2001:db8::1/32"},
+        ]}
+        with (
+            patch("omr_admin.read_omr_config", return_value=config),
+            patch("omr_admin._nft_ensure_dscp_sets") as ensure_sets,
+            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_sync_dscp_mark") as sync_mark,
+        ):
+            omr_admin._nft_resync_dscp_classify()
+        ensure_sets.assert_called_once()
+        assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
+        cs4_calls = {c.args[1]: c.args[2] for c in refresh.call_args_list if c.args[0] == "cs4"}
+        assert cs4_calls[4] == ["10.0.0.0/24"]
+        assert cs4_calls[6] == ["2001:db8::/32"]
+        sync_mark.assert_called_once()
+
+    def test_missing_config_key_clears_every_set(self):
+        with (
+            patch("omr_admin.read_omr_config", return_value={}),
+            patch("omr_admin._nft_ensure_dscp_sets"),
+            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_sync_dscp_mark"),
+        ):
+            omr_admin._nft_resync_dscp_classify()
+        assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
+        assert all(c.args[2] == [] for c in refresh.call_args_list)
+
+    def test_unreadable_config_is_a_noop_not_a_crash(self):
+        with (
+            patch("omr_admin.read_omr_config", return_value=None),
+            patch("omr_admin._nft_ensure_dscp_sets"),
+            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_sync_dscp_mark"),
+        ):
+            omr_admin._nft_resync_dscp_classify()
+        assert all(c.args[2] == [] for c in refresh.call_args_list)
+
+    def test_by_class_skips_invalid_entries_silently(self):
+        entries = [
+            {"dscp": "af11", "cidr": "10.0.0.0/24"},  # not in DSCP_CLASSIFY_CLASSES
+            {"dscp": "cs4", "cidr": "not-an-ip"},
+            {"dscp": "cs4", "cidr": "10.0.0.0/24"},
+        ]
+        by_class = omr_admin._dscp_classify_by_class(entries)
+        assert by_class["cs4"][4] == ["10.0.0.0/24"]
+
 
 # ===========================================================================
 # Helper: _nft_dscp_set_name

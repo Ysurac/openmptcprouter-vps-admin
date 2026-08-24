@@ -296,6 +296,72 @@ class TestRenderClient2Client:
             assert f'"{pattern}"' in lines[0]
 
 
+class _NoCloseStringIO(io.StringIO):
+    """A StringIO whose content survives the `with open(...) as n:` block
+    that writes to it (that block calls .close() on exit)."""
+    def close(self):
+        pass
+
+
+class TestSyncOpenvpnClientToClient:
+    """_sync_openvpn_client2client() -- reapplies the persisted client2client
+    choice to /etc/openvpn/tun0.conf's own `client-to-client` directive.
+
+    Needed for the same reason _nft_sync_client2client() exists: the sibling
+    openmptcprouter-vps repo's debian9-x86_64.sh regenerates tun0.conf from
+    its shipped template on every VPS install *and* update run, silently
+    dropping this line -- this is what the /client2client endpoint and
+    _nft_resync_all() (at every omr-admin startup) call to put it back.
+    """
+
+    def _run(self, existing_content, enabled):
+        captured = _NoCloseStringIO()
+        # Mirrors what move(tmpfile, path) really does on disk: content read
+        # back from `path` after the move reflects what was written to the
+        # tmpfile, not the pre-edit content.
+        state = {"content": existing_content}
+
+        def _open(path, mode="r", *a, **kw):
+            if "tun0.conf" in str(path):
+                content = state["content"]
+                return io.BytesIO(content.encode()) if "b" in mode else io.StringIO(content)
+            return io.BytesIO() if "b" in mode else captured  # the mkstemp() tmpfile
+
+        def _move(_src, _dst):
+            state["content"] = captured.getvalue()
+
+        with patch("omr_admin.os.path.isfile", return_value=True), \
+             patch("builtins.open", side_effect=_open), \
+             patch("omr_admin.move", side_effect=_move) as move_mock, \
+             patch("subprocess.run") as run_mock:
+            changed = omr_admin._sync_openvpn_client2client(enabled)
+        return changed, captured.getvalue(), move_mock, run_mock
+
+    def test_missing_file_is_a_noop(self):
+        with patch("omr_admin.os.path.isfile", return_value=False), \
+             patch("subprocess.run") as run_mock:
+            assert omr_admin._sync_openvpn_client2client(True) is False
+        run_mock.assert_not_called()
+
+    def test_enable_appends_line_and_restarts(self):
+        changed, written, move_mock, run_mock = self._run("proto tcp6-server\n", True)
+        assert changed is True
+        assert "client-to-client" in written
+        move_mock.assert_called_once()
+        run_mock.assert_called_once_with(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
+
+    def test_disable_removes_line_and_restarts(self):
+        changed, written, move_mock, run_mock = self._run("proto tcp6-server\nclient-to-client\n", False)
+        assert changed is True
+        assert "client-to-client" not in written
+        run_mock.assert_called_once()
+
+    def test_already_matching_state_is_idempotent(self):
+        changed, written, _move_mock, run_mock = self._run("proto tcp6-server\nclient-to-client\n", True)
+        assert changed is False
+        run_mock.assert_not_called()
+
+
 class TestRenderCtHelpers:
     def test_disabled_is_empty(self):
         assert omr_admin._render_ct_helpers(False) == []

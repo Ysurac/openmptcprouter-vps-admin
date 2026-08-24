@@ -1550,6 +1550,42 @@ def _nft_sync_client2client():
     enabled = bool(config_data.get('client2client', False)) if config_data else False
     return _nft_flush_chain('client2client', _render_client2client(enabled))
 
+def _sync_openvpn_client2client(enabled):
+    """Reapply the persisted client2client choice to OpenVPN's own
+    `client-to-client` directive in tun0.conf.
+
+    Needed for the same reason _nft_sync_client2client() exists: the sibling
+    openmptcprouter-vps repo's debian9-x86_64.sh unconditionally regenerates
+    /etc/openvpn/tun0.conf from its shipped template on every VPS install
+    *and* update run, which silently drops any 'client-to-client' line this
+    added previously. omr-admin-config.json's `client2client` flag is the
+    only durable copy of that choice, so this re-derives the file from it --
+    called both right after the /client2client endpoint flips the flag, and
+    from _nft_resync_all() at every omr-admin startup (which the update path
+    already triggers right after it rewrites tun0.conf, so this is enough to
+    survive an update with no changes needed on the VPS-script side).
+    Idempotent: only rewrites/restarts openvpn@tun0 if the line's presence
+    doesn't already match `enabled`.
+    """
+    path = '/etc/openvpn/tun0.conf'
+    if not os.path.isfile(path):
+        return False
+    initial_md5 = hashlib.md5(file_as_bytes(open(path, 'rb'))).hexdigest()
+    fd, tmpfile = mkstemp()
+    with open(path, 'r') as f, open(tmpfile, 'a+') as n:
+        for line in f:
+            if 'client-to-client' not in line:
+                n.write(line)
+        if enabled:
+            n.write('client-to-client' + "\n")
+    os.close(fd)
+    move(tmpfile, path)
+    final_md5 = hashlib.md5(file_as_bytes(open(path, 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        subprocess.run(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
+        return True
+    return False
+
 # --- destination DSCP classification (dscp_mark chain + native nft sets) -
 
 def _nft_dscp_set_name(dscp, family):
@@ -1587,6 +1623,50 @@ def _render_dscp_mark():
 def _nft_sync_dscp_mark():
     return _nft_flush_chain('dscp_mark', _render_dscp_mark())
 
+def _dscp_classify_by_class(entries):
+    """`entries` (a persisted list of {'dscp':.., 'cidr':..} dicts, the same
+    shape as the /dscp_classify request) -> {dscp: {4: [cidr,...], 6: [...]}}
+    Silently skips anything that doesn't validate -- the live endpoint is
+    the strict-validation gate; this only ever replays that endpoint's own
+    already-validated input back from omr-admin-config.json."""
+    by_class = {dscp: {4: [], 6: []} for dscp in DSCP_CLASSIFY_CLASSES}
+    for entry in entries:
+        dscp = entry.get('dscp')
+        cidr = entry.get('cidr')
+        if dscp not in DSCP_CLASSIFY_CLASSES:
+            continue
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except (ValueError, TypeError):
+            continue
+        by_class[dscp][net.version].append(str(net))
+    return by_class
+
+def _nft_apply_dscp_classify(by_class):
+    _nft_ensure_dscp_sets()
+    for dscp in DSCP_CLASSIFY_CLASSES:
+        for family in (4, 6):
+            _nft_refresh_dscp_set(dscp, family, by_class[dscp][family])
+    _nft_sync_dscp_mark()
+
+def _nft_resync_dscp_classify():
+    """Reapply the router's last-pushed destination->DSCP classification.
+
+    Unlike user_accept/user_dnat/gre_snat/client2client/sipalg, this state's
+    source of truth is the router (openmptcprouter-feeds' omr-dscp
+    post-tracking hook), not omr-admin's own API -- the /dscp_classify
+    endpoint below just persists the router's last push into
+    omr-admin-config.json so this can replay it. Without this, an nftables
+    restart (e.g. the VPS update path -- see debian9-x86_64.sh) empties
+    these sets and they'd stay empty until the router's classification
+    content next *changes*: its resync is a periodic, content-diffed push
+    that has no way to notice the VPS lost state with nothing on the router
+    side having changed.
+    """
+    config_data = read_omr_config()
+    entries = config_data.get('dscp_classify', []) if config_data else []
+    _nft_apply_dscp_classify(_dscp_classify_by_class(entries))
+
 # --- SIP ALG (ct_helpers chain) ------------------------------------------
 #
 # Modern kernels require an explicit `ct helper` object + a rule assigning
@@ -1611,16 +1691,20 @@ def _nft_sync_sipalg(enabled):
     return _nft_flush_chain('ct_helpers', _render_ct_helpers(enabled))
 
 def _nft_resync_all():
-    """Rebuild every dynamic chain from persisted state. Needed because nft
-    itself has no persistence across a ruleset reload/reboot -- only
-    omr-admin-config.json does -- mirrors add_gre_tunnels() already running
-    at import time for the same reason. Called once at process startup."""
-    _nft_ensure_dscp_sets()
+    """Rebuild every dynamic chain (plus OpenVPN's client-to-client
+    directive and the router-pushed DSCP classify sets) from persisted
+    state. Needed because nft itself has no persistence across a ruleset
+    reload/reboot -- only omr-admin-config.json does -- mirrors
+    add_gre_tunnels() already running at import time for the same reason.
+    Also covers /etc/openvpn/tun0.conf getting regenerated from its shipped
+    template on every VPS update (see _sync_openvpn_client2client()).
+    Called once at process startup."""
     _nft_sync_ports()
     _nft_sync_gre_snat()
     _nft_sync_client2client()
-    _nft_sync_dscp_mark()
+    _nft_resync_dscp_classify()
     config_data = read_omr_config()
+    _sync_openvpn_client2client(bool(config_data.get('client2client', False)) if config_data else False)
     _nft_sync_sipalg(bool(config_data.get('sipalg', True)) if config_data else True)
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
@@ -3796,11 +3880,11 @@ def dscp_classify(*, params: DscpClassifyParams, current_user: User = Depends(ge
         except ValueError:
             return {'result': 'error', 'reason': f'Invalid cidr {entry.cidr!r}', 'route': 'dscp_classify'}
         by_class[entry.dscp][net.version].append(str(net))
-    _nft_ensure_dscp_sets()
-    for dscp in DSCP_CLASSIFY_CLASSES:
-        for family in (4, 6):
-            _nft_refresh_dscp_set(dscp, family, by_class[dscp][family])
-    _nft_sync_dscp_mark()
+    # Persist so _nft_resync_dscp_classify() can replay this after an
+    # nftables restart empties the sets (e.g. a VPS update) instead of
+    # waiting on the router's own periodic, content-diffed re-push.
+    set_global_param('dscp_classify', [{'dscp': e.dscp, 'cidr': e.cidr} for e in params.entries])
+    _nft_apply_dscp_classify(by_class)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'dscp_classify'}
 
 class VPN(str, Enum):
@@ -5069,20 +5153,7 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'client2client'}
     set_global_param('client2client', params.enable)
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    if os.path.isfile('/etc/openvpn/tun0.conf'):
-        with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
-            for line in f:
-                if not 'client-to-client' in line:
-                    n.write(line)
-            if params.enable == True:
-                n.write('client-to-client' + "\n")
-        os.close(fd)
-        move(tmpfile, '/etc/openvpn/tun0.conf')
-        final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-        if initial_md5 != final_md5:
-            subprocess.run(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
+    _sync_openvpn_client2client(params.enable)
     _nft_sync_client2client()
     return {'result': 'done'}
 

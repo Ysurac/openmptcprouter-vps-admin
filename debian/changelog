@@ -13,6 +13,9 @@ omr-vps-admin (0.18+20260824) unstable; urgency=medium
   * Offload synchronous metrics helpers (user/history reads, interface writes) to a thread pool so they no longer block the event loop
   * Add unit tests for the new nftables engine (test/test_nft.py) and update test/test_dscp_sync.py for the nft-based /dscp_classify implementation
   * Document the Shorewall->nftables migration and new /firewall* endpoints in docs/api.md
+  * Persist /dscp_classify's entries into omr-admin-config.json and replay them from _nft_resync_all() at startup, so an nftables restart (e.g. the VPS update path) doesn't leave the dscp sets empty until the router's own periodic, content-diffed re-push happens to notice
+  * Extract the OpenVPN tun0.conf `client-to-client` line rewrite into _sync_openvpn_client2client() and also call it from _nft_resync_all() at startup, since the sibling openmptcprouter-vps install/update script unconditionally regenerates tun0.conf from its shipped template and silently drops that line
+  * Add unit tests for the dscp_classify resync/persistence and the OpenVPN client2client resync (test/test_dscp_sync.py, test/test_nft.py)
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 24 Aug 2026 00:00:00 +0200
 
