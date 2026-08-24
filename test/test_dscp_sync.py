@@ -29,7 +29,6 @@ classification):
 
 import io
 import json
-import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -269,39 +268,36 @@ class TestDscpClassifyEndpoint:
         r = ro_client.post("/dscp_classify", json={"entries": []})
         assert r.json()["result"] == "permission"
 
-    def test_ipset_missing_warns(self, user_client):
-        with patch("subprocess.run", side_effect=FileNotFoundError):
-            r = user_client.post("/dscp_classify", json={"entries": []})
-        assert r.json()["result"] == "warning"
-
-    def test_ipset_version_check_failure_warns(self, user_client):
-        with patch(
-            "subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, ["ipset", "version"]),
-        ):
+    def test_nft_missing_warns(self, user_client):
+        with patch("os.path.exists", side_effect=_exists_only()):
             r = user_client.post("/dscp_classify", json={"entries": []})
         assert r.json()["result"] == "warning"
 
     def test_invalid_dscp_class_errors(self, user_client):
         # 'af11' is a valid mptcp_dscp class but not in the narrower
-        # DSCP_CLASSIFY_CLASSES set (Shorewall's %dscpmap has no af*/le entries).
-        r = user_client.post(
-            "/dscp_classify",
-            json={"entries": [{"dscp": "af11", "cidr": "10.0.0.0/24"}]},
-        )
+        # DSCP_CLASSIFY_CLASSES set (kept for continuity with what the
+        # router's omr-dscp/omr-dscp-nft classifiers actually produce).
+        with patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)):
+            r = user_client.post(
+                "/dscp_classify",
+                json={"entries": [{"dscp": "af11", "cidr": "10.0.0.0/24"}]},
+            )
         assert r.json()["result"] == "error"
 
     def test_invalid_cidr_errors(self, user_client):
-        r = user_client.post(
-            "/dscp_classify",
-            json={"entries": [{"dscp": "cs4", "cidr": "not-an-ip"}]},
-        )
+        with patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)):
+            r = user_client.post(
+                "/dscp_classify",
+                json={"entries": [{"dscp": "cs4", "cidr": "not-an-ip"}]},
+            )
         assert r.json()["result"] == "error"
 
     def test_success_dispatches_normalized_cidrs_per_class_and_family(self, user_client):
         with (
-            patch("omr_admin._refresh_dscp_classify_ipset") as refresh,
-            patch("omr_admin._ensure_dscp_classify_mangle") as ensure_mangle,
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_ensure_dscp_sets") as ensure_sets,
+            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_sync_dscp_mark") as sync_mark,
         ):
             r = user_client.post(
                 "/dscp_classify",
@@ -313,31 +309,33 @@ class TestDscpClassifyEndpoint:
                 },
             )
         assert r.json()["result"] == "done"
+        ensure_sets.assert_called_once()
         assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
-        cs4_calls = {
-            c.args[1]: c.args[2] for c in refresh.call_args_list if "_cs4_" in c.args[0]
-        }
+        cs4_calls = {c.args[1]: c.args[2] for c in refresh.call_args_list if c.args[0] == "cs4"}
         assert cs4_calls[4] == ["10.0.0.0/24"]
         assert cs4_calls[6] == ["2001:db8::/32"]
-        ensure_mangle.assert_any_call(4)
-        ensure_mangle.assert_any_call(6)
+        sync_mark.assert_called_once()
 
     def test_unmentioned_classes_get_empty_lists(self, user_client):
         with (
-            patch("omr_admin._refresh_dscp_classify_ipset") as refresh,
-            patch("omr_admin._ensure_dscp_classify_mangle"),
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_ensure_dscp_sets"),
+            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_sync_dscp_mark"),
         ):
             user_client.post(
                 "/dscp_classify",
                 json={"entries": [{"dscp": "cs4", "cidr": "10.0.0.0/24"}]},
             )
-        ef_calls = [c for c in refresh.call_args_list if "_ef_" in c.args[0]]
+        ef_calls = [c for c in refresh.call_args_list if c.args[0] == "ef"]
         assert ef_calls and all(c.args[2] == [] for c in ef_calls)
 
     def test_entries_field_defaults_when_omitted(self, user_client):
         with (
-            patch("omr_admin._refresh_dscp_classify_ipset") as refresh,
-            patch("omr_admin._ensure_dscp_classify_mangle"),
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_ensure_dscp_sets"),
+            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_sync_dscp_mark"),
         ):
             r = user_client.post("/dscp_classify", json={})
         assert r.json()["result"] == "done"
@@ -346,134 +344,91 @@ class TestDscpClassifyEndpoint:
 
 
 # ===========================================================================
-# Helper: _dscp_classify_ipset_name
+# Helper: _nft_dscp_set_name
 # ===========================================================================
 
 
-class TestDscpClassifyIpsetName:
+class TestNftDscpSetName:
     def test_name_format(self):
-        assert omr_admin._dscp_classify_ipset_name("cs4", 4) == "omr_dscp_classify_cs4_4"
-        assert omr_admin._dscp_classify_ipset_name("ef", 6) == "omr_dscp_classify_ef_6"
+        assert omr_admin._nft_dscp_set_name("cs4", 4) == "omr_dscp_classify_cs4_4"
+        assert omr_admin._nft_dscp_set_name("ef", 6) == "omr_dscp_classify_ef_6"
 
 
 # ===========================================================================
-# Helper: _refresh_dscp_classify_ipset
+# Helper: _nft_refresh_dscp_set / _nft_ensure_dscp_sets
+# (these, plus every other _nft_sync_*/_nft_ensure_* helper, apply their
+# script via one `nft -f -` call -- subprocess.run's `input` kwarg is the
+# exact transaction that would be committed, so that's what these assert on
+# rather than a real nft binary.)
 # ===========================================================================
 
 
-class TestRefreshDscpClassifyIpset:
-    def test_ipv4_atomic_swap_sequence(self):
+def _applied_script(run_mock):
+    """The nft script text passed to the mocked `nft -f -` call."""
+    return run_mock.call_args.kwargs["input"].decode()
+
+
+class TestNftRefreshDscpSet:
+    def test_flush_and_add_element_are_one_atomic_call(self):
         with patch("subprocess.run") as run:
-            omr_admin._refresh_dscp_classify_ipset(
-                "myset", 4, ["10.0.0.0/24", "10.0.1.0/24"]
-            )
-        calls = [c.args[0] for c in run.call_args_list]
-        assert calls == [
-            ["ipset", "destroy", "myset_tmp"],
-            ["ipset", "create", "myset_tmp", "hash:net", "family", "inet"],
-            ["ipset", "add", "myset_tmp", "10.0.0.0/24", "-exist"],
-            ["ipset", "add", "myset_tmp", "10.0.1.0/24", "-exist"],
-            ["ipset", "create", "myset", "hash:net", "family", "inet", "-exist"],
-            ["ipset", "swap", "myset_tmp", "myset"],
-            ["ipset", "destroy", "myset_tmp"],
-        ]
+            run.return_value.returncode = 0
+            omr_admin._nft_refresh_dscp_set("cs4", 4, ["10.0.0.0/24", "10.0.1.0/24"])
+        run.assert_called_once()
+        script = _applied_script(run)
+        assert "flush set inet omr omr_dscp_classify_cs4_4" in script
+        assert "add element inet omr omr_dscp_classify_cs4_4 { 10.0.0.0/24, 10.0.1.0/24 }" in script
 
-    def test_ipv6_uses_inet6_family(self):
+    def test_empty_cidrs_only_flushes(self):
         with patch("subprocess.run") as run:
-            omr_admin._refresh_dscp_classify_ipset("myset6", 6, [])
-        calls = [c.args[0] for c in run.call_args_list]
-        assert ["ipset", "create", "myset6_tmp", "hash:net", "family", "inet6"] in calls
-        assert not any(c[1] == "add" for c in calls)
+            run.return_value.returncode = 0
+            omr_admin._nft_refresh_dscp_set("ef", 6, [])
+        script = _applied_script(run)
+        assert "flush set inet omr omr_dscp_classify_ef_6" in script
+        assert "add element" not in script
 
 
-# ===========================================================================
-# Helper: _dscp_classify_mangle_line
-# ===========================================================================
-
-
-class TestDscpClassifyMangleLine:
-    def test_ipv4_column_count_and_action(self):
-        line = omr_admin._dscp_classify_mangle_line("cs4", 4, "someset")
-        cols = line.rstrip("\n").split("\t")
-        assert cols[0] == "DSCP(CS4)"
-        assert cols[1] == "-"
-        assert cols[2] == "+someset"
-        assert len(cols) == 14
-        assert all(c == "-" for c in cols[3:])
-
-    def test_ipv6_has_one_extra_column(self):
-        line = omr_admin._dscp_classify_mangle_line("ef", 6, "someset6")
-        cols = line.rstrip("\n").split("\t")
-        assert cols[0] == "DSCP(EF)"
-        assert len(cols) == 15
-
-    def test_ends_with_newline(self):
-        line = omr_admin._dscp_classify_mangle_line("cs0", 4, "s")
-        assert line.endswith("\n")
-
-
-# ===========================================================================
-# Helper: _ensure_dscp_classify_mangle
-# ===========================================================================
-
-
-_TMPFILE = "/tmp/fake-mangle-tmp"
-
-
-class TestEnsureDscpClassifyMangle:
-    def _run(self, family=4, existing=None, isfile=True):
-        mangle_path = "/etc/shorewall/mangle" if family == 4 else "/etc/shorewall6/mangle"
-        files = {} if existing is None else {mangle_path: existing}
-        env = _FileEnv(files)
-
-        def _fake_move(src, dst):
-            env.files[dst] = env.files.get(src, "")
-
-        with (
-            patch("builtins.open", side_effect=env),
-            patch("os.path.isfile", return_value=isfile),
-            patch("omr_admin.mkstemp", return_value=(999, _TMPFILE)),
-            patch("os.close"),
-            patch("omr_admin.move", side_effect=_fake_move),
-            patch("subprocess.run") as run,
-        ):
-            omr_admin._ensure_dscp_classify_mangle(family)
-        return mangle_path, env, run
-
-    def test_creates_missing_file_with_full_block(self):
-        mangle_path, env, run = self._run(family=4, existing=None, isfile=False)
-        content = env.files[mangle_path]
-        assert content.count(omr_admin.DSCP_CLASSIFY_MANGLE_BEGIN) == 1
-        assert content.count(omr_admin.DSCP_CLASSIFY_MANGLE_END) == 1
+class TestNftEnsureDscpSets:
+    def test_declares_v4_and_v6_sets_for_every_class(self):
+        with patch("subprocess.run") as run:
+            run.return_value.returncode = 0
+            omr_admin._nft_ensure_dscp_sets()
+        script = _applied_script(run)
         for dscp in omr_admin.DSCP_CLASSIFY_CLASSES:
-            assert f"omr_dscp_classify_{dscp}_4" in content
-        run.assert_called_once_with(["systemctl", "-q", "reload", "shorewall"], check=False)
+            assert f"add set inet omr omr_dscp_classify_{dscp}_4 {{ type ipv4_addr; flags interval; }}" in script
+            assert f"add set inet omr omr_dscp_classify_{dscp}_6 {{ type ipv6_addr; flags interval; }}" in script
 
-    def test_ipv6_reloads_shorewall6(self):
-        _, _, run = self._run(family=6, existing=None, isfile=False)
-        run.assert_called_once_with(["systemctl", "-q", "reload", "shorewall6"], check=False)
 
-    def test_preserves_content_outside_markers_and_replaces_stale_block(self):
-        begin = omr_admin.DSCP_CLASSIFY_MANGLE_BEGIN
-        end = omr_admin.DSCP_CLASSIFY_MANGLE_END
-        existing = f"# custom rule\nSomeRule\n{begin}\nstale-row\n{end}\n# trailer\n"
-        mangle_path, env, _run_result = self._run(family=4, existing=existing, isfile=True)
-        content = env.files[mangle_path]
-        assert "# custom rule" in content
-        assert "# trailer" in content
-        assert "stale-row" not in content
-        assert content.count(begin) == 1
-        assert content.count(end) == 1
+# ===========================================================================
+# Helper: _render_dscp_mark (pure -- no mocking needed)
+# ===========================================================================
 
-    def test_rerun_with_unchanged_content_skips_reload(self):
-        # First pass produces the canonical generated content.
-        mangle_path, env, _ = self._run(family=4, existing=None, isfile=False)
-        generated = env.files[mangle_path]
-        # A second pass seeded with that exact content is a no-op: same
-        # bytes back out, so no reload should fire.
-        _, env2, run2 = self._run(family=4, existing=generated, isfile=True)
-        assert env2.files[mangle_path] == generated
-        run2.assert_not_called()
+
+class TestRenderDscpMark:
+    def test_one_v4_and_one_v6_rule_per_class(self):
+        lines = omr_admin._render_dscp_mark()
+        assert len(lines) == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
+        v4 = next(l for l in lines if "omr_dscp_classify_cs4_4" in l)
+        assert v4.startswith("ip daddr @omr_dscp_classify_cs4_4 ip dscp set cs4")
+        v6 = next(l for l in lines if "omr_dscp_classify_cs4_6" in l)
+        assert v6.startswith("ip6 daddr @omr_dscp_classify_cs4_6 ip6 dscp set cs4")
+
+
+# ===========================================================================
+# Helper: _nft_sync_dscp_mark
+# ===========================================================================
+
+
+class TestNftSyncDscpMark:
+    def test_flushes_and_repopulates_the_chain_atomically(self):
+        with patch("subprocess.run") as run:
+            run.return_value.returncode = 0
+            omr_admin._nft_sync_dscp_mark()
+        run.assert_called_once()
+        script = _applied_script(run)
+        assert "flush chain inet omr dscp_mark" in script
+        for dscp in omr_admin.DSCP_CLASSIFY_CLASSES:
+            assert f"omr_dscp_classify_{dscp}_4" in script
+            assert f"omr_dscp_classify_{dscp}_6" in script
 
 
 # ===========================================================================

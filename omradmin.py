@@ -84,27 +84,34 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
 USERNAME_PATTERN = r'^[A-Za-z0-9_.-]{1,256}$'
 
-# Get main net interface
-IFACE = None
-try:
-    with open('/etc/shorewall/params.net', "r") as FILE:
-        READ = FILE.read()
-        for line in READ.splitlines():
-            if 'NET_IFACE=' in line:
-                IFACE = line.split('=', 1)[1]
-except OSError as err:
-    LOG.warning("Could not read /etc/shorewall/params.net: %s", err)
+# Get main net interface(s) -- the WAN interface used both for traffic
+# accounting (get_bytes()/`ip addr show` calls further down) and, since the
+# Shorewall->nftables migration, as NET_IFACE in the rendered nft rules
+# (see the nft engine block below shorewall_add_port). Detected from the
+# default route rather than Shorewall's params.net (which no longer ships
+# once a box is on nftables/omr.nft) -- falls back to that file if present,
+# for boxes still mid-migration with Shorewall still installed.
+def _detect_default_iface(family):
+    try:
+        entry = netifaces.gateways().get('default', {}).get(family)
+        if entry:
+            return entry[1]
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
 
-# Get ipv6 net interface
-IFACE6 = None
-try:
-    with open('/etc/shorewall6/params.net', "r") as FILE:
-        READ = FILE.read()
-        for line in READ.splitlines():
-            if 'NET_IFACE=' in line:
-                IFACE6 = line.split('=', 1)[1]
-except OSError as err:
-    LOG.warning("Could not read /etc/shorewall6/params.net: %s", err)
+def _detect_iface_legacy(params_net_path):
+    try:
+        with open(params_net_path, "r") as FILE:
+            for line in FILE.read().splitlines():
+                if 'NET_IFACE=' in line:
+                    return line.split('=', 1)[1]
+    except OSError:
+        pass
+    return None
+
+IFACE = _detect_default_iface(netifaces.AF_INET) or _detect_iface_legacy('/etc/shorewall/params.net')
+IFACE6 = _detect_default_iface(netifaces.AF_INET6) or _detect_iface_legacy('/etc/shorewall6/params.net')
 
 def delete_oldest_files(path, keep = 10):
     files = glob.glob(path)
@@ -990,7 +997,6 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
     if nbip > 1:
         nbgre = 0
         nbip = 0
-        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
         for intf in netifaces.interfaces():
             addrs = netifaces.ifaddresses(intf)
             try:
@@ -1027,36 +1033,22 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
                                         n.write('BROADCASTIP=' + str(network.broadcast) + "\n")
                                         n.write('USERNAME=' + str(username) + "\n")
                                         n.write('USERID=' + str(userid) + "\n")
-                                fd, tmpfile = mkstemp()
-                                with open('/etc/shorewall/snat', 'r') as h, open(tmpfile, 'a+') as n:
-                                    for line in h:
-                                        if not '# OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) in line:
-                                            n.write(line)
-                                    n.write('SNAT(' + str(addr) + ')	' + str(network) + '	' + str(iface) + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
-                                    n.write('SNAT(' + str(list(network)[1]) + ')	-	' + gre_intf + ' # OMR GRE for public IP ' + str(addr) + ' for user ' + str(user) + "\n")
-                                os.close(fd)
-                                move(tmpfile, '/etc/shorewall/snat')
-                                    #fd, tmpfile = mkstemp()
-                                    #with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
-                                    #    for line in h:
-                                    #        if not 'gre-user' + str(userid) + '-ip' + str(nbip) in line:
-                                    #            n.write(line)
-                                    #    n.write('vpn	gre-user' + str(userid) + '-ip' + str(nbip) + '	nosmurfs,tcpflags' + "\n")
-                                    #os.close(fd)
-                                    #move(tmpfile, '/etc/shorewall/interfaces')
-                                if str(iface) != IFACE:
-                                    fd, tmpfile = mkstemp()
-                                    with open('/etc/shorewall/interfaces', 'r') as h, open(tmpfile, 'a+') as n:
-                                        for line in h:
-                                            if not str(iface) in line:
-                                                n.write(line)
-                                        n.write('net	' + str(iface) + '	dhcp,nosmurfs,tcpflags,routefilter,sourceroute=0' + "\n")
-                                    os.close(fd)
-                                    move(tmpfile, '/etc/shorewall/interfaces')
+                                # SNAT for this tunnel is rendered from gre_tunnels (iface/network
+                                # added below) into the gre_snat nft chain by _nft_sync_gre_snat(),
+                                # called once at the end of this function -- see the nftables
+                                # engine block above shorewall_add_port. No firewall zone
+                                # declaration is needed for a secondary public-IP interface the way
+                                # the old /etc/shorewall/interfaces write handled it: the static nft
+                                # ruleset's forward/output ACCEPT rules only match the single
+                                # NET_IFACE define, so a secondary WAN interface here is picked up
+                                # for SNAT/egress but not (yet) for forwarding through it -- a known
+                                # gap in multi-public-IP setups, unchanged in scope from before this
+                                # migration since the live test VPS doesn't have a second public IP
+                                # to validate against either.
                                 user_gre_tunnels = {}
                                 if 'gre_tunnels' in content['users'][0][user]:
                                     user_gre_tunnels = content['users'][0][user]['gre_tunnels']
-                                user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
+                                user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr), 'iface': str(iface), 'network': str(network)}
                                 if os.path.isfile('/etc/shadowsocks-libev/manager.json') and not 'shadowsocks_port' in user_gre_tunnels[gre_intf]:
                                     with open('/etc/shadowsocks-libev/manager.json') as g:
                                         contentss = g.read()
@@ -1109,11 +1101,9 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
                         nbip = nbip + 1
             except Exception as exception:
                 pass
-        final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/snat', 'rb'))).hexdigest()
-        if initial_md5 != final_md5:
-            subprocess.run(["systemctl", "-q", "reload", "shorewall"], check=False)
-            if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-                subprocess.run(["systemctl", "-q", "restart", "shadowsocks-libev-manager@manager"], check=False)
+        _nft_sync_gre_snat()
+        if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+            subprocess.run(["systemctl", "-q", "restart", "shadowsocks-libev-manager@manager"], check=False)
     set_global_param('allips', allips)
 
 def add_glorytun_tcp(userid):
@@ -1362,163 +1352,288 @@ def xray_del_port(user, port, proto, name, destip, destport):
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", "xray"], check=False)
 
+#
+# --- nftables engine ---------------------------------------------------
+#
+# Replaces Shorewall as the firewall enforcement mechanism (see
+# docs/api.md and the sibling openmptcprouter-vps repo's nftables/omr.nft
+# for the static/base ruleset this plugs into). Design:
+#
+#   1. State lives entirely in omr-admin-config.json (per-user `fw_ports`/
+#      `gre_tunnels` entries, global `bulk_redirect_v4/v6`/`client2client`/
+#      `sipalg` flags) -- the same file/helpers (read_omr_config,
+#      modif_config_user, set_global_param) every other feature already
+#      uses, instead of a second parallel state store.
+#   2. Each `_render_*` function is a PURE function of that state -> a list
+#      of nft rule-body strings, with no system access, so it's directly
+#      unit-testable (see test/test_nft.py).
+#   3. Each `_nft_sync_*` function re-reads state, renders, and atomically
+#      replaces one regular chain's contents via `nft -f -` (flush + add,
+#      all in one transaction -- no partial-apply window, and no more
+#      MD5-diff-then-reload dance: a full regenerate+apply is cheap).
+#
+# The five chains below (plus ct_helpers) are declared empty in the base
+# ruleset and jumped into from its base chains -- this file only ever
+# flushes/repopulates their *contents*, never touches table/chain/hook
+# declarations, so a live sync here can't perturb the base policy.
+NFT_FAMILY = 'inet'
+NFT_TABLE = 'omr'
+NFT_BIN = '/usr/sbin/nft'
+
+# Must stay in sync with openmptcprouter-vps's nftables/omr-vars.nft
+# VPN_IFACES/VPNCL_IFACES defines. Duplicated here because every `nft -f -`
+# call below is a separate nft invocation from the one that loaded
+# /etc/nftables.conf at boot -- nft's own `define` is parse-time text
+# substitution local to one invocation/file, not a runtime object, so it
+# doesn't carry over between separate `nft` calls.
+NFT_VPN_IFACES = ('gt-tun*', 'gt-udp-tun*', 'mlvpn*', 'tun*', 'wg*', 'dsvpn*',
+                   'mqvpn*', 'gre-user*', 'vx-user*', 'omr-bonding', 'tap_softether')
+
+def _nft_iface_set(patterns):
+    return '{ ' + ', '.join(f'"{p}"' for p in patterns) + ' }'
+
+def _nft_comment(text):
+    """nft rule comments are a quoted string (max 128 bytes) -- keep ours
+    short and strip anything that would break out of the quotes."""
+    return text.replace('"', "'")[:128]
+
+def _nft_run(script):
+    """Apply an nft script as one atomic transaction via `nft -f -`.
+    Returns True on success; on failure (nft not installed yet, a bad
+    reference, ...) logs and returns False without raising, matching this
+    file's usual subprocess.run(check=False) convention for system tools."""
+    try:
+        result = subprocess.run([NFT_BIN, '-f', '-'], input=script.encode(),
+                                 capture_output=True, check=False)
+    except FileNotFoundError:
+        LOG.warning("nft binary not found, firewall change not applied")
+        return False
+    if result.returncode != 0:
+        LOG.warning("nft apply failed: %s", result.stderr.decode(errors='replace').strip())
+        return False
+    return True
+
+def _nft_flush_chain(chain, rule_lines):
+    script = f'flush chain {NFT_FAMILY} {NFT_TABLE} {chain}\n'
+    for line in rule_lines:
+        script += f'add rule {NFT_FAMILY} {NFT_TABLE} {chain} {line}\n'
+    return _nft_run(script)
+
+# --- per-user opened/redirected ports (user_accept / user_dnat chains) ---
+
+def _render_fw_ports(config_data):
+    """Pure: (accept_rules, dnat_rules) from every user's fw_ports entries."""
+    accept_rules, dnat_rules = [], []
+    users = config_data.get('users', [{}])[0]
+    for username, udata in users.items():
+        for entry in udata.get('fw_ports', []):
+            name = entry.get('name', '')
+            port = entry.get('port', '')
+            proto = entry.get('proto', 'tcp')
+            fwtype = entry.get('fwtype', 'ACCEPT')
+            family = entry.get('family', 4)
+            source_dip = entry.get('source_dip', '')
+            dest_ip = entry.get('dest_ip', '')
+            vpn = entry.get('vpn', 'default')
+            comment = entry.get('comment', '')
+            match = f'meta nfproto {"ipv4" if family == 4 else "ipv6"}'
+            # source_dip/dest_ip are Shorewall's own confusing legacy naming:
+            # source_dip is actually the pre-NAT/original destination (which
+            # public IP the connection arrived on, ORIGDEST in Shorewall
+            # terms), dest_ip is a source-host restriction (Shorewall's
+            # SOURCE zone sub-host syntax) -- kept as-is for continuity with
+            # every existing caller (shorewallopen etc).
+            if source_dip:
+                match += f' {"ip" if family == 4 else "ip6"} daddr {source_dip}'
+            if dest_ip:
+                match += f' {"ip" if family == 4 else "ip6"} saddr {dest_ip}'
+            tag = _nft_comment(f'OMR {username} {"open" if fwtype == "ACCEPT" else "redirect"} {name} {proto}{comment}')
+            if fwtype == 'ACCEPT':
+                accept_rules.append(f'{match} {proto} dport {port} accept comment "{tag}"')
+            elif fwtype == 'DNAT':
+                if vpn != 'default':
+                    target = vpn
+                elif family == 4:
+                    target = udata.get('vpnremoteip', '')
+                else:
+                    target = 'fd00::a0{:x}:2'.format(udata.get('userid', 0) or 0)
+                if not target:
+                    continue  # no known tunnel address yet -- nothing to redirect to
+                dnat_rules.append(f'{match} {proto} dport {port} dnat {"ip" if family == 4 else "ip6"} to {target} comment "{tag}"')
+    return accept_rules, dnat_rules
+
+def _render_bulk_redirect(config_data):
+    """The old `/shorewall` bulk "redirect ports 1-64999" toggle, targeting
+    userid 0 (the primary/default user) same as before."""
+    lines = []
+    default_user = config_data.get('users', [{}])[0].get('openmptcprouter', {})
+    if config_data.get('bulk_redirect_v4'):
+        target = default_user.get('vpnremoteip', '')
+        if target:
+            for proto in ('tcp', 'udp'):
+                lines.append(f'meta nfproto ipv4 {proto} dport 1-64999 dnat ip to {target} comment "OMR bulk redirect {proto}"')
+    if config_data.get('bulk_redirect_v6'):
+        target6 = 'fd00::a0{:x}:2'.format(default_user.get('userid', 0) or 0)
+        for proto in ('tcp', 'udp'):
+            lines.append(f'meta nfproto ipv6 {proto} dport 1-64999 dnat ip6 to {target6} comment "OMR bulk redirect {proto}6"')
+    return lines
+
+def _nft_sync_ports():
+    config_data = read_omr_config()
+    if not config_data:
+        return False
+    accept_rules, dnat_rules = _render_fw_ports(config_data)
+    dnat_rules = _render_bulk_redirect(config_data) + dnat_rules
+    return _nft_flush_chain('user_accept', accept_rules) and _nft_flush_chain('user_dnat', dnat_rules)
+
+def _fw_port_key(entry):
+    return (entry.get('name'), str(entry.get('port')), entry.get('proto'),
+            entry.get('fwtype'), entry.get('family'),
+            entry.get('source_dip', ''), entry.get('dest_ip', ''))
+
+def _fw_port_add(username, port, proto, name, fwtype, family, source_dip, dest_ip, vpn, comment):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        data = json.load(f)
+    if username not in data['users'][0]:
+        return
+    ports = data['users'][0][username].get('fw_ports', [])
+    key = (name, str(port), proto, fwtype, family, source_dip, dest_ip)
+    ports = [p for p in ports if _fw_port_key(p) != key]
+    ports.append({'name': name, 'port': port, 'proto': proto, 'fwtype': fwtype, 'family': family,
+                  'source_dip': source_dip, 'dest_ip': dest_ip, 'vpn': vpn, 'comment': comment})
+    modif_config_user(username, {'fw_ports': ports})
+    _nft_sync_ports()
+
+def _fw_port_del(username, port, proto, name, fwtype, family, source_dip='', dest_ip=''):
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        data = json.load(f)
+    if username not in data['users'][0]:
+        return
+    ports = data['users'][0][username].get('fw_ports', [])
+    key = (name, str(port), proto, fwtype, family, source_dip, dest_ip)
+    new_ports = [p for p in ports if _fw_port_key(p) != key]
+    if new_ports != ports:
+        modif_config_user(username, {'fw_ports': new_ports})
+        _nft_sync_ports()
+
+# --- GRE-tunnel-per-public-IP SNAT (gre_snat chain) ---------------------
+
+def _render_gre_snat(config_data):
+    lines = []
+    users = config_data.get('users', [{}])[0]
+    for username, udata in users.items():
+        for gre_intf, tunnel in udata.get('gre_tunnels', {}).items():
+            public_ip, network, iface, local_ip = (tunnel.get(k) for k in ('public_ip', 'network', 'iface', 'local_ip'))
+            if not (public_ip and network and iface and local_ip):
+                continue  # entry predates the iface/network fields (below); nothing to render yet
+            tag = _nft_comment(f'OMR GRE ip {public_ip} user {username}')
+            lines.append(f'ip saddr {network} oifname "{iface}" snat ip to {public_ip} comment "{tag}"')
+            lines.append(f'oifname "{gre_intf}" snat ip to {local_ip} comment "{tag}"')
+    return lines
+
+def _nft_sync_gre_snat():
+    config_data = read_omr_config()
+    if not config_data:
+        return False
+    return _nft_flush_chain('gre_snat', _render_gre_snat(config_data))
+
+# --- client-to-client policy (client2client chain) -----------------------
+
+def _render_client2client(enabled):
+    if not enabled:
+        return []
+    vpn_set = _nft_iface_set(NFT_VPN_IFACES)
+    return [f'iifname {vpn_set} oifname {vpn_set} accept comment "OMR client2client"']
+
+def _nft_sync_client2client():
+    config_data = read_omr_config()
+    enabled = bool(config_data.get('client2client', False)) if config_data else False
+    return _nft_flush_chain('client2client', _render_client2client(enabled))
+
+# --- destination DSCP classification (dscp_mark chain + native nft sets) -
+
+def _nft_dscp_set_name(dscp, family):
+    return f'omr_dscp_classify_{dscp}_{family}'
+
+def _nft_ensure_dscp_sets():
+    """Declare the sets that replace the old per-class/family ipsets --
+    `add` (unlike `create`) is idempotent, a no-op if the set already
+    exists with the same spec, so this is safe to call on every sync."""
+    script = ''
+    for dscp in DSCP_CLASSIFY_CLASSES:
+        script += f'add set {NFT_FAMILY} {NFT_TABLE} {_nft_dscp_set_name(dscp, 4)} {{ type ipv4_addr; flags interval; }}\n'
+        script += f'add set {NFT_FAMILY} {NFT_TABLE} {_nft_dscp_set_name(dscp, 6)} {{ type ipv6_addr; flags interval; }}\n'
+    return _nft_run(script)
+
+def _nft_refresh_dscp_set(dscp, family, cidrs):
+    """Atomically replace one set's contents. flush+add-element in the same
+    transaction means (unlike the old ipset create-tmp+swap dance, which
+    only existed to work around ipset lacking a single-command atomic
+    replace) there's no window where it's empty/partial."""
+    name = _nft_dscp_set_name(dscp, family)
+    script = f'flush set {NFT_FAMILY} {NFT_TABLE} {name}\n'
+    if cidrs:
+        script += f'add element {NFT_FAMILY} {NFT_TABLE} {name} {{ {", ".join(cidrs)} }}\n'
+    return _nft_run(script)
+
+def _render_dscp_mark():
+    lines = []
+    for dscp in DSCP_CLASSIFY_CLASSES:
+        tag = _nft_comment(f'OMR DSCP classify {dscp}')
+        lines.append(f'ip daddr @{_nft_dscp_set_name(dscp, 4)} ip dscp set {dscp} comment "{tag}"')
+        lines.append(f'ip6 daddr @{_nft_dscp_set_name(dscp, 6)} ip6 dscp set {dscp} comment "{tag}"')
+    return lines
+
+def _nft_sync_dscp_mark():
+    return _nft_flush_chain('dscp_mark', _render_dscp_mark())
+
+# --- SIP ALG (ct_helpers chain) ------------------------------------------
+#
+# Modern kernels require an explicit `ct helper` object + a rule assigning
+# it, rather than the old global auto-attach flag Shorewall's
+# DONT_LOAD/AUTOHELPERS toggled (netfilter's automatic-helper-assignment
+# was disabled by default years ago regardless of iptables/nftables) --
+# this is the part of the migration flagged in the plan as needing live
+# validation against this VPS's actual kernel rather than assumed correct.
+def _nft_ensure_ct_helpers():
+    script = (f'add ct helper {NFT_FAMILY} {NFT_TABLE} sip_udp {{ type "sip" protocol udp; }}\n'
+              f'add ct helper {NFT_FAMILY} {NFT_TABLE} sip_tcp {{ type "sip" protocol tcp; }}\n')
+    return _nft_run(script)
+
+def _render_ct_helpers(enabled):
+    if not enabled:
+        return []
+    return ['udp dport 5060 ct helper set "sip_udp" comment "OMR sipalg"',
+            'tcp dport 5060 ct helper set "sip_tcp" comment "OMR sipalg"']
+
+def _nft_sync_sipalg(enabled):
+    _nft_ensure_ct_helpers()
+    return _nft_flush_chain('ct_helpers', _render_ct_helpers(enabled))
+
+def _nft_resync_all():
+    """Rebuild every dynamic chain from persisted state. Needed because nft
+    itself has no persistence across a ruleset reload/reboot -- only
+    omr-admin-config.json does -- mirrors add_gre_tunnels() already running
+    at import time for the same reason. Called once at process startup."""
+    _nft_ensure_dscp_sets()
+    _nft_sync_ports()
+    _nft_sync_gre_snat()
+    _nft_sync_client2client()
+    _nft_sync_dscp_mark()
+    config_data = read_omr_config()
+    _nft_sync_sipalg(bool(config_data.get('sipalg', True)) if config_data else True)
+
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
-    userid = user.userid
-    if userid is None:
-        userid = 0
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/shorewall/rules', 'r') as f, \
-          open(tmpfile, 'a+') as n:
-        for line in f:
-            if source_dip == '' and dest_ip == '':
-                if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment in line):
-                    n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment in line:
-                    n.write(line)
-            else:
-                comment = ''
-                if source_dip != '':
-                    comment = ' to ' + source_dip
-                if dest_ip != '':
-                    comment = comment + ' from ' + dest_ip
-                if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment in line):
-                    n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
-                    n.write(line)
-        if source_dip == '' and dest_ip == '':
-            if fwtype == 'ACCEPT':
-                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment + "\n")
-            elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
-            elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
-        else:
-            net = 'net'
-            comment = ''
-            if source_dip != '':
-                comment = ' to ' + source_dip
-            if dest_ip != '':
-                comment = comment + ' from ' + dest_ip
-                net = 'net:' + dest_ip
-            if fwtype == 'ACCEPT':
-                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment + "\n")
-            elif fwtype == 'DNAT' and vpn != 'default':
-                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
-                #n.write('DNAT		' + net + '		vpn:$OMR_ADDR' + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
-            elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
-            elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall/rules')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", "shorewall"], check=False)
+    _fw_port_add(user.username, str(port), proto, name, fwtype, 4, source_dip, dest_ip, vpn, gencomment)
 
 def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if source_dip == '' and dest_ip == '':
-                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + gencomment in line:
-                    n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + gencomment  in line:
-                    n.write(line)
-            else:
-                comment = ''
-                if source_dip != '':
-                    comment = ' to ' + source_dip
-                if dest_ip != '':
-                    comment = comment + ' from ' + dest_ip
-                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
-                    n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
-                    n.write(line)
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall/rules')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", "shorewall"], check=False)
+    _fw_port_del(username, str(port), proto, name, fwtype, 4, source_dip, dest_ip)
 
 def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
-    userid = user.userid
-    if userid is None:
-        userid = 0
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if source_dip == '' and dest_ip == '':
-                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment in line:
-                    n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment in line:
-                    n.write(line)
-            else:
-                comment = ''
-                if source_dip != '':
-                    comment = ' to ' + source_dip
-                if dest_ip != '':
-                    comment = comment + ' from ' + dest_ip
-                if fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
-                    n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
-                    n.write(line)
-        if source_dip == '' and dest_ip == '':
-            if fwtype == 'ACCEPT':
-                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment + "\n")
-            elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
-            elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
-        else:
-            net = 'net'
-            comment = ''
-            if source_dip != '':
-                comment = ' to ' + source_dip
-            if dest_ip != '':
-                comment = comment + ' from ' + dest_ip
-                net = 'net:' + dest_ip
-            if fwtype == 'ACCEPT':
-                n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment + "\n")
-            elif fwtype == 'DNAT' and vpn != 'default':
-                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
-            elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
-            elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall6/rules')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", "shorewall6"], check=False)
+    _fw_port_add(user.username, str(port), proto, name, fwtype, 6, source_dip, dest_ip, vpn, gencomment)
 
 def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if source_dip == '' and dest_ip == '':
-                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto + gencomment in line:
-                    n.write(line)
-                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto + gencomment in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto + gencomment  in line:
-                    n.write(line)
-            else:
-                comment = ''
-                if source_dip != '':
-                    comment = ' to ' + source_dip
-                if dest_ip != '':
-                    comment = comment + ' from ' + dest_ip
-                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + comment + gencomment in line:
-                    n.write(line)
-                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + comment + gencomment in line:
-                    n.write(line)
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall6/rules')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", "shorewall6"], check=False)
+    _fw_port_del(username, str(port), proto, name, fwtype, 6, source_dip, dest_ip)
 
 def set_lastchange(sync=0):
     configdata = read_omr_config()
@@ -2707,8 +2822,11 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
         available_proxy = [proxy]
 
     localvpn = ""
-    if any(iface.startswith('vpn') for iface in netifaces.interfaces()):
-        localvpn = "vpn1"
+    try:
+        if any(iface.startswith('vpn') for iface in netifaces.interfaces()):
+            localvpn = "vpn1"
+    except OSError as exc:
+        LOG.debug("config: could not enumerate interfaces for localvpn: %s", exc)
 
     lanips = ""
     if 'lanips' in omr_config_data['users'][0][username]:
@@ -2722,11 +2840,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
             if 'lanips' in omr_config_data['users'][0][users] and users != username and omr_config_data['users'][0][users]['lanips'][0] not in alllanips:
                 alllanips.append(omr_config_data['users'][0][users]['lanips'][0])
 
-    shorewall_redirect = "enable"
-    with open('/etc/shorewall/rules', 'r') as f:
-        for line in f:
-            if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
-                shorewall_redirect = "disable"
+    shorewall_redirect = "disable" if omr_config_data.get('bulk_redirect_v4') else "enable"
     LOG.debug('Get config: done')
     return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'vxlan': get_vxlan_config(username, userid), 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
@@ -2986,88 +3100,75 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     else:
         return {'result': 'done', 'reason': 'no changes', 'route': 'shadowsocks-go'}
 
-# Set shorewall config
+# Firewall config (nftables-backed -- see the nft engine block above
+# shorewall_add_port; Shorewall itself no longer creates any firewall
+# rules). New code should use these /firewall* routes; the /shorewall*
+# routes below are kept as deprecated aliases so older routers/clients
+# still calling them keep working.
 class IPPROTO(str, Enum):
     ipv4 = "ipv4"
     ipv6 = "ipv6"
 
-class ShorewallAllparams(BaseModel):
+class FirewallAllparams(BaseModel):
     redirect_ports: str = Query(..., title="Port or ports range")
     ipproto: IPPROTO = Query("ipv4", title="Protocol IP to apply changes")
 
-@app.post('/shorewall', summary="Redirect all ports from Server to router")
-def shorewall(*, params: ShorewallAllparams, current_user: User = Depends(get_current_user)):
+ShorewallAllparams = FirewallAllparams  # deprecated alias, kept for compatibility
+
+def _firewall_set(params, current_user, route):
     if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'shorewall'}
+        return {'result': 'permission', 'reason': 'Read only user', 'route': route}
     state = params.redirect_ports
     if state is None:
-        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewall'}
-    if params.ipproto == 'ipv4':
-        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
-        fd, tmpfile = mkstemp()
-        with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
-            for line in f:
-                if state == 'enable' and line == '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999\n':
-                    n.write(line.replace(line[:1], ''))
-                elif state == 'enable' and line == '#DNAT		net		vpn:$OMR_ADDR	udp	1-64999\n':
-                    n.write(line.replace(line[:1], ''))
-                elif state == 'disable' and line == 'DNAT		net		vpn:$OMR_ADDR	tcp	1-64999\n':
-                    n.write('#' + line)
-                elif state == 'disable' and line == 'DNAT		net		vpn:$OMR_ADDR	udp	1-64999\n':
-                    n.write('#' + line)
-                else:
-                    n.write(line)
-        os.close(fd)
-        move(tmpfile, '/etc/shorewall/rules')
-        final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
-        if initial_md5 != final_md5:
-            subprocess.run(["systemctl", "-q", "reload", "shorewall"], check=False)
-    else:
-        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
-        fd, tmpfile = mkstemp()
-        with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
-            for line in f:
-                if state == 'enable' and line == '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999\n':
-                    n.write(line.replace(line[:1], ''))
-                elif state == 'enable' and line == '#DNAT		net		vpn:$OMR_ADDR	udp	1-64999\n':
-                    n.write(line.replace(line[:1], ''))
-                elif state == 'disable' and line == 'DNAT		net		vpn:$OMR_ADDR	tcp	1-64999\n':
-                    n.write('#' + line)
-                elif state == 'disable' and line == 'DNAT		net		vpn:$OMR_ADDR	udp	1-64999\n':
-                    n.write('#' + line)
-                else:
-                    n.write(line)
-        os.close(fd)
-        move(tmpfile, '/etc/shorewall6/rules')
-        final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
-        if initial_md5 != final_md5:
-            subprocess.run(["systemctl", "-q", "reload", "shorewall6"], check=False)
-    # Need to do the same for IPv6...
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
+    key = 'bulk_redirect_v4' if params.ipproto == 'ipv4' else 'bulk_redirect_v6'
+    set_global_param(key, state == 'enable')
+    _nft_sync_ports()
     return {'result': 'done', 'reason': 'changes applied'}
 
-class ShorewallListparams(BaseModel):
+@app.post('/firewall', summary="Redirect all ports from Server to router")
+def firewall(*, params: FirewallAllparams, current_user: User = Depends(get_current_user)):
+    return _firewall_set(params, current_user, 'firewall')
+
+@app.post('/shorewall', summary="Redirect all ports from Server to router (deprecated alias for /firewall, kept for compatibility)")
+def shorewall(*, params: ShorewallAllparams, current_user: User = Depends(get_current_user)):
+    return _firewall_set(params, current_user, 'shorewall')
+
+class FirewallListparams(BaseModel):
     name: str
     ipproto: IPPROTO = Query("ipv4", title="Protocol IP to list")
 
-@app.post('/shorewalllist', summary="Display all OpenMPTCProuter rules in Shorewall config")
-def shorewall_list(*, params: ShorewallListparams, current_user: User = Depends(get_current_user)):
+ShorewallListparams = FirewallListparams  # deprecated alias, kept for compatibility
+
+def _firewall_list(params, current_user, route):
     name = params.name
     if name is None:
-        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewalllist'}
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
+    # `name` here is historically the verb ("open" or "redirect"), not a
+    # service name -- matches shorewall_add_port's fwtype ('ACCEPT'/'DNAT').
+    fwtype_wanted = {'open': 'ACCEPT', 'redirect': 'DNAT'}.get(name)
+    family = 4 if params.ipproto == 'ipv4' else 6
+    config_data = read_omr_config()
+    entries = config_data.get('users', [{}])[0].get(current_user.username, {}).get('fw_ports', []) if config_data else []
     fwlist = []
-    if params.ipproto == 'ipv4':
-        with open('/etc/shorewall/rules', 'r') as f:
-            for line in f:
-                if '# OMR ' + current_user.username + ' ' + name in line:
-                    fwlist.append(line)
-    else:
-        with open('/etc/shorewall6/rules', 'r') as f:
-            for line in f:
-                if '# OMR ' + current_user.username + ' ' + name in line:
-                    fwlist.append(line)
+    for entry in entries:
+        if entry.get('family', 4) != family:
+            continue
+        if fwtype_wanted and entry.get('fwtype') != fwtype_wanted:
+            continue
+        verb = 'open' if entry.get('fwtype') == 'ACCEPT' else 'redirect'
+        fwlist.append(f"# OMR {current_user.username} {verb} {entry.get('name', '')} port {entry.get('proto', '')} {entry.get('port', '')}{entry.get('comment', '')}\n")
     return {'list': fwlist}
 
-class Shorewallparams(BaseModel):
+@app.post('/firewalllist', summary="Display all OpenMPTCProuter firewall rules")
+def firewall_list(*, params: FirewallListparams, current_user: User = Depends(get_current_user)):
+    return _firewall_list(params, current_user, 'firewalllist')
+
+@app.post('/shorewalllist', summary="Display all OpenMPTCProuter rules in Shorewall config (deprecated alias for /firewalllist, kept for compatibility)")
+def shorewall_list(*, params: ShorewallListparams, current_user: User = Depends(get_current_user)):
+    return _firewall_list(params, current_user, 'shorewalllist')
+
+class Firewallparams(BaseModel):
     name: str
     port: str
     proto: str
@@ -3077,10 +3178,11 @@ class Shorewallparams(BaseModel):
     source_ip: str = ""
     comment: str = ""
 
-@app.post('/shorewallopen', summary="Redirect a port from Server to Router")
-def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
+Shorewallparams = Firewallparams  # deprecated alias, kept for compatibility
+
+def _firewall_open(params, current_user, route):
     if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'shorewallopen'}
+        return {'result': 'permission', 'reason': 'Read only user', 'route': route}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
@@ -3098,7 +3200,7 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
     vpn = "default"
     username = current_user.username
     if name is None:
-        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallopen'}
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
     #proxy = 'shadowsocks'
     #if 'proxy' in omr_config_data['users'][0][username]:
     #    proxy = omr_config_data['users'][0][username]['proxy']
@@ -3112,13 +3214,24 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
                     vpn = omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['remote_ip']
         shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
     else:
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, comment)
+        # `vpn` stays 'default' here (GRE tunnels are IPv4-only, so the
+        # lookup above never runs for the v6 branch) -- passed explicitly
+        # so `comment` lands in shorewall6_add_port's actual gencomment
+        # slot instead of silently taking vpn's position.
+        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
     return {'result': 'done', 'reason': 'changes applied'}
 
-@app.post('/shorewallclose', summary="Remove a redirected port")
-def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
+@app.post('/firewallopen', summary="Redirect a port from Server to Router")
+def firewall_open(*, params: Firewallparams, current_user: User = Depends(get_current_user)):
+    return _firewall_open(params, current_user, 'firewallopen')
+
+@app.post('/shorewallopen', summary="Redirect a port from Server to Router (deprecated alias for /firewallopen, kept for compatibility)")
+def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
+    return _firewall_open(params, current_user, 'shorewallopen')
+
+def _firewall_close(params, current_user, route):
     if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'shorewallclose'}
+        return {'result': 'permission', 'reason': 'Read only user', 'route': route}
     name = params.name
     port = params.port
     proto = params.proto
@@ -3129,7 +3242,7 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     if comment != '':
         comment = ' --- ' + comment
     if name is None:
-        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallclose'}
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
     #v2ray_del_port(current_user.username, str(port), proto, name)
     if params.ipproto == 'ipv4':
         shorewall_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
@@ -3137,7 +3250,15 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     else:
         shorewall6_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
         shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
-    return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': route}
+
+@app.post('/firewallclose', summary="Remove a redirected port")
+def firewall_close(*, params: Firewallparams, current_user: User = Depends(get_current_user)):
+    return _firewall_close(params, current_user, 'firewallclose')
+
+@app.post('/shorewallclose', summary="Remove a redirected port (deprecated alias for /firewallclose, kept for compatibility)")
+def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
+    return _firewall_close(params, current_user, 'shorewallclose')
 
 class SipALGparams(BaseModel):
     enable: bool = Query(True, title="Enable or disable SIP ALG")
@@ -3147,26 +3268,8 @@ def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_use
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'sipalg'}
     enable = params.enable
-
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/shorewall.conf', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/shorewall/shorewall.conf', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if not enable and line == 'DONT_LOAD=\n':
-                n.write('DONT_LOAD=nf_conntrack_sip\n')
-            elif not enable and line == 'AUTOHELPERS=Yes\n':
-                n.write('AUTOHELPERS=No\n')
-            elif enable and 'DONT_LOAD' in line and line != 'DONT_LOAD=\n':
-                n.write('DONT_LOAD=\n')
-            elif enable and line == 'AUTOHELPERS=No\n':
-                n.write('AUTOHELPERS=Yes\n')
-            else:
-                n.write(line)
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall/shorewall.conf')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/shorewall.conf', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", "shorewall"], check=False)
+    set_global_param('sipalg', enable)
+    _nft_sync_sipalg(enable)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'sipalg'}
 
 class V2rayconfig(BaseModel):
@@ -3654,38 +3757,21 @@ def mptcp_weight(*, params: MPTCPWeightParams, current_user: User = Depends(get_
 # needing to survive the router->VPS hop on the wire -- both ends just
 # independently classify the same destination the same way.
 #
-# One ipset per class+family holds the current destination CIDRs, atomically
-# refreshed (created-then-swapped, so there's no window where it's
-# empty/partial) on every sync. One Shorewall *mangle* line per class+family
-# marks packets whose destination is in that class's set -- written once,
-# idempotently (rewritten from scratch by filtering our own marker lines
-# out first, so re-running never accumulates duplicates); only the ipset
-# *contents* change on subsequent syncs, not this file, so in the common
-# case a sync is just `ipset swap` calls with no Shorewall reload at all.
+# One native nft set per class+family holds the current destination CIDRs
+# (replacing the old per-class/family ipset), marked via a native `ip[6]
+# dscp set <class>` rule in the dscp_mark chain (replacing Shorewall's
+# DSCP(CLASS) mangle-row contortion documented in the git history of this
+# file) -- see _nft_refresh_dscp_set/_render_dscp_mark in the nftables
+# engine block above shorewall_add_port. Both the set contents and the
+# marking rule are applied as single atomic `nft -f -` transactions, so
+# there's never a window where a set is empty/partial the way the old
+# ipset-create-tmp+swap dance had to work around.
 #
-# `mangle`, not the older `tcrules`: live-checked against this VPS's actual
-# /usr/share/shorewall/Shorewall/Tc.pm (Shorewall 5.2.8) -- tcrules is no
-# longer read directly ("The tcrules file is no longer supported -- use
-# '$product update' to convert $fn to an equivalent 'mangle' file"). Row
-# layout, ACTION value and DSCP-column value were all live-verified with
-# `shorewall check`/`shorewall6 check` against this VPS -- see
-# _dscp_classify_mangle_line for the exact column positions (one column
-# more for IPv6 -- an extra HEADERS column IPv4 rows don't have). The
-# ACTION column must be a real target (`CONTINUE`, not `-`); the DSCP
-# column is a *bare* class name matched against Shorewall's own %dscpmap
-# in Chains.pm's do_dscp() (`CS4`, not the `DSCP(CS4)` inline-action-style
-# syntax that's valid elsewhere, e.g. the rules file's ACTION column, but
-# not here).
-DSCP_CLASSIFY_IPSET_PREFIX = 'omr_dscp_classify_'
-DSCP_CLASSIFY_MANGLE_BEGIN = '# BEGIN OMR DSCP classify (autogenerated, do not edit -- see /dscp_classify)'
-DSCP_CLASSIFY_MANGLE_END = '# END OMR DSCP classify'
 # Deliberately narrower than DSCP_CLASSES above (which also has 'le' and the
-# af* classes, for mptcp_dscp's bpf-pin use case): Shorewall's own %dscpmap
-# in Chains.pm has no 'LE' entry, so converging every DSCP_CLASSES member to
-# a mangle row unconditionally would write a row Shorewall itself rejects
-# (confirmed live) the moment that class has ever been synced -- restrict
-# to the classes omr-dscp/omr-dscp-nft actually produce (see their
-# _add_dscp_domains_rules loops), all of which are valid %dscpmap keys.
+# af* classes, for mptcp_dscp's bpf-pin use case): those were only ever
+# needed to match Shorewall's own %dscpmap; native nft's `ip dscp set`
+# accepts any of DSCP_CLASSES, but kept to this subset for continuity with
+# what the router's omr-dscp/omr-dscp-nft classifiers actually produce.
 DSCP_CLASSIFY_CLASSES = ('cs0', 'cs1', 'cs2', 'cs3', 'cs4', 'cs5', 'cs6', 'cs7', 'ef')
 
 class DscpClassifyEntry(BaseModel):
@@ -3695,81 +3781,12 @@ class DscpClassifyEntry(BaseModel):
 class DscpClassifyParams(BaseModel):
     entries: List[DscpClassifyEntry] = []
 
-def _dscp_classify_ipset_name(dscp, family):
-    return f'{DSCP_CLASSIFY_IPSET_PREFIX}{dscp}_{family}'
-
-def _refresh_dscp_classify_ipset(name, family, cidrs):
-    hash_family = 'inet6' if family == 6 else 'inet'
-    tmp_name = f'{name}_tmp'
-    # Both sets must exist (even if empty) before `ipset swap`, which requires
-    # matching types and fails outright if either side is missing.
-    subprocess.run(['ipset', 'destroy', tmp_name], check=False)
-    subprocess.run(['ipset', 'create', tmp_name, 'hash:net', 'family', hash_family], check=False)
-    for cidr in cidrs:
-        subprocess.run(['ipset', 'add', tmp_name, cidr, '-exist'], check=False)
-    subprocess.run(['ipset', 'create', name, 'hash:net', 'family', hash_family, '-exist'], check=False)
-    subprocess.run(['ipset', 'swap', tmp_name, name], check=False)
-    subprocess.run(['ipset', 'destroy', tmp_name], check=False)
-
-def _dscp_classify_mangle_line(dscp, family, setname):
-    # Live-verified against this VPS's real Shorewall 5.2.8, including confirming the actual
-    # DSCP byte on the wire with tcpdump (not just `shorewall check` syntax acceptance) -- two
-    # earlier attempts both passed `shorewall check` but did NOT work:
-    #  1. ACTION='-', DSCP column='CS4': "Invalid ACTION (-)" -- '-' isn't a valid ACTION.
-    #  2. ACTION='CONTINUE', DSCP column='CS4' (bare class name, matching Chains.pm's %dscpmap):
-    #     passed `shorewall check`, reloaded fine, but outbound packets stayed at tos 0x0. The
-    #     trailing DSCP column feeds Chains.pm's do_dscp(), which builds a `-m dscp --dscp`
-    #     *match* clause (only matches packets that ALREADY carry that DSCP) -- it cannot set it.
-    # The actual setter is the parameterized ACTION verb `DSCP(CLASS)` in the ACTION column
-    # itself (Rules.pm's %synonym-like target hash lists DSCP alongside MARK/TTL/TOS/etc as a
-    # recognized parameterized action) -- confirmed live: outbound ICMP to a classified
-    # destination showed tos 0x80 (CS4) only after switching to this form. With ACTION carrying
-    # the real verb, Shorewall accepts fewer trailing columns than the full mark-based row
-    # (14 total for IPv4, 15 for IPv6, vs. 15/16 for a plain numeric mark) -- verified by
-    # `awk -F'\t' '{print NF}'` against the exact accepted line, not assumed from the column-name
-    # table alone.
-    filler = ['-'] * (12 if family == 6 else 11)
-    cols = [f'DSCP({dscp.upper()})', '-', f'+{setname}', *filler]
-    return '\t'.join(cols) + '\n'
-
-def _ensure_dscp_classify_mangle(family):
-    mangle_path = '/etc/shorewall/mangle' if family == 4 else '/etc/shorewall6/mangle'
-    service = 'shorewall' if family == 4 else 'shorewall6'
-    if not os.path.isfile(mangle_path):
-        open(mangle_path, 'a').close()
-    initial_md5 = hashlib.md5(file_as_bytes(open(mangle_path, 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open(mangle_path, 'r') as f, open(tmpfile, 'a+') as n:
-        skipping = False
-        for line in f:
-            stripped = line.rstrip('\n')
-            if stripped == DSCP_CLASSIFY_MANGLE_BEGIN:
-                skipping = True
-                continue
-            if stripped == DSCP_CLASSIFY_MANGLE_END:
-                skipping = False
-                continue
-            if not skipping:
-                n.write(line)
-        n.write(DSCP_CLASSIFY_MANGLE_BEGIN + '\n')
-        for dscp in DSCP_CLASSIFY_CLASSES:
-            setname = _dscp_classify_ipset_name(dscp, family)
-            n.write(_dscp_classify_mangle_line(dscp, family, setname))
-        n.write(DSCP_CLASSIFY_MANGLE_END + '\n')
-    os.close(fd)
-    move(tmpfile, mangle_path)
-    final_md5 = hashlib.md5(file_as_bytes(open(mangle_path, 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", service], check=False)
-
-@app.post('/dscp_classify', summary="Sync router destination->DSCP classification into VPS ipset+mangle marking")
+@app.post('/dscp_classify', summary="Sync router destination->DSCP classification into VPS nft sets")
 def dscp_classify(*, params: DscpClassifyParams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'dscp_classify'}
-    try:
-        subprocess.run(['ipset', 'version'], check=True, capture_output=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return {'result': 'warning', 'reason': 'ipset not installed', 'route': 'dscp_classify'}
+    if not os.path.exists(NFT_BIN):
+        return {'result': 'warning', 'reason': 'nft not installed', 'route': 'dscp_classify'}
     by_class = {dscp: {4: [], 6: []} for dscp in DSCP_CLASSIFY_CLASSES}
     for entry in params.entries:
         if entry.dscp not in DSCP_CLASSIFY_CLASSES:
@@ -3779,11 +3796,11 @@ def dscp_classify(*, params: DscpClassifyParams, current_user: User = Depends(ge
         except ValueError:
             return {'result': 'error', 'reason': f'Invalid cidr {entry.cidr!r}', 'route': 'dscp_classify'}
         by_class[entry.dscp][net.version].append(str(net))
+    _nft_ensure_dscp_sets()
     for dscp in DSCP_CLASSIFY_CLASSES:
         for family in (4, 6):
-            _refresh_dscp_classify_ipset(_dscp_classify_ipset_name(dscp, family), family, by_class[dscp][family])
-    _ensure_dscp_classify_mangle(4)
-    _ensure_dscp_classify_mangle(6)
+            _nft_refresh_dscp_set(dscp, family, by_class[dscp][family])
+    _nft_sync_dscp_mark()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'dscp_classify'}
 
 class VPN(str, Enum):
@@ -4641,7 +4658,8 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         omr_config_data = json.load(f)
     if 'vpnremoteip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnremoteip'] == remoteip and 'vpnlocalip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnlocalip'] == localip and ula and ('ula' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['ula'] == ula):
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
-    if 'vpnremoteip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnremoteip'] != remoteip:
+    remoteip_changed = 'vpnremoteip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnremoteip'] != remoteip
+    if remoteip_changed:
         LOG.debug("modif_config_user for vpnips")
         modif_config_user(current_user.username, {'vpnremoteip': remoteip})
     if 'vpnlocalip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnlocalip'] != localip:
@@ -4680,56 +4698,15 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     if 'vxlan' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vxlan']:
         write_vxlan_conf(current_user.username, userid)
 
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    dataexist = False
-    with open('/etc/shorewall/params.vpn', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
-                n.write(line)
-            elif not userid == 0:
-                n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
-                dataexist = True
-            elif userid == 0:
-                n.write('OMR_ADDR=' + remoteip + '\n')
-                dataexist = True
-        if not dataexist:
-            if not userid == 0:
-                n.write('OMR_ADDR_USER' + str(userid) + '=' + remoteip + '\n')
-            elif userid == 0:
-                n.write('OMR_ADDR=' + remoteip + '\n')
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall/params.vpn')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/params.vpn', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", "shorewall"], check=False)
-        #set_lastchange()
-
-    if not '6in4' in omr_config_data or omr_config_data['6in4']:
-        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
-        fd, tmpfile = mkstemp()
-        dataexist = False
-        with open('/etc/shorewall6/params.vpn', 'r') as f, open(tmpfile, 'a+') as n:
-            for line in f:
-                if not ('OMR_ADDR_USER' + str(userid) +'=' in line and not userid == 0) and not ('OMR_ADDR=' in line and userid == 0):
-                    n.write(line)
-                elif  not userid == 0:
-                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
-                    dataexist = True
-                elif userid == 0:
-                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
-                    dataexist = True
-            if not dataexist:
-                if  not userid == 0:
-                    n.write('OMR_ADDR_USER' + str(userid) + '=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
-                elif userid == 0:
-                    n.write('OMR_ADDR=fd00::a0' + hex(userid)[2:] + ':2' + '\n')
-        os.close(fd)
-        move(tmpfile, '/etc/shorewall6/params.vpn')
-        final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/params.vpn', 'rb'))).hexdigest()
-        if initial_md5 != final_md5:
-            subprocess.run(["systemctl", "-q", "reload", "shorewall6"], check=False)
-            #set_lastchange()
+    # OMR_ADDR/OMR_ADDR_USER<id> no longer need their own params.vpn file:
+    # _render_fw_ports/_render_bulk_redirect/_render_gre_snat (nft engine
+    # block above shorewall_add_port) read the v4 target straight out of
+    # this same vpnremoteip field we just saved, and compute the v6 target
+    # (fd00::a0<hex(userid)>:2) the same way this endpoint always has.
+    # Only worth resyncing the DNAT-carrying chains if the address actually
+    # changed -- gre_snat doesn't depend on it, only user_dnat does.
+    if remoteip_changed:
+        _nft_sync_ports()
 
     return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
 
@@ -5106,21 +5083,7 @@ def client2client(*, params: ClienttoClient, current_user: User = Depends(get_cu
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
         if initial_md5 != final_md5:
             subprocess.run(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/shorewall/policy', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if not line == 'vpn		vpn		DROP\n' and not line == '# THE FOLLOWING POLICY MUST BE LAST\n' and not line == 'all		all		REJECT		info\n':
-                n.write(line)
-        if params.enable == False:
-            n.write('vpn		vpn		DROP\n')
-        n.write('# THE FOLLOWING POLICY MUST BE LAST\n')
-        n.write('all		all		REJECT		info\n')
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall/policy')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "reload", "shorewall"], check=False)
+    _nft_sync_client2client()
     return {'result': 'done'}
 
 class SerialEnforce(BaseModel):
@@ -5260,6 +5223,13 @@ class MPTCPServer(uvicorn.Server):
                 sockets = [sock]
         await super().serve(sockets=sockets)
 
+
+# Rebuild the dynamic nft chains (user_accept/user_dnat/gre_snat/
+# client2client/dscp_mark/ct_helpers) from persisted state at every process
+# startup -- mirrors add_gre_tunnels() above (nft itself has no persistence
+# of rule content across a ruleset reload/reboot, only omr-admin-config.json
+# does). Runs once per module import, i.e. once per uvicorn worker.
+_nft_resync_all()
 
 def main(omrport: int, omrhost: str, workers: int):
     LOG.debug("Main OMR-Admin launch")

@@ -27,6 +27,15 @@ On startup ("lifespan") the server:
 3. Starts the optional `omr_metrics` auto-learning loop (no-op unless enabled, see
    [omr-decision-engine.md](omr-decision-engine.md)).
 
+Additionally, importing `omradmin` — which happens once per uvicorn worker,
+before the `lifespan` startup step above runs — replays two pieces of state
+that have no persistence of their own: GRE tunnels are re-added from the
+`gre_tunnels` config, and the dynamic nftables chains (`user_accept`,
+`user_dnat`, `gre_snat`, `client2client`, `dscp_mark`, `ct_helpers`) are
+rebuilt from `omr-admin-config.json`. Neither GRE interfaces nor nft rule
+*contents* survive a reboot/ruleset-reload on their own, so this replay is
+what makes them do so.
+
 ## Authentication
 
 All endpoints except `/`, `/token`, `/login_basic`, `/clienthost` and `/mptcpsupport`
@@ -111,18 +120,33 @@ Configuration endpoints return a JSON object of the form:
 | POST | `/vxlan_user` | `VxlanUser` | Admin only: assign a specific user's VNI, mode or enabled state. Rejects a VNI already used by another user unless `force: true` is passed to deliberately merge them into the same L2 segment |
 | POST | `/vpnips` | `VPNips` | Set the user's VPN local/remote IPs (RFC1918 IPv4, optional IPv6/ULA) |
 
-Port changes automatically update the Shorewall rules and restart the matching
-systemd service when the on-disk configuration actually changed (MD5 comparison).
+Port changes update the matching VPN service's config file and restart the
+service when the on-disk file actually changed (MD5 comparison); the firewall
+rules needed to reach that port are handled separately by the nftables engine
+described below.
 
-### Firewall (Shorewall)
+### Firewall (nftables)
+
+Firewall enforcement is nftables-based (migrated from Shorewall). All state
+lives in `omr-admin-config.json` — per-user `fw_ports` entries plus global
+`bulk_redirect_v4`/`bulk_redirect_v6`/`client2client`/`sipalg` flags — and
+every change is re-rendered into the relevant dynamic chain of the `inet omr`
+table (`user_accept`, `user_dnat`, `gre_snat`, `client2client`, `dscp_mark`,
+`ct_helpers`) and applied as one atomic `nft -f -` transaction, so there's no
+MD5-diff-then-reload dance and no partial-apply window. The static base
+ruleset/chain declarations ship separately (`nftables` package plus the
+sibling `openmptcprouter-vps` repo's `nftables/omr.nft`); these endpoints
+only ever flush/repopulate chain *contents*. Endpoint paths keep their
+historical `/shorewall*` names for router/client compatibility even though
+Shorewall itself is no longer used.
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
-| POST | `/shorewall` | `ShorewallAllparams` | Enable/disable the "redirect all ports (1–64999) to the router" DNAT rules (`redirect_ports`: `enable`/`disable`, `ipproto`: `ipv4`/`ipv6`) |
-| POST | `/shorewalllist` | `ShorewallListparams` | List the OMR-managed rules for the current user |
+| POST | `/shorewall` | `ShorewallAllparams` | Enable/disable the "redirect all ports (1–64999) to the router" DNAT rules (`redirect_ports`: `enable`/`disable`, `ipproto`: `ipv4`/`ipv6`), stored as `bulk_redirect_v4`/`bulk_redirect_v6` |
+| POST | `/shorewalllist` | `ShorewallListparams` | List the OMR-managed rules for the current user, read back from `fw_ports` |
 | POST | `/shorewallopen` | `Shorewallparams` | Open/redirect a port (name, port, proto, fwtype `ACCEPT`/`DNAT`, optional source_dip/source_ip/comment) |
 | POST | `/shorewallclose` | `Shorewallparams` | Remove a previously added rule |
-| POST | `/sipalg` | `SipALGparams` | Enable/disable SIP ALG |
+| POST | `/sipalg` | `SipALGparams` | Enable/disable SIP ALG via an nft `ct helper` object for SIP plus a rule assigning it (`ct_helpers` chain), replacing Shorewall's AUTOHELPERS/DONT_LOAD toggle |
 
 ### Network settings
 
@@ -131,7 +155,7 @@ systemd service when the on-disk configuration actually changed (MD5 comparison)
 | POST | `/mptcp` | `MPTCPparams` | Server MPTCP settings: checksum, path manager, scheduler, syn retries, congestion control, and protocol-version specific knobs |
 | POST | `/mptcp_dscp` | `MPTCPDscpParams` | Sync the router's per-WAN DSCP pins (`pins: [{dscp, remote_id}]`) into bpf_dscp's `dscp_remote_id` map via `mptcp-scheduler-dscp.sh`; keyed by MPTCP remote endpoint id since every subflow shares one local IP on the VPS. Warns if `mptcp-dscp-manager` isn't installed |
 | POST | `/mptcp_weight` | `MPTCPWeightParams` | Sync the router's per-WAN weights (`weights: [{remote_id, weight}]`) into bpf_weight(_rr)'s `weight_remote_id` map via `mptcp-scheduler-weight.sh`, cleaning up remote ids dropped since the previous sync. Warns if `mptcp-weight-manager` isn't installed |
-| POST | `/dscp_classify` | `DscpClassifyParams` | Mirror the router's destination→DSCP classification (`entries: [{dscp, cidr}]`) into per-class/family ipsets plus an idempotent Shorewall mangle block, so the VPS's own outbound traffic to a proxied destination carries the same DSCP as the router→VPS leg. Warns if `ipset` isn't installed |
+| POST | `/dscp_classify` | `DscpClassifyParams` | Mirror the router's destination→DSCP classification (`entries: [{dscp, cidr}]`) into native per-class/family nft sets plus the `dscp_mark` chain's `ip[6] dscp set` rules, so the VPS's own outbound traffic to a proxied destination carries the same DSCP as the router→VPS leg. Warns if `nft` isn't installed |
 | POST | `/bypass` | `ByPass` | IPs to bypass (direct out via `intf` instead of the tunnel) |
 | POST | `/wan` | `Wanips` | Router WAN IPs (written to the Shadowsocks ACL white list) |
 | POST | `/lan` | `Lanips` | Current user LAN subnets (also updates OpenVPN iroutes when client2client is enabled) |

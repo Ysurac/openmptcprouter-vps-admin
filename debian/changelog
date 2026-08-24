@@ -1,3 +1,28 @@
+omr-vps-admin (0.18+20260824) unstable; urgency=medium
+
+  * Migrate firewall enforcement from Shorewall to nftables: dynamic chains (user_accept, user_dnat, gre_snat, client2client, dscp_mark, ct_helpers) of the "inet omr" table are rendered from pure functions of omr-admin-config.json and applied as atomic `nft -f -` transactions, replacing the previous file-edit + MD5-diff + service-reload dance
+  * Add POST /firewall, /firewalllist, /firewallopen, /firewallclose as the nftables-backed replacements for /shorewall, /shorewalllist, /shorewallopen, /shorewallclose; the /shorewall* paths are kept as deprecated aliases for router/client compatibility
+  * /dscp_classify now mirrors destination->DSCP classification into native per-class/family nft sets plus the dscp_mark chain instead of ipset + a Shorewall mangle block; warns if nft isn't installed instead of ipset
+  * /sipalg now toggles an nft ct helper object (sip_udp/sip_tcp) instead of Shorewall's AUTOHELPERS/DONT_LOAD config lines
+  * Persist bulk port-redirect state (formerly /shorewall) as bulk_redirect_v4/bulk_redirect_v6, and per-user opened/redirected ports as fw_ports, in omr-admin-config.json
+  * Rebuild every dynamic nft chain from persisted state at each process startup, since nft rule content does not survive a ruleset reload/reboot on its own (mirrors the existing GRE tunnel replay)
+  * Detect the WAN interface(s) from the default route via netifaces instead of parsing Shorewall's params.net, falling back to that file for boxes still mid-migration
+  * Add nftables to debian/control dependencies
+  * Retry the InfluxDB3 retention-policy push with exponential backoff, to absorb InfluxDB3 still starting up right after boot
+  * Add an auto-learning guard (min_available_mb, default 512) that skips a training round when free RAM is below threshold, re-checked every interval
+  * Offload synchronous metrics helpers (user/history reads, interface writes) to a thread pool so they no longer block the event loop
+  * Add unit tests for the new nftables engine (test/test_nft.py) and update test/test_dscp_sync.py for the nft-based /dscp_classify implementation
+  * Document the Shorewall->nftables migration and new /firewall* endpoints in docs/api.md
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 24 Aug 2026 00:00:00 +0200
+
+omr-vps-admin (0.18+20260820) unstable; urgency=medium
+
+  * Fix POST /mptcp raising a raw 422 instead of its own error contract when a v1-only field (close_timeout, pm_type, stale_loss_cnt, syn_retrans_before_tcp_fallback) is posted as an empty string by a router where the matching uci option was never set (issue #4350); blank now coerces to the field's documented default
+  * Add regression tests for the blank-field coercion (test/test_api.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 20 Aug 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260813) unstable; urgency=medium
 
   * Add POST /mptcp_dscp to sync the router's per-WAN DSCP pins into bpf_dscp's dscp_remote_id map, keyed by MPTCP remote endpoint id since every subflow shares one local IP on the VPS

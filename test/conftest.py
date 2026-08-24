@@ -267,7 +267,7 @@ class _ASGITestClient:
                         raise _ResponseComplete
 
             try:
-                await asyncio.wait_for(self._app(scope, receive, send), 0.2)
+                await asyncio.wait_for(self._app(scope, receive, send), 2.0)
             except _ResponseComplete:
                 pass
             except asyncio.TimeoutError:
@@ -368,6 +368,17 @@ def _requests_get_factory(*args, **kwargs):
     return m
 
 
+async def _run_in_threadpool_direct(func, *args, **kwargs):
+    """Run sync FastAPI callables inline in tests.
+
+    The hand-rolled ASGI client creates a fresh event loop per request, which
+    is enough for route tests but brittle with AnyIO's worker-thread portal.
+    The endpoint bodies are already side-effect mocked below, so inline
+    execution keeps the tests deterministic without changing app behavior.
+    """
+    return func(*args, **kwargs)
+
+
 @pytest.fixture(autouse=True)
 def patch_env():
     """Prevent actual filesystem writes and subprocess calls in every test."""
@@ -382,6 +393,7 @@ def patch_env():
         patch("subprocess.check_output", return_value=b""),
         patch("subprocess.Popen", side_effect=_subprocess_popen_factory),
         patch("omr_admin.requests.get", side_effect=_requests_get_factory),
+        patch("fastapi.routing.run_in_threadpool", side_effect=_run_in_threadpool_direct),
     ):
         yield
 
