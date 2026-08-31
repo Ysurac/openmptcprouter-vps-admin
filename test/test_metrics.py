@@ -817,6 +817,83 @@ class TestBackendSelection:
         mock_init.assert_called_once()
 
 
+class TestApplyRetention:
+    """InfluxBackend._apply_retention() talks to the InfluxDB 3 Core management
+    API directly, so exercise it against a bare instance (bypassing __init__,
+    which requires the influxdb_client_3 package) rather than a real client.
+    """
+
+    def _make_backend(self):
+        backend = object.__new__(omr_metrics.InfluxBackend)
+        backend._bucket = "omr_metrics"
+        backend._url = "http://127.0.0.1:65501"
+        backend._token = "tok"
+        backend._retention_days = 60
+        return backend
+
+    def test_success_on_create_logs_info_and_does_not_retry(self):
+        backend = self._make_backend()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        with (
+            patch("urllib.request.urlopen", return_value=resp) as mock_urlopen,
+            patch("omr_metrics.time.sleep") as mock_sleep,
+        ):
+            backend._apply_retention()
+        mock_urlopen.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    def test_409_conflict_is_treated_as_already_configured_no_retry(self):
+        # InfluxDB 3 Core has no endpoint to change retention_period on an
+        # existing database (only Enterprise supports that, via PATCH) -- a
+        # 409 here just means the installer already created the database,
+        # which is the normal case on every restart. Must not retry or warn.
+        import urllib.error
+        backend = self._make_backend()
+        exc = urllib.error.HTTPError("url", 409, "Conflict", {}, None)
+        with (
+            patch("urllib.request.urlopen", side_effect=exc) as mock_urlopen,
+            patch("omr_metrics.time.sleep") as mock_sleep,
+            patch.object(omr_metrics.LOG, "warning") as mock_warning,
+        ):
+            backend._apply_retention()
+        mock_urlopen.assert_called_once()
+        mock_sleep.assert_not_called()
+        mock_warning.assert_not_called()
+
+    def test_transient_failure_retries_with_backoff_then_warns(self):
+        import urllib.error
+        backend = self._make_backend()
+        exc = urllib.error.URLError("connection refused")
+        with (
+            patch("urllib.request.urlopen", side_effect=exc) as mock_urlopen,
+            patch("omr_metrics.time.sleep") as mock_sleep,
+            patch.object(omr_metrics.LOG, "warning") as mock_warning,
+        ):
+            backend._apply_retention()
+        assert mock_urlopen.call_count == backend._RETENTION_MAX_ATTEMPTS
+        assert mock_sleep.call_count == backend._RETENTION_MAX_ATTEMPTS - 1
+        mock_warning.assert_called_once()
+
+    def test_success_after_transient_failure_stops_retrying(self):
+        import urllib.error
+        backend = self._make_backend()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        with (
+            patch("urllib.request.urlopen",
+                  side_effect=[urllib.error.URLError("not ready"), resp]) as mock_urlopen,
+            patch("omr_metrics.time.sleep") as mock_sleep,
+        ):
+            backend._apply_retention()
+        assert mock_urlopen.call_count == 2
+        mock_sleep.assert_called_once()
+
+
 # ===========================================================================
 # Feature extraction (pure Python — no torch required)
 # ===========================================================================

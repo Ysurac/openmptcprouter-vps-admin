@@ -1,3 +1,13 @@
+omr-vps-admin (0.18+20260831) unstable; urgency=medium
+
+  * Fix POST /mptcp scheduler set failing with ENOENT when the router sends a BPF scheduler's .o filename stem (e.g. mptcp_bpf_red) instead of the name the kernel registers it under (e.g. bpf_red); normalize_mptcp_scheduler() now maps filename stems from /usr/share/bpf/scheduler to their struct_ops name before it reaches sysctl
+  * load_mptcp_bpf_schedulers() applies the same normalization when re-applying the scheduler after a BPF load, and persists the corrected value back into /etc/sysctl.d/90-shadowsocks.conf so a stale prefixed entry self-heals instead of failing forever
+  * Add GET /vpn_list and /proxy_list, returning the VPN/Proxy types actually installed on this VPS (mirroring the same "is it installed" file checks each /<vpn> and /<proxy> POST endpoint already guards on)
+  * Fix omr_metrics InfluxDB3 retention sync issuing a PATCH after a 409 Conflict: InfluxDB 3 Core has no endpoint to change retention_period on an existing database (Enterprise-only), so PATCH always 404s there; a 409 now just means the installer already created the database and is treated as done, with backoff retries reserved for actual transient failures
+  * Add unit tests for the scheduler normalization (test/test_api.py) and the revised retention-sync behavior (test/test_metrics.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 31 Aug 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260824) unstable; urgency=medium
 
   * Migrate firewall enforcement from Shorewall to nftables: dynamic chains (user_accept, user_dnat, gre_snat, client2client, dscp_mark, ct_helpers) of the "inet omr" table are rendered from pure functions of omr-admin-config.json and applied as atomic `nft -f -` transactions, replacing the previous file-edit + MD5-diff + service-reload dance

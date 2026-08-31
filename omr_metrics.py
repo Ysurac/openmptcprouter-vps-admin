@@ -420,11 +420,16 @@ class InfluxBackend:
     def _apply_retention(self):
         """Push the configured retention period to the InfluxDB 3 management API.
 
-        Tries POST (create) first; on 409 Conflict (database already exists)
-        falls back to PATCH (update).  Retries with backoff on failure since
-        InfluxDB3 may still be starting up; logs a warning and gives up after
-        the last attempt, leaving the DB-level retention set by the installer
-        as the hard floor.
+        Only POST (create) is attempted. InfluxDB 3 Core (unlike Enterprise)
+        has no endpoint to change retention_period on an existing database —
+        it can only be set at creation time and a PATCH/PUT there 404s. So a
+        409 Conflict here just means the database already exists (the normal
+        case on every restart after the first successful boot, since the
+        installer already created it with --retention-period): that's not an
+        error, retention is already what the installer set, and there is
+        nothing more this call can do about it. Retries with backoff are
+        reserved for actual transient failures (InfluxDB3 still starting up,
+        connection errors, ...).
         """
         body = json.dumps({
             "db": self._bucket,
@@ -436,8 +441,8 @@ class InfluxBackend:
             "Content-Type": "application/json",
         }
 
-        def _do_request(method: str):
-            req = urllib.request.Request(base_url, data=body, method=method)
+        def _do_request():
+            req = urllib.request.Request(base_url, data=body, method="POST")
             for k, v in headers.items():
                 req.add_header(k, v)
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -446,24 +451,26 @@ class InfluxBackend:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self._RETENTION_MAX_ATTEMPTS + 1):
             try:
-                try:
-                    status = _do_request("POST")
-                except urllib.error.HTTPError as exc:
-                    if exc.code != 409:
-                        raise
-                    status = _do_request("PATCH")
+                status = _do_request()
                 LOG.info("omr_metrics: InfluxDB retention set to %d days (HTTP %s)",
                          self._retention_days, status)
                 return
+            except urllib.error.HTTPError as exc:
+                if exc.code == 409:
+                    LOG.info("omr_metrics: InfluxDB database %s already exists; "
+                             "retention stays at whatever the installer set "
+                             "(Core cannot change it afterwards)", self._bucket)
+                    return
+                last_exc = exc
             except Exception as exc:
                 last_exc = exc
-                if attempt < self._RETENTION_MAX_ATTEMPTS:
-                    delay = min(self._RETENTION_BACKOFF_BASE * (2 ** (attempt - 1)),
-                                self._RETENTION_BACKOFF_CAP)
-                    LOG.debug("omr_metrics: InfluxDB retention attempt %d/%d failed (%s), "
-                              "retrying in %ds", attempt, self._RETENTION_MAX_ATTEMPTS,
-                              exc, delay)
-                    time.sleep(delay)
+            if attempt < self._RETENTION_MAX_ATTEMPTS:
+                delay = min(self._RETENTION_BACKOFF_BASE * (2 ** (attempt - 1)),
+                            self._RETENTION_BACKOFF_CAP)
+                LOG.debug("omr_metrics: InfluxDB retention attempt %d/%d failed (%s), "
+                          "retrying in %ds", attempt, self._RETENTION_MAX_ATTEMPTS,
+                          last_exc, delay)
+                time.sleep(delay)
 
         LOG.warning("omr_metrics: could not apply InfluxDB retention policy after %d attempts: %s",
                     self._RETENTION_MAX_ATTEMPTS, last_exc)

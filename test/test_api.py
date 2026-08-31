@@ -647,6 +647,43 @@ class TestMPTCPV0Scheduler:
         assert "net.mptcp.scheduler=bpf_red" not in flat or "mptcp_scheduler" in flat
 
 
+class TestMPTCPSchedulerNormalization:
+    """POST /mptcp must normalize a BPF .o filename stem (e.g. what the
+    router might send if it lists /usr/share/bpf/scheduler verbatim) to the
+    registered struct_ops name before ever handing it to sysctl."""
+
+    _PAYLOAD = {
+        "checksum": "0",
+        "path_manager": "default",
+        "scheduler": "mptcp_bpf_red",
+        "syn_retries": 3,
+        "congestion_control": "bbr",
+        "version": 0,
+    }
+
+    def _v0_exists(self, p):
+        return str(p) == "/proc/sys/net/mptcp/mptcp_enabled"
+
+    def test_normalizes_prefixed_scheduler_before_sysctl(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v0_exists),
+            patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "done"
+        flat = [" ".join(c) for c in sysctl_calls]
+        assert any("net.mptcp.mptcp_scheduler=bpf_red" in c for c in flat)
+        assert not any("mptcp_bpf_red" in c for c in flat)
+
+
 class TestMPTCPV1Scheduler:
     """v1 (upstream) kernel: net.mptcp.scheduler sysctl path and new sysctls."""
 
@@ -851,6 +888,80 @@ class TestLoadMptcpBpfSchedulers:
     def test_no_op_when_bpf_dir_missing(self):
         with patch("os.path.isdir", return_value=False):
             omr_admin.load_mptcp_bpf_schedulers()
+
+    def test_normalizes_stale_prefixed_scheduler_and_persists_fix(self):
+        # A conf file written before the naming was well understood (or by a
+        # UI listing .o filenames directly) can end up with the BPF object's
+        # filename stem instead of its registered struct_ops name -- that
+        # must self-heal here rather than fail sysctl forever.
+        sysctl_calls = []
+        written = {}
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0, stderr="")
+
+        class _CapturingFile(io.StringIO):
+            def close(self):
+                written["content"] = self.getvalue()
+                super().close()
+
+        stale_conf = "net.mptcp.scheduler=mptcp_bpf_red\nnet.ipv4.tcp_congestion_control=bbr\n"
+
+        def _open_conf(p, mode="r", *a, **kw):
+            if str(p) == "/etc/sysctl.d/90-shadowsocks.conf":
+                return io.StringIO(stale_conf)
+            if "w" in mode:
+                return _CapturingFile()
+            return _mock_open(p, mode, *a, **kw)
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.path.exists", return_value=True),
+            patch("os.makedirs"),
+            patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
+            patch("subprocess.run", side_effect=_run),
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_conf),
+            patch("omr_admin.move") as mock_move,
+        ):
+            omr_admin.load_mptcp_bpf_schedulers()
+
+        # bpftool's own register call legitimately references the .o file by
+        # its 'mptcp_bpf_red' path -- only the sysctl invocations matter here.
+        sysctl_only = [" ".join(c) for c in sysctl_calls if c and c[0] == "sysctl"]
+        assert any("net.mptcp.scheduler=bpf_red" in c for c in sysctl_only)
+        assert not any("mptcp_bpf_red" in c for c in sysctl_only)
+        mock_move.assert_called_once()
+        assert "net.mptcp.scheduler=bpf_red" in written.get("content", "")
+        assert "mptcp_bpf_red" not in written.get("content", "")
+
+
+class TestNormalizeMptcpScheduler:
+    """normalize_mptcp_scheduler() must map a BPF .o filename stem to the
+    struct_ops name the kernel registers it under, and leave everything
+    else (non-BPF names, already-correct BPF names, blanks) untouched."""
+
+    def test_maps_bpf_filename_stem_to_registered_name(self):
+        with patch("os.listdir", return_value=["mptcp_bpf_red.o"]):
+            assert omr_admin.normalize_mptcp_scheduler("mptcp_bpf_red") == "bpf_red"
+
+    def test_leaves_already_correct_bpf_name_unchanged(self):
+        with patch("os.listdir", return_value=["mptcp_bpf_red.o"]):
+            assert omr_admin.normalize_mptcp_scheduler("bpf_red") == "bpf_red"
+
+    def test_leaves_non_bpf_scheduler_names_unchanged(self):
+        with patch("os.listdir", return_value=["mptcp_bpf_red.o"]):
+            assert omr_admin.normalize_mptcp_scheduler("bbr") == "bbr"
+            assert omr_admin.normalize_mptcp_scheduler("default") == "default"
+
+    def test_no_op_when_bpf_dir_missing(self):
+        with patch("os.listdir", side_effect=FileNotFoundError):
+            assert omr_admin.normalize_mptcp_scheduler("mptcp_bpf_red") == "mptcp_bpf_red"
+
+    def test_blank_scheduler_passes_through(self):
+        assert omr_admin.normalize_mptcp_scheduler("") == ""
+        assert omr_admin.normalize_mptcp_scheduler(None) is None
 
 
 class TestMPTCPV1ConfigRead:

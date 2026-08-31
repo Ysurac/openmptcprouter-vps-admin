@@ -1879,6 +1879,52 @@ basic_auth = BasicAuth(auto_error=False)
 
 oauth2_scheme = OAuth2PasswordBearerCookie(tokenUrl="/token")
 
+_MPTCP_BPF_SCHED_PREFIX = 'mptcp_'
+
+def _available_mptcp_bpf_schedulers(bpf_dir='/usr/share/bpf/scheduler'):
+    """Map each BPF scheduler .o file's basename to the scheduler name the
+    kernel actually registers it under.
+
+    The .o files in bpf_dir are named 'mptcp_<name>.o' (e.g. 'mptcp_bpf_red.o')
+    so they're recognizable at a glance in that directory, but the
+    struct_ops '.name' field baked into the compiled object -- the name
+    'net.mptcp.scheduler' actually looks up -- is just '<name>' (e.g.
+    'bpf_red'), without the 'mptcp_' prefix. Returns {filename-stem:
+    canonical-name}, e.g. {'mptcp_bpf_red': 'bpf_red'}.
+    """
+    available = {}
+    try:
+        fnames = os.listdir(bpf_dir)
+    except OSError:
+        return available
+    for fname in fnames:
+        if not fname.endswith('.o'):
+            continue
+        stem = fname[:-2]
+        canonical = stem[len(_MPTCP_BPF_SCHED_PREFIX):] if stem.startswith(_MPTCP_BPF_SCHED_PREFIX) else stem
+        available[stem] = canonical
+    return available
+
+
+def normalize_mptcp_scheduler(scheduler, bpf_dir='/usr/share/bpf/scheduler'):
+    """Correct a scheduler name given as a BPF .o filename stem (e.g.
+    'mptcp_bpf_red', as a naive file listing would show it) to the name the
+    kernel actually registers it under (e.g. 'bpf_red'), so a stale or
+    mistaken 'mptcp_'-prefixed value self-heals instead of permanently
+    failing 'sysctl -w net.mptcp.scheduler=...' with ENOENT. Non-BPF
+    scheduler names (bbr, default, ...) and already-correct BPF scheduler
+    names pass through unchanged.
+    """
+    if not scheduler:
+        return scheduler
+    canonical = _available_mptcp_bpf_schedulers(bpf_dir).get(scheduler)
+    if canonical and canonical != scheduler:
+        LOG.warning("Normalizing MPTCP scheduler '%s' to '%s' (BPF object filename vs. "
+                    "registered struct_ops name)", scheduler, canonical)
+        return canonical
+    return scheduler
+
+
 def load_mptcp_bpf_schedulers():
     bpf_dir = '/usr/share/bpf/scheduler'
     bpf_pin_dir = '/sys/fs/bpf/mptcp'
@@ -1911,22 +1957,47 @@ def load_mptcp_bpf_schedulers():
         sysctl_conf = '/etc/sysctl.d/90-shadowsocks.conf'
         if os.path.isfile(sysctl_conf):
             with open(sysctl_conf, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('net.mptcp.mptcp_scheduler=') or line.startswith('net.mptcp.scheduler='):
-                        proc_path = '/proc/sys/' + line.split('=')[0].replace('.', '/')
-                        if os.path.exists(proc_path):
-                            # Retry briefly: the BPF struct_ops may not be visible to the
-                            # MPTCP scheduler lookup immediately after bpftool register.
-                            for attempt in range(5):
-                                result = subprocess.run(['sysctl', '-qw', line], check=False, capture_output=True, text=True)
-                                if result.returncode == 0:
-                                    LOG.info('Re-applied scheduler after BPF load: ' + line)
-                                    break
-                                time.sleep(0.1 * (2 ** attempt))
-                            else:
-                                LOG.warning('Failed to re-apply scheduler after BPF load: ' + line + ' — ' + result.stderr.strip())
-                        break
+                conf_lines = f.readlines()
+            for line in conf_lines:
+                line = line.strip()
+                if line.startswith('net.mptcp.mptcp_scheduler=') or line.startswith('net.mptcp.scheduler='):
+                    key, _, value = line.partition('=')
+                    normalized = normalize_mptcp_scheduler(value, bpf_dir)
+                    line = key + '=' + normalized
+                    proc_path = '/proc/sys/' + key.replace('.', '/')
+                    if os.path.exists(proc_path):
+                        # Retry briefly: the BPF struct_ops may not be visible to the
+                        # MPTCP scheduler lookup immediately after bpftool register.
+                        for attempt in range(5):
+                            result = subprocess.run(['sysctl', '-qw', line], check=False, capture_output=True, text=True)
+                            if result.returncode == 0:
+                                LOG.info('Re-applied scheduler after BPF load: ' + line)
+                                if normalized != value:
+                                    _rewrite_sysctl_conf_line(sysctl_conf, key, normalized)
+                                break
+                            time.sleep(0.1 * (2 ** attempt))
+                        else:
+                            LOG.warning('Failed to re-apply scheduler after BPF load: ' + line + ' — ' + result.stderr.strip())
+                    break
+
+
+def _rewrite_sysctl_conf_line(sysctl_conf, key, value):
+    """Persist a corrected 'key=value' line into sysctl_conf so future
+    restarts don't need to re-normalize it."""
+    try:
+        with open(sysctl_conf, 'r') as f:
+            lines = f.readlines()
+        fd, tmpfile = mkstemp()
+        with open(tmpfile, 'w') as n:
+            for line in lines:
+                if line.strip().startswith(key + '='):
+                    n.write(key + '=' + value + "\n")
+                else:
+                    n.write(line)
+        os.close(fd)
+        move(tmpfile, sysctl_conf)
+    except Exception as e:
+        LOG.warning('Failed to persist normalized scheduler into ' + sysctl_conf + ': ' + str(e))
 
 
 @contextlib.asynccontextmanager
@@ -3662,7 +3733,10 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'mptcp'}
     checksum = params.checksum
     path_manager = params.path_manager
-    scheduler = params.scheduler
+    # The router may send a BPF scheduler's .o filename stem (e.g.
+    # 'mptcp_bpf_red') instead of the name the kernel actually registers it
+    # under (e.g. 'bpf_red') -- normalize so sysctl doesn't fail with ENOENT.
+    scheduler = normalize_mptcp_scheduler(params.scheduler)
     syn_retries = params.syn_retries
     congestion_control = params.congestion_control
     version = params.version
@@ -3901,6 +3975,33 @@ class VPN(str, Enum):
 class Vpn(BaseModel):
     vpn: VPN
 
+def _installed_vpn_types():
+    """Return the VPN enum values whose backing service is actually installed on this VPS.
+
+    Mirrors the same "is it installed" file checks each /<vpn> POST endpoint
+    already guards on, so this stays in sync with what setting that VPN would
+    actually do.
+    """
+    installed = []
+    if os.path.isfile('/etc/glorytun-tcp/tun0'):
+        installed.append(VPN.glorytuntcp.value)
+    if os.path.isfile('/etc/glorytun-udp/tun0'):
+        installed.append(VPN.glorytunudp.value)
+    if os.path.isfile('/etc/openvpn/tun0.conf'):
+        installed.append(VPN.openvpn.value)
+    if os.path.isfile('/etc/openvpn/bonding1.conf'):
+        installed.append(VPN.openvpnbonding.value)
+    if os.path.isfile('/etc/dsvpn/dsvpn'):
+        installed.append(VPN.dsvpn.value)
+    if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
+        installed.append(VPN.mlvpn.value)
+    if os.path.isfile('/etc/mqvpn/server.json'):
+        installed.append(VPN.mqvpn.value)
+    if os.path.isfile('/var/lib/softether/vpn_server.config'):
+        installed.append(VPN.softether.value)
+    installed.append(VPN.none.value)
+    return installed
+
 # Set global VPN config
 @app.post('/vpn', summary="Set current VPN used by the current user")
 def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
@@ -3917,6 +4018,10 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
     current_user.vpn = vpn
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
+
+@app.get('/vpn_list', summary="List VPN types installed and available on this server")
+def vpn_list(current_user: User = Depends(get_current_user)):
+    return {'result': 'done', 'vpn': _installed_vpn_types()}
 
 class Vxlan(BaseModel):
     enable: bool = True
@@ -4054,6 +4159,28 @@ class PROXY(str, Enum):
 class Proxy(BaseModel):
     proxy: PROXY
 
+def _installed_proxy_types():
+    """Return the PROXY enum values whose backing service is actually installed on this VPS.
+
+    Mirrors the same "is it installed" file checks each /<proxy> POST endpoint
+    already guards on, so this stays in sync with what setting that proxy would
+    actually do.
+    """
+    installed = []
+    if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+        installed.append(PROXY.shadowsockslibev.value)
+    if os.path.isfile('/etc/shadowsocks-go/server.json'):
+        installed.append(PROXY.shadowsocksgo.value)
+        installed.append(PROXY.shadowsocksrust.value)
+    if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        installed += [PROXY.v2ray.value, PROXY.v2rayvless.value, PROXY.v2rayvmess.value,
+                      PROXY.v2raysocks.value, PROXY.v2raytrojan.value]
+    if os.path.isfile('/etc/xray/xray-server.json'):
+        installed += [PROXY.xray.value, PROXY.xrayvless.value, PROXY.xrayvmess.value,
+                      PROXY.xraysocks.value, PROXY.xraytrojan.value, PROXY.xrayshadowsocks.value]
+    installed.append(PROXY.none.value)
+    return installed
+
 # Set global Proxy config
 @app.post('/proxy', summary="Set Proxy used by the current user")
 def proxy(*, proxyconfig: Proxy, current_user: User = Depends(get_current_user)):
@@ -4070,6 +4197,10 @@ def proxy(*, proxyconfig: Proxy, current_user: User = Depends(get_current_user))
     #current_user.proxy = proxy
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
+
+@app.get('/proxy_list', summary="List Proxy types installed and available on this server")
+def proxy_list(current_user: User = Depends(get_current_user)):
+    return {'result': 'done', 'proxy': _installed_proxy_types()}
 
 
 class GlorytunConfig(BaseModel):
