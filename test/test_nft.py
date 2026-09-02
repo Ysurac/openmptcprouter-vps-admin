@@ -23,7 +23,7 @@ rule text for each state shape.
 
 import io
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from conftest import omr_admin  # noqa: F401  (fixture import side effect)
 
@@ -370,6 +370,46 @@ class TestRenderCtHelpers:
         lines = omr_admin._render_ct_helpers(True)
         assert any('udp dport 5060 ct helper set "sip_udp"' in l for l in lines)
         assert any('tcp dport 5060 ct helper set "sip_tcp"' in l for l in lines)
+
+
+class TestSyncSipAlg:
+    def test_disable_only_flushes_the_chain(self):
+        # Disable must not modprobe or `add ct helper`: on the shipped
+        # default (nf_conntrack_sip blacklisted, SIP ALG off) those can only
+        # fail, and the router re-POSTs /sipalg every sync cycle -- the
+        # recurring journal errors of openmptcprouter#4361.
+        with patch("subprocess.run") as run:
+            run.return_value.returncode = 0
+            assert omr_admin._nft_sync_sipalg(False) is True
+        assert run.call_count == 1
+        assert _applied_script(run).strip() == "flush chain inet omr ct_helpers"
+
+    def test_enable_modprobes_then_creates_helpers_and_rules(self):
+        with patch("subprocess.run") as run:
+            run.return_value.returncode = 0
+            assert omr_admin._nft_sync_sipalg(True) is True
+        calls = run.call_args_list
+        # a modprobe blacklist only blocks alias autoloading, so the module
+        # must be loaded explicitly before the helper objects are created
+        assert calls[0].args[0] == ["modprobe", "nf_conntrack_sip"]
+        helper_script = calls[1].kwargs["input"].decode()
+        assert 'add ct helper inet omr sip_udp { type "sip" protocol udp; }' in helper_script
+        assert 'add ct helper inet omr sip_tcp { type "sip" protocol tcp; }' in helper_script
+        chain_script = calls[2].kwargs["input"].decode()
+        assert chain_script.splitlines()[0] == "flush chain inet omr ct_helpers"
+        assert 'ct helper set "sip_udp"' in chain_script
+        assert 'ct helper set "sip_tcp"' in chain_script
+
+    def test_enable_returns_false_when_nft_rejects_the_rules(self):
+        # e.g. the module really is unavailable: the helper objects were
+        # never created, so the rule batch referencing them fails
+        def _run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 1 if cmd[0] == omr_admin.NFT_BIN else 0
+            result.stderr = b"Error: Could not process rule: No such file or directory"
+            return result
+        with patch("subprocess.run", side_effect=_run):
+            assert omr_admin._nft_sync_sipalg(True) is False
 
 
 # ===========================================================================

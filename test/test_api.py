@@ -423,6 +423,14 @@ class TestSipAlg:
         r = user_client.post("/sipalg", json={"enable": False})
         assert r.json()["result"] == "done"
 
+    def test_enable_reports_error_when_helpers_cannot_apply(self, user_client):
+        # nf_conntrack_sip unavailable -> nft rejects the helper rules -> the
+        # endpoint must not answer 'done' for a firewall state it did not
+        # reach (openmptcprouter#4361 saw 200 OK with nothing applied)
+        with patch("omr_admin._nft_sync_sipalg", return_value=False):
+            r = user_client.post("/sipalg", json={"enable": True})
+        assert r.json()["result"] == "error"
+
 
 # ===========================================================================
 # V2Ray

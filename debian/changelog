@@ -1,3 +1,14 @@
+omr-vps-admin (0.18+20260902) unstable; urgency=medium
+
+  * Fix recurring "Could not process rule: No such file or directory" journal errors from the SIP ALG nftables sync (issue #4361): the installer blacklists nf_conntrack_sip, and a blacklist also stops the kernel's alias autoload when the ct helper object is created, so _nft_ensure_ct_helpers() now modprobes the module explicitly (which ignores blacklists) before adding the sip_udp/sip_tcp helper objects
+  * Disabling SIP ALG now only flushes the ct_helpers chain instead of first re-creating the helper objects, which could only fail on the shipped default (module blacklisted, SIP ALG off) and was re-triggered by the router re-POSTing /sipalg on every sync cycle
+  * Default sipalg to off in the startup resync, matching the router's own default (uci openmptcprouter.settings.sipalg unset) and the blacklisted module, so a fresh install no longer logs ct-helper failures at boot
+  * POST /sipalg now returns an error instead of 'done' when the conntrack helpers could not be applied (previously answered 200 OK with nothing applied)
+  * Log a warning when the MQVPN control API rejects an add_user/remove_user call instead of silently discarding the result
+  * Add unit tests for the /sipalg error contract (test/test_api.py) and the sipalg sync behavior on enable/disable/failure (test/test_nft.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 02 Sep 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260831) unstable; urgency=medium
 
   * Fix POST /mptcp scheduler set failing with ENOENT when the router sends a BPF scheduler's .o filename stem (e.g. mptcp_bpf_red) instead of the name the kernel registers it under (e.g. bpf_red); normalize_mptcp_scheduler() now maps filename stems from /usr/share/bpf/scheduler to their struct_ops name before it reaches sysctl

@@ -1218,7 +1218,13 @@ def add_mqvpn(username, fixed_ip=None):
         users = mqvpn_config.get('users', [])
         if not any(u.get('name') == username for u in users):
             mqvpn_user_key = secrets.token_urlsafe(32)
-            mqvpn_api({'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key})
+            api_result = mqvpn_api({'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key})
+            if not api_result.get('ok'):
+                # the user is still persisted below, but the running daemon
+                # will reject this client until it learns the key via the
+                # control API (check control_listen in /etc/mqvpn/server.json)
+                LOG.warning("MQVPN control API add_user failed for %s: %s",
+                            username, api_result.get('error', api_result))
             entry = {'name': username, 'key': mqvpn_user_key}
             if fixed_ip:
                 entry['fixed_ip'] = fixed_ip
@@ -1230,7 +1236,10 @@ def add_mqvpn(username, fixed_ip=None):
         LOG.debug("MQVPN add user json error (" + str(e) + ")")
 
 def remove_mqvpn(username):
-    mqvpn_api({'cmd': 'remove_user', 'name': username})
+    api_result = mqvpn_api({'cmd': 'remove_user', 'name': username})
+    if not api_result.get('ok'):
+        LOG.warning("MQVPN control API remove_user failed for %s: %s",
+                    username, api_result.get('error', api_result))
     try:
         with open('/etc/mqvpn/server.json') as f:
             mqvpn_config = json.load(f)
@@ -1676,6 +1685,12 @@ def _nft_resync_dscp_classify():
 # this is the part of the migration flagged in the plan as needing live
 # validation against this VPS's actual kernel rather than assumed correct.
 def _nft_ensure_ct_helpers():
+    # The installer blacklists nf_conntrack_sip (SIP ALG off by default), and
+    # a blacklist entry also stops the kernel's alias autoload when the ct
+    # helper object is created -- so the `add ct helper` lines fail with
+    # ENOENT unless the module is loaded explicitly first (an explicit
+    # modprobe ignores blacklists). See openmptcprouter#4361.
+    subprocess.run(['modprobe', 'nf_conntrack_sip'], capture_output=True, check=False)
     script = (f'add ct helper {NFT_FAMILY} {NFT_TABLE} sip_udp {{ type "sip" protocol udp; }}\n'
               f'add ct helper {NFT_FAMILY} {NFT_TABLE} sip_tcp {{ type "sip" protocol tcp; }}\n')
     return _nft_run(script)
@@ -1687,8 +1702,17 @@ def _render_ct_helpers(enabled):
             'tcp dport 5060 ct helper set "sip_tcp" comment "OMR sipalg"']
 
 def _nft_sync_sipalg(enabled):
+    if not enabled:
+        # Don't touch the helper objects on disable: with the module absent
+        # (the shipped default) _nft_ensure_ct_helpers() can only fail, and
+        # the router re-POSTs /sipalg on every sync cycle -- that was the
+        # recurring "Could not process rule" journal spam of issue 4361.
+        return _nft_flush_chain('ct_helpers', [])
+    # A re-add of an already-existing helper object may EEXIST-fail depending
+    # on kernel; ignore it -- the flush below referencing the helpers by name
+    # is the real success signal either way.
     _nft_ensure_ct_helpers()
-    return _nft_flush_chain('ct_helpers', _render_ct_helpers(enabled))
+    return _nft_flush_chain('ct_helpers', _render_ct_helpers(True))
 
 def _nft_resync_all():
     """Rebuild every dynamic chain (plus OpenVPN's client-to-client
@@ -1705,7 +1729,11 @@ def _nft_resync_all():
     _nft_resync_dscp_classify()
     config_data = read_omr_config()
     _sync_openvpn_client2client(bool(config_data.get('client2client', False)) if config_data else False)
-    _nft_sync_sipalg(bool(config_data.get('sipalg', True)) if config_data else True)
+    # sipalg defaults to *off*: the router's own default is off (uci
+    # openmptcprouter.settings.sipalg unset) and the installer blacklists
+    # nf_conntrack_sip, so defaulting to on just made every fresh install
+    # log ct-helper failures at startup (issue 4361).
+    _nft_sync_sipalg(bool(config_data.get('sipalg', False)) if config_data else False)
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
     _fw_port_add(user.username, str(port), proto, name, fwtype, 4, source_dip, dest_ip, vpn, gencomment)
@@ -3424,7 +3452,8 @@ def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_use
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'sipalg'}
     enable = params.enable
     set_global_param('sipalg', enable)
-    _nft_sync_sipalg(enable)
+    if not _nft_sync_sipalg(enable):
+        return {'result': 'error', 'reason': 'SIP conntrack helpers not applied (nf_conntrack_sip kernel module unavailable?)', 'route': 'sipalg'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'sipalg'}
 
 class V2rayconfig(BaseModel):
