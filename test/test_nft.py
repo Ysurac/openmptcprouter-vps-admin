@@ -160,6 +160,51 @@ class TestFwPortState:
         ports = modif.call_args.args[1]["fw_ports"]
         assert [p["port"] for p in ports] == ["80", "443"]
 
+    def test_add_ignores_unsupported_fwtype(self):
+        # Routers push fwtype "REDIRECT" for a traffic rule saved without a
+        # target; the Shorewall implementation wrote nothing for it and so
+        # must we -- no config rewrite, no chain resync.
+        config = _config({"openmptcprouter": {"fw_ports": []}})
+        with (
+            patch("builtins.open", side_effect=_open_config(config)),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("omr_admin._nft_sync_ports") as sync,
+        ):
+            omr_admin._fw_port_add("openmptcprouter", "21", "tcp", "router 21", "REDIRECT", 4, "", "", "default", "")
+        assert not modif.called
+        assert not sync.called
+
+    def test_add_prunes_legacy_unsupported_entries(self):
+        config = _config({
+            "openmptcprouter": {"fw_ports": [
+                {"name": "router 21", "port": "21", "proto": "tcp", "fwtype": "REDIRECT", "family": 4,
+                 "source_dip": "", "dest_ip": "", "vpn": "default", "comment": ""},
+                {"name": "router 21", "port": "21", "proto": "tcp", "fwtype": "DNAT", "family": 4,
+                 "source_dip": "", "dest_ip": "", "vpn": "default", "comment": ""},
+            ]},
+        })
+        with (
+            patch("builtins.open", side_effect=_open_config(config)),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("omr_admin._nft_sync_ports"),
+        ):
+            omr_admin._fw_port_add("openmptcprouter", "443", "tcp", "router 443", "DNAT", 4, "", "", "default", "")
+        ports = modif.call_args.args[1]["fw_ports"]
+        assert [(p["port"], p["fwtype"]) for p in ports] == [("21", "DNAT"), ("443", "DNAT")]
+
+    def test_add_identical_entry_is_a_noop(self):
+        existing = {"name": "router 21", "port": "21", "proto": "tcp", "fwtype": "DNAT", "family": 4,
+                    "source_dip": "", "dest_ip": "", "vpn": "default", "comment": ""}
+        config = _config({"openmptcprouter": {"fw_ports": [existing]}})
+        with (
+            patch("builtins.open", side_effect=_open_config(config)),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("omr_admin._nft_sync_ports") as sync,
+        ):
+            omr_admin._fw_port_add("openmptcprouter", "21", "tcp", "router 21", "DNAT", 4, "", "", "default", "")
+        assert not modif.called
+        assert not sync.called
+
     def test_add_replaces_only_the_same_port(self):
         config = _config({
             "openmptcprouter": {"fw_ports": [
@@ -206,18 +251,77 @@ class TestFwPortState:
 
 
 class TestShorewallListRendering:
-    def test_includes_protocol_and_port(self):
+    """/shorewalllist (and /firewalllist) must keep returning the Shorewall-era
+    rules-file line layout: the router's openmptcprouter-vps init script
+    greps "<port>\t# OMR <user> redirect router <port> port <proto>" to know a
+    port is already handled and awk-splits the columns to decide what to
+    close. A free-form summary line made it re-open every port on every pass
+    and never close removed ones."""
+
+    @staticmethod
+    def _list(config, name, ipproto="ipv4"):
+        params = omr_admin.ShorewallListparams(name=name, ipproto=ipproto)
+        user = omr_admin.User(username="openmptcprouter", userid=0)
+        with patch("omr_admin.read_omr_config", return_value=config):
+            return omr_admin.shorewall_list(params=params, current_user=user)["list"]
+
+    def test_accept_line_uses_legacy_shorewall_layout(self):
         config = _config({
             "openmptcprouter": {"fw_ports": [
                 {"name": "http", "port": "80", "proto": "tcp", "fwtype": "ACCEPT", "family": 4,
                  "comment": " --- web"},
             ]},
         })
-        params = omr_admin.ShorewallListparams(name="open", ipproto="ipv4")
-        user = omr_admin.User(username="openmptcprouter", userid=0)
-        with patch("omr_admin.read_omr_config", return_value=config):
-            result = omr_admin.shorewall_list(params=params, current_user=user)
-        assert result["list"] == ["# OMR openmptcprouter open http port tcp 80 --- web\n"]
+        assert self._list(config, "open") == [
+            "ACCEPT\t\tnet\t\t$FW\t\ttcp\t80\t# OMR openmptcprouter open http port tcp --- web\n"
+        ]
+
+    def test_dnat_line_matches_router_side_grep(self):
+        config = _config({
+            "openmptcprouter": {"fw_ports": [
+                {"name": "router 21", "port": "21", "proto": "tcp", "fwtype": "DNAT", "family": 4,
+                 "source_dip": "", "dest_ip": "", "vpn": "default", "comment": ""},
+            ]},
+        })
+        lines = self._list(config, "redirect router")
+        assert lines == ["DNAT\t\tnet\t\tvpn:$OMR_ADDR\ttcp\t21\t# OMR openmptcprouter redirect router 21 port tcp\n"]
+        # exact substring _vps_firewall_redirect_port greps for
+        assert "21\t# OMR openmptcprouter redirect router 21 port tcp" in lines[0]
+        # awk columns _vps_firewall_close_port reads: $1 type, $4 proto, $5 port, $6 "#" (no ORIGDEST column)
+        cols = lines[0].split()
+        assert (cols[0], cols[3], cols[4], cols[5]) == ("DNAT", "tcp", "21", "#")
+
+    def test_origdest_and_source_host_columns(self):
+        config = _config({
+            "openmptcprouter": {"fw_ports": [
+                {"name": "router 8080", "port": "8080", "proto": "tcp", "fwtype": "DNAT", "family": 4,
+                 "source_dip": "1.2.3.4", "dest_ip": "5.6.7.8", "vpn": "10.255.250.2", "comment": ""},
+            ]},
+        })
+        lines = self._list(config, "redirect router")
+        assert lines == [
+            "DNAT\t\tnet:5.6.7.8\t\tvpn:10.255.250.2\ttcp\t8080\t-\t1.2.3.4\t"
+            "# OMR openmptcprouter redirect router 8080 port tcp to 1.2.3.4 from 5.6.7.8\n"
+        ]
+        cols = lines[0].split()
+        assert (cols[1], cols[5], cols[6]) == ("net:5.6.7.8", "-", "1.2.3.4")
+
+    def test_name_filter_and_family_filter(self):
+        config = _config({
+            "openmptcprouter": {"fw_ports": [
+                {"name": "router 21", "port": "21", "proto": "tcp", "fwtype": "DNAT", "family": 4},
+                {"name": "router 22", "port": "22", "proto": "tcp", "fwtype": "ACCEPT", "family": 4},
+                {"name": "shadowsocks", "port": "65101", "proto": "tcp", "fwtype": "DNAT", "family": 4},
+                {"name": "router 23", "port": "23", "proto": "tcp", "fwtype": "DNAT", "family": 6},
+                {"name": "router 21", "port": "21", "proto": "udp", "fwtype": "REDIRECT", "family": 4},
+            ]},
+        })
+        redirect = self._list(config, "redirect router")
+        assert [l.split()[4] for l in redirect] == ["21"]
+        assert self._list(config, "open router")[0].split()[4] == "22"
+        assert [l.split()[4] for l in self._list(config, "redirect router", "ipv6")] == ["23"]
+        # unsupported fwtype (a rule pushed without target) is never listed
+        assert all("udp" not in l for l in redirect)
 
 
 # ===========================================================================

@@ -34,7 +34,12 @@ that have no persistence of their own: GRE tunnels are re-added from the
 `user_dnat`, `gre_snat`, `client2client`, `dscp_mark`, `ct_helpers`) are
 rebuilt from `omr-admin-config.json`. Neither GRE interfaces nor nft rule
 *contents* survive a reboot/ruleset-reload on their own, so this replay is
-what makes them do so.
+what makes them do so. The packaged `debian/omr-admin.service` is ordered
+after `nftables.service`, and the `debian/omr-admin-resync.conf` drop-in
+installed under `nftables.service.d/` try-restarts omr-admin after every
+nftables start or reload (both re-run `/etc/nftables.conf`, which begins with
+`flush ruleset`), so the replay is re-triggered whoever reloaded the firewall,
+instead of relying on them to also restart omr-admin by hand.
 
 ## Authentication
 
@@ -143,7 +148,7 @@ Shorewall itself is no longer used.
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
 | POST | `/shorewall` | `ShorewallAllparams` | Enable/disable the "redirect all ports (1–64999) to the router" DNAT rules (`redirect_ports`: `enable`/`disable`, `ipproto`: `ipv4`/`ipv6`), stored as `bulk_redirect_v4`/`bulk_redirect_v6` |
-| POST | `/shorewalllist` | `ShorewallListparams` | List the OMR-managed rules for the current user, read back from `fw_ports` |
+| POST | `/shorewalllist` | `ShorewallListparams` | List the OMR-managed rules for the current user, read back from `fw_ports` and rendered in the Shorewall rules-file line layout (`DNAT\t\tnet\t\tvpn:...\tproto\tport\t# OMR user redirect name port proto`), which the router's `openmptcprouter-vps` init script greps and awk-splits to reconcile its port forwards |
 | POST | `/shorewallopen` | `Shorewallparams` | Open/redirect a port (name, port, proto, fwtype `ACCEPT`/`DNAT`, optional source_dip/source_ip/comment) |
 | POST | `/shorewallclose` | `Shorewallparams` | Remove a previously added rule |
 | POST | `/sipalg` | `SipALGparams` | Enable/disable SIP ALG via an nft `ct helper` object for SIP plus a rule assigning it (`ct_helpers` chain), replacing Shorewall's AUTOHELPERS/DONT_LOAD toggle |

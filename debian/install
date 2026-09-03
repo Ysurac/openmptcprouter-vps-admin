@@ -2,3 +2,4 @@ omr-admin-config.json usr/share/omr-admin
 omr-admin-config.json etc/openmptcprouter-vps-admin
 omradmin.py usr/bin
 debian/omr-admin.service lib/systemd/system
+debian/omr-admin-resync.conf lib/systemd/system/nftables.service.d

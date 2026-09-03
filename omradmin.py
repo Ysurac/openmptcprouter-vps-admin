@@ -1501,15 +1501,30 @@ def _fw_port_key(entry):
             entry.get('source_dip', ''), entry.get('dest_ip', ''))
 
 def _fw_port_add(username, port, proto, name, fwtype, family, source_dip, dest_ip, vpn, comment):
+    if fwtype not in ('ACCEPT', 'DNAT'):
+        # The Shorewall implementation only ever wrote ACCEPT/DNAT lines and
+        # silently dropped anything else (routers push e.g. "REDIRECT" for a
+        # traffic rule saved without a target); storing those here rendered
+        # nothing but bloated fw_ports forever.
+        LOG.debug("ignoring firewall entry with unsupported fwtype %s (%s %s/%s)", fwtype, name, proto, port)
+        return
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         data = json.load(f)
     if username not in data['users'][0]:
         return
     ports = data['users'][0][username].get('fw_ports', [])
     key = (name, str(port), proto, fwtype, family, source_dip, dest_ip)
-    ports = [p for p in ports if _fw_port_key(p) != key]
-    ports.append({'name': name, 'port': port, 'proto': proto, 'fwtype': fwtype, 'family': family,
-                  'source_dip': source_dip, 'dest_ip': dest_ip, 'vpn': vpn, 'comment': comment})
+    entry = {'name': name, 'port': port, 'proto': proto, 'fwtype': fwtype, 'family': family,
+             'source_dip': source_dip, 'dest_ip': dest_ip, 'vpn': vpn, 'comment': comment}
+    # Routers re-POST every port they know on each reconciliation pass; an
+    # identical entry already present means nothing to write or resync.
+    supported = [p for p in ports if p.get('fwtype') in ('ACCEPT', 'DNAT')]
+    if entry in ports and supported == ports:
+        return
+    # also prune entries with unsupported fwtypes accumulated before the
+    # check above existed -- they render nothing and only bloat the config
+    ports = [p for p in supported if _fw_port_key(p) != key]
+    ports.append(entry)
     modif_config_user(username, {'fw_ports': ports})
     _nft_sync_ports()
 
@@ -1520,7 +1535,7 @@ def _fw_port_del(username, port, proto, name, fwtype, family, source_dip='', des
         return
     ports = data['users'][0][username].get('fw_ports', [])
     key = (name, str(port), proto, fwtype, family, source_dip, dest_ip)
-    new_ports = [p for p in ports if _fw_port_key(p) != key]
+    new_ports = [p for p in ports if _fw_port_key(p) != key and p.get('fwtype') in ('ACCEPT', 'DNAT')]
     if new_ports != ports:
         modif_config_user(username, {'fw_ports': new_ports})
         _nft_sync_ports()
@@ -3323,24 +3338,68 @@ class FirewallListparams(BaseModel):
 
 ShorewallListparams = FirewallListparams  # deprecated alias, kept for compatibility
 
+def _legacy_fw_line(username, entry):
+    """Render one fw_ports entry in the exact line layout the Shorewall-era
+    omr-admin wrote to /etc/shorewall/rules (and /shorewalllist returned
+    verbatim).
+
+    The router's openmptcprouter-vps init script still parses that layout:
+    `_vps_firewall_redirect_port` looks for the substring
+    "<port>\t# OMR <user> redirect router <port> port <proto>" to know a
+    port is already handled, and `_vps_firewall_close_port` reads the awk
+    columns ($1 type, $2 net[:source-host], $4 proto, $5 port, $6 "-",
+    $7 original-destination, " --- " comment) to decide what to close. The
+    nftables migration replaced this with a free-form summary line, so the
+    router never recognised its own ports: every set_vps_firewall pass
+    re-issued /shorewallopen for every port (config rewrite + user_dnat/
+    user_accept chain flush each time) and then fired a /shorewallclose
+    with garbage columns for every line, while ports removed on the router
+    were never closed here. Keep this byte-compatible."""
+    fwtype = entry.get('fwtype', 'ACCEPT')
+    if fwtype not in ('ACCEPT', 'DNAT'):
+        return None
+    name = entry.get('name', '')
+    port = str(entry.get('port', ''))
+    proto = entry.get('proto', 'tcp')
+    source_dip = entry.get('source_dip', '') or ''
+    dest_ip = entry.get('dest_ip', '') or ''
+    vpn = entry.get('vpn', 'default') or 'default'
+    gencomment = entry.get('comment', '') or ''
+    verb = 'open' if fwtype == 'ACCEPT' else 'redirect'
+    dest = '$FW\t' if fwtype == 'ACCEPT' else ('vpn:$OMR_ADDR' if vpn == 'default' else 'vpn:' + vpn)
+    if source_dip == '' and dest_ip == '':
+        return f'{fwtype}\t\tnet\t\t{dest}\t{proto}\t{port}\t# OMR {username} {verb} {name} port {proto}{gencomment}\n'
+    net = 'net'
+    comment = ''
+    if source_dip != '':
+        comment = ' to ' + source_dip
+    if dest_ip != '':
+        comment = comment + ' from ' + dest_ip
+        net = 'net:' + dest_ip
+    return f'{fwtype}\t\t{net}\t\t{dest}\t{proto}\t{port}\t-\t{source_dip}\t# OMR {username} {verb} {name} port {proto}{comment}{gencomment}\n'
+
 def _firewall_list(params, current_user, route):
     name = params.name
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
     # `name` here is historically the verb ("open" or "redirect"), not a
     # service name -- matches shorewall_add_port's fwtype ('ACCEPT'/'DNAT').
-    fwtype_wanted = {'open': 'ACCEPT', 'redirect': 'DNAT'}.get(name)
     family = 4 if params.ipproto == 'ipv4' else 6
     config_data = read_omr_config()
     entries = config_data.get('users', [{}])[0].get(current_user.username, {}).get('fw_ports', []) if config_data else []
+    # Same selection the Shorewall-era implementation did on the rules file:
+    # keep every line carrying "# OMR <user> <name>", where <name> is the
+    # verb + name prefix the router asks for ("redirect router", "open
+    # router"), so installer-opened services with other names never end up
+    # in the router's "close what I don't know" pass.
+    needle = f'# OMR {current_user.username} {name}'
     fwlist = []
     for entry in entries:
         if entry.get('family', 4) != family:
             continue
-        if fwtype_wanted and entry.get('fwtype') != fwtype_wanted:
-            continue
-        verb = 'open' if entry.get('fwtype') == 'ACCEPT' else 'redirect'
-        fwlist.append(f"# OMR {current_user.username} {verb} {entry.get('name', '')} port {entry.get('proto', '')} {entry.get('port', '')}{entry.get('comment', '')}\n")
+        line = _legacy_fw_line(current_user.username, entry)
+        if line and needle in line:
+            fwlist.append(line)
     return {'list': fwlist}
 
 @app.post('/firewalllist', summary="Display all OpenMPTCProuter firewall rules")
