@@ -379,9 +379,24 @@ async def _run_in_threadpool_direct(func, *args, **kwargs):
     return func(*args, **kwargs)
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_env: skip the autouse patch_env fixture (real open/subprocess), "
+        "for tests that drive external scripts in tmp_path",
+    )
+
+
 @pytest.fixture(autouse=True)
-def patch_env():
-    """Prevent actual filesystem writes and subprocess calls in every test."""
+def patch_env(request):
+    """Prevent actual filesystem writes and subprocess calls in every test.
+
+    Tests marked ``real_env`` (test_install_omr_ai.py runs the shipped shell
+    script with fake binaries) opt out and get the real environment.
+    """
+    if request.node.get_closest_marker("real_env"):
+        yield
+        return
     with (
         patch("builtins.open", side_effect=_mock_open),
         patch("os.system", return_value=0),

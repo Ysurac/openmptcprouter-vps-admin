@@ -293,6 +293,31 @@ class TestShadowsocks:
             r = user_client.post("/shadowsocks", json=self._PAYLOAD)
         assert r.json()["result"] == "warning"
 
+    def test_legacy_config_without_prefer_ipv6_is_supported(self, user_client):
+        manager = json.dumps({
+            "timeout": 600,
+            "verbose": 0,
+            "port_key": {"65101": "old-key"},
+        })
+
+        def _open_legacy(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/shadowsocks-libev/manager.json":
+                if "w" in str(mode):
+                    return io.StringIO()
+                if "b" in str(mode):
+                    return io.BytesIO(manager.encode())
+                return io.StringIO(manager)
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/shadowsocks-libev/manager.json")),
+            patch("builtins.open", side_effect=_open_legacy),
+        ):
+            r = user_client.post("/shadowsocks", json=self._PAYLOAD)
+
+        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+
 
 class TestShadowsocksGo:
     _PAYLOAD = {
@@ -373,7 +398,6 @@ class TestShorewallOpen:
         with patch("os.path.isfile", return_value=True):
             r = user_client.post("/shorewallopen", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
-
 
 class TestShorewallClose:
     _PAYLOAD = {
@@ -1129,6 +1153,29 @@ class TestDsvpn:
             r = user_client.post("/dsvpn", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
 
+    def test_writes_current_users_key_file(self, user_client):
+        written_paths = []
+
+        def _open_dsvpn(path, mode="r", *args, **kwargs):
+            sp = str(path)
+            if sp == "/etc/dsvpn/dsvpn0.key":
+                if "w" in str(mode):
+                    written_paths.append(sp)
+                    return io.StringIO()
+                return io.BytesIO(b"old-key")
+            if sp == "/etc/dsvpn/dsvpn0":
+                return io.StringIO("PORT=65400\n")
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_dsvpn),
+        ):
+            r = user_client.post("/dsvpn", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "done"
+        assert written_paths == ["/etc/dsvpn/dsvpn0.key"]
+
 
 class TestMlvpn:
     _PAYLOAD = {
@@ -1374,6 +1421,229 @@ class TestMqvpn:
         assert mqvpn.get("reorder_rules") == []
 
 
+def _open_with_mqvpn_config(cfg):
+    """builtins.open replacement serving *cfg* as /etc/mqvpn/server.json (reads only)."""
+    from conftest import _mock_open as _base_open
+    cfg_json = json.dumps(cfg)
+
+    def _open(path, mode="r", *args, **kwargs):
+        if str(path) == "/etc/mqvpn/server.json" and "w" not in str(mode):
+            return io.StringIO(cfg_json)
+        return _base_open(path, mode, *args, **kwargs)
+    return _open
+
+
+class TestMqvpnUsers:
+    _STATUS = {"ok": True, "n_clients": 1,
+               "clients": [{"user": "openmptcprouter", "enable_fec": 1, "mp_state": 1}]}
+
+    @staticmethod
+    def _api(list_users, status):
+        def _mock(cmd):
+            if cmd["cmd"] == "list_users":
+                return list_users
+            if cmd["cmd"] == "get_status":
+                return status
+            raise AssertionError(f"unexpected control command {cmd}")
+        return _mock
+
+    def test_requires_auth(self, unauth_client):
+        r = unauth_client.get("/mqvpn_users")
+        assert r.status_code == 403
+
+    def test_non_admin_denied(self, user_client):
+        r = user_client.get("/mqvpn_users")
+        assert r.json()["result"] == "permission"
+
+    def test_ro_user_denied(self, ro_client):
+        r = ro_client.get("/mqvpn_users")
+        assert r.json()["result"] == "permission"
+
+    def test_missing_mqvpn_returns_warning(self, admin_client):
+        with patch("os.path.isfile", return_value=False):
+            r = admin_client.get("/mqvpn_users")
+        assert r.json()["result"] == "warning"
+        assert r.json()["route"] == "mqvpn_users"
+
+    def test_merges_configured_known_and_connected(self, admin_client):
+        cfg = json.loads(json.dumps(MQVPN_CONFIG))
+        cfg["users"].append({"name": "persisted-only", "key": "k", "fixed_ip": "10.255.220.7"})
+        listed = {"ok": True, "users": ["openmptcprouter", "daemon-only"]}
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("builtins.open", side_effect=_open_with_mqvpn_config(cfg)),
+            patch("omr_admin.mqvpn_api", side_effect=self._api(listed, self._STATUS)),
+        ):
+            r = admin_client.get("/mqvpn_users")
+        body = r.json()
+        assert body["result"] == "done"
+        assert body["control"]["ok"] is True
+        assert body["control"]["address"] == "127.0.0.1:9090"
+        assert [u["name"] for u in body["users"]] == ["daemon-only", "openmptcprouter", "persisted-only"]
+        users = {u["name"]: u for u in body["users"]}
+        assert users["openmptcprouter"] == {
+            "name": "openmptcprouter", "configured": True, "fixed_ip": None,
+            "known": True, "connected": True}
+        # in server.json but the daemon never learnt it (add_user failed, no restart yet)
+        assert users["persisted-only"] == {
+            "name": "persisted-only", "configured": True, "fixed_ip": "10.255.220.7",
+            "known": False, "connected": False}
+        # accepted by the daemon but not persisted (added over the control socket by hand)
+        assert users["daemon-only"] == {
+            "name": "daemon-only", "configured": False, "fixed_ip": None,
+            "known": True, "connected": False}
+        assert body["global_key_clients"] == 0
+
+    def test_global_key_sessions_counted_not_listed(self, admin_client):
+        """Clients authenticating with the server-wide auth_key are reported by
+        get_status as user "(global)": a pseudo-name, not a registered user, so
+        it must not show up as a connected-but-unconfigured user."""
+        listed = {"ok": True, "users": ["openmptcprouter"]}
+        status = {"ok": True, "n_clients": 3, "clients": [
+            {"user": "openmptcprouter"}, {"user": "(global)"}, {"user": "(global)"}]}
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=self._api(listed, status)),
+        ):
+            r = admin_client.get("/mqvpn_users")
+        body = r.json()
+        assert [u["name"] for u in body["users"]] == ["openmptcprouter"]
+        assert body["users"][0]["connected"] is True
+        assert body["global_key_clients"] == 2
+
+    def test_does_not_leak_keys(self, admin_client):
+        listed = {"ok": True, "users": ["openmptcprouter"]}
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=self._api(listed, self._STATUS)),
+        ):
+            r = admin_client.get("/mqvpn_users")
+        body = r.json()
+        assert all("key" not in u for u in body["users"])
+        assert MQVPN_CONFIG["users"][0]["key"] not in json.dumps(body)
+        assert MQVPN_CONFIG["auth_key"] not in json.dumps(body)
+
+    def test_control_socket_down_keeps_configured_list(self, admin_client):
+        listed = {"ok": False, "error": "[Errno 111] Connection refused"}
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=self._api(listed, None)),
+        ):
+            r = admin_client.get("/mqvpn_users")
+        body = r.json()
+        assert body["result"] == "done"
+        assert body["control"]["ok"] is False
+        assert "refused" in body["control"]["error"]
+        users = {u["name"]: u for u in body["users"]}
+        assert users["openmptcprouter"]["configured"] is True
+        assert users["openmptcprouter"]["known"] is None
+        assert users["openmptcprouter"]["connected"] is None
+        assert body["global_key_clients"] is None
+
+    def test_get_status_failure_leaves_connected_unknown(self, admin_client):
+        listed = {"ok": True, "users": ["openmptcprouter"]}
+        status = {"ok": False, "error": "boom"}
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("omr_admin.mqvpn_api", side_effect=self._api(listed, status)),
+        ):
+            r = admin_client.get("/mqvpn_users")
+        body = r.json()
+        assert body["control"] == {"ok": False, "address": "127.0.0.1:9090", "error": "boom"}
+        users = {u["name"]: u for u in body["users"]}
+        assert users["openmptcprouter"]["known"] is True
+        assert users["openmptcprouter"]["connected"] is None
+
+
+class TestMqvpnControlAddr:
+    """mqvpn_api() must reach the address in server.json's control_listen, not a hardcoded 9090."""
+
+    def _addr(self, control_listen):
+        import omr_admin
+        cfg = dict(MQVPN_CONFIG)
+        if control_listen is not None:
+            cfg["control_listen"] = control_listen
+        with patch("builtins.open", side_effect=_open_with_mqvpn_config(cfg)):
+            return omr_admin._mqvpn_control_addr()
+
+    def test_default_without_control_listen(self):
+        assert self._addr(None) == ("127.0.0.1", 9090)
+
+    def test_host_port(self):
+        assert self._addr("127.0.0.1:9191") == ("127.0.0.1", 9191)
+
+    def test_surrounding_whitespace_tolerated(self):
+        assert self._addr(" 127.0.0.1:9191 ") == ("127.0.0.1", 9191)
+
+    def test_wildcard_v4_reached_via_loopback(self):
+        assert self._addr("0.0.0.0:9090") == ("127.0.0.1", 9090)
+
+    def test_bracketed_ipv6(self):
+        assert self._addr("[::1]:9090") == ("::1", 9090)
+
+    def test_wildcard_v6_reached_via_loopback(self):
+        assert self._addr("[::]:9191") == ("::1", 9191)
+
+    @pytest.mark.parametrize("bad", [
+        "", "9090", ":9090", "127.0.0.1:", "127.0.0.1:0", "127.0.0.1:70000",
+        "127.0.0.1:abc", "127.0.0.1:+9090", "[::1]", "[::1]9090", "[]:9090", 9090, None,
+    ])
+    def test_malformed_falls_back_to_default(self, bad):
+        cfg = dict(MQVPN_CONFIG)
+        cfg["control_listen"] = bad
+        import omr_admin
+        with patch("builtins.open", side_effect=_open_with_mqvpn_config(cfg)):
+            assert omr_admin._mqvpn_control_addr() == ("127.0.0.1", 9090)
+
+    def test_missing_file_falls_back_to_default(self):
+        import omr_admin
+        from conftest import _mock_open as _base_open
+
+        def _open_missing(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json":
+                raise FileNotFoundError(path)
+            return _base_open(path, mode, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=_open_missing):
+            assert omr_admin._mqvpn_control_addr() == ("127.0.0.1", 9090)
+
+    def test_mqvpn_api_connects_to_configured_address(self):
+        import socket as _socket_mod
+        import omr_admin
+
+        connects = []
+        mock_sock = _mock_mqvpn_socket({"ok": True, "users": ["openmptcprouter"]})
+        mock_sock.connect.side_effect = lambda addr: connects.append(addr)
+        _real_socket = _socket_mod.socket
+
+        def _mock_socket_class(family=_socket_mod.AF_INET, type=_socket_mod.SOCK_STREAM,
+                               proto=0, fileno=None):
+            if fileno is not None:
+                return _real_socket(family, type, proto, fileno)
+            return mock_sock
+
+        cfg = {**MQVPN_CONFIG, "control_listen": "127.0.0.1:9191"}
+        with (
+            patch("builtins.open", side_effect=_open_with_mqvpn_config(cfg)),
+            patch("socket.socket", side_effect=_mock_socket_class),
+        ):
+            r = omr_admin.mqvpn_api({"cmd": "list_users"})
+        assert r == {"ok": True, "users": ["openmptcprouter"]}
+        assert connects == [("127.0.0.1", 9191)]
+        assert mock_sock.sendall.call_args[0][0] == b'{"cmd": "list_users"}\n'
+
+    def test_mqvpn_api_connection_error_is_returned_not_raised(self):
+        import omr_admin
+        cfg = {**MQVPN_CONFIG, "control_listen": "127.0.0.1:9191"}
+        with (
+            patch("builtins.open", side_effect=_open_with_mqvpn_config(cfg)),
+            patch("socket.create_connection", side_effect=ConnectionRefusedError("refused")),
+        ):
+            r = omr_admin.mqvpn_api({"cmd": "list_users"})
+        assert r["ok"] is False
+        assert "refused" in r["error"]
+
+
 class TestOpenVpn:
     _PAYLOAD = {"port": 65301, "cipher": "AES-256-GCM"}
 
@@ -1479,6 +1749,39 @@ class TestLan:
         with patch("os.path.isfile", return_value=True):
             r = user_client.post("/lan", json={"lanips": ["192.168.1.0/24"]})
         assert r.json()["result"] == "done"
+
+    def test_all_lan_prefixes_are_pushed_to_openvpn(self, user_client):
+        config = json.loads(json.dumps(MOCK_CONFIG))
+        config["client2client"] = True
+        config["users"][0]["openmptcprouter"]["lanips"] = ["192.168.9.0/24"]
+        tun_config = 'server 10.8.0.0 255.255.255.0\npush "route 192.168.9.0 255.255.255.0"\n'
+        rewritten = io.StringIO()
+        rewritten.close = lambda: None
+
+        def _open_lan(path, mode="r", *args, **kwargs):
+            sp = str(path)
+            if sp == "/etc/openmptcprouter-vps-admin/omr-admin-config.json":
+                return io.StringIO(json.dumps(config))
+            if sp == "/etc/openvpn/tun0.conf":
+                return io.BytesIO(tun_config.encode()) if "b" in str(mode) else io.StringIO(tun_config)
+            if "a" in str(mode):
+                return rewritten
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf")),
+            patch("builtins.open", side_effect=_open_lan),
+            patch("omr_admin.modif_config_user"),
+        ):
+            r = user_client.post("/lan", json={
+                "lanips": ["192.168.1.0/24", "192.168.2.0/24"],
+            })
+
+        assert r.json()["result"] == "done"
+        output = rewritten.getvalue()
+        assert 'push "route 192.168.1.0 255.255.255.0"' in output
+        assert 'push "route 192.168.2.0 255.255.255.0"' in output
+        assert 'push "route 192.168.9.0 255.255.255.0"' not in output
 
 
 class TestVpnIps:
@@ -1610,8 +1913,8 @@ class TestAddUser:
 
     def test_admin_can_add_user(self, admin_client):
         r = admin_client.post("/add_user", json=self._PAYLOAD)
-        # Even if ss/vpn config files don't exist, the endpoint runs
-        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+        assert r.json()["route"] == "add_user"
 
     def test_add_user_calls_mqvpn_api_when_installed(self, admin_client):
         api_calls = []
@@ -1645,7 +1948,8 @@ class TestAddUserNote:
 
     def test_admin_succeeds(self, admin_client):
         r = admin_client.post("/add_user_note", json=self._PAYLOAD)
-        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+        assert r.json()["route"] == "add_user_note"
 
 
 class TestRemoveUser:
@@ -1818,6 +2122,23 @@ class TestAddUserResponseFields:
         pw = written.get("users", [{}])[0].get("newuser", {}).get("user_password", "")
         assert pw == pw.upper()
         assert len(pw) == 64  # 32 bytes hex
+
+    def test_custom_user_key_is_respected(self, admin_client):
+        written = {}
+        real_json_dump = __import__("json").dump
+
+        def _capture_write(data, f, **kw):
+            written.update(data)
+            real_json_dump(data, f, **kw)
+
+        with patch("omr_admin.json.dump", side_effect=_capture_write):
+            admin_client.post("/add_user", json={
+                **self._PAYLOAD,
+                "user_key": "custom-user-key",
+            })
+
+        password = written.get("users", [{}])[0].get("newuser", {}).get("user_password")
+        assert password == "custom-user-key"
 
     def test_invalid_permission_returns_422(self, admin_client):
         r = admin_client.post("/add_user", json={**self._PAYLOAD, "permission": "superadmin"})
@@ -2138,6 +2459,22 @@ class TestAddUserSideEffects:
     # OpenVPN
     # ------------------------------------------------------------------
 
+    def test_openvpn_failure_happens_before_proxy_provisioning(self, admin_client):
+        result = MagicMock(returncode=1, stderr=b"certificate error")
+
+        with (
+            patch("os.path.isfile", _isfile_for(
+                "/etc/openvpn/tun0.conf",
+                "/etc/shadowsocks-libev/manager.json",
+            )),
+            patch("subprocess.run", return_value=result),
+            patch("omr_admin.add_ss_user") as add_ss_user,
+        ):
+            r = admin_client.post("/add_user", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "error"
+        add_ss_user.assert_not_called()
+
     def test_openvpn_cert_build_includes_username(self, admin_client):
         run_calls = []
 
@@ -2404,7 +2741,11 @@ class TestAddUserSideEffects:
             return key
 
         with (
-            patch("os.path.isfile", _isfile_for("/etc/openvpn/tun0.conf", "/etc/shadowsocks-go/server.json")),
+            patch("os.path.isfile", _isfile_for(
+                "/etc/openvpn/tun0.conf",
+                "/etc/openvpn/ca/pki/issued/newuser.crt",
+                "/etc/shadowsocks-go/server.json",
+            )),
             patch("subprocess.run", side_effect=_mock_run),
             patch("omr_admin.add_ss_go_user", side_effect=_mock_add_ss_go),
         ):

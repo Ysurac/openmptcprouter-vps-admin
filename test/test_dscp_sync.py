@@ -16,8 +16,9 @@ classification):
     a proxied session's real destination carries the same DSCP as the
     router->VPS leg for that session.
   - POST /mqvpn_dscp:    the MQVPN analogue of /mptcp_dscp -- pushes a
-    per-path dscp_mask both live (mqvpn_api() control socket,
-    127.0.0.1:9090) and persisted (server.json's "path_policy" array),
+    per-path dscp_mask both live (mqvpn_api() control socket, at
+    server.json's control_listen, default 127.0.0.1:9090) and persisted
+    (server.json's "path_policy" array),
     keyed by (user, iface) since mqvpn has no MPTCP-style remote_id.
     server.json is also the source of truth for convergence: an iface
     dropped from the request has its dscp_mask cleared both live and in

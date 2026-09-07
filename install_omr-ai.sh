@@ -8,6 +8,7 @@ set -eu
 #   1. Installs InfluxDB 3 Core (InfluxData apt repo, fingerprint-verified)
 #   2. Writes /etc/influxdb3/influxdb3-core.conf and starts the service
 #   3. Bootstraps the admin token (first run only — token is never shown again)
+#      and saves it to /etc/influxdb3/omr-influxdb.env straight away
 #   4. Creates the omr_metrics database with 60-day retention (configurable)
 #   5. python3-influxdb3  (apt when available, pip fallback)
 #   6. PyTorch + pre-initialised decision model  [INSTALL_AI=true]
@@ -15,12 +16,13 @@ set -eu
 #   7. Deploys omr_metrics.py and restarts omr-admin
 #   8. Injects "influxdb" block into omr-admin-config.json
 #
-# Edit the variables below before running.
+# Edit the variables below before running, or override the tunables from the
+# environment, e.g.:  sudo RESET_DATA=true INSTALL_AI=false sh ./install_omr-ai.sh
 
 INFLUX_ORG="omr"              # kept for omr-admin-config.json compatibility; ignored by v3
 INFLUX_BUCKET="omr_metrics"
-INFLUX_RETENTION="60d"        # retention period (e.g. "60d", "30d", "168h"); "" = infinite
-INFLUX_RETENTION_DAYS=60      # must match INFLUX_RETENTION (written to omr-admin-config.json)
+INFLUX_RETENTION="${INFLUX_RETENTION-60d}"           # retention period (e.g. "60d", "30d", "168h"); "" = infinite
+INFLUX_RETENTION_DAYS="${INFLUX_RETENTION_DAYS-60}"  # must match INFLUX_RETENTION (written to omr-admin-config.json)
 INFLUX_HOST="http://127.0.0.1:65501"
 INFLUX_NODE_ID="omr-node"
 INFLUX_DATA_DIR="/var/lib/influxdb3/data"
@@ -28,12 +30,12 @@ INFLUX_DATA_DIR="/var/lib/influxdb3/data"
 # Set to "true" ONLY if you want to wipe all InfluxDB 3 data and start fresh.
 # Needed when a previous admin token exists but the creds file was lost.
 # WARNING: destroys all stored metrics.
-RESET_DATA="false"
+RESET_DATA="${RESET_DATA:-false}"
 OMR_CONFIG_FILE="/etc/openmptcprouter-vps-admin/omr-admin-config.json"
 CREDS_FILE="/etc/influxdb3/omr-influxdb.env"
 
 # Set to "false" to skip PyTorch + decision-model init (~250 MB if pip fallback).
-INSTALL_AI="true"
+INSTALL_AI="${INSTALL_AI:-true}"
 
 # ---------------------------------------------------------------------------
 
@@ -118,18 +120,22 @@ step "Enabling and (re)starting influxdb3-core to apply config..."
 systemctl enable influxdb3-core
 systemctl restart influxdb3-core
 
+# Wait (up to 30 s) for the HTTP API.  /health is unauthenticated (disable-authz
+# in config); accept 200 (no auth / disabled) or 401 (up, auth required).
+_wait_for_influx() {
+    HTTP_CODE=""
+    _i=1
+    while [ "$_i" -le 30 ]; do
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${INFLUX_HOST}/health" 2>/dev/null || true)
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then return 0; fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+    die "InfluxDB 3 did not respond after 30 seconds (last HTTP code: ${HTTP_CODE:-none})"
+}
+
 step "Waiting for InfluxDB 3 HTTP API..."
-HTTP_CODE=""
-_i=1
-while [ "$_i" -le 30 ]; do
-    # /health is unauthenticated (disable-authz in config).
-    # Accept 200 (no auth / disabled) or 401 (up, auth required) as "server ready".
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${INFLUX_HOST}/health" 2>/dev/null || true)
-    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then break; fi
-    [ "$_i" -eq 30 ] && die "InfluxDB 3 did not respond after 30 seconds"
-    sleep 1
-    _i=$((_i + 1))
-done
+_wait_for_influx
 log "InfluxDB 3 is up (HTTP ${HTTP_CODE})."
 
 # ---------------------------------------------------------------------------
@@ -144,29 +150,60 @@ _extract_token() {
     python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('token') or d.get('unhashed_token',''))" 2>/dev/null
 }
 
+# Ask the server for a brand-new admin (operator) token.
+# influxdb3 3.x parses "create token --admin" as its own sub-command, so
+# --host/--format MUST come after --admin ("--host ... --admin" is rejected
+# with "unexpected argument '--host' found").  Both output streams are kept:
+# on a fresh catalog the CLI prints the token as JSON on stdout; when an
+# admin token already exists it prints a non-JSON "token name already exists"
+# line and still exits 0; anything else (usage error, connection refused...)
+# is shown to the user instead of being mistaken for an existing token.
+# Sets ADMIN_TOKEN (empty when none was created) and TOKEN_EXISTS (true/false).
+_create_admin_token() {
+    ADMIN_TOKEN=""
+    TOKEN_EXISTS="false"
+    TOKEN_OUT=$(influxdb3 create token --admin --host "$INFLUX_HOST" --format json 2>&1) || true
+    ADMIN_TOKEN=$(printf '%s\n' "$TOKEN_OUT" | _extract_token || true)
+    [ -n "$ADMIN_TOKEN" ] && return 0
+    if printf '%s\n' "$TOKEN_OUT" | grep -qi "already exists"; then
+        TOKEN_EXISTS="true"
+        return 0
+    fi
+    echo "ERROR: 'influxdb3 create token --admin --host ${INFLUX_HOST}' failed:" >&2
+    printf '%s\n' "$TOKEN_OUT" | sed 's/^/       /' >&2
+    exit 1
+}
+
+_save_creds() {
+    mkdir -p "$(dirname "$CREDS_FILE")"
+    : > "$CREDS_FILE"
+    chmod 600 "$CREDS_FILE"
+    cat > "$CREDS_FILE" <<EOF
+INFLUX_HOST=${INFLUX_HOST}
+INFLUX_ORG=${INFLUX_ORG}
+INFLUX_BUCKET=${INFLUX_BUCKET}
+INFLUX_ADMIN_TOKEN=${ADMIN_TOKEN}
+EOF
+}
+
 ADMIN_TOKEN=""
 if ADMIN_TOKEN=$(_read_saved_token) && [ -n "$ADMIN_TOKEN" ]; then
     log "Using existing admin token from ${CREDS_FILE}"
 else
     step "Bootstrapping admin token..."
-    ADMIN_TOKEN=$(influxdb3 create token --host "$INFLUX_HOST" --admin --format json 2>/dev/null | _extract_token || true)
+    _create_admin_token
 
-    if [ -z "$ADMIN_TOKEN" ]; then
+    if [ "$TOKEN_EXISTS" = "true" ]; then
         # Admin token exists in the catalog but we don't have it saved.
         if [ "$RESET_DATA" = "true" ]; then
             log "RESET_DATA=true — wiping catalog to re-bootstrap..."
             systemctl stop influxdb3-core
-            rm -rf "${INFLUX_DATA_DIR}/${INFLUX_NODE_ID}"
+            rm -rf "${INFLUX_DATA_DIR:?}/${INFLUX_NODE_ID:?}"
             systemctl start influxdb3-core
-            _i=1
-            while [ "$_i" -le 30 ]; do
-                HC=$(curl -s -o /dev/null -w "%{http_code}" "${INFLUX_HOST}/health" 2>/dev/null || true)
-                if [ "$HC" = "200" ] || [ "$HC" = "401" ]; then break; fi
-                sleep 1
-                _i=$((_i + 1))
-            done
-            TOKEN_JSON=$(influxdb3 create token --host "$INFLUX_HOST" --admin --format json 2>/dev/null || true)
-            ADMIN_TOKEN=$(echo "$TOKEN_JSON" | _extract_token || true)
+            _wait_for_influx
+            _create_admin_token
+            [ "$TOKEN_EXISTS" = "true" ] \
+                && die "An admin token still exists after wiping ${INFLUX_DATA_DIR}/${INFLUX_NODE_ID}"
         else
             echo ""
             echo "ERROR: An admin token exists in the InfluxDB 3 catalog but"
@@ -174,7 +211,8 @@ else
             echo ""
             echo "Options:"
             echo "  1. Restore ${CREDS_FILE} from backup and set INFLUX_ADMIN_TOKEN=<token>"
-            echo "  2. Re-run with RESET_DATA=\"true\" to wipe all data and start fresh"
+            echo "  2. Re-run with RESET_DATA=true in the environment to wipe all data and start fresh:"
+            echo "       sudo RESET_DATA=true sh $0"
             echo "     WARNING: this destroys all stored metrics in InfluxDB 3."
             exit 1
         fi
@@ -183,6 +221,12 @@ else
     [ -n "$ADMIN_TOKEN" ] || die "Failed to create or recover admin token"
     log "Admin token ready."
 fi
+
+# Persist the token right away: it is never shown again, and a failure in any
+# later step (pip, PyTorch, download) must not lose it, otherwise the next run
+# would hit the "token exists but creds file missing" dead end above.
+_save_creds
+log "Credentials saved to ${CREDS_FILE} (mode 600)."
 
 # ---------------------------------------------------------------------------
 # 4. Create database
@@ -326,18 +370,6 @@ print(f"Written {config_file}")
 PYEOF
 
 chmod 600 "$OMR_CONFIG_FILE"
-
-# ---------------------------------------------------------------------------
-# 9. Save credentials
-# ---------------------------------------------------------------------------
-mkdir -p "$(dirname "$CREDS_FILE")"
-cat > "$CREDS_FILE" <<EOF
-INFLUX_HOST=${INFLUX_HOST}
-INFLUX_ORG=${INFLUX_ORG}
-INFLUX_BUCKET=${INFLUX_BUCKET}
-INFLUX_ADMIN_TOKEN=${ADMIN_TOKEN}
-EOF
-chmod 600 "$CREDS_FILE"
 
 # ---------------------------------------------------------------------------
 # Done

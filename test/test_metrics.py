@@ -151,6 +151,28 @@ def user_client(user_client):
 
 
 # ===========================================================================
+# EMA smoothing
+# ===========================================================================
+
+class TestApplyEma:
+    def test_offline_probability_bypasses_previous_ema(self):
+        assert omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5}) == {
+            "wan": 0.5, "wan2": 0.5,
+        }
+
+        result = omr_metrics._apply_ema("alice", {"wan": 1.0, "wan2": 0.0})
+
+        assert result == {"wan": 1.0, "wan2": 0.0}
+
+    def test_interface_removal_renormalises_remaining_probabilities(self):
+        omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
+
+        result = omr_metrics._apply_ema("alice", {"wan": 1.0})
+
+        assert result == {"wan": 1.0}
+
+
+# ===========================================================================
 # GET /metrics
 # ===========================================================================
 
@@ -333,6 +355,12 @@ class TestPostMetrics:
     def test_unauthenticated_returns_403(self, unauth_client):
         r = unauth_client.post("/metrics", json=_WAN)
         assert r.status_code == 403
+
+    def test_storage_failure_returns_503(self, user_client):
+        with patch.object(omr_metrics, "_write_interface", return_value=False):
+            r = self._post(user_client, _WAN)
+        assert r.status_code == 503
+        assert r.json()["detail"] == "Metrics storage unavailable"
 
     def test_missing_interface_field_returns_422(self, user_client):
         bad = {k: v for k, v in _WAN.items() if k != "interface"}
@@ -640,6 +668,14 @@ class TestJSONBackend:
             backend.write_interface("alice", _WAN)
 
         assert events == ["enter", "exit"]
+
+    def test_write_interface_reports_failure(self):
+        backend = omr_metrics.JSONBackend()
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("builtins.open", side_effect=OSError("disk full")),
+        ):
+            assert backend.write_interface("alice", _WAN) is False
 
 
 # ===========================================================================
@@ -1290,6 +1326,7 @@ class TestDscpClassWeights:
 
         expected_horizons = sorted({c[4] for c in omr_metrics._DSCP_CLASSES})
         assert sorted(set(captured_horizons)) == expected_horizons
+        assert len(captured_horizons) == len(expected_horizons)
 
     def test_short_history_falls_back_to_current_snapshot(self):
         # Fewer than 2 points: _predict_payload must not be called for that interface.
@@ -2670,6 +2707,17 @@ class TestInfluxBackendHistory:
         params = call_kwargs.kwargs.get("query_parameters") or call_kwargs[1].get("query_parameters", {})
         assert params.get("username") == "bob"
         assert params.get("interface") == "lte0"
+
+    def test_single_interface_query_selects_newest_limit_then_orders_ascending(self):
+        backend, mock_client = self._make_backend()
+        mock_client.query.return_value = self._fake_table([])
+
+        backend.read_history("alice", "wan", 3600, 7)
+
+        sql = mock_client.query.call_args.args[0]
+        assert "ROW_NUMBER() OVER (ORDER BY time DESC)" in sql
+        assert ") AS ranked WHERE rn <= 7" in sql
+        assert sql.endswith("ORDER BY time ASC")
 
     def test_skips_rows_with_invalid_json(self):
         backend, mock_client = self._make_backend()

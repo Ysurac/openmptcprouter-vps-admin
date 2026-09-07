@@ -432,6 +432,40 @@ def modif_config_user(user, changes):
     else:
         LOG.debug("No real changes in modif_config_user")
 
+# Default VXLAN L3 (routed P2P) tunnel addresses, one /30 (v4) and one /126
+# (v6) per userid, server side .1 / router side .2. Userids 0..63 keep the
+# original 10.255.249.0/24 slicing (renumbering them would break tunnels
+# already in use); 64..1087 continue into 10.255.224.0/20, which no other
+# OMR component uses. Before this, userid 64 produced 10.255.249.257.
+VXLAN_V4_POOL_LEGACY = IPNetwork('10.255.249.0/24')
+VXLAN_V4_POOL_EXT = IPNetwork('10.255.224.0/20')
+
+def _vxlan_default_v4(userid):
+    """(localip, remoteip) /30 slice for *userid*, or (None, None) past the pools."""
+    legacy_slices = VXLAN_V4_POOL_LEGACY.size // 4
+    if 0 <= userid < legacy_slices:
+        net = VXLAN_V4_POOL_LEGACY.ip + userid * 4
+    elif 0 <= userid - legacy_slices < VXLAN_V4_POOL_EXT.size // 4:
+        net = VXLAN_V4_POOL_EXT.ip + (userid - legacy_slices) * 4
+    else:
+        return None, None
+    return str(net + 1) + '/30', str(net + 2) + '/30'
+
+def _vxlan_default_v6(userid):
+    """(localip6, remoteip6) /126 slice for *userid*, or (None, None) past 4095.
+
+    Userids below 256 keep the historical fd00::b0<hex>:x group (b00..b0ff);
+    256..4095 use fd00::b<hex>:x (b100..bfff), which never overlaps it. The
+    old formula grew a fifth hex digit (fd00::b0100:1) from userid 256 on.
+    """
+    if 0 <= userid < 0x100:
+        group = 'b0' + hex(userid)[2:]
+    elif 0x100 <= userid < 0x1000:
+        group = 'b' + hex(userid)[2:]
+    else:
+        return None, None
+    return 'fd00::' + group + ':1/126', 'fd00::' + group + ':2/126'
+
 def get_vxlan_config(username, userid):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
@@ -440,15 +474,17 @@ def get_vxlan_config(username, userid):
     mode = vxlan_config.get('mode', 'l3')
     if mode not in ('l2', 'l3'):
         mode = 'l3'
+    default_localip, default_remoteip = _vxlan_default_v4(userid)
+    default_localip6, default_remoteip6 = _vxlan_default_v6(userid)
     return {
         'enabled': bool(vxlan_config.get('enabled', False)),
         'mode': mode,
         'vni': vxlan_config.get('vni', userid + 1),
         'port': vxlan_config.get('port', 4789),
-        'localip': vxlan_config.get('localip', '10.255.249.' + str(userid * 4 + 1) + '/30'),
-        'remoteip': vxlan_config.get('remoteip', '10.255.249.' + str(userid * 4 + 2) + '/30'),
-        'localip6': vxlan_config.get('localip6', 'fd00::b0' + hex(userid)[2:] + ':1/126'),
-        'remoteip6': vxlan_config.get('remoteip6', 'fd00::b0' + hex(userid)[2:] + ':2/126'),
+        'localip': vxlan_config.get('localip', default_localip),
+        'remoteip': vxlan_config.get('remoteip', default_remoteip),
+        'localip6': vxlan_config.get('localip6', default_localip6),
+        'remoteip6': vxlan_config.get('remoteip6', default_remoteip6),
         'mtu': vxlan_config.get('mtu', 1380)
     }
 
@@ -485,8 +521,12 @@ def write_vxlan_conf(username, userid):
             # VNI lands on the same server-side bridge (shared L2 segment)
             n.write('BRIDGE=br-vxlan' + str(vxlan_config['vni']) + "\n")
         else:
-            n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
-            n.write('LOCALTUNIP6=' + vxlan_config['localip6'] + "\n")
+            if vxlan_config['localip']:
+                n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
+            if vxlan_config['localip6']:
+                n.write('LOCALTUNIP6=' + vxlan_config['localip6'] + "\n")
+            if not vxlan_config['localip'] and not vxlan_config['localip6']:
+                LOG.warning("No VXLAN L3 tunnel address for user %s: userid %d is past the derived pools, set localip/localip6 explicitly", username, userid)
         n.write('MTU=' + str(vxlan_config['mtu']) + "\n")
     final_md5 = hashlib.md5(file_as_bytes(open(vxlan_file, 'rb'))).hexdigest()
     if initial_md5 != final_md5:
@@ -3095,7 +3135,8 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         verbose = data["verbose"]
     else:
         verbose = 0
-    prefer_ipv6 = data["prefer_ipv6"]
+    # Older manager configurations do not contain this optional setting.
+    prefer_ipv6 = data.get("prefer_ipv6", False)
     port = params.port
     method = params.method
     fast_open = params.fast_open
@@ -4111,27 +4152,57 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
 def vpn_list(current_user: User = Depends(get_current_user)):
     return {'result': 'done', 'vpn': _installed_vpn_types()}
 
-class Vxlan(BaseModel):
-    enable: bool = True
-    mode: Optional[str] = None
+class _VxlanIds(BaseModel):
+    """vni/port range checks shared by the self-service and admin models."""
     vni: Optional[int] = None
     port: Optional[int] = None
+
+    @field_validator('vni')
+    @classmethod
+    def _vni_range(cls, v):
+        if v is not None and not 0 <= v <= 0xFFFFFF:
+            raise ValueError('vni must be between 0 and 16777215')
+        return v
+
+    @field_validator('port')
+    @classmethod
+    def _port_range(cls, v):
+        if v is not None and not 1 <= v <= 65535:
+            raise ValueError('port must be between 1 and 65535')
+        return v
+
+class Vxlan(_VxlanIds):
+    enable: bool = True
+    mode: Optional[str] = None
     localip: Optional[str] = None
     remoteip: Optional[str] = None
     localip6: Optional[str] = None
     remoteip6: Optional[str] = None
     mtu: Optional[int] = None
 
-def _vxlan_vni_map(exclude_username=None):
-    """Return {username: vni} for every user carrying a userid, admin or not.
+def _vxlan_as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
 
-    Used to flag VNI collisions before assigning one: two users sharing a
-    VNI in L2 mode land on the same server-side bridge, merging their LANs.
+def _vxlan_assignments(exclude_username=None):
+    """Return {username: {'vni', 'port'}} for every user carrying a userid,
+    admin or not, as the omr-vxlan@ units would create the devices.
+
+    Used to flag collisions before assigning a VNI or port. Two users on the
+    same VNI *and* the same UDP port is a hard error: the kernel refuses a
+    second VXLAN device with the same VNI on the same dstport whatever the
+    local/remote addresses ("A VXLAN device with the specified VNI already
+    exists"), so the second omr-vxlan@ unit fails at `ip link add` and that
+    user gets no tunnel at all. Two users on the same VNI but different ports
+    is legal, and how they land on the same server-side bridge (shared L2
+    segment) in L2 mode.
     """
     data = read_omr_config()
-    vnis = {}
+    assignments = {}
     if not data or 'users' not in data:
-        return vnis
+        return assignments
     for username, ucfg in data['users'][0].items():
         if username == exclude_username:
             continue
@@ -4139,8 +4210,28 @@ def _vxlan_vni_map(exclude_username=None):
             userid = int(ucfg.get('userid'))
         except (TypeError, ValueError):
             continue
-        vnis[username] = get_vxlan_config(username, userid)['vni']
-    return vnis
+        cfg = get_vxlan_config(username, userid)
+        assignments[username] = {'vni': _vxlan_as_int(cfg['vni']), 'port': _vxlan_as_int(cfg['port'])}
+    return assignments
+
+def _vxlan_conflicts(username, vni, port):
+    """Other users sharing *vni*, split into (same UDP port, other port) lists."""
+    same_port, other_port = [], []
+    vni, port = _vxlan_as_int(vni), _vxlan_as_int(port)
+    for other, cfg in _vxlan_assignments(exclude_username=username).items():
+        if cfg['vni'] != vni:
+            continue
+        (same_port if cfg['port'] == port else other_port).append(other)
+    return sorted(same_port), sorted(other_port)
+
+def _vxlan_hard_conflict(route, vni, port, users):
+    return {
+        'result': 'conflict',
+        'reason': 'VNI ' + str(vni) + ' on UDP port ' + str(port) + ' already used by: ' + ', '.join(users)
+                  + ' (Linux refuses a second VXLAN device with the same VNI on the same port,'
+                  + ' so users sharing a VNI must each have their own port)',
+        'route': route
+    }
 
 def _merge_vxlan_config(username, userid, **overrides):
     """Merge overrides onto the user's current vxlan config (modif_config_user
@@ -4169,12 +4260,16 @@ def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user))
         remoteip=vxlanconfig.remoteip or None, localip6=vxlanconfig.localip6 or None,
         remoteip6=vxlanconfig.remoteip6 or None, mtu=vxlanconfig.mtu
     )
+    if vxlan_user_config['enabled']:
+        same_port, _other_port = _vxlan_conflicts(current_user.username, vxlan_user_config['vni'], vxlan_user_config['port'])
+        if same_port:
+            return _vxlan_hard_conflict('vxlan', vxlan_user_config['vni'], vxlan_user_config['port'], same_port)
     LOG.debug("modif_config_user for vxlan setting")
     modif_config_user(current_user.username, {'vxlan': vxlan_user_config})
     write_vxlan_conf(current_user.username, userid)
     return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(current_user.username, userid)}
 
-@app.get('/vxlan_vnis', summary="Admin: list every user's VXLAN VNI assignment")
+@app.get('/vxlan_vnis', summary="Admin: list every user's VXLAN VNI and port assignment")
 def vxlan_vnis(current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'vxlan_vnis'}
@@ -4188,17 +4283,16 @@ def vxlan_vnis(current_user: User = Depends(get_current_user)):
         except (TypeError, ValueError):
             continue
         cfg = get_vxlan_config(username, userid)
-        users[username] = {'userid': userid, 'enabled': cfg['enabled'], 'mode': cfg['mode'], 'vni': cfg['vni']}
+        users[username] = {'userid': userid, 'enabled': cfg['enabled'], 'mode': cfg['mode'], 'vni': cfg['vni'], 'port': cfg['port']}
     return {'result': 'done', 'users': users}
 
-class VxlanUser(BaseModel):
+class VxlanUser(_VxlanIds):
     username: str = Query(..., pattern=USERNAME_PATTERN, title="Username")
-    vni: Optional[int] = None
     mode: Optional[str] = None
     enable: Optional[bool] = None
     force: bool = False
 
-@app.post('/vxlan_user', summary="Admin: assign a user's VXLAN VNI, mode or enabled state")
+@app.post('/vxlan_user', summary="Admin: assign a user's VXLAN VNI, UDP port, mode or enabled state")
 def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'vxlan_user'}
@@ -4211,18 +4305,25 @@ def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get
         return {'result': 'error', 'reason': 'User has no userid', 'route': 'vxlan_user'}
     if params.mode is not None and params.mode not in ('l2', 'l3'):
         return {'result': 'error', 'reason': 'mode must be l2 or l3', 'route': 'vxlan_user'}
-    if params.vni is not None and not params.force:
-        conflicts = [u for u, v in _vxlan_vni_map(exclude_username=params.username).items() if v == params.vni]
-        if conflicts:
-            return {
-                'result': 'conflict',
-                'reason': 'VNI ' + str(params.vni) + ' already used by: ' + ', '.join(sorted(conflicts))
-                          + ' (pass force=true to merge them into the same L2 segment on purpose)',
-                'route': 'vxlan_user'
-            }
-    vxlan_user_config = _merge_vxlan_config(params.username, userid, vni=params.vni, mode=params.mode)
+    vxlan_user_config = _merge_vxlan_config(params.username, userid, vni=params.vni, port=params.port, mode=params.mode)
     if params.enable is not None:
         vxlan_user_config['enabled'] = params.enable
+    same_port, other_port = _vxlan_conflicts(params.username, vxlan_user_config['vni'], vxlan_user_config['port'])
+    # A VNI+port pair another user already holds is never accepted, force or
+    # not (see _vxlan_assignments); the only exception is a request that
+    # merely disables an already colliding user, since that removes a device
+    # rather than creating one.
+    assigning = params.vni is not None or params.port is not None
+    if same_port and (assigning or vxlan_user_config['enabled']):
+        return _vxlan_hard_conflict('vxlan_user', vxlan_user_config['vni'], vxlan_user_config['port'], same_port)
+    if other_port and params.vni is not None and not params.force:
+        return {
+            'result': 'conflict',
+            'reason': 'VNI ' + str(vxlan_user_config['vni']) + ' already used by: ' + ', '.join(other_port)
+                      + ' (pass force=true to merge them into the same L2 segment on purpose;'
+                      + ' they already use a different port so both devices can coexist)',
+            'route': 'vxlan_user'
+        }
     modif_config_user(params.username, {'vxlan': vxlan_user_config})
     write_vxlan_conf(params.username, userid)
     return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(params.username, userid), 'route': 'vxlan_user'}
@@ -4386,10 +4487,11 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     os.close(fd)
     move(tmpfile, '/etc/dsvpn/dsvpn' + str(userid))
 
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn' + str(userid) + '.key', 'rb'))).hexdigest()
-    with open('/etc/dsvpn/dsvpn.key', 'w') as outfile:
+    dsvpn_key_file = '/etc/dsvpn/dsvpn' + str(userid) + '.key'
+    initial_md5 = hashlib.md5(file_as_bytes(open(dsvpn_key_file, 'rb'))).hexdigest()
+    with open(dsvpn_key_file, 'w') as outfile:
         outfile.write(key)
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn' + str(userid) + '.key', 'rb'))).hexdigest()
+    final_md5 = hashlib.md5(file_as_bytes(open(dsvpn_key_file, 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", f"dsvpn-server@dsvpn{userid}"], check=False)
     shorewall_add_port(current_user, str(port), 'tcp', 'dsvpn')
@@ -4430,11 +4532,50 @@ def mlvpn(*, params: MLVPN, current_user: User = Depends(get_current_user)):
 
 # MQVPN helpers
 
+MQVPN_CONTROL_DEFAULT = ('127.0.0.1', 9090)
+
+def _mqvpn_control_addr():
+    """Return the (host, port) of MQVPN's JSON control API.
+
+    Taken from ``control_listen`` in /etc/mqvpn/server.json, the address the
+    daemon binds its control socket to, in the same forms the daemon accepts
+    ("HOST:PORT" split on the last colon, or "[V6]:PORT" for IPv6). A wildcard
+    bind (0.0.0.0 / ::) is reached through the matching loopback address.
+    Falls back to 127.0.0.1:9090 (what omr-admin always used before
+    control_listen was honoured) when the file or the key is missing, or when
+    the value is malformed.
+    """
+    try:
+        with open('/etc/mqvpn/server.json') as f:
+            listen = json.load(f).get('control_listen')
+    except Exception as e:
+        LOG.debug("MQVPN control_listen read error (" + str(e) + ")")
+        return MQVPN_CONTROL_DEFAULT
+    if not isinstance(listen, str) or not listen.strip():
+        return MQVPN_CONTROL_DEFAULT
+    listen = listen.strip()
+    if listen.startswith('['):
+        close = listen.find(']')
+        if close < 2 or listen[close + 1:close + 2] != ':':
+            host, port_str = '', ''
+        else:
+            host, port_str = listen[1:close], listen[close + 2:]
+    else:
+        host, _sep, port_str = listen.rpartition(':')
+    port = int(port_str) if port_str.isascii() and port_str.isdigit() else 0
+    if not host or not 0 < port <= 65535:
+        LOG.warning("MQVPN control_listen '%s' is invalid, using %s:%d",
+                    listen, MQVPN_CONTROL_DEFAULT[0], MQVPN_CONTROL_DEFAULT[1])
+        return MQVPN_CONTROL_DEFAULT
+    if host in ('0.0.0.0', '*'):
+        host = '127.0.0.1'
+    elif host == '::':
+        host = '::1'
+    return host, port
+
 def mqvpn_api(cmd: dict) -> dict:
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(5)
-            s.connect(('127.0.0.1', 9090))
+        with socket.create_connection(_mqvpn_control_addr(), timeout=5) as s:
             s.sendall((json.dumps(cmd) + '\n').encode())
             data = b''
             while True:
@@ -4560,6 +4701,62 @@ def mqvpn_user_set_config(*, params: MQVPNUser, current_user: User = Depends(get
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", "mqvpn"], check=False)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_user'}
+
+# List MQVPN users. Three views that can legitimately differ:
+#   configured - present in /etc/mqvpn/server.json (what omr-admin writes)
+#   known      - accepted by the running daemon (control socket `list_users`);
+#                add_mqvpn() persists a user even when the live add_user call
+#                fails, and the daemon only learns it on the next restart
+#   connected  - has a live session right now (control socket `get_status`)
+@app.get('/mqvpn_users', summary="List MQVPN users: configured, known by the running daemon, connected")
+def mqvpn_users(current_user: User = Depends(get_current_user)):
+    if current_user.permissions not in ("admin",):
+        return {'result': 'permission', 'reason': 'Admin only', 'route': 'mqvpn_users'}
+    if not os.path.isfile('/etc/mqvpn/server.json'):
+        return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn_users'}
+    with open('/etc/mqvpn/server.json') as f:
+        mqvpn_cfg = json.load(f)
+    configured = {}
+    for u in mqvpn_cfg.get('users', []):
+        if isinstance(u, dict) and u.get('name'):
+            configured[u['name']] = u.get('fixed_ip')
+    host, port = _mqvpn_control_addr()
+    control = {'ok': True, 'address': ('[%s]:%d' if ':' in host else '%s:%d') % (host, port)}
+    listed = mqvpn_api({'cmd': 'list_users'})
+    if listed.get('ok'):
+        known = {n for n in listed.get('users', []) if isinstance(n, str)}
+    else:
+        known = None
+        control.update(ok=False, error=listed.get('error', 'unknown error'))
+    connected = None
+    global_key_clients = None
+    if known is not None:
+        status = mqvpn_api({'cmd': 'get_status'})
+        if status.get('ok'):
+            connected = set()
+            global_key_clients = 0
+            for c in status.get('clients', []):
+                if not isinstance(c, dict) or not isinstance(c.get('user'), str) or not c['user']:
+                    continue
+                # A session authenticated with the server-wide auth_key is
+                # reported as user "(global)": a pseudo-name, not a registered
+                # user, so count it rather than list it as one
+                if c['user'].startswith('(') and c['user'].endswith(')'):
+                    global_key_clients += 1
+                else:
+                    connected.add(c['user'])
+        else:
+            control.update(ok=False, error=status.get('error', 'unknown error'))
+    names = set(configured) | (known or set()) | (connected or set())
+    users = [{
+        'name': name,
+        'configured': name in configured,
+        'fixed_ip': configured.get(name),
+        'known': (name in known) if known is not None else None,
+        'connected': (name in connected) if connected is not None else None,
+    } for name in sorted(names)]
+    return {'result': 'done', 'route': 'mqvpn_users', 'users': users, 'control': control,
+            'global_key_clients': global_key_clients}
 
 # Set per-path DSCP class assignment / per-path weight for MQVPN, mirroring
 # /mptcp_dscp and /mptcp_weight above. Each pin is pushed two ways:
@@ -4910,6 +5107,11 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     lanips = lanconfig.lanips
     if not lanips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'lan'}
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        previous_config = json.load(f)
+    previous_lanips = previous_config.get('users', [{}])[0].get(
+        current_user.username, {}).get('lanips', [])
+
     LOG.debug("modif_config_user for lanip")
     modif_config_user(current_user.username, {'lanips': lanips})
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -4918,18 +5120,34 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     if 'client2client' in omr_config_data:
         client2client = omr_config_data["client2client"]
     if client2client == True and os.path.isfile('/etc/openvpn/tun0.conf'):
+        user_lan_networks = [IPNetwork(lan) for lan in lanips]
         with open('/etc/openvpn/ccd/' + current_user.username, 'w') as outfile:
-            for lan in lanips:
-                ip = IPNetwork(lan)
+            for ip in user_lan_networks:
                 outfile.write('iroute ' + str(ip.network) + ' ' + str(ip.netmask) + "\n")
                 #outfile.write('route ' + str(ip.network) + ' ' + str(ip.netmask) + "\n")
+
+        # Rebuild the set of LAN push routes known to omr-admin. This removes
+        # routes dropped by this user while retaining routes used by others.
+        desired_lan_networks = set()
+        for username, user_config in omr_config_data.get('users', [{}])[0].items():
+            configured_lanips = lanips if username == current_user.username else user_config.get('lanips', [])
+            for configured_lan in configured_lanips:
+                configured_ip = IPNetwork(configured_lan)
+                desired_lan_networks.add((str(configured_ip.network), str(configured_ip.netmask)))
+        managed_lan_networks = set(desired_lan_networks)
+        for previous_lan in previous_lanips:
+            previous_ip = IPNetwork(previous_lan)
+            managed_lan_networks.add((str(previous_ip.network), str(previous_ip.netmask)))
+
         initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
         fd, tmpfile = mkstemp()
         with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
             for line in f:
-                if not 'push "route ' + str(ip.network) + ' ' + str(ip.netmask) + '"' in line:
+                if not any(('push "route ' + network + ' ' + netmask + '"') in line
+                           for network, netmask in managed_lan_networks):
                     n.write(line)
-            n.write('push "route ' + str(ip.network) + ' ' + str(ip.netmask) + '"' + "\n")
+            for network, netmask in sorted(desired_lan_networks):
+                n.write('push "route ' + network + ' ' + netmask + '"' + "\n")
         os.close(fd)
         move(tmpfile, '/etc/openvpn/tun0.conf')
         final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
@@ -5135,8 +5353,8 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
         publicips = []
     else:
         publicips = params.ips
-    user_key = secrets.token_hex(32)
-    user_json = {params.username: {"username": params.username, "permissions": params.permission, "user_password": user_key.upper(), "disabled": "false", "userid": str(userid), "public_ips": publicips}}
+    user_key = params.user_key if params.user_key is not None else secrets.token_hex(32).upper()
+    user_json = {params.username: {"username": params.username, "permissions": params.permission, "user_password": user_key, "disabled": "false", "userid": str(userid), "public_ips": publicips}}
 #    shadowsocks_port = params.shadowsocks_port
 #    if params.shadowsocks_port is None:
 #    shadowsocks_port = '651{:02d}'.format(userid)
@@ -5150,6 +5368,35 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     softethervpn_pass = params.softethervpn_pass
     upsk = ''
     uuid = ''
+
+    # Create the OpenVPN certificate before provisioning any other service so
+    # a certificate failure cannot leave orphaned proxy or tunnel accounts.
+    if os.path.isfile('/etc/openvpn/tun0.conf'):
+        LOG.debug("Create user " + params.username + " in OpenVPN")
+        # Clean up any leftover revoked PKI entry for this CN so easyrsa can reissue
+        index_file = '/etc/openvpn/ca/pki/index.txt'
+        if os.path.isfile(index_file):
+            with open(index_file, 'r') as f:
+                lines = f.readlines()
+            filtered = [l for l in lines if '/CN=' + params.username not in l]
+            if len(filtered) != len(lines):
+                LOG.debug("Removing stale PKI index entry for %s", params.username)
+                with open(index_file, 'w') as f:
+                    f.writelines(filtered)
+        for stale in [
+            f"/etc/openvpn/ca/pki/reqs/{params.username}.req",
+            f"/etc/openvpn/ca/pki/private/{params.username}.key",
+            f"/etc/openvpn/ca/pki/issued/{params.username}.crt",
+        ]:
+            if os.path.isfile(stale):
+                os.remove(stale)
+        env = os.environ.copy()
+        env['EASYRSA_CERT_EXPIRE'] = '3650'
+        result = subprocess.run(["./easyrsa", "--batch", "build-client-full", params.username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
+        if result.returncode != 0 or not os.path.isfile('/etc/openvpn/ca/pki/issued/' + params.username + '.crt'):
+            LOG.error("easyrsa failed for %s: %s", params.username, result.stderr.decode())
+            return {'result': 'error', 'reason': 'OpenVPN certificate creation failed', 'route': 'add_user'}
+
     if not publicips:
         if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
             shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key, userid)
@@ -5180,33 +5427,6 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
         user_json[params.username].update({"vpn": params.vpn})
     if params.proxy is not None:
         user_json[params.username].update({"proxy": params.proxy})
-    # Create OpenVPN cert first — fail early before saving the user
-    if os.path.isfile('/etc/openvpn/tun0.conf'):
-        LOG.debug("Create user " + params.username + " in OpenVPN")
-        # Clean up any leftover revoked PKI entry for this CN so easyrsa can reissue
-        index_file = '/etc/openvpn/ca/pki/index.txt'
-        if os.path.isfile(index_file):
-            with open(index_file, 'r') as f:
-                lines = f.readlines()
-            filtered = [l for l in lines if '/CN=' + params.username not in l]
-            if len(filtered) != len(lines):
-                LOG.debug("Removing stale PKI index entry for %s", params.username)
-                with open(index_file, 'w') as f:
-                    f.writelines(filtered)
-        for stale in [
-            f"/etc/openvpn/ca/pki/reqs/{params.username}.req",
-            f"/etc/openvpn/ca/pki/private/{params.username}.key",
-            f"/etc/openvpn/ca/pki/issued/{params.username}.crt",
-        ]:
-            if os.path.isfile(stale):
-                os.remove(stale)
-        env = os.environ.copy()
-        env['EASYRSA_CERT_EXPIRE'] = '3650'
-        result = subprocess.run(["./easyrsa", "--batch", "build-client-full", params.username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
-        if result.returncode != 0 or not os.path.isfile('/etc/openvpn/ca/pki/issued/' + params.username + '.crt'):
-            LOG.error("easyrsa failed for %s: %s", params.username, result.stderr.decode())
-            return {'result': 'error', 'reason': 'OpenVPN certificate creation failed', 'route': 'add_user'}
-
     content['users'][0].update(user_json)
     if content:
         LOG.debug("backup_config() in add user")
@@ -5236,6 +5456,8 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
 
     LOG.info("User admin (IP: " + request.client.host + ") added user " + params.username)
 
+    return {'result': 'done', 'reason': 'User added', 'route': 'add_user'}
+
     #set_lastchange(30)
     #os.execv(__file__, sys.argv)
     #with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -5253,6 +5475,7 @@ def add_user_note(*, params: ExistingUser, current_user: User = Depends(get_curr
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
     modif_config_user(params.username,{"note": params.note})
     #set_lastchange(30)
+    return {'result': 'done', 'reason': 'Note added', 'route': 'add_user_note'}
 
 
 class RemoveUser(BaseModel):

@@ -173,8 +173,21 @@ def _apply_ema(username: str, probs: dict) -> dict:
         prev = _weight_ema.get(username, {})
         new_ema: dict = {}
         for iface, p_new in probs.items():
-            p_prev = prev.get(iface, float(p_new))   # no prior → start at current
-            new_ema[iface] = EMA_ALPHA * float(p_new) + (1.0 - EMA_ALPHA) * p_prev
+            p_new = float(p_new)
+            # A zero probability is the hard-offline mask produced by both
+            # scorers. Carrying its previous EMA forward would keep routing a
+            # substantial share of traffic to an interface after it goes down.
+            if p_new <= 0.0:
+                new_ema[iface] = 0.0
+                continue
+            p_prev = prev.get(iface, p_new)   # no prior → start at current
+            new_ema[iface] = EMA_ALPHA * p_new + (1.0 - EMA_ALPHA) * p_prev
+
+        # Interface additions/removals and hard-offline zeroing can change the
+        # sum even though both input distributions were normalised.
+        total = sum(new_ema.values())
+        if total > 0.0:
+            new_ema = {iface: value / total for iface, value in new_ema.items()}
         _weight_ema[username] = new_ema
     return new_ema
 
@@ -380,8 +393,10 @@ class JSONBackend:
                 with open(tmp, 'w') as f:
                     json.dump(data, f, indent=4)
                 os.replace(tmp, METRICS_FILE)
+                return True
             except Exception as exc:
                 LOG.error("omr_metrics JSON: write error: %s", exc)
+                return False
 
 
 class InfluxBackend:
@@ -559,11 +574,13 @@ class InfluxBackend:
     def _read_history_iface(self, username: str, interface: str,
                             since_seconds: int, limit: int) -> list:
         sql = (
-            f"SELECT time, json_payload FROM {self._MEASUREMENT} "
+            "SELECT time, json_payload FROM ("
+            f"SELECT time, json_payload, ROW_NUMBER() OVER (ORDER BY time DESC) AS rn "
+            f"FROM {self._MEASUREMENT} "
             f"WHERE username = $username AND interface = $interface "
-            f"AND time >= now() - interval '{since_seconds} seconds' "
-            f"ORDER BY time ASC "
-            f"LIMIT {int(limit)}"
+            f"AND time >= now() - interval '{since_seconds} seconds'"
+            f") AS ranked WHERE rn <= {int(limit)} "
+            "ORDER BY time ASC"
         )
         try:
             table = self._client.query(
@@ -738,8 +755,10 @@ class InfluxBackend:
         p = p.time(ts, write_precision="s")
         try:
             self._client.write(record=p)
+            return True
         except Exception as exc:
             LOG.debug("omr_metrics InfluxDB: write error: %s", exc)
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +826,7 @@ def _read_user(username: str) -> dict:
 
 
 def _write_interface(username: str, payload: dict):
-    _get_backend().write_interface(username, payload)
+    return _get_backend().write_interface(username, payload)
 
 
 # Accepted shorthands for the ?since= query parameter → seconds.
@@ -1721,6 +1740,18 @@ def _dscp_class_weights(user_data: dict, history_data: dict, model_probs: dict) 
     """
     interfaces = list(user_data.keys())
     result: dict = {}
+    # Several classes share a horizon. Forecast each interface/horizon only
+    # once; the torch path trains one small MLP per predictable metric.
+    horizons = {class_info[4] for class_info in _DSCP_CLASSES}
+    forecast_cache: dict = {}
+    for iface in interfaces:
+        p = user_data[iface]
+        hist = history_data.get(iface) or []
+        if not _is_interface_down(p) and len(hist) >= 2:
+            forecast_cache[iface] = {
+                horizon_s: _predict_payload(hist, horizon_seconds=horizon_s)
+                for horizon_s in horizons
+            }
     for key, dscp_values, label, profile, horizon_s in _DSCP_CLASSES:
         raw: list = []
         for iface in interfaces:
@@ -1730,7 +1761,7 @@ def _dscp_class_weights(user_data: dict, history_data: dict, model_probs: dict) 
                 raw.append(0.0)
                 continue
             hist = history_data.get(iface) or []
-            fpayload = _predict_payload(hist, horizon_seconds=horizon_s) if len(hist) >= 2 else p
+            fpayload = forecast_cache.get(iface, {}).get(horizon_s, p)
             feat = _extract_features(fpayload, history=hist)
             raw.append(max(0.0, sum(w * feat[_FEATURE_INDEX[name]] for name, w in profile.items())))
 
@@ -2798,7 +2829,10 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         payload = metrics.model_dump()
         if payload.get('timestamp') is None:
             payload['timestamp'] = int(time.time())
-        await asyncio.to_thread(_write_interface, target, payload)
+        written = await asyncio.to_thread(_write_interface, target, payload)
+        if written is False:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=503, detail="Metrics storage unavailable")
         return {'result': 'ok'}
 
     @router.get('/metrics/all', summary="Get stored metrics for all users (admin only)")
@@ -2890,9 +2924,13 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             history_data = await asyncio.to_thread(_fetch_preemptive)
 
         if not _TORCH_AVAILABLE:
-            result = _compute_weights_heuristic(user_data, history_data=history_data)
+            result = await asyncio.to_thread(
+                _compute_weights_heuristic, user_data, history_data=history_data
+            )
         else:
-            result = _compute_weights(user_data, explain=explain, history_data=history_data)
+            result = await asyncio.to_thread(
+                _compute_weights, user_data, explain=explain, history_data=history_data
+            )
 
         # EMA on raw probabilities (floats) then convert to [1, 255] integers.
         # Exploration (when auto-learning is on) perturbs after EMA so the
@@ -2902,7 +2940,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         output = {k: v for k, v in result.items() if k != "probs"}
 
         if dscp:
-            dscp_classes = _dscp_class_weights(user_data, history_data or {}, result.get("probs", {}))
+            dscp_classes = await asyncio.to_thread(
+                _dscp_class_weights, user_data, history_data or {}, result.get("probs", {})
+            )
             output["dscp_classes"] = dscp_classes
             output["dscp_by_interface"] = _dscp_by_interface(dscp_classes)
 
@@ -2949,33 +2989,35 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                 h = [snap] if snap.get("timestamp") is not None else []
             return iface, h
 
-        result: dict = {}
-        fetched = await asyncio.to_thread(lambda: [_qfetch(i) for i in user_data])
-        for iface, hist in fetched:
-            result[iface] = {
-                "congestion": _forecast_metric(
-                    hist, ("congestion", "score"), _CONGESTION_LEVELS,
-                    hi_clamp=100.0, stable_slope_per_min=0.5, horizon_s=horizon,
-                    halflife_s=120.0,   # congestion reacts quickly
-                ),
-                "loss": _forecast_metric(
-                    hist, ("loss",), _LOSS_THRESHOLDS,
-                    hi_clamp=100.0, stable_slope_per_min=0.1, horizon_s=horizon,
-                    halflife_s=180.0,
-                ),
-                "jitter": _forecast_metric(
-                    hist, ("jitter",), _JITTER_THRESHOLDS,
-                    hi_clamp=None, stable_slope_per_min=0.5, horizon_s=horizon,
-                    halflife_s=180.0,
-                ),
-                "rtt": _forecast_metric(
-                    hist, ("rtt_min",), _RTT_THRESHOLDS,
-                    hi_clamp=None, stable_slope_per_min=2.0, horizon_s=horizon,
-                    halflife_s=180.0,
-                ),
-            }
+        def _build_forecasts():
+            result: dict = {}
+            for iface in user_data:
+                _, hist = _qfetch(iface)
+                result[iface] = {
+                    "congestion": _forecast_metric(
+                        hist, ("congestion", "score"), _CONGESTION_LEVELS,
+                        hi_clamp=100.0, stable_slope_per_min=0.5, horizon_s=horizon,
+                        halflife_s=120.0,
+                    ),
+                    "loss": _forecast_metric(
+                        hist, ("loss",), _LOSS_THRESHOLDS,
+                        hi_clamp=100.0, stable_slope_per_min=0.1, horizon_s=horizon,
+                        halflife_s=180.0,
+                    ),
+                    "jitter": _forecast_metric(
+                        hist, ("jitter",), _JITTER_THRESHOLDS,
+                        hi_clamp=None, stable_slope_per_min=0.5, horizon_s=horizon,
+                        halflife_s=180.0,
+                    ),
+                    "rtt": _forecast_metric(
+                        hist, ("rtt_min",), _RTT_THRESHOLDS,
+                        hi_clamp=None, stable_slope_per_min=2.0, horizon_s=horizon,
+                        halflife_s=180.0,
+                    ),
+                }
+            return result
 
-        return result
+        return await asyncio.to_thread(_build_forecasts)
 
     @router.post('/metrics/decision/train',
                  summary="Submit interface quality feedback to fine-tune the scorer")
@@ -3023,13 +3065,17 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                 return hd
             history_data = await asyncio.to_thread(_fetch_history)
 
-        loss = _train_step(
-            user_data,
-            target_weights,
-            feedback.learning_rate,
-            history_data=history_data,
-        )
-        _save_model(_get_model())
+        def _train_and_save():
+            loss_value = _train_step(
+                user_data,
+                target_weights,
+                feedback.learning_rate,
+                history_data=history_data,
+            )
+            _save_model(_get_model())
+            return loss_value
+
+        loss = await asyncio.to_thread(_train_and_save)
         return {"result": "ok", "loss": round(loss, 6)}
 
     @router.post('/metrics/decision/reset',
