@@ -97,7 +97,8 @@ Configuration endpoints return a JSON object of the form:
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
-| POST | `/proxy` | `Proxy` | Select the proxy used by the current user (`shadowsocks`, `shadowsocks-go`, `shadowsocks-rust`, `v2ray[-vless/vmess/socks/trojan]`, `xray[-vless/vmess/socks/trojan/shadowsocks]`, `none`) |
+| POST | `/proxy` | `Proxy` | Select the proxy used by the current user. Accepts exactly the names `GET /config` advertises in `proxy.available` and `/proxy_list` returns: `shadowsocks`, `shadowsocks-go`, `shadowsocks-rust`, `v2ray[-vless/vmess/socks/trojan]`, `xray[-vless/vless-reality/vmess/socks/trojan/shadowsocks]`, `none` |
+| GET | `/proxy_list` | – | Proxy names installed on this server (same list as `proxy.available` in `GET /config`) |
 | POST | `/shadowsocks` | `ShadowsocksConfigparams` | Shadowsocks-libev settings: port, method, key, fast_open, reuse_port, no_delay, MPTCP, obfs (v2ray/obfs plugin, tls/http) |
 | POST | `/shadowsocks-go` | `ShadowsocksGoConfigparams` | Shadowsocks-Go settings: port, method, fast_open, reuse_port, MPTCP |
 | POST | `/v2ray` | `V2rayconfig` | Refresh V2Ray key/port in the user config |

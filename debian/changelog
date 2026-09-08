@@ -1,3 +1,12 @@
+omr-vps-admin (0.18+20260907) unstable; urgency=medium
+
+  * Fix POST /proxy answering 422 ("Input should be 'v2ray', 'v2ray-vless', ... or 'none'") for xray-vless-reality, a name GET /config has advertised in proxy.available since VLESS Reality support was added (0.5+20231017) while the PROXY validation enum was never given it: the router builds its proxy list from proxy.available and posts the chosen name straight back, so selecting "XRay VLESS Reality" in the wizard could never be applied on the VPS and the log only showed the rejection as an [INFO] line
+  * Build proxy.available (GET /config) and GET /proxy_list from the same _installed_proxy_types() helper instead of a list hardcoded in /config, so a name can no longer be advertised on one side and refused on the other; proxy.available consequently also lists shadowsocks-rust (accepted by POST /proxy, and the router's own default, but never advertised) and, like /proxy_list, now only lists the proxies whose service file is actually present on this VPS
+  * Fix GET /config reporting v2ray.tx/rx and xray.tx/rx as 0 for every protocol variant: the counters were only read when the selected proxy was exactly 'v2ray' or 'xray', so xray-vless-reality, xray-vmess, xray-shadowsocks, v2ray-trojan, ... showed no traffic at all although they are served by the same process; both guards now match the name by substring like /status already did
+  * Add unit tests locking the advertised names to the values POST /proxy accepts, the presence of every name the router can select and the equality of proxy.available and /proxy_list, and covering the traffic counters for every v2ray/xray variant (test/test_api.py); document the accepted proxy names and GET /proxy_list in docs/api.md
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 07 Sep 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20260906) unstable; urgency=medium
 
   * Add GET /mqvpn_users (admin only) listing MQVPN users with, per name, whether it is persisted in /etc/mqvpn/server.json (with its fixed_ip), known by the running daemon (control socket list_users) and currently connected (get_status); the three can differ since add_mqvpn() persists a user even when the live add_user call fails and the daemon only learns it on restart, which now shows up as configured but not known. Keys are not returned; known/connected are null and control.error is set when the control socket is unreachable

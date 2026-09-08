@@ -9,6 +9,8 @@ Tests focus on:
   - Basic happy-path behaviour (mocked filesystem / subprocess)
 """
 
+import contextlib
+import copy
 import io
 import json
 from unittest.mock import MagicMock, patch
@@ -1109,6 +1111,109 @@ class TestProxySelection:
     def test_invalid_proxy_value_returns_422(self, user_client):
         r = user_client.post("/proxy", json={"proxy": "invalid_proxy"})
         assert r.status_code == 422
+
+    def test_reality_proxy_accepted(self, user_client):
+        # The router reads xray-vless-reality from /config and posts it back
+        r = user_client.post("/proxy", json={"proxy": "xray-vless-reality"})
+        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+
+    def test_advertised_proxies_are_all_settable(self, user_client):
+        """proxy.available / proxy_list and POST /proxy must not drift apart.
+
+        A name advertised by one side and unknown to the other makes the
+        router's proxy switch fail with a 422, which is what xray-vless-reality
+        did while it was missing from the PROXY enum.
+        """
+        with patch("os.path.isfile", side_effect=_isfile_for(
+                "/etc/shadowsocks-libev/manager.json",
+                "/etc/shadowsocks-go/server.json",
+                "/etc/v2ray/v2ray-server.json",
+                "/etc/xray/xray-server.json",
+        )):
+            advertised = omr_admin._installed_proxy_types()
+        assert set(advertised) == {
+            "shadowsocks", "shadowsocks-go", "shadowsocks-rust",
+            "v2ray", "v2ray-vless", "v2ray-vmess", "v2ray-socks",
+            "v2ray-trojan",
+            "xray", "xray-vless", "xray-vless-reality", "xray-vmess",
+            "xray-socks", "xray-trojan", "xray-shadowsocks", "none",
+        }
+        # Every name the router can select must be in there
+        assert {
+            "shadowsocks", "shadowsocks-rust", "v2ray", "v2ray-vmess",
+            "v2ray-socks", "v2ray-trojan", "xray", "xray-vless-reality",
+            "xray-vmess", "xray-socks", "xray-trojan", "xray-shadowsocks",
+        } <= set(advertised)
+        for name in advertised:
+            r = user_client.post("/proxy", json={"proxy": name})
+            assert r.status_code == 200, name
+            assert r.json()["result"] == "done", name
+
+    def test_config_advertises_the_proxy_list(self, user_client):
+        available = user_client.get("/config").json()["proxy"]["available"]
+        assert available == user_client.get("/proxy_list").json()["proxy"]
+
+
+class TestConfigProxyTraffic:
+    """/config must count proxy traffic for the protocol variants too.
+
+    A v2ray-* / xray-* variant is served by the same process as the bare name,
+    but /config only counted traffic when proxy was exactly 'v2ray' or 'xray',
+    so tx/rx stayed 0 on xray-vless-reality, xray-vmess, v2ray-trojan, ...
+    /status already matched by substring.
+    """
+
+    @staticmethod
+    def _config_with(proxy):
+        config = copy.deepcopy(MOCK_CONFIG)
+        user = config["users"][0]["openmptcprouter"]
+        user["proxy"] = proxy
+        # Pre-seeded so /config takes the cached branch instead of reading
+        # the server json through the mocked open()
+        user["v2ray"] = {"key": "v2key", "port": "65228"}
+        user["xray"] = {"key": "xrkey", "port": "65228", "sskey": "a:b"}
+        return config
+
+    @contextlib.contextmanager
+    def _env(self, proxy):
+        with (
+            patch("omr_admin.read_omr_config", return_value=self._config_with(proxy)),
+            patch("os.path.isfile", side_effect=_isfile_for(
+                "/etc/v2ray/v2ray-server.json", "/etc/xray/xray-server.json")),
+            patch("omr_admin.checkIfProcessRunning", return_value=True),
+            patch("omr_admin.get_bytes_v2ray",
+                  side_effect=lambda d, u: 11 if d == "tx" else 12),
+            patch("omr_admin.get_bytes_xray",
+                  side_effect=lambda d, u: 21 if d == "tx" else 22),
+        ):
+            yield
+
+    @pytest.mark.parametrize("proxy", [
+        "xray", "xray-vless", "xray-vless-reality", "xray-vmess",
+        "xray-socks", "xray-trojan", "xray-shadowsocks",
+    ])
+    def test_xray_variants_counted(self, user_client, proxy):
+        with self._env(proxy):
+            body = user_client.get("/config").json()
+        assert (body["xray"]["tx"], body["xray"]["rx"]) == (21, 22)
+        assert (body["v2ray"]["tx"], body["v2ray"]["rx"]) == (0, 0)
+
+    @pytest.mark.parametrize("proxy", [
+        "v2ray", "v2ray-vless", "v2ray-vmess", "v2ray-socks", "v2ray-trojan",
+    ])
+    def test_v2ray_variants_counted(self, user_client, proxy):
+        with self._env(proxy):
+            body = user_client.get("/config").json()
+        assert (body["v2ray"]["tx"], body["v2ray"]["rx"]) == (11, 12)
+        assert (body["xray"]["tx"], body["xray"]["rx"]) == (0, 0)
+
+    @pytest.mark.parametrize("proxy", ["shadowsocks", "shadowsocks-rust", "none"])
+    def test_other_proxies_not_counted(self, user_client, proxy):
+        with self._env(proxy):
+            body = user_client.get("/config").json()
+        assert (body["v2ray"]["tx"], body["v2ray"]["rx"]) == (0, 0)
+        assert (body["xray"]["tx"], body["xray"]["rx"]) == (0, 0)
 
 
 # ===========================================================================

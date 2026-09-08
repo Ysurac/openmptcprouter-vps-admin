@@ -2833,7 +2833,9 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
             modif_config_user(username, {'v2ray': v2ray_conf})
         else:
             v2ray_conf = omr_config_data['users'][0][username]['v2ray']
-        if checkIfProcessRunning('v2ray') and proxy == 'v2ray':
+        # Every v2ray-* variant is served by the same v2ray process, so match
+        # the name like /status does instead of only the bare 'v2ray'
+        if checkIfProcessRunning('v2ray') and 'v2ray' in proxy:
             v2ray_tx = get_bytes_v2ray('tx',username)
             v2ray_rx = get_bytes_v2ray('rx',username)
 
@@ -2867,7 +2869,8 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
             modif_config_user(username, {'xray': xray_conf})
         else:
             xray_conf = omr_config_data['users'][0][username]['xray']
-        if checkIfProcessRunning('xray') and proxy == 'xray':
+        # Same for xray-vless-reality, xray-vmess, xray-shadowsocks, ...
+        if checkIfProcessRunning('xray') and 'xray' in proxy:
             xray_tx = get_bytes_xray('tx',username)
             xray_rx = get_bytes_xray('rx',username)
 
@@ -3052,7 +3055,11 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
         vpn_traffic_tx = vpn_txrx['downlinkBytes']
 
     #vpn = current_user.vpn
-    available_proxy = ["shadowsocks", "shadowsocks-go","v2ray","v2ray-vmess","v2ray-socks","v2ray-trojan","xray","xray-vless-reality","xray-vmess","xray-socks","xray-trojan","xray-shadowsocks"]
+    # Same list as /proxy_list: the router picks a name from here and posts it
+    # straight back to /proxy, so it has to be built from the PROXY enum or a
+    # name added on one side gets a 422 on the other (xray-vless-reality was
+    # advertised here for two years while /proxy did not know it at all).
+    available_proxy = _installed_proxy_types()
     if user_permissions == 'ro':
         del available_vpn
         available_vpn = [vpn]
@@ -4329,13 +4336,22 @@ def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get
     return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(params.username, userid), 'route': 'vxlan_user'}
 
 class PROXY(str, Enum):
+    """Proxy names shared by POST /proxy, /config and /proxy_list.
+
+    The single source of truth for the proxy vocabulary: /config's
+    proxy.available and /proxy_list are built from these values (see
+    _installed_proxy_types()), because the router posts back the name it read
+    from /config and any name only one side knows is a 422 on the proxy switch.
+    v2ray-vless / xray-vless and v2ray / xray both name plain VLESS; the VPS
+    side keys on the substring ('xray' in proxy), so the variants are served by
+    the same process.
+    """
     v2ray = "v2ray"
-    v2rayvless = "v2ray-vless"
     v2rayvmess = "v2ray-vmess"
     v2raysocks = "v2ray-socks"
     v2raytrojan = "v2ray-trojan"
     xray = "xray"
-    xrayvless = "xray-vless"
+    xrayvlessreality = "xray-vless-reality"
     xrayvmess = "xray-vmess"
     xraysocks = "xray-socks"
     xraytrojan = "xray-trojan"
@@ -4344,6 +4360,9 @@ class PROXY(str, Enum):
     shadowsocksgo = "shadowsocks-go"
     shadowsocksrust = "shadowsocks-rust"
     none = "none"
+    # Plain VLESS also spelled out, same inbound as v2ray / xray above
+    v2rayvless = "v2ray-vless"
+    xrayvless = "xray-vless"
 
 class Proxy(BaseModel):
     proxy: PROXY
@@ -4353,7 +4372,9 @@ def _installed_proxy_types():
 
     Mirrors the same "is it installed" file checks each /<proxy> POST endpoint
     already guards on, so this stays in sync with what setting that proxy would
-    actually do.
+    actually do. Feeds both /proxy_list and /config's proxy.available, which is
+    what the router builds its proxy list from, so every name returned here has
+    to be a PROXY value POST /proxy accepts.
     """
     installed = []
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
@@ -4365,8 +4386,9 @@ def _installed_proxy_types():
         installed += [PROXY.v2ray.value, PROXY.v2rayvless.value, PROXY.v2rayvmess.value,
                       PROXY.v2raysocks.value, PROXY.v2raytrojan.value]
     if os.path.isfile('/etc/xray/xray-server.json'):
-        installed += [PROXY.xray.value, PROXY.xrayvless.value, PROXY.xrayvmess.value,
-                      PROXY.xraysocks.value, PROXY.xraytrojan.value, PROXY.xrayshadowsocks.value]
+        installed += [PROXY.xray.value, PROXY.xrayvless.value, PROXY.xrayvlessreality.value,
+                      PROXY.xrayvmess.value, PROXY.xraysocks.value, PROXY.xraytrojan.value,
+                      PROXY.xrayshadowsocks.value]
     installed.append(PROXY.none.value)
     return installed
 
