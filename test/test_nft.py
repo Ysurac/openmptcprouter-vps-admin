@@ -555,3 +555,103 @@ class TestNftRun:
         with patch("subprocess.run") as run:
             run.return_value.returncode = 0
             assert omr_admin._nft_run("add table inet omr") is True
+
+
+# ===========================================================================
+# missing base ruleset (the `inet omr` table from openmptcprouter-vps's
+# nftables/omr.nft) -- expected transient, must stay quiet
+# ===========================================================================
+
+
+def _nft_run_mock(apply_rc, table_rc, stderr=b""):
+    """Mock subprocess.run distinguishing the `nft -f -` apply from the
+    `nft list table inet omr` probe _nft_run() falls back on."""
+    def _run(cmd, **kwargs):
+        result = MagicMock()
+        result.returncode = table_rc if 'list' in cmd else apply_rc
+        result.stderr = stderr
+        return result
+    return _run
+
+
+class TestNftMissingBaseTable:
+    """During a VPS install/update our own deb (re)starts omr-admin before
+    the new base ruleset is loaded, so every apply fails with ENOENT until
+    nftables.service's omr-admin-resync drop-in restarts us. That pass is
+    what lands the state; this one must not fill the journal with errors it
+    can do nothing about (openmptcprouter#4361 territory)."""
+
+    _ENOENT = b"/dev/stdin:1:18-20: Error: Could not process rule: No such file or directory"
+
+    def test_table_probe_decides_between_warning_and_debug(self):
+        with patch("subprocess.run", side_effect=_nft_run_mock(1, 1, self._ENOENT)), \
+             patch("omr_admin.LOG") as log:
+            assert omr_admin._nft_run("flush chain inet omr user_accept") is False
+        log.warning.assert_not_called()
+        log.debug.assert_called_once()
+
+    def test_real_failure_with_table_present_still_warns(self):
+        with patch("subprocess.run", side_effect=_nft_run_mock(1, 0, b"Error: syntax error")), \
+             patch("omr_admin.LOG") as log:
+            assert omr_admin._nft_run("garbage") is False
+        log.warning.assert_called_once()
+
+    def test_successful_apply_never_probes_the_table(self):
+        with patch("subprocess.run", side_effect=_nft_run_mock(0, 0)) as run:
+            assert omr_admin._nft_run("flush chain inet omr user_accept") is True
+        assert all('list' not in c.args[0] for c in run.call_args_list)
+
+    def test_resync_all_skips_nft_work_but_still_syncs_openvpn(self):
+        with patch("omr_admin._nft_base_table_exists", return_value=False), \
+             patch("omr_admin.read_omr_config", return_value={"client2client": True}), \
+             patch("omr_admin._nft_sync_ports") as ports, \
+             patch("omr_admin._nft_sync_gre_snat") as gre, \
+             patch("omr_admin._nft_sync_client2client") as c2c, \
+             patch("omr_admin._nft_resync_dscp_classify") as dscp, \
+             patch("omr_admin._nft_sync_sipalg") as sipalg, \
+             patch("omr_admin._sync_openvpn_client2client") as openvpn:
+            omr_admin._nft_resync_all()
+        for mock in (ports, gre, c2c, dscp, sipalg):
+            mock.assert_not_called()
+        openvpn.assert_called_once_with(True)
+
+    def test_resync_all_runs_everything_with_the_table_present(self):
+        with patch("omr_admin._nft_base_table_exists", return_value=True), \
+             patch("omr_admin.read_omr_config", return_value={"sipalg": True}), \
+             patch("omr_admin._nft_sync_ports") as ports, \
+             patch("omr_admin._nft_sync_gre_snat") as gre, \
+             patch("omr_admin._nft_sync_client2client") as c2c, \
+             patch("omr_admin._nft_resync_dscp_classify") as dscp, \
+             patch("omr_admin._nft_sync_sipalg") as sipalg, \
+             patch("omr_admin._sync_openvpn_client2client") as openvpn:
+            omr_admin._nft_resync_all()
+        for mock in (ports, gre, c2c, dscp):
+            mock.assert_called_once()
+        sipalg.assert_called_once_with(True)
+        openvpn.assert_called_once_with(False)
+
+
+class TestNftErrorSummary:
+    def test_repeated_identical_errors_collapse_with_a_count(self):
+        stderr = "".join(
+            f"/dev/stdin:{i}:14-16: Error: No such file or directory\n"
+            f"add set inet omr omr_dscp_classify_cs{i}_4 {{ type ipv4_addr; }}\n"
+            "             ^^^\n"
+            for i in range(1, 11)
+        )
+        summary = omr_admin._nft_error_summary(stderr)
+        assert summary == "Error: No such file or directory (x10)"
+        assert "\n" not in summary
+
+    def test_distinct_errors_are_all_kept_on_one_line(self):
+        stderr = ("/dev/stdin:1:1-3: Error: syntax error, unexpected junk\n"
+                  "/dev/stdin:2:1-3: Error: No such file or directory\n")
+        summary = omr_admin._nft_error_summary(stderr)
+        assert summary == ("Error: syntax error, unexpected junk; "
+                           "Error: No such file or directory")
+
+    def test_unprefixed_stderr_is_passed_through(self):
+        assert omr_admin._nft_error_summary("Error: syntax error") == "Error: syntax error"
+
+    def test_empty_stderr_never_logs_a_blank_message(self):
+        assert omr_admin._nft_error_summary("") == "unknown error"

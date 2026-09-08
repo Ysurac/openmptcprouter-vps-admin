@@ -13,6 +13,8 @@ import contextlib
 import copy
 import io
 import json
+import logging
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,6 +33,10 @@ from conftest import (
 # ---------------------------------------------------------------------------
 
 _CONFIG_JSON = json.dumps(MOCK_CONFIG)
+
+# Must stay identical to the text log_auth_failure() emits and to the failregex
+# in fail2ban-filter-omradmin.conf (openmptcprouter-vps repo).
+_AUTH_FAILURE_MARKER = "omr-admin: authentication failure from"
 
 
 def _isfile_for(*paths):
@@ -161,6 +167,28 @@ class TestToken:
         r = unauth_client.post("/token", data={"username": "admin"})
         assert r.status_code == 422
 
+    # The next two pin down what the fail2ban "omradmin" jail counts. Its
+    # filter (fail2ban-filter-omradmin.conf, openmptcprouter-vps repo) matches
+    # this exact marker, so a router polling /token with no key yet must not
+    # produce one -- that is what used to ban routers off the API they were
+    # being configured from.
+    def test_invalid_password_logs_fail2ban_marker(self, unauth_client, caplog):
+        with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+            unauth_client.post(
+                "/token",
+                data={"username": "admin", "password": "wrongpassword"},
+            )
+        assert any(_AUTH_FAILURE_MARKER in r.getMessage() for r in caplog.records)
+
+    def test_empty_password_does_not_log_fail2ban_marker(self, unauth_client, caplog):
+        with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+            r = unauth_client.post(
+                "/token",
+                data={"username": "admin", "password": ""},
+            )
+        assert r.status_code in (400, 422)
+        assert not any(_AUTH_FAILURE_MARKER in rec.getMessage() for rec in caplog.records)
+
 
 class TestLoginBasic:
     def test_no_auth_header_returns_401(self, unauth_client):
@@ -186,6 +214,24 @@ class TestLoginBasic:
             headers={"Authorization": f"Basic {creds}"},
         )
         assert r.status_code == 401
+
+    def test_invalid_basic_auth_logs_fail2ban_marker(self, unauth_client, caplog):
+        import base64
+        creds = base64.b64encode(b"admin:wrong").decode()
+        with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+            unauth_client.get(
+                "/login_basic",
+                headers={"Authorization": f"Basic {creds}"},
+            )
+        assert any(_AUTH_FAILURE_MARKER in r.getMessage() for r in caplog.records)
+
+    def test_basic_challenge_does_not_log_fail2ban_marker(self, unauth_client, caplog):
+        # A browser's first /docs request carries no Authorization header and
+        # gets the 401 challenge back; counting that banned the operator after
+        # six visits.
+        with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+            unauth_client.get("/login_basic")
+        assert not any(_AUTH_FAILURE_MARKER in r.getMessage() for r in caplog.records)
 
 
 # ===========================================================================
@@ -969,6 +1015,94 @@ class TestLoadMptcpBpfSchedulers:
         mock_move.assert_called_once()
         assert "net.mptcp.scheduler=bpf_red" in written.get("content", "")
         assert "mptcp_bpf_red" not in written.get("content", "")
+
+    def test_kernel_without_mptcp_bpf_support_reports_once_without_warnings(self):
+        # A kernel built without MPTCP BPF scheduler support fails every
+        # shipped object the same way (no bpf_struct_ops_mptcp_sched_ops /
+        # bpf_mptcp_subflow_ctx in its BTF). That's one fact about the
+        # kernel, not four faults: it used to be a multi-line libbpf
+        # warning per object per uvicorn worker at every startup.
+        objects = ["mptcp_bpf_first.o", "mptcp_bpf_red.o", "mptcp_bpf_rr.o", "mptcp_bpf_bkup.o"]
+
+        def _run(cmd, *a, **kw):
+            return MagicMock(returncode=255, stderr=(
+                "libbpf: extern (func ksym) 'bpf_mptcp_subflow_ctx': not found in kernel or module BTFs\n"
+                "libbpf: failed to load object '" + cmd[3] + "'\n"
+                "Error: can't register struct_ops\n"))
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.makedirs"),
+            patch("os.listdir", return_value=objects),
+            patch("subprocess.run", side_effect=_run),
+            patch("omr_admin.LOG") as log,
+        ):
+            omr_admin.load_mptcp_bpf_schedulers()
+
+        log.warning.assert_not_called()
+        summaries = [c.args[0] % c.args[1:] if len(c.args) > 1 else c.args[0]
+                     for c in log.info.call_args_list]
+        assert len(summaries) == 1
+        assert "no MPTCP BPF scheduler support" in summaries[0]
+        for fname in objects:
+            assert fname in summaries[0]
+
+    def test_unrelated_load_failure_still_warns_on_one_line(self):
+        def _run(cmd, *a, **kw):
+            return MagicMock(returncode=255, stderr=(
+                "libbpf: elf: failed to open /usr/share/bpf/scheduler/mptcp_bpf_red.o: Permission denied\n"
+                "Error: can't register struct_ops\n"))
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.makedirs"),
+            patch("os.listdir", return_value=["mptcp_bpf_red.o"]),
+            patch("subprocess.run", side_effect=_run),
+            patch("omr_admin.LOG") as log,
+        ):
+            omr_admin.load_mptcp_bpf_schedulers()
+
+        log.warning.assert_called_once()
+        message = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
+        assert "\n" not in message
+        assert "Permission denied" in message
+
+
+class TestLogStartupEnvironment:
+    """log_startup_environment() -- the one line main() logs per service
+    start. The kernel version is what tells a bug report whether MPTCP, the
+    BPF schedulers and the nftables objects this API drives can exist at
+    all, so it must be there even when nothing else can be determined."""
+
+    def _uname(self):
+        return os.uname_result(("Linux", "vps", "6.18.41-20260730.x64v3-omr",
+                                "#0 SMP", "x86_64"))
+
+    def test_logs_kernel_release_machine_and_vps_version(self):
+        with (
+            patch("platform.uname", return_value=self._uname()),
+            patch("omr_admin.get_omr_version", return_value="0.1057"),
+            patch("omr_admin.LOG") as log,
+        ):
+            omr_admin.log_startup_environment()
+
+        log.info.assert_called_once()
+        message = log.info.call_args.args[0] % log.info.call_args.args[1:]
+        assert "6.18.41-20260730.x64v3-omr" in message
+        assert "x86_64" in message
+        assert "0.1057" in message
+
+    def test_unknown_vps_version_still_logs_the_kernel(self):
+        with (
+            patch("platform.uname", return_value=self._uname()),
+            patch("omr_admin.get_omr_version", return_value=""),
+            patch("omr_admin.LOG") as log,
+        ):
+            omr_admin.log_startup_environment()
+
+        message = log.info.call_args.args[0] % log.info.call_args.args[1:]
+        assert "6.18.41-20260730.x64v3-omr" in message
+        assert "unknown" in message
 
 
 class TestNormalizeMptcpScheduler:

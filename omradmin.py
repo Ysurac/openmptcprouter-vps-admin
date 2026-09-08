@@ -1446,6 +1446,46 @@ def _nft_comment(text):
     short and strip anything that would break out of the quotes."""
     return text.replace('"', "'")[:128]
 
+_NFT_ERR_LOCATION = re.compile(r'^\S*:\d+:\d+(?:-\d+)?:\s*')
+
+def _nft_error_summary(stderr):
+    """Collapse nft's stderr to a single journal line.
+
+    nft prints three lines per problem (the diagnostic, the offending input
+    line echoed back, a caret line), and one of our scripts can carry a
+    problem per element -- the DSCP set declarations alone are 10 -- so a
+    single failed apply used to spam 30+ journal lines. Keep the
+    diagnostics only, deduplicated on their text with the
+    file:line:col prefix stripped, so N identical errors read as "(x N)".
+    """
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    diags = [l for l in lines if ': Error:' in l or ': Warning:' in l] or lines
+    counts = {}
+    for diag in diags:
+        text = _NFT_ERR_LOCATION.sub('', diag)
+        counts[text] = counts.get(text, 0) + 1
+    summary = '; '.join(t if n == 1 else f'{t} (x{n})' for t, n in counts.items())
+    return summary[:500] or 'unknown error'
+
+def _nft_base_table_exists():
+    """Is the base ruleset present?
+
+    Every apply below only ever flushes/repopulates chains and sets *inside*
+    the `inet omr` table declared by the sibling openmptcprouter-vps repo's
+    nftables/omr.nft (loaded from /etc/nftables.conf), so with that table
+    absent they all fail with the same ENOENT. That's an expected transient
+    rather than a fault: during a VPS install/update this service is
+    (re)started by its own deb before the new ruleset is loaded, and
+    nftables.service's omr-admin-resync drop-in restarts us right after the
+    load -- which is the pass that actually lands the state.
+    """
+    try:
+        result = subprocess.run([NFT_BIN, 'list', 'table', NFT_FAMILY, NFT_TABLE],
+                                 capture_output=True, check=False)
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
+
 def _nft_run(script):
     """Apply an nft script as one atomic transaction via `nft -f -`.
     Returns True on success; on failure (nft not installed yet, a bad
@@ -1458,7 +1498,13 @@ def _nft_run(script):
         LOG.warning("nft binary not found, firewall change not applied")
         return False
     if result.returncode != 0:
-        LOG.warning("nft apply failed: %s", result.stderr.decode(errors='replace').strip())
+        stderr = result.stderr.decode(errors='replace')
+        if not _nft_base_table_exists():
+            # See _nft_base_table_exists(): the base ruleset isn't loaded
+            # (yet) -- nothing actionable, and a restart is already queued.
+            LOG.debug("table %s %s absent, firewall change not applied", NFT_FAMILY, NFT_TABLE)
+            return False
+        LOG.warning("nft apply failed: %s", _nft_error_summary(stderr))
         return False
     return True
 
@@ -1778,17 +1824,28 @@ def _nft_resync_all():
     Also covers /etc/openvpn/tun0.conf getting regenerated from its shipped
     template on every VPS update (see _sync_openvpn_client2client()).
     Called once at process startup."""
-    _nft_sync_ports()
-    _nft_sync_gre_snat()
-    _nft_sync_client2client()
-    _nft_resync_dscp_classify()
     config_data = read_omr_config()
+    if _nft_base_table_exists():
+        _nft_sync_ports()
+        _nft_sync_gre_snat()
+        _nft_sync_client2client()
+        _nft_resync_dscp_classify()
+        # sipalg defaults to *off*: the router's own default is off (uci
+        # openmptcprouter.settings.sipalg unset) and the installer blacklists
+        # nf_conntrack_sip, so defaulting to on just made every fresh install
+        # log ct-helper failures at startup (issue 4361).
+        _nft_sync_sipalg(bool(config_data.get('sipalg', False)) if config_data else False)
+    else:
+        # Install/update path: our deb (re)starts this service before the new
+        # base ruleset is loaded, so there's nothing to repopulate yet -- see
+        # _nft_base_table_exists(). nftables.service's omr-admin-resync
+        # drop-in restarts us once it is up, and that pass does the work;
+        # attempting it here would only be a few dozen ENOENT journal lines.
+        LOG.info("base nftables table %s %s not loaded yet, skipping firewall resync "
+                 "(it runs again when nftables.service restarts this service)",
+                 NFT_FAMILY, NFT_TABLE)
+    # Unrelated to nftables state (a plain config file), so always resync.
     _sync_openvpn_client2client(bool(config_data.get('client2client', False)) if config_data else False)
-    # sipalg defaults to *off*: the router's own default is off (uci
-    # openmptcprouter.settings.sipalg unset) and the installer blacklists
-    # nf_conntrack_sip, so defaulting to on just made every fresh install
-    # log ct-helper failures at startup (issue 4361).
-    _nft_sync_sipalg(bool(config_data.get('sipalg', False)) if config_data else False)
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
     _fw_port_add(user.username, str(port), proto, name, fwtype, 4, source_dip, dest_ip, vpn, gencomment)
@@ -1862,6 +1919,29 @@ def authenticate_user(fake_db, username: str, password: str):
         LOG.debug("wrong password")
         return False
     return user
+
+# One fixed line per rejected credential pair, for fail2ban's "omradmin" jail
+# to count (failregex lives in fail2ban-filter-omradmin.conf, openmptcprouter-vps
+# repo -- keep the marker text and the two accepted log prefixes in step with
+# it). Nothing user-supplied goes into the line on purpose: a username echoed
+# here could carry a newline and forge a second line matching the failregex
+# with an <HOST> of the attacker's choosing, which would turn this jail into a
+# way to have any address banned.
+#
+# Only a genuine guess is logged, i.e. one where both halves of the pair were
+# actually filled in. A router polls POST /token with an empty password for as
+# long as it has no VPS key (freshly flashed, or mid-wizard) and must not ban
+# itself out of the API it is being configured from; a browser opening /docs
+# gets the Basic challenge before it can prompt, and must not ban the operator.
+def log_auth_failure(request):
+    client = None
+    try:
+        if request is not None and request.client is not None:
+            client = request.client.host
+    except Exception:  # pragma: no cover - never break a request over logging
+        client = None
+    if client:
+        LOG.warning("omr-admin: authentication failure from %s", client)
 
 def inactive_user_exception():
     return HTTPException(status_code=400, detail="Inactive user")
@@ -2008,6 +2088,17 @@ def normalize_mptcp_scheduler(scheduler, bpf_dir='/usr/share/bpf/scheduler'):
     return scheduler
 
 
+# A kernel built without MPTCP BPF scheduler support has neither the
+# struct_ops type nor the kfuncs the shipped objects reference in its BTF.
+# Every .o then fails the same way, for a reason that's a property of the
+# kernel and not of the file -- so report it once for the set instead of a
+# multi-line libbpf warning per object per worker at every startup.
+_MPTCP_BPF_UNSUPPORTED_MARKERS = ('is not found in kernel BTF',
+                                  'not found in kernel or module BTFs')
+
+def _mptcp_bpf_kernel_unsupported(stderr):
+    return any(marker in stderr for marker in _MPTCP_BPF_UNSUPPORTED_MARKERS)
+
 def load_mptcp_bpf_schedulers():
     bpf_dir = '/usr/share/bpf/scheduler'
     bpf_pin_dir = '/sys/fs/bpf/mptcp'
@@ -2015,6 +2106,7 @@ def load_mptcp_bpf_schedulers():
         return
     os.makedirs(bpf_pin_dir, exist_ok=True)
     loaded = False
+    unsupported = []
     for fname in os.listdir(bpf_dir):
         if not fname.endswith('.o'):
             continue
@@ -2024,16 +2116,24 @@ def load_mptcp_bpf_schedulers():
                 ['bpftool', 'struct_ops', 'register', obj_path, bpf_pin_dir],
                 capture_output=True, text=True
             )
+            stderr = str(result.stderr or '').strip()
             if result.returncode == 0:
                 LOG.info('Loaded MPTCP BPF scheduler: ' + fname)
                 loaded = True
-            elif 'File exists' in result.stderr:
+            elif 'File exists' in stderr:
                 LOG.debug('MPTCP BPF scheduler already registered: ' + fname)
                 loaded = True
+            elif _mptcp_bpf_kernel_unsupported(stderr):
+                unsupported.append(fname)
+                LOG.debug('MPTCP BPF scheduler %s unsupported by this kernel: %s', fname, stderr)
             else:
-                LOG.warning('Failed to load MPTCP BPF scheduler ' + fname + ': ' + result.stderr.strip())
+                LOG.warning('Failed to load MPTCP BPF scheduler %s: %s',
+                            fname, '; '.join(l.strip() for l in stderr.splitlines() if l.strip()))
         except Exception as e:
             LOG.warning('Error loading MPTCP BPF scheduler ' + fname + ': ' + str(e))
+    if unsupported:
+        LOG.info('Kernel has no MPTCP BPF scheduler support, skipped %d shipped scheduler(s): %s',
+                 len(unsupported), ', '.join(sorted(unsupported)))
     if loaded:
         # sysctl.d is applied before this service starts, so BPF schedulers aren't loaded yet at
         # that point — re-apply the configured scheduler now that BPF programs are registered.
@@ -2212,7 +2312,7 @@ async def homepage():
 # Provide a method to create access tokens. The create_jwt()
 # function is used to actually generate the token
 @app.post('/token', response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
     fake_users_db = omr_config_data['users'][0]
@@ -2220,6 +2320,8 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     user = authenticate_user(fake_users_db, form_data.username, form_data.password)
     if not user:
         LOG.debug("Incorrect username or password")
+        if form_data.username and form_data.password:
+            log_auth_failure(request)
         raise HTTPException(status_code=400, detail="Incorrect username or password")
     if user.disabled:
         raise inactive_user_exception()
@@ -2254,6 +2356,8 @@ async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
 
         user = authenticate_user(fake_users_db, username, password)
         if not user:
+            if username and password:
+                log_auth_failure(request)
             raise HTTPException(status_code=400, detail="Incorrect email or password")
         if user.disabled:
             raise inactive_user_exception()
@@ -5766,8 +5870,24 @@ class MPTCPServer(uvicorn.Server):
 # does). Runs once per module import, i.e. once per uvicorn worker.
 _nft_resync_all()
 
+def log_startup_environment():
+    """One journal line per service start identifying what we run on.
+
+    The kernel decides whether the features this API drives exist at all:
+    MPTCP itself, the BPF schedulers (a kernel without MPTCP BPF struct_ops
+    support skips every shipped one -- see load_mptcp_bpf_schedulers()) and
+    the nftables objects the firewall engine expects, so having its version
+    in the journal makes a report self-contained. Called from main(), i.e.
+    in the parent process only, so it stays a single line however many
+    uvicorn workers follow.
+    """
+    uname = platform.uname()
+    LOG.info("OMR-Admin starting on kernel %s %s (OpenMPTCProuter VPS %s)",
+             uname.release, uname.machine, get_omr_version() or 'unknown')
+
 def main(omrport: int, omrhost: str, workers: int):
     LOG.debug("Main OMR-Admin launch")
+    log_startup_environment()
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
