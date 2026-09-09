@@ -113,6 +113,41 @@ def _detect_iface_legacy(params_net_path):
 IFACE = _detect_default_iface(netifaces.AF_INET) or _detect_iface_legacy('/etc/shorewall/params.net')
 IFACE6 = _detect_default_iface(netifaces.AF_INET6) or _detect_iface_legacy('/etc/shorewall6/params.net')
 
+# Read one global address off an interface, or '' when we cannot.
+#
+# Both detectors above return None when there is no default route for that
+# family and the legacy Shorewall params file is gone (it is, on every
+# nftables box) -- so IFACE6 is None on any VPS without an IPv6 default route.
+# Passing that None straight to subprocess raised
+# "TypeError: expected str, bytes or os.PathLike object, not NoneType", which
+# the callers' `except (subprocess.SubprocessError, OSError)` does not catch:
+# GET /config then answered 500 on every single call. The router treats any
+# non-empty body as a config, so it silently applied nothing -- no MQVPN key,
+# no Shadowsocks password -- leaving the tunnel on the placeholder key and a
+# 403 from the MQVPN server (https://github.com/Ysurac/openmptcprouter/issues/4367).
+# TypeError stays in the except tuple as defence in depth.
+def _iface_global_addr(iface, family):
+    if not iface:
+        # Re-detect. IFACE/IFACE6 are module constants evaluated at import, so
+        # an omr-admin that started before the default route for this family
+        # existed (RA/DHCPv6 still pending at boot) would otherwise report no
+        # address for the whole process lifetime -- and once
+        # set_global_param() has persisted the empty value there is nothing to
+        # correct it. Cheap: netifaces reads the kernel routing table.
+        iface = _detect_default_iface(netifaces.AF_INET6 if family == 6
+                                      else netifaces.AF_INET)
+    if not iface:
+        return ''
+    flag = '-6' if family == 6 else '-4'
+    pattern = r'inet6 (\S+) scope global' if family == 6 else r'inet (\d+\.\d+\.\d+\.\d+)/'
+    try:
+        out = subprocess.check_output(['ip', flag, 'addr', 'show', iface], timeout=2,
+                                      stderr=subprocess.DEVNULL).decode()
+    except (subprocess.SubprocessError, OSError, TypeError):
+        return ''
+    match = re.search(pattern, out)
+    return match.group(1) if match else ''
+
 def delete_oldest_files(path, keep = 10):
     files = glob.glob(path)
     fileData = {}
@@ -3041,12 +3076,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     if 'ipv6_network' in omr_config_data:
         ipv6_network = omr_config_data['ipv6_network']
     else:
-        try:
-            _ip6out = subprocess.check_output(['ip', '-6', 'addr', 'show', IFACE6], timeout=2, stderr=subprocess.DEVNULL).decode()
-            _m = re.search(r'inet6 (\S+) scope global', _ip6out)
-            ipv6_network = _m.group(1) if _m else ''
-        except (subprocess.SubprocessError, OSError):
-            ipv6_network = ''
+        ipv6_network = _iface_global_addr(IFACE6, 6)
     if ipv6_network != '':
         set_global_param('ipv6_network', ipv6_network)
     if 'ipv6_addr' in omr_config_data:
@@ -3060,12 +3090,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     if 'ipv4' in omr_config_data:
         ipv4_addr = omr_config_data['ipv4']
     elif 'internet' in omr_config_data and not omr_config_data['internet']:
-        try:
-            _ip4out = subprocess.check_output(['ip', '-4', 'addr', 'show', IFACE], timeout=2, stderr=subprocess.DEVNULL).decode()
-            _m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/', _ip4out)
-            ipv4_addr = _m.group(1) if _m else ''
-        except (subprocess.SubprocessError, OSError):
-            ipv4_addr = ''
+        ipv4_addr = _iface_global_addr(IFACE, 4)
     else:
         try:
             ipv4_addr = requests.get('http://ip.openmptcprouter.com', timeout=2).text.strip()
@@ -3223,12 +3248,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if not os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         return {'result': 'warning', 'reason': 'Shadowsocks-lib not installed', 'route': 'shadowsocks'}
 
-    try:
-        _ip6out = subprocess.check_output(['ip', '-6', 'addr', 'show', IFACE6], timeout=2, stderr=subprocess.DEVNULL).decode()
-        _m = re.search(r'inet6 (\S+) scope global', _ip6out)
-        ipv6_network = _m.group(1) if _m else ''
-    except (subprocess.SubprocessError, OSError):
-        ipv6_network = ''
+    ipv6_network = _iface_global_addr(IFACE6, 6)
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/manager.json', 'rb'))).hexdigest()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
