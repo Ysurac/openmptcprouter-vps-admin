@@ -39,6 +39,13 @@ _CONFIG_JSON = json.dumps(MOCK_CONFIG)
 _AUTH_FAILURE_MARKER = "omr-admin: authentication failure from"
 
 
+class _KeepOpenStringIO(io.StringIO):
+    """StringIO whose contents survive the `with` block that wrote them."""
+
+    def close(self):
+        pass
+
+
 def _isfile_for(*paths):
     """Return a side_effect that returns True only for the given paths."""
     def _side_effect(p):
@@ -1130,6 +1137,175 @@ class TestNormalizeMptcpScheduler:
     def test_blank_scheduler_passes_through(self):
         assert omr_admin.normalize_mptcp_scheduler("") == ""
         assert omr_admin.normalize_mptcp_scheduler(None) is None
+
+
+class TestNormalizeMptcpPathManager:
+    """normalize_mptcp_path_manager() must map the out-of-tree (v0) path
+    manager names the router still sends onto the mainline path manager that
+    implements them, and leave everything else untouched."""
+
+    _AVAIL = "/proc/sys/net/mptcp/available_path_managers"
+
+    def _read_proc(self, value):
+        def _side_effect(path):
+            return value if str(path) == self._AVAIL else ""
+        return _side_effect
+
+    def test_maps_v0_names_to_kernel(self):
+        with patch("omr_admin.read_proc", side_effect=self._read_proc("kernel userspace")):
+            for name in ("fullmesh", "ndiffports", "binder", "default", "netlink"):
+                assert omr_admin.normalize_mptcp_path_manager(name) == "kernel"
+
+    def test_leaves_available_names_unchanged(self):
+        with patch("omr_admin.read_proc", side_effect=self._read_proc("kernel userspace")):
+            assert omr_admin.normalize_mptcp_path_manager("kernel") == "kernel"
+            assert omr_admin.normalize_mptcp_path_manager("userspace") == "userspace"
+
+    def test_leaves_unknown_name_unchanged(self):
+        with patch("omr_admin.read_proc", side_effect=self._read_proc("kernel userspace")):
+            assert omr_admin.normalize_mptcp_path_manager("bpf_pm") == "bpf_pm"
+
+    def test_no_op_on_kernel_advertising_no_list(self):
+        # v0 kernel: net.mptcp.mptcp_path_manager really does take 'fullmesh'.
+        with patch("omr_admin.read_proc", side_effect=self._read_proc("")):
+            assert omr_admin.normalize_mptcp_path_manager("fullmesh") == "fullmesh"
+
+    def test_blank_path_manager_passes_through(self):
+        assert omr_admin.normalize_mptcp_path_manager("") == ""
+        assert omr_admin.normalize_mptcp_path_manager(None) is None
+
+
+class TestMPTCPPathManagerNormalization:
+    """POST /mptcp must translate the router's v0 path manager name before
+    handing it to sysctl and before persisting it into 90-shadowsocks.conf --
+    otherwise the stale line fails at every boot with ENOENT."""
+
+    _PAYLOAD = {
+        "checksum": "0",
+        "path_manager": "fullmesh",
+        "scheduler": "default",
+        "syn_retries": 3,
+        "congestion_control": "bbr",
+        "version": 0,
+    }
+
+    _CONF = "/etc/sysctl.d/90-shadowsocks.conf"
+
+    def _v1_exists(self, p):
+        return str(p) in (
+            "/proc/sys/net/mptcp/enabled",
+            "/proc/sys/net/mptcp/scheduler",
+            "/proc/sys/net/mptcp/syn_retries",
+            "/proc/sys/net/mptcp/path_manager",
+        )
+
+    def _read_proc(self, path):
+        if str(path) == "/proc/sys/net/mptcp/available_path_managers":
+            return "kernel userspace"
+        return ""
+
+    def test_normalizes_path_manager_before_sysctl(self, user_client):
+        sysctl_calls = []
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("omr_admin.read_proc", side_effect=self._read_proc),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "done"
+        flat = [" ".join(c) for c in sysctl_calls]
+        assert any("net.mptcp.path_manager=kernel" in c for c in flat)
+        assert not any("fullmesh" in c for c in flat)
+
+    def test_persists_normalized_path_manager(self, user_client):
+        written = _KeepOpenStringIO()
+
+        def _open(path, mode="r", *a, **kw):
+            sp = str(path)
+            if sp == self._CONF and "b" not in str(mode):
+                return io.StringIO("net.mptcp.path_manager=fullmesh\n")
+            if "w" in str(mode) or "a" in str(mode):
+                return written
+            return _mock_open(path, mode, *a, **kw)
+
+        with (
+            patch("os.path.exists", side_effect=self._v1_exists),
+            patch("omr_admin.read_proc", side_effect=self._read_proc),
+            patch("builtins.open", side_effect=_open),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "done"
+        assert "net.mptcp.path_manager=kernel" in written.getvalue()
+        assert "fullmesh" not in written.getvalue()
+
+
+class TestNormalizePersistedMptcpPathManager:
+    """A v0 path manager name already written into 90-shadowsocks.conf by an
+    earlier /mptcp call must be repaired at startup: sysctl.d is applied at
+    boot, well before this service runs, so nothing else ever fixes it."""
+
+    _CONF = "/etc/sysctl.d/90-shadowsocks.conf"
+    _CONF_BODY = ("net.mptcp.checksum_enabled=0\n"
+                  "net.mptcp.scheduler=default\n"
+                  "net.mptcp.path_manager=fullmesh\n")
+
+    def _read_proc(self, path):
+        if str(path) == "/proc/sys/net/mptcp/available_path_managers":
+            return "kernel userspace"
+        return ""
+
+    def _open(self, path, mode="r", *a, **kw):
+        if str(path) == self._CONF and "b" not in str(mode):
+            return io.StringIO(self._CONF_BODY)
+        return _mock_open(path, mode, *a, **kw)
+
+    def _run_startup(self, read_proc):
+        rewrites = []
+        sysctl_calls = []
+
+        def _rewrite(conf, key, value):
+            rewrites.append((conf, key, value))
+
+        def _run(cmd, *a, **kw):
+            sysctl_calls.append(list(cmd) if cmd else [])
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.exists", return_value=True),
+            patch("omr_admin.read_proc", side_effect=read_proc),
+            patch("omr_admin._rewrite_sysctl_conf_line", side_effect=_rewrite),
+            patch("builtins.open", side_effect=self._open),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            omr_admin.normalize_persisted_mptcp_path_manager(self._CONF)
+        return rewrites, sysctl_calls
+
+    def test_rewrites_and_applies_kernel(self):
+        rewrites, sysctl_calls = self._run_startup(self._read_proc)
+        assert rewrites == [(self._CONF, "net.mptcp.path_manager", "kernel")]
+        assert any("net.mptcp.path_manager=kernel" in " ".join(c) for c in sysctl_calls)
+
+    def test_leaves_valid_value_alone(self):
+        def _read_proc(path):
+            return "kernel userspace" if "available" in str(path) else ""
+
+        body = self._CONF_BODY.replace("fullmesh", "kernel")
+        with patch.object(type(self), "_CONF_BODY", body):
+            rewrites, sysctl_calls = self._run_startup(_read_proc)
+        assert rewrites == []
+        assert not any("path_manager" in " ".join(c) for c in sysctl_calls)
+
+    def test_no_op_when_conf_missing(self):
+        with patch("os.path.isfile", return_value=False):
+            omr_admin.normalize_persisted_mptcp_path_manager(self._CONF)
 
 
 class TestMPTCPV1ConfigRead:

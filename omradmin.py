@@ -374,27 +374,30 @@ def read_omr_config():
         return {}
 
 _OMR_VERSION_CACHE: Optional[str] = None
+# The version token must start with a digit -- see get_omr_version().
+_OMR_VERSION_RE = re.compile(r'OpenMPTCProuter VPS\s+(\d[^\s>]*)')
 
 def get_omr_version():
-    """Python equivalent of: grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'"""
     global _OMR_VERSION_CACHE
-    if _OMR_VERSION_CACHE is not None:
+    if _OMR_VERSION_CACHE:
         return _OMR_VERSION_CACHE
-    for filepath in glob.glob('/etc/*'):
+    seen = set()
+    for filepath in ['/etc/motd.head', '/etc/motd'] + sorted(glob.glob('/etc/*')):
+        if filepath in seen:
+            continue
+        seen.add(filepath)
         if not os.path.isfile(filepath):
             continue
         try:
             with open(filepath, 'r', errors='ignore') as f:
                 for line in f:
-                    if 'OpenMPTCProuter VPS' in line:
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            _OMR_VERSION_CACHE = parts[3]
-                            return _OMR_VERSION_CACHE
+                    match = _OMR_VERSION_RE.search(line)
+                    if match:
+                        _OMR_VERSION_CACHE = match.group(1)
+                        return _OMR_VERSION_CACHE
         except OSError:
             pass
-    _OMR_VERSION_CACHE = ''
-    return _OMR_VERSION_CACHE
+    return ''
 
 def get_username_from_userid(userid):
     if userid == 0:
@@ -2123,6 +2126,76 @@ def normalize_mptcp_scheduler(scheduler, bpf_dir='/usr/share/bpf/scheduler'):
     return scheduler
 
 
+
+# Mainline MPTCP registers exactly two path managers -- 'kernel' (the in-kernel
+# netlink PM, the one that actually creates the extra subflows) and
+# 'userspace' -- and net.mptcp.path_manager rejects any other name with ENOENT.
+# The router's uci network.globals.mptcp_path_manager still carries the
+# out-of-tree v0.95 vocabulary (default/fullmesh/ndiffports/binder/netlink), so
+# a router that has always sent 'fullmesh' leaves a
+# 'net.mptcp.path_manager=fullmesh' line in 90-shadowsocks.conf that fails at
+# every boot ("Couldn't write 'fullmesh' ... ignoring: No such file or
+# directory") while the live value silently stays 'kernel'. Every v0 path
+# manager is an in-kernel one, so they all map onto 'kernel' here.
+_MPTCP_V0_PATH_MANAGERS = ('default', 'fullmesh', 'ndiffports', 'binder', 'netlink')
+_MPTCP_AVAILABLE_PM_PROC = '/proc/sys/net/mptcp/available_path_managers'
+
+def _available_mptcp_path_managers(proc_path=_MPTCP_AVAILABLE_PM_PROC):
+    """Path manager names the running kernel accepts, [] when it advertises
+    no list (a v0 kernel, or a v1 kernel predating the path_manager sysctl)."""
+    return read_proc(proc_path).split()
+
+
+def normalize_mptcp_path_manager(path_manager, proc_path=_MPTCP_AVAILABLE_PM_PROC):
+    """Map an out-of-tree path manager name onto the mainline path manager
+    that implements it, so 'sysctl -w net.mptcp.path_manager=...' doesn't fail
+    with ENOENT. A name the kernel does advertise passes through unchanged, and
+    so does every name on a kernel that advertises no list at all -- notably
+    the v0 net.mptcp.mptcp_path_manager sysctl, where 'fullmesh' is valid.
+    """
+    if not path_manager:
+        return path_manager
+    available = _available_mptcp_path_managers(proc_path)
+    if not available or path_manager in available:
+        return path_manager
+    if path_manager in _MPTCP_V0_PATH_MANAGERS and 'kernel' in available:
+        LOG.warning("Normalizing MPTCP path manager '%s' to 'kernel' (out-of-tree name, "
+                    "this kernel registers only: %s)", path_manager, ' '.join(available))
+        return 'kernel'
+    LOG.warning("MPTCP path manager '%s' is not registered by this kernel (available: %s), "
+                "keeping it as-is", path_manager, ' '.join(available))
+    return path_manager
+
+
+def normalize_persisted_mptcp_path_manager(sysctl_conf='/etc/sysctl.d/90-shadowsocks.conf'):
+    """Repair a net.mptcp.path_manager line an earlier /mptcp call persisted
+    with an out-of-tree name. sysctl.d is applied at boot, long before this
+    service starts, so such a line just fails there at every boot and nothing
+    ever rewrites it -- do it once at startup, and apply the corrected value
+    now instead of waiting for the router's next /mptcp push.
+    """
+    if not os.path.isfile(sysctl_conf) or not os.path.exists('/proc/sys/net/mptcp/path_manager'):
+        return
+    key = 'net.mptcp.path_manager'
+    try:
+        with open(sysctl_conf, 'r') as f:
+            conf_lines = f.readlines()
+    except OSError as e:
+        LOG.warning('Failed to read ' + sysctl_conf + ': ' + str(e))
+        return
+    for line in conf_lines:
+        line = line.strip()
+        if not line.startswith(key + '='):
+            continue
+        value = line.partition('=')[2].strip()
+        normalized = normalize_mptcp_path_manager(value)
+        if normalized != value:
+            _rewrite_sysctl_conf_line(sysctl_conf, key, normalized)
+            subprocess.run(['sysctl', '-qw', key + '=' + normalized], check=False)
+            LOG.info('Fixed persisted MPTCP path manager in %s: %s -> %s',
+                     sysctl_conf, value, normalized)
+        break
+
 # A kernel built without MPTCP BPF scheduler support has neither the
 # struct_ops type nor the kfuncs the shipped objects reference in its BTF.
 # Every .o then fails the same way, for a reason that's a property of the
@@ -2201,7 +2274,8 @@ def load_mptcp_bpf_schedulers():
 
 def _rewrite_sysctl_conf_line(sysctl_conf, key, value):
     """Persist a corrected 'key=value' line into sysctl_conf so future
-    restarts don't need to re-normalize it."""
+    boots (sysctl.d is applied long before this service starts) and restarts
+    don't need to re-normalize it."""
     try:
         with open(sysctl_conf, 'r') as f:
             lines = f.readlines()
@@ -2215,12 +2289,13 @@ def _rewrite_sysctl_conf_line(sysctl_conf, key, value):
         os.close(fd)
         move(tmpfile, sysctl_conf)
     except Exception as e:
-        LOG.warning('Failed to persist normalized scheduler into ' + sysctl_conf + ': ' + str(e))
+        LOG.warning('Failed to persist normalized ' + key + ' into ' + sysctl_conf + ': ' + str(e))
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(app):
     load_mptcp_bpf_schedulers()
+    normalize_persisted_mptcp_path_manager()
     sync_ss_go_users()
     # Optional omr_metrics module: start the background auto-learning loop
     # (no-op unless enabled in config with PyTorch + InfluxDB available).
@@ -3992,7 +4067,9 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'mptcp'}
     checksum = params.checksum
-    path_manager = params.path_manager
+    # The router still names path managers with the out-of-tree v0 vocabulary
+    # ('fullmesh' & co.); mainline only knows 'kernel'/'userspace'.
+    path_manager = normalize_mptcp_path_manager(params.path_manager)
     # The router may send a BPF scheduler's .o filename stem (e.g.
     # 'mptcp_bpf_red') instead of the name the kernel actually registers it
     # under (e.g. 'bpf_red') -- normalize so sysctl doesn't fail with ENOENT.
