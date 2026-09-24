@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -287,6 +288,16 @@ class TestStatus:
         r = admin_client.get("/status?username=openmptcprouter")
         assert r.status_code == 200
 
+    def test_unknown_username_returns_controlled_error(self, admin_client):
+        r = admin_client.get("/status?username=does-not-exist")
+        assert r.status_code == 200
+        assert r.json() == {"error": "Unknown user", "route": "status"}
+
+    def test_unknown_userid_returns_controlled_error(self, admin_client):
+        r = admin_client.get("/status?userid=99999")
+        assert r.status_code == 200
+        assert r.json() == {"error": "Unknown user", "route": "status"}
+
     def test_vps_subkeys(self, user_client):
         r = user_client.get("/status")
         vps = r.json()["vps"]
@@ -417,6 +428,20 @@ class TestShorewall:
             )
         assert r.json()["result"] == "done"
 
+    def test_family_any_toggles_both_families(self, user_client):
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.set_global_param") as set_param,
+        ):
+            r = user_client.post(
+                "/shorewall", json={"redirect_ports": "enable", "ipproto": "any"}
+            )
+        assert r.json()["result"] == "done"
+        assert [c.args for c in set_param.call_args_list] == [
+            ("bulk_redirect_v4", True),
+            ("bulk_redirect_v6", True),
+        ]
+
 
 class TestShorewallList:
     def test_requires_auth(self, unauth_client):
@@ -454,6 +479,38 @@ class TestShorewallOpen:
             r = user_client.post("/shorewallopen", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
 
+    def test_family_any_opens_both_families(self, user_client):
+        # LuCI's "Restrict to address family = IPv4 and IPv6" writes
+        # family='any' and the router passes it through untouched: it used
+        # to be rejected by the ipproto enum with a 422 nothing on the
+        # router side ever looks at, so the port was silently never opened.
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port") as add4,
+            patch("omr_admin.shorewall6_add_port") as add6,
+        ):
+            r = user_client.post("/shorewallopen", json={**self._PAYLOAD, "ipproto": "any"})
+        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+        assert add4.called and add6.called
+
+    def test_family_any_with_ipv4_restriction_stays_ipv4(self, user_client):
+        # An address restriction pins the rule to that literal's family:
+        # a v6 copy would render nft syntax that does not parse and, since
+        # the chain is flushed in one transaction, drop every other port.
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port") as add4,
+            patch("omr_admin.shorewall6_add_port") as add6,
+        ):
+            r = user_client.post(
+                "/shorewallopen",
+                json={**self._PAYLOAD, "ipproto": "any", "source_dip": "1.2.3.4"},
+            )
+        assert r.json()["result"] == "done"
+        assert add4.called
+        assert not add6.called
+
 class TestShorewallClose:
     _PAYLOAD = {
         "name": "http",
@@ -478,6 +535,18 @@ class TestShorewallClose:
         with patch("os.path.isfile", return_value=True):
             r = user_client.post("/shorewallclose", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
+
+    def test_family_any_closes_both_families(self, user_client):
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_del_port") as del4,
+            patch("omr_admin.shorewall6_del_port") as del6,
+        ):
+            r = user_client.post("/shorewallclose", json={**self._PAYLOAD, "ipproto": "any"})
+        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+        # DNAT and ACCEPT, for each family
+        assert del4.call_count == 2 and del6.call_count == 2
 
 
 # ===========================================================================
@@ -769,6 +838,86 @@ class TestMPTCPSchedulerNormalization:
         flat = [" ".join(c) for c in sysctl_calls]
         assert any("net.mptcp.mptcp_scheduler=bpf_red" in c for c in flat)
         assert not any("mptcp_bpf_red" in c for c in flat)
+
+
+class TestMPTCPListenerRestarts:
+    """A changed scheduler only reaches the download direction once the
+    services that terminate MPTCP here are restarted: an MPTCP socket keeps
+    the scheduler its listener had when it was created. shadowsocks-go was
+    missing from that list, so a router on proxy shadowsocks-rust/-go could
+    select bpf_red, get it on uploads, and keep the old one on everything the
+    server sent back."""
+
+    _PAYLOAD = {
+        "checksum": "0",
+        "path_manager": "default",
+        "scheduler": "bpf_red",
+        "syn_retries": 3,
+        "congestion_control": "bbr",
+        "version": 0,
+    }
+
+    def _post_and_collect(self, user_client, present):
+        """POST /mptcp with `present` the set of service config files that
+        exist, and return the flattened command lines subprocess.run saw."""
+        calls = []
+
+        def _run(cmd, *a, **kw):
+            calls.append(" ".join(cmd) if cmd else "")
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("os.path.isfile", side_effect=lambda p: str(p) in present),
+            # The restart block is gated on the sysctl file actually changing;
+            # `move` is mocked in this suite so the two hashes would match.
+            patch("omr_admin.file_as_bytes", side_effect=[b"before", b"after"]),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+        assert r.json()["result"] == "done"
+        return calls
+
+    def test_shadowsocks_go_restarted(self, user_client):
+        calls = self._post_and_collect(
+            user_client, {"/etc/shadowsocks-go/server.json"})
+        assert any("restart shadowsocks-go" in c for c in calls), calls
+
+    def test_shadowsocks_go_not_restarted_when_absent(self, user_client):
+        calls = self._post_and_collect(user_client, set())
+        assert not any("shadowsocks-go" in c for c in calls), calls
+
+    def test_every_mptcp_listener_restarted(self, user_client):
+        present = {
+            "/etc/shadowsocks-libev/manager.json",
+            "/etc/shadowsocks-go/server.json",
+            "/etc/v2ray/v2ray-server.json",
+            "/etc/xray/xray-server.json",
+            "/etc/glorytun-tcp/tun0",
+            "/etc/openvpn/tun0.conf",
+        }
+        calls = self._post_and_collect(user_client, present)
+        for svc in ("shadowsocks-libev-manager@manager", "shadowsocks-go",
+                    "v2ray", "xray", "glorytun-tcp@tun0", "openvpn@tun0"):
+            assert any("restart " + svc in c for c in calls), (svc, calls)
+
+    def test_no_restart_when_sysctl_file_unchanged(self, user_client):
+        calls = []
+
+        def _run(cmd, *a, **kw):
+            calls.append(" ".join(cmd) if cmd else "")
+            return MagicMock(returncode=0)
+
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.file_as_bytes", side_effect=[b"same", b"same"]),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+
+        assert r.json()["result"] == "done"
+        assert not any("restart" in c for c in calls), calls
 
 
 class TestMPTCPV1Scheduler:
@@ -2261,9 +2410,56 @@ class TestBackupPost:
         r = user_client.post("/backuppost", json={"data": ""})
         assert r.json()["result"] == "error"
 
+    @pytest.mark.parametrize("payload", ["%%%%", "not-base64", "!!!!"])
+    def test_invalid_base64_is_rejected_before_files_are_opened(self, user_client, payload):
+        opened_for_write = []
+
+        def track_open(path, mode="r", *args, **kwargs):
+            if str(path).startswith("/var/opt/openmptcprouter/") and "w" in mode:
+                opened_for_write.append(str(path))
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=track_open):
+            r = user_client.post("/backuppost", json={"data": payload})
+
+        assert r.status_code == 200
+        assert r.json()["result"] == "error"
+        assert opened_for_write == []
+
     def test_success(self, user_client):
         r = user_client.post("/backuppost", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
+
+
+class TestConfigConcurrency:
+    def test_concurrent_mutations_preserve_every_update(self, tmp_path):
+        config_path = tmp_path / "omr-admin-config.json"
+        lock_path = tmp_path / "omr-admin-config.json.lock"
+        config_path.write_text(json.dumps(MOCK_CONFIG))
+        errors = []
+
+        def update(index):
+            try:
+                omr_admin.set_global_param(f"concurrent_{index}", index)
+            except Exception as exc:  # pragma: no cover - assertion reports details
+                errors.append(exc)
+
+        with (
+            patch.object(omr_admin, "OMR_CONFIG_FILE", str(config_path)),
+            patch.object(omr_admin, "OMR_CONFIG_LOCK_FILE", str(lock_path)),
+            patch.object(omr_admin, "backup_config"),
+            patch.object(omr_admin, "move", side_effect=os.replace),
+            patch("builtins.open", side_effect=io.open),
+        ):
+            threads = [threading.Thread(target=update, args=(i,)) for i in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert errors == []
+        written = json.loads(config_path.read_text())
+        assert {written[f"concurrent_{i}"] for i in range(20)} == set(range(20))
 
 
 class TestBackupGet:

@@ -149,10 +149,20 @@ Shorewall itself is no longer used.
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
-| POST | `/shorewall` | `ShorewallAllparams` | Enable/disable the "redirect all ports (1–64999) to the router" DNAT rules (`redirect_ports`: `enable`/`disable`, `ipproto`: `ipv4`/`ipv6`), stored as `bulk_redirect_v4`/`bulk_redirect_v6` |
+| POST | `/shorewall` | `ShorewallAllparams` | Enable/disable the "redirect all ports (1–64999) to the router" DNAT rules (`redirect_ports`: `enable`/`disable`, `ipproto`: `ipv4`/`ipv6`/`any`), stored as `bulk_redirect_v4`/`bulk_redirect_v6` |
 | POST | `/shorewalllist` | `ShorewallListparams` | List the OMR-managed rules for the current user, read back from `fw_ports` and rendered in the Shorewall rules-file line layout (`DNAT\t\tnet\t\tvpn:...\tproto\tport\t# OMR user redirect name port proto`), which the router's `openmptcprouter-vps` init script greps and awk-splits to reconcile its port forwards |
 | POST | `/shorewallopen` | `Shorewallparams` | Open/redirect a port (name, port, proto, fwtype `ACCEPT`/`DNAT`, optional source_dip/source_ip/comment) |
 | POST | `/shorewallclose` | `Shorewallparams` | Remove a previously added rule |
+
+`ipproto` accepts `ipv4`, `ipv6` and `any` on all four endpoints. `any` means
+both families: LuCI's "Restrict to address family = IPv4 and IPv6" stores
+`family='any'` in uci and the router's `_vps_firewall_redirect_port` passes
+that value through untouched, so anything else here is a rule the router
+believes it pushed and the VPS never applied (the router doesn't look at the
+API result). On `/shorewallopen`, an address restriction still pins the rule
+to the family of that literal, since an IPv4 `source_dip` on a v6 rule would
+render nft syntax that doesn't parse and the chain is flushed in a single
+transaction.
 | POST | `/sipalg` | `SipALGparams` | Enable/disable SIP ALG via an nft `ct helper` object for SIP plus a rule assigning it (`ct_helpers` chain), replacing Shorewall's AUTOHELPERS/DONT_LOAD toggle |
 
 ### Network settings

@@ -235,10 +235,17 @@ step "Creating database '${INFLUX_BUCKET}'..."
 RETENTION_FLAG=""
 [ -n "$INFLUX_RETENTION" ] && RETENTION_FLAG="--retention-period ${INFLUX_RETENTION}"
 # shellcheck disable=SC2086
-influxdb3 create database "$INFLUX_BUCKET" \
-    --host "$INFLUX_HOST" \
-    --token "$ADMIN_TOKEN" \
-    $RETENTION_FLAG 2>&1 | grep -v "already exists" || true
+if DB_OUT=$(influxdb3 create database "$INFLUX_BUCKET" \
+        --host "$INFLUX_HOST" \
+        --token "$ADMIN_TOKEN" \
+        $RETENTION_FLAG 2>&1); then
+    [ -z "$DB_OUT" ] || printf '%s\n' "$DB_OUT"
+elif printf '%s\n' "$DB_OUT" | grep -qi "already exists"; then
+    log "Database already exists."
+else
+    printf '%s\n' "$DB_OUT" >&2
+    die "Failed to create database '${INFLUX_BUCKET}'"
+fi
 log "Database ready."
 
 # ---------------------------------------------------------------------------
@@ -328,9 +335,12 @@ step "Updating ${OMR_CONFIG_FILE}..."
 mkdir -p "$(dirname "$OMR_CONFIG_FILE")"
 
 python3 - "$OMR_CONFIG_FILE" "$INFLUX_HOST" "$INFLUX_ORG" "$INFLUX_BUCKET" "$ADMIN_TOKEN" "$INFLUX_RETENTION_DAYS" <<'PYEOF'
-import sys, json, os
+import sys, json, os, fcntl
 
 config_file, url, org, bucket, token, retention_days = sys.argv[1:]
+lock_path = os.path.join(os.path.dirname(config_file), ".omr-admin-config.lock")
+lock_file = open(lock_path, "a+")
+fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 try:
     with open(config_file) as f:
         cfg = json.load(f)
@@ -366,6 +376,8 @@ with open(tmp, "w") as f:
     json.dump(cfg, f, indent=4)
     f.write("\n")
 os.replace(tmp, config_file)
+fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+lock_file.close()
 print(f"Written {config_file}")
 PYEOF
 

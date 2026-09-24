@@ -113,6 +113,8 @@
 # GET  /metrics/engine           — inference/training stats + storage info (admin only)
 
 import asyncio
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -139,7 +141,32 @@ except ImportError:
 
 METRICS_FILE = '/etc/openmptcprouter-vps-admin/omr-metrics.json'
 OMR_CONFIG_FILE = '/etc/openmptcprouter-vps-admin/omr-admin-config.json'
+OMR_CONFIG_LOCK_FILE = os.path.join(os.path.dirname(OMR_CONFIG_FILE), '.omr-admin-config.lock')
 DECISION_MODEL_FILE = '/etc/openmptcprouter-vps-admin/omr-decision-model.pt'
+_config_thread_lock = threading.RLock()
+
+
+@contextlib.contextmanager
+def _config_write_lock():
+    """Use the same cross-process lock as omradmin's config mutations."""
+    with _config_thread_lock:
+        lock_file = None
+        lock_acquired = False
+        try:
+            lock_file = open(OMR_CONFIG_LOCK_FILE, 'a+')
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                lock_acquired = True
+            except (OSError, ValueError, AttributeError):
+                pass
+            yield
+        finally:
+            if lock_file is not None:
+                try:
+                    if lock_acquired:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                finally:
+                    lock_file.close()
 
 # ---------------------------------------------------------------------------
 # Engine runtime stats (thread-safe counters, reset only on process restart)
@@ -2411,19 +2438,30 @@ def _auto_set_enabled(enabled: bool) -> bool:
     """
     persisted = False
     try:
-        try:
-            with open(OMR_CONFIG_FILE) as f:
-                cfg_file = json.load(f)
-        except FileNotFoundError:
-            cfg_file = {}
-        block = cfg_file.get("auto_learning") or {}
-        block["enabled"] = bool(enabled)
-        cfg_file["auto_learning"] = block
-        tmp = OMR_CONFIG_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(cfg_file, f, indent=4)
-        os.replace(tmp, OMR_CONFIG_FILE)
-        persisted = True
+        with _config_write_lock():
+            try:
+                with open(OMR_CONFIG_FILE) as f:
+                    cfg_file = json.load(f)
+            except FileNotFoundError:
+                cfg_file = {}
+            block = cfg_file.get("auto_learning") or {}
+            block["enabled"] = bool(enabled)
+            cfg_file["auto_learning"] = block
+            tmp = '{}.tmp.{}.{}'.format(OMR_CONFIG_FILE, os.getpid(), threading.get_ident())
+            try:
+                with open(tmp, 'w') as f:
+                    json.dump(cfg_file, f, indent=4)
+                    f.write('\n')
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                os.replace(tmp, OMR_CONFIG_FILE)
+                persisted = True
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
     except Exception as exc:
         LOG.warning("omr_auto: could not persist auto_learning.enabled=%s: %s",
                     enabled, exc)

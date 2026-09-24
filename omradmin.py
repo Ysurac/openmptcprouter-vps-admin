@@ -8,6 +8,7 @@
 
 import json
 import base64
+import binascii
 import secrets
 import uuid
 import configparser
@@ -21,6 +22,7 @@ import platform
 import glob
 import socket
 import socket as _socket
+import functools
 from operator import itemgetter
 import re
 import hashlib
@@ -39,6 +41,8 @@ from ipaddress import ip_address, IPv4Address, IPv6Address
 import logging
 import asyncio
 import contextlib
+import fcntl
+import threading
 import uvicorn
 import jwt
 import requests
@@ -83,6 +87,102 @@ PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
 USERNAME_PATTERN = r'^[A-Za-z0-9_.-]{1,256}$'
+OMR_CONFIG_FILE = '/etc/openmptcprouter-vps-admin/omr-admin-config.json'
+OMR_CONFIG_LOCK_FILE = os.path.join(os.path.dirname(OMR_CONFIG_FILE), '.omr-admin-config.lock')
+_omr_config_thread_lock = threading.RLock()
+_omr_config_lock_state = threading.local()
+
+
+@contextlib.contextmanager
+def _omr_config_lock(exclusive=True):
+    """Serialise config access across threads and uvicorn worker processes."""
+    depth = getattr(_omr_config_lock_state, 'depth', 0)
+    if depth:
+        _omr_config_lock_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            _omr_config_lock_state.depth -= 1
+        return
+
+    with _omr_config_thread_lock:
+        lock_file = None
+        lock_acquired = False
+        try:
+            lock_file = open(OMR_CONFIG_LOCK_FILE, 'a+')
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                lock_acquired = True
+            except (OSError, ValueError, AttributeError):
+                # Some tests use in-memory file objects without a file descriptor.
+                pass
+            _omr_config_lock_state.depth = 1
+            try:
+                yield
+            finally:
+                _omr_config_lock_state.depth = 0
+        finally:
+            if lock_file is not None:
+                try:
+                    if lock_acquired:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                finally:
+                    lock_file.close()
+
+
+def _serialise_config_write(func):
+    """Hold the config lock across a multi-step user lifecycle operation."""
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        with _omr_config_lock(exclusive=True):
+            return func(*args, **kwargs)
+    return wrapped
+
+
+def _read_omr_config_unlocked():
+    with open(OMR_CONFIG_FILE) as f:
+        content = f.read()
+    content = re.sub(r",\s*}", "}", content)  # pylint: disable=W1401
+    return json.loads(content)
+
+
+def _write_omr_config_unlocked(data):
+    """Atomically replace the config; caller must hold the exclusive lock."""
+    tmp = '{}.tmp.{}.{}'.format(OMR_CONFIG_FILE, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp, 'w') as outfile:
+            json.dump(data, outfile, indent=4)
+            outfile.write('\n')
+            try:
+                outfile.flush()
+                os.fsync(outfile.fileno())
+            except (OSError, ValueError, AttributeError):
+                pass
+        try:
+            mode = os.stat(OMR_CONFIG_FILE).st_mode & 0o777
+        except OSError:
+            mode = 0o600
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        move(tmp, OMR_CONFIG_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _mutate_omr_config(mutator, *, make_backup=True):
+    """Apply *mutator* to the latest config without losing concurrent updates."""
+    with _omr_config_lock(exclusive=True):
+        data = _read_omr_config_unlocked()
+        initial = copy.deepcopy(data)
+        result = mutator(data)
+        if data != initial:
+            if make_backup:
+                backup_config()
+            _write_omr_config_unlocked(data)
+        return result
 
 # Get main net interface(s) -- the WAN interface used both for traffic
 # accounting (get_bytes()/`ip addr show` calls further down) and, since the
@@ -160,8 +260,8 @@ def delete_oldest_files(path, keep = 10):
             os.remove(sorted_files[x][0])
 
 def backup_config():
-    shutil.copy2('/etc/openmptcprouter-vps-admin/omr-admin-config.json','/etc/openmptcprouter-vps-admin/omr-admin-config.json.' + str(int(time.time())))
-    delete_oldest_files('/etc/openmptcprouter-vps-admin/omr-admin-config.json.*')
+    shutil.copy2(OMR_CONFIG_FILE, OMR_CONFIG_FILE + '.' + str(int(time.time())))
+    delete_oldest_files(OMR_CONFIG_FILE + '.*')
 
 # Get interface rx/tx
 def get_bytes(t, iface='eth0'):
@@ -365,12 +465,10 @@ def read_proc(path):
 
 def read_omr_config():
     """Read and parse omr-admin-config.json, tolerating trailing commas."""
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content)  # pylint: disable=W1401
     try:
-        return json.loads(content)
-    except ValueError:
+        with _omr_config_lock(exclusive=False):
+            return _read_omr_config_unlocked()
+    except (OSError, ValueError):
         return {}
 
 _OMR_VERSION_CACHE: Optional[str] = None
@@ -421,54 +519,44 @@ def get_userid_from_username(username):
     return int(data['users'][0][username]['userid'])
 
 def check_username_serial(username, serial):
-    data = read_omr_config()
-    if not data:
+    def mutate(data):
+        if not data or 'serial_enforce' not in data or data['serial_enforce'] is False:
+            return bool(data)
+        user = data.get('users', [{}])[0].get(username)
+        if user is None:
+            return False
+        if 'serial' not in user:
+            user['serial'] = serial
+            return True
+        if user['serial'] == serial:
+            return True
+        user['serial_error'] = int(user.get('serial_error', 0)) + 1
         return False
-    if 'serial_enforce' not in data or data['serial_enforce'] is False:
-        return True
-    if 'serial' not in data['users'][0][username]:
-        data['users'][0][username]['serial'] = serial
-        if data:
-            with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-                json.dump(data, outfile, indent=4)
-        return True
-    if data['users'][0][username]['serial'] == serial:
-        return True
-    if 'serial_error' not in data['users'][0][username]:
-        data['users'][0][username]['serial_error'] = 1
-    else:
-        data['users'][0][username]['serial_error'] = int(data['users'][0][username]['serial_error']) + 1
-    backup_config()
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-        json.dump(data, outfile, indent=4)
-    return False
+
+    try:
+        return _mutate_omr_config(mutate)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 def set_global_param(key, value):
-    data = read_omr_config()
-    if not data:
+    def mutate(data):
+        if not data:
+            raise ValueError('Config file not readable')
+        data[key] = value
+
+    try:
+        _mutate_omr_config(mutate)
+    except (OSError, ValueError):
         LOG.debug("Can't read file for set_global_param")
         return {'error': 'Config file not readable', 'route': 'global_param'}
-    if not key in data or data[key] != value:
-        data[key] = value
-        #LOG.debug("backup_config() in set_global_param")
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-            json.dump(data, outfile, indent=4)
 #    else:
 #        LOG.debug("Already exist data for set_global_param key:" + key)
 
 def modif_config_user(user, changes):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
-    content_initial = copy.deepcopy(content)
-    content['users'][0][user].update(changes)
-    if content_initial != content:
-        LOG.debug("backup_config() in modif_config_user")
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-            json.dump(content, f, indent=4)
-    else:
-        LOG.debug("No real changes in modif_config_user")
+    def mutate(content):
+        content['users'][0][user].update(changes)
+
+    _mutate_omr_config(mutate)
 
 # Default VXLAN L3 (routed P2P) tunnel addresses, one /30 (v4) and one /126
 # (v6) per userid, server side .1 / router side .2. Userids 0..63 keep the
@@ -1554,6 +1642,16 @@ def _nft_flush_chain(chain, rule_lines):
 
 # --- per-user opened/redirected ports (user_accept / user_dnat chains) ---
 
+def _addr_family(value):
+    """4 or 6 for an IP address or CIDR literal, None for anything else
+    (empty, hostname, interface name, comma-separated list...)."""
+    if not value:
+        return None
+    try:
+        return ipaddress.ip_network(value, strict=False).version
+    except ValueError:
+        return None
+
 def _render_fw_ports(config_data):
     """Pure: (accept_rules, dnat_rules) from every user's fw_ports entries."""
     accept_rules, dnat_rules = [], []
@@ -1569,6 +1667,15 @@ def _render_fw_ports(config_data):
             dest_ip = entry.get('dest_ip', '')
             vpn = entry.get('vpn', 'default')
             comment = entry.get('comment', '')
+            if any(af not in (None, family) for af in (_addr_family(source_dip), _addr_family(dest_ip))):
+                # An address restriction from the other family renders nft
+                # syntax that does not parse (`meta nfproto ipv6 ip6 daddr
+                # 1.2.3.4`), and the chain is flushed in a single nft
+                # transaction: one such entry would drop every other port of
+                # every user. Skip just this one.
+                LOG.warning("skipping firewall entry %s %s/%s of user %s: IPv%d rule restricted to %s",
+                            name, proto, port, username, family, source_dip or dest_ip)
+                continue
             match = f'meta nfproto {"ipv4" if family == 4 else "ipv6"}'
             # source_dip/dest_ip are Shorewall's own confusing legacy naming:
             # source_dip is actually the pre-NAT/original destination (which
@@ -1898,18 +2005,15 @@ def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip
     _fw_port_del(username, str(port), proto, name, fwtype, 6, source_dip, dest_ip)
 
 def set_lastchange(sync=0):
-    configdata = read_omr_config()
-    if not configdata:
+    def mutate(data):
+        if not data:
+            raise ValueError('Config file not readable')
+        data["lastchange"] = time.time() + sync
+
+    try:
+        _mutate_omr_config(mutate)
+    except (OSError, ValueError):
         return {'error': 'Config file not readable', 'route': 'lastchange'}
-    data = copy.deepcopy(configdata)
-    data["lastchange"] = time.time() + sync
-    if data and data != configdata:
-        LOG.debug("backup_config() in set_last_change")
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as outfile:
-            json.dump(data, outfile, indent=4)
-    else:
-        LOG.debug("Empty data for set_last_change")
 
 
 with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -2550,9 +2654,13 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
         userid = current_user.userid
     elif username is not None:
         userid = get_userid_from_username(username)
+        if isinstance(userid, dict):
+            return {'error': 'Unknown user', 'route': 'status'}
     if userid is None:
         userid = 0
     username = get_username_from_userid(userid)
+    if not isinstance(username, str) or not username:
+        return {'error': 'Unknown user', 'route': 'status'}
     if not current_user.permissions == "admin" and serial is not None:
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
@@ -3553,6 +3661,23 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
 class IPPROTO(str, Enum):
     ipv4 = "ipv4"
     ipv6 = "ipv6"
+    any = "any"
+
+def _fw_families(ipproto):
+    """Address families an `ipproto` value covers.
+
+    LuCI's "Restrict to address family = IPv4 and IPv6" stores family='any'
+    in uci and the router's `_vps_firewall_redirect_port` passes that value
+    straight to us, so 'any' has to be accepted here and mean *both*. It
+    used to be rejected by the enum with a 422 nobody checked (the router
+    never looks at the API result), so the port was silently never opened.
+    Everything below also used to read "not ipv4" as IPv6, which made 'any'
+    consult the wrong family even where it got that far."""
+    if ipproto == IPPROTO.any:
+        return (4, 6)
+    if ipproto == IPPROTO.ipv6:
+        return (6,)
+    return (4,)
 
 class FirewallAllparams(BaseModel):
     redirect_ports: str = Query(..., title="Port or ports range")
@@ -3566,8 +3691,8 @@ def _firewall_set(params, current_user, route):
     state = params.redirect_ports
     if state is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
-    key = 'bulk_redirect_v4' if params.ipproto == 'ipv4' else 'bulk_redirect_v6'
-    set_global_param(key, state == 'enable')
+    for family in _fw_families(params.ipproto):
+        set_global_param('bulk_redirect_v4' if family == 4 else 'bulk_redirect_v6', state == 'enable')
     _nft_sync_ports()
     return {'result': 'done', 'reason': 'changes applied'}
 
@@ -3631,7 +3756,7 @@ def _firewall_list(params, current_user, route):
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
     # `name` here is historically the verb ("open" or "redirect"), not a
     # service name -- matches shorewall_add_port's fwtype ('ACCEPT'/'DNAT').
-    family = 4 if params.ipproto == 'ipv4' else 6
+    families = _fw_families(params.ipproto)
     config_data = read_omr_config()
     entries = config_data.get('users', [{}])[0].get(current_user.username, {}).get('fw_ports', []) if config_data else []
     # Same selection the Shorewall-era implementation did on the rules file:
@@ -3642,10 +3767,13 @@ def _firewall_list(params, current_user, route):
     needle = f'# OMR {current_user.username} {name}'
     fwlist = []
     for entry in entries:
-        if entry.get('family', 4) != family:
+        if entry.get('family', 4) not in families:
             continue
         line = _legacy_fw_line(current_user.username, entry)
-        if line and needle in line:
+        # ipproto='any' walks both families and the legacy line layout has
+        # no family column, so a port opened for both renders twice: keep
+        # the list as the router expects it, one line per rule it knows.
+        if line and needle in line and line not in fwlist:
             fwlist.append(line)
     return {'list': fwlist}
 
@@ -3696,18 +3824,28 @@ def _firewall_open(params, current_user, route):
     #if proxy == 'v2ray':
     #    v2ray_add_port(current_user, str(port), proto, name)
     #    fwtype = 'ACCEPT'
-    if params.ipproto == 'ipv4':
+    families = _fw_families(params.ipproto)
+    if params.ipproto == IPPROTO.any:
+        # 'any' means "whatever applies", not "write a broken rule": an
+        # address restriction pins the rule to the family of that literal.
+        # Rendering e.g. `meta nfproto ipv6 ip6 daddr 1.2.3.4` would make
+        # the whole user_accept/user_dnat flush fail (one nft transaction),
+        # taking every other port with it.
+        wanted = [_addr_family(addr) for addr in (source_dip, source_ip)]
+        families = tuple(f for f in families if all(w in (None, f) for w in wanted))
+    if 4 in families:
         if 'gre_tunnels' in omr_config_data['users'][0][current_user.username]:
             for tunnel in omr_config_data['users'][0][current_user.username]['gre_tunnels']:
                 if omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['public_ip'] == source_dip:
                     vpn = omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['remote_ip']
         shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
-    else:
-        # `vpn` stays 'default' here (GRE tunnels are IPv4-only, so the
-        # lookup above never runs for the v6 branch) -- passed explicitly
-        # so `comment` lands in shorewall6_add_port's actual gencomment
-        # slot instead of silently taking vpn's position.
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
+    if 6 in families:
+        # GRE tunnels are IPv4-only, so the lookup above never applies to
+        # the v6 rule: pass 'default' explicitly (not `vpn`, which the v4
+        # branch may just have set) so `comment` lands in
+        # shorewall6_add_port's actual gencomment slot instead of silently
+        # taking vpn's position.
+        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, 'default', comment)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/firewallopen', summary="Redirect a port from Server to Router")
@@ -3733,10 +3871,11 @@ def _firewall_close(params, current_user, route):
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
     #v2ray_del_port(current_user.username, str(port), proto, name)
-    if params.ipproto == 'ipv4':
+    families = _fw_families(params.ipproto)
+    if 4 in families:
         shorewall_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
         shorewall_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
-    else:
+    if 6 in families:
         shorewall6_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
         shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
     return {'result': 'done', 'reason': 'changes applied', 'route': route}
@@ -4139,9 +4278,19 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     os.close(fd)
     move(tmpfile, '/etc/sysctl.d/90-shadowsocks.conf')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/sysctl.d/90-shadowsocks.conf', 'rb'))).hexdigest()
+    # An MPTCP socket keeps the scheduler its listener had when it was created,
+    # so a sysctl change alone never reaches the connections the router already
+    # has: every service that terminates MPTCP here has to be restarted or it
+    # keeps scheduling the download direction the old way. shadowsocks-go was
+    # missing from this list, so a router on proxy shadowsocks-rust/-go could
+    # select a scheduler (e.g. bpf_red for redundancy), see it applied on the
+    # upload side, and silently keep the previous one on everything the server
+    # sends back.
     if initial_md5 != final_md5:
         if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
             subprocess.run(["systemctl", "-q", "restart", "shadowsocks-libev-manager@manager"], check=False)
+        if os.path.isfile('/etc/shadowsocks-go/server.json'):
+            subprocess.run(["systemctl", "-q", "restart", "shadowsocks-go.service"], check=False)
         if os.path.isfile('/etc/v2ray/v2ray-server.json'):
             subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
         if os.path.isfile('/etc/xray/xray-server.json'):
@@ -4475,7 +4624,7 @@ def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user))
     LOG.debug("modif_config_user for vxlan setting")
     modif_config_user(current_user.username, {'vxlan': vxlan_user_config})
     write_vxlan_conf(current_user.username, userid)
-    return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(current_user.username, userid)}
+    return {'result': 'done', 'reason': 'changes applied', 'vxlan': vxlan_user_config}
 
 @app.get('/vxlan_vnis', summary="Admin: list every user's VXLAN VNI and port assignment")
 def vxlan_vnis(current_user: User = Depends(get_current_user)):
@@ -4534,7 +4683,7 @@ def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get
         }
     modif_config_user(params.username, {'vxlan': vxlan_user_config})
     write_vxlan_conf(params.username, userid)
-    return {'result': 'done', 'reason': 'changes applied', 'vxlan': get_vxlan_config(params.username, userid), 'route': 'vxlan_user'}
+    return {'result': 'done', 'reason': 'changes applied', 'vxlan': vxlan_user_config, 'route': 'vxlan_user'}
 
 class PROXY(str, Enum):
     """Proxy names shared by POST /proxy, /config and /proxy_list.
@@ -5477,9 +5626,15 @@ def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_curre
     backup_file = backupfile.data
     if not backup_file:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'backuppost'}
+    try:
+        decoded = base64.b64decode(backup_file, validate=True)
+    except (binascii.Error, ValueError):
+        return {'result': 'error', 'reason': 'Invalid base64 backup data', 'route': 'backuppost'}
+    if not decoded:
+        return {'result': 'error', 'reason': 'Empty backup data', 'route': 'backuppost'}
     with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', 'wb') as f, open('/var/opt/openmptcprouter/' + current_user.username + '-' + str(int(time.time())) + '-backup.tar.gz', 'wb') as g:
-        g.write(base64.b64decode(backup_file))
-        f.write(base64.b64decode(backup_file))
+        g.write(decoded)
+        f.write(decoded)
     delete_oldest_files('/var/opt/openmptcprouter/' + current_user.username + '-*-backup.tar.gz')
     return {'result': 'done', 'route': 'backuppost'}
 
@@ -5559,6 +5714,7 @@ class NewUser(BaseModel):
     softethervpn_pass: Optional[str] = Query(None, title="SoftEther VPN password")
 
 @app.post('/add_user', summary="Add a new user")
+@_serialise_config_write
 def add_user(*, params: NewUser, current_user: User = Depends(get_current_user), request: Request):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
@@ -5650,14 +5806,10 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
         user_json[params.username].update({"vpn": params.vpn})
     if params.proxy is not None:
         user_json[params.username].update({"proxy": params.proxy})
-    content['users'][0].update(user_json)
-    if content:
-        LOG.debug("backup_config() in add user")
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-            json.dump(content, f, indent=4)
-    else:
-        LOG.debug("Empty data for add_user")
+    def persist_user(latest):
+        latest['users'][0].update(user_json)
+
+    _mutate_omr_config(persist_user)
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
         LOG.debug("Create user " + params.username + " in Glorytun-TCP")
         add_glorytun_tcp(userid)
@@ -5705,6 +5857,7 @@ class RemoveUser(BaseModel):
     username: str = Query(..., pattern=USERNAME_PATTERN)
 
 @app.post('/remove_user', summary="Remove an user")
+@_serialise_config_write
 def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user), request: Request):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
@@ -5726,14 +5879,10 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         v2ray_del_user(params.username)
     if os.path.isfile('/etc/xray/xray-server.json'):
         xray_del_user(params.username)
-    del content['users'][0][params.username]
-    if content:
-        LOG.debug("backup_config() in remove user")
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-            json.dump(content, f, indent=4)
-    else:
-        LOG.debug("Empty data for remover_user")
+    def persist_removal(latest):
+        latest.get('users', [{}])[0].pop(params.username, None)
+
+    _mutate_omr_config(persist_removal)
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         subprocess.run(["./easyrsa", "--batch", "revoke", params.username], cwd="/etc/openvpn/ca", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         env = os.environ.copy()

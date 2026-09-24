@@ -98,6 +98,28 @@ def _bootstrap_harness():
     ])
 
 
+def _database_section():
+    start = SCRIPT_TEXT.index("# 4. Create database")
+    end = SCRIPT_TEXT.index("# 5. Python influxdb3-python client")
+    return SCRIPT_TEXT[start:end]
+
+
+def _database_harness():
+    return "\n".join([
+        "#!/bin/sh",
+        "set -eu",
+        _function("log"),
+        _function("die"),
+        _function("step"),
+        'INFLUX_BUCKET="omr_metrics"',
+        'INFLUX_HOST="http://127.0.0.1:65501"',
+        'ADMIN_TOKEN="test-token"',
+        'INFLUX_RETENTION="60d"',
+        _database_section(),
+        "",
+    ])
+
+
 # ---------------------------------------------------------------------------
 # Fake executables
 # ---------------------------------------------------------------------------
@@ -265,6 +287,10 @@ class TestScriptText:
         assert "\n_save_creds\n" in SCRIPT_TEXT
         assert SCRIPT_TEXT.index("\n_save_creds\n") < SCRIPT_TEXT.index("# 4. Create database")
 
+    def test_config_update_uses_same_process_lock_as_api(self):
+        assert '".omr-admin-config.lock"' in SCRIPT_TEXT
+        assert "fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)" in SCRIPT_TEXT
+
 
 # ===========================================================================
 # Tunables: defaults vs environment
@@ -427,3 +453,36 @@ class TestCliFailures:
         assert r.stdout == ""
         assert "unexpected argument '--host' found" in r.stderr
         assert not sandbox.marker.exists()
+
+
+class TestDatabaseCreation:
+    @staticmethod
+    def _run(tmp_path, fake_body):
+        fakebin = tmp_path / "bin"
+        fakebin.mkdir()
+        influxdb3 = fakebin / "influxdb3"
+        influxdb3.write_text("#!/bin/sh\n" + fake_body + "\n")
+        influxdb3.chmod(0o755)
+        harness = tmp_path / "database.sh"
+        harness.write_text(_database_harness())
+        env = {
+            **os.environ,
+            "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "LC_ALL": "C",
+        }
+        return subprocess.run(
+            ["sh", str(harness)], env=env, capture_output=True, text=True, timeout=30,
+        )
+
+    def test_database_failure_aborts_installer(self, tmp_path):
+        r = self._run(tmp_path, 'echo "connection refused" >&2; exit 9')
+        assert r.returncode == 1
+        assert "connection refused" in r.stderr
+        assert "Failed to create database 'omr_metrics'" in r.stderr
+        assert "Database ready." not in r.stdout
+
+    def test_already_existing_database_is_success(self, tmp_path):
+        r = self._run(tmp_path, 'echo "database already exists" >&2; exit 1')
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Database already exists." in r.stdout
+        assert "Database ready." in r.stdout

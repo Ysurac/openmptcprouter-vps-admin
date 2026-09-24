@@ -127,6 +127,21 @@ class TestRenderFwPorts:
         assert "ip daddr 203.0.113.5" in accept[0]
         assert "ip saddr 198.51.100.9" in accept[0]
 
+    def test_entry_restricted_to_the_other_family_is_skipped(self):
+        # A v4 literal on a v6 rule would render `meta nfproto ipv6 ip6
+        # daddr 1.2.3.4`, which nft refuses -- and the chain is flushed in a
+        # single transaction, so it would take every other port with it.
+        config = _config({
+            "openmptcprouter": {"userid": 0, "fw_ports": [
+                {"name": "http", "port": "80", "proto": "tcp", "fwtype": "ACCEPT", "family": 6,
+                 "source_dip": "1.2.3.4"},
+                {"name": "https", "port": "443", "proto": "tcp", "fwtype": "ACCEPT", "family": 6},
+            ]},
+        })
+        accept, _ = omr_admin._render_fw_ports(config)
+        assert [l for l in accept if "dport 443" in l]
+        assert not [l for l in accept if "dport 80" in l]
+
     def test_comment_tags_include_username_and_verb(self):
         config = _config({
             "bob": {"userid": 1, "fw_ports": [
@@ -322,6 +337,20 @@ class TestShorewallListRendering:
         assert [l.split()[4] for l in self._list(config, "redirect router", "ipv6")] == ["23"]
         # unsupported fwtype (a rule pushed without target) is never listed
         assert all("udp" not in l for l in redirect)
+
+    def test_family_any_lists_both_families_without_duplicates(self):
+        # LuCI's "Restrict to address family = IPv4 and IPv6" sends
+        # ipproto='any'; the legacy line layout has no family column, so a
+        # port opened for both families must still appear once or the router
+        # would close it on the line it did not match.
+        config = _config({
+            "openmptcprouter": {"fw_ports": [
+                {"name": "router 21", "port": "21", "proto": "tcp", "fwtype": "DNAT", "family": 4},
+                {"name": "router 21", "port": "21", "proto": "tcp", "fwtype": "DNAT", "family": 6},
+                {"name": "router 23", "port": "23", "proto": "tcp", "fwtype": "DNAT", "family": 6},
+            ]},
+        })
+        assert [l.split()[4] for l in self._list(config, "redirect router", "any")] == ["21", "23"]
 
 
 # ===========================================================================
