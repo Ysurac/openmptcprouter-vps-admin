@@ -15,9 +15,7 @@ Strategy
 
 import io
 import json
-from unittest.mock import call, patch
-
-import pytest
+from unittest.mock import patch
 
 from conftest import _mock_open, omr_admin
 

@@ -19,7 +19,7 @@ import json
 import math
 import os
 import time
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -682,7 +682,7 @@ class TestJSONBackend:
 # GET /metrics/history
 # ===========================================================================
 
-class TestGetMetricsHistory:
+class TestGetMetricsHistoryEndpoint:
     def test_requires_influxdb_backend(self, user_client):
         r = user_client.get("/metrics/history")
         assert r.status_code == 501

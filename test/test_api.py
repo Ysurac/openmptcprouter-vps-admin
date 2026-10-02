@@ -24,7 +24,6 @@ from conftest import (
     MOCK_CONFIG,
     MQVPN_CONFIG,
     _mock_open,
-    admin_headers,
     omr_admin,
     user_headers,
 )
@@ -33,7 +32,6 @@ from conftest import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-_CONFIG_JSON = json.dumps(MOCK_CONFIG)
 
 # Must stay identical to the text log_auth_failure() emits and to the failregex
 # in fail2ban-filter-omradmin.conf (openmptcprouter-vps repo).
@@ -2205,7 +2203,9 @@ class TestMqvpnControlAddr:
         ):
             r = omr_admin.mqvpn_api({"cmd": "list_users"})
         assert r["ok"] is False
-        assert "refused" in r["error"]
+        # the exception text is logged, never relayed to API clients
+        assert "refused" not in r["error"]
+        assert r["error"]
 
 
 class TestOpenVpn:
@@ -4063,3 +4063,28 @@ class TestSpeedtestIntegration:
         assert "bytes" in body
         assert "speed_mbps" in body
         assert "duration" in body
+
+
+class TestSecurityHelpers:
+    def test_safe_path_join_accepts_child(self):
+        import omr_admin
+        assert omr_admin.safe_path_join("/etc/openvpn/ccd", "alice") == "/etc/openvpn/ccd/alice"
+
+    @pytest.mark.parametrize("name", ["..", "../../etc/passwd", "/etc/passwd", "."])
+    def test_safe_path_join_rejects_escape(self, name):
+        import omr_admin
+        with pytest.raises(ValueError):
+            omr_admin.safe_path_join("/etc/openvpn/ccd", name)
+
+    def test_log_safe_neutralises_line_breaks(self):
+        import omr_admin
+        assert omr_admin.log_safe("bob\r\nfake line") == "bob\\r\\nfake line"
+
+    @pytest.mark.parametrize("name,ok", [
+        ("alice", True), ("a.b-c_d", True), ("openmptcprouter", True),
+        (".", False), ("..", False), (".hidden", False), ("a/b", False), ("", False),
+    ])
+    def test_username_pattern(self, name, ok):
+        import re
+        import omr_admin
+        assert bool(re.fullmatch(omr_admin.USERNAME_PATTERN, name)) is ok

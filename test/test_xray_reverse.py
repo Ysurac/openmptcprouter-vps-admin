@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from conftest import omr_admin, user_headers  # noqa: F401  (fixtures)
+from conftest import omr_admin  # noqa: F401  (fixtures)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -81,8 +81,8 @@ class _FileEnv:
             env = self
 
             class _Recorder(io.BytesIO if binary else io.StringIO):
-                def close(recorder):
-                    env.written[sp] = recorder.getvalue()
+                def close(self):
+                    env.written[sp] = self.getvalue()
                     super().close()
 
             return _Recorder()

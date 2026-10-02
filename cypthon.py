@@ -51,7 +51,7 @@ def build(keep_c: bool = False):
         *extra,
         "-o", output,
     ])
-    os.chmod(output, 0o755)
+    os.chmod(output, 0o700)
 
     if not keep_c:
         os.remove(c_file)

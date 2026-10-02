@@ -263,7 +263,7 @@ def _tunables(**env_extra):
         "set -eu",
         *(_assignment(n) for n in TUNABLES),
         'printf "%s\\n" "RESET_DATA=$RESET_DATA" "INSTALL_AI=$INSTALL_AI" '
-        '"INFLUX_RETENTION=$INFLUX_RETENTION" "INFLUX_RETENTION_DAYS=$INFLUX_RETENTION_DAYS"',
+        + '"INFLUX_RETENTION=$INFLUX_RETENTION" "INFLUX_RETENTION_DAYS=$INFLUX_RETENTION_DAYS"',
     ])
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env_extra}
     r = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=30)

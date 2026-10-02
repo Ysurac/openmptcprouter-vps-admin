@@ -19,7 +19,6 @@ import importlib.util
 import io
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, urlsplit
@@ -269,7 +268,7 @@ class _ASGITestClient:
             try:
                 await asyncio.wait_for(self._app(scope, receive, send), 2.0)
             except _ResponseComplete:
-                pass
+                pass  # response fully sent, stop the app
             except asyncio.TimeoutError:
                 if not chunks:
                     raise

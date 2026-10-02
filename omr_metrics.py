@@ -158,7 +158,7 @@ def _config_write_lock():
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 lock_acquired = True
             except (OSError, ValueError, AttributeError):
-                pass
+                pass  # locking unsupported here, carry on unlocked
             yield
         finally:
             if lock_file is not None:
@@ -559,7 +559,7 @@ class InfluxBackend:
                 try:
                     result.setdefault(uname, {})[iface] = json.loads(payload_str)
                 except Exception:
-                    pass
+                    pass  # skip a corrupt row
         except Exception as exc:
             LOG.error("omr_metrics InfluxDB: result parse error: %s", exc)
         return result
@@ -593,7 +593,7 @@ class InfluxBackend:
                         entry["timestamp"] = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
                     result.append(entry)
                 except Exception:
-                    pass
+                    pass  # skip a corrupt row
         except Exception as exc:
             LOG.debug("omr_metrics InfluxDB history: result parse error: %s", exc)
         return result
@@ -651,7 +651,7 @@ class InfluxBackend:
                     if len(entries) < int(limit):
                         entries.append(entry)
                 except Exception:
-                    pass
+                    pass  # skip a corrupt row
         except Exception as exc:
             LOG.debug("omr_metrics InfluxDB history: result parse error: %s", exc)
         return result
@@ -808,7 +808,7 @@ def _init_backend():
                 EMA_ALPHA = max(0.01, min(1.0, float(ema_alpha)))
                 LOG.info("omr_metrics: EMA_ALPHA=%.2f (from config)", EMA_ALPHA)
             except (TypeError, ValueError):
-                pass
+                pass  # invalid value, keep the default
         influx_cfg = config.get("influxdb") or {}
         if influx_cfg.get("url") and influx_cfg.get("token"):
             try:
@@ -2456,7 +2456,7 @@ def _auto_set_enabled(enabled: bool) -> bool:
                         f.flush()
                         os.fsync(f.fileno())
                     except (OSError, ValueError, AttributeError):
-                        pass
+                        pass  # fsync is best effort
                 os.replace(tmp, OMR_CONFIG_FILE)
                 persisted = True
             finally:
@@ -2464,7 +2464,7 @@ def _auto_set_enabled(enabled: bool) -> bool:
                     os.remove(tmp)
     except Exception as exc:
         LOG.warning("omr_auto: could not persist auto_learning.enabled=%s: %s",
-                    enabled, exc)
+                    bool(enabled), exc)
 
     cfg = _auto_cfg(force=True)
     cfg["enabled"] = bool(enabled)   # runtime effect even if persistence failed
@@ -2525,7 +2525,7 @@ def _model_meta() -> dict:
         try:
             file_bytes = os.path.getsize(DECISION_MODEL_FILE)
         except OSError:
-            pass
+            pass  # size stays unknown
     meta["model_file_bytes"] = file_bytes
 
     param_count: Optional[int] = None
@@ -2533,7 +2533,7 @@ def _model_meta() -> dict:
         m = _get_model()
         param_count = sum(p.numel() for p in m.parameters())
     except Exception:
-        pass
+        pass  # model not loadable, count stays unknown
     meta["model_parameters"] = param_count
     meta["model_loaded_at"] = _engine_stats.get("model_loaded_at")
     return meta
@@ -2584,7 +2584,7 @@ def _parse_prometheus_metrics(text: str) -> dict:
         try:
             result[base] = float(value_str)
         except ValueError:
-            pass
+            pass  # not a numeric sample
     return result
 
 
@@ -2603,9 +2603,12 @@ def _fetch_influx_metrics(influx_url: str, token: str, timeout: int = 5) -> dict
                 return {"error": f"HTTP {resp.status}"}
             return _parse_prometheus_metrics(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.URLError as exc:
-        return {"error": str(exc)}
+        # Details stay in the log: this dict is returned by /metrics/engine
+        LOG.debug("InfluxDB metrics fetch failed: %s", exc)
+        return {"error": "InfluxDB metrics endpoint unreachable"}
     except Exception as exc:
-        return {"error": str(exc)}
+        LOG.debug("InfluxDB metrics fetch failed: %s", exc)
+        return {"error": "InfluxDB metrics fetch failed"}
 
 
 _INFLUX_CONFIG_PATHS = [
@@ -2644,7 +2647,7 @@ def _find_influx_data_dir() -> Optional[str]:
                                 if val and os.path.isdir(val):
                                     return val
         except OSError:
-            pass
+            pass  # unreadable config, try the next one
 
     for d in _INFLUX_DATA_DIRS:
         if os.path.isdir(d):
@@ -2661,9 +2664,9 @@ def _dir_size_bytes(path: str) -> int:
                 try:
                     total += os.path.getsize(os.path.join(dirpath, fname))
                 except OSError:
-                    pass
+                    pass  # file vanished while walking
     except OSError:
-        pass
+        pass  # unreadable directory, report what was summed
     return total
 
 
@@ -2675,7 +2678,7 @@ def _backend_meta() -> dict:
         try:
             size = os.path.getsize(METRICS_FILE) if os.path.isfile(METRICS_FILE) else 0
         except OSError:
-            pass
+            pass  # size stays unknown
         return {"backend": "json", "file_bytes": size, "file_path": METRICS_FILE}
 
     # InfluxDB backend — read config to get URL + token, then fetch /metrics
@@ -2684,7 +2687,7 @@ def _backend_meta() -> dict:
         with open(OMR_CONFIG_FILE) as f:
             influx_cfg = json.load(f).get("influxdb") or {}
     except Exception:
-        pass
+        pass  # no influxdb settings, use the defaults
     url   = influx_cfg.get("url", "")
     token = influx_cfg.get("token", "")
     bucket = influx_cfg.get("bucket", "omr_metrics")

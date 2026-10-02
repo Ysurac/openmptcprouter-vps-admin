@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
-from conftest import omr_admin, user_headers  # noqa: F401  (fixtures)
+from conftest import omr_admin  # noqa: F401  (fixtures)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,8 +38,8 @@ class _FileEnv:
             env = self
 
             class _Recorder(io.BytesIO if binary else io.StringIO):
-                def close(recorder):
-                    value = recorder.getvalue()
+                def close(self):
+                    value = self.getvalue()
                     env.written[sp] = value
                     # Feed the write back so later reads in the same test see it
                     env.files[sp] = value.decode() if binary else value

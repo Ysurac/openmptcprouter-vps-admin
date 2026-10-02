@@ -8,7 +8,6 @@ full omr-admin.py performs at import time.
 
 import io
 import time
-import pytest
 from typing import Optional
 from unittest.mock import patch
 

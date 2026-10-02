@@ -544,6 +544,20 @@ class TestSyncSipAlg:
         with patch("subprocess.run", side_effect=_run):
             assert omr_admin._nft_sync_sipalg(True) is False
 
+    def test_enable_stops_when_modprobe_fails(self):
+        # omr-admin.service without CAP_SYS_MODULE: modprobe gets EPERM. Report
+        # that, rather than running nft batches that can only fail with ENOENT
+        def _run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 1 if cmd[0] == "modprobe" else 0
+            result.stderr = b"modprobe: ERROR: could not insert 'nf_conntrack_sip': Operation not permitted"
+            return result
+        with patch("subprocess.run", side_effect=_run) as run, \
+             patch.object(omr_admin.LOG, "warning") as warning:
+            assert omr_admin._nft_sync_sipalg(True) is False
+        assert [c.args[0][0] for c in run.call_args_list] == ["modprobe"]
+        assert "Operation not permitted" in warning.call_args.args[-1]
+
 
 # ===========================================================================
 # _nft_flush_chain / _nft_run -- the shared apply mechanism
