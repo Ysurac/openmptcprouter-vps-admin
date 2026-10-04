@@ -325,6 +325,54 @@ class TestConfig:
         assert r.status_code == 200
 
 
+class TestConfigWritePermissions:
+    """The config holds every user's password and the VPN keys, so a write of
+    it must leave it root-only (0600), even if some other writer had widened
+    it; and a backup of it must be 0600 too. Rotation must keep only the
+    timestamped backups, never the installer's pre-upgrade `.bak`."""
+
+    @pytest.mark.real_env
+    def test_write_forces_0600_even_if_file_was_world_readable(self, tmp_path, monkeypatch):
+        import stat
+        cfg = tmp_path / "omr-admin-config.json"
+        cfg.write_text(json.dumps({"users": [{"openmptcprouter": {"userid": 0}}]}))
+        cfg.chmod(0o644)
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_FILE", str(cfg))
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        omr_admin._write_omr_config_unlocked({"users": [{"openmptcprouter": {"userid": 0}}], "touched": True})
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+        assert json.loads(cfg.read_text())["touched"] is True
+
+    @pytest.mark.real_env
+    def test_backup_is_0600_even_from_a_world_readable_config(self, tmp_path, monkeypatch):
+        import stat
+        cfg = tmp_path / "omr-admin-config.json"
+        cfg.write_text(json.dumps({"users": [{}]}))
+        cfg.chmod(0o644)
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_FILE", str(cfg))
+        omr_admin.backup_config()
+        backups = list(tmp_path.glob("omr-admin-config.json.[0-9]*"))
+        assert len(backups) == 1
+        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+
+    @pytest.mark.real_env
+    def test_rotation_keeps_installer_bak(self, tmp_path):
+        # The installer's pre-upgrade copy has an old mtime, so a naive
+        # "keep the 10 newest of .*" rotation would evict it first. The
+        # rotation glob must match only the timestamped backups.
+        import time
+        bak = tmp_path / "omr-admin-config.json.bak"
+        bak.write_text("{}")
+        old = time.time() - 10000
+        os.utime(bak, (old, old))
+        for i in range(12):
+            ts = tmp_path / f"omr-admin-config.json.{1700000000 + i}"
+            ts.write_text("{}")
+        omr_admin.delete_oldest_files(str(tmp_path / "omr-admin-config.json.[0-9]*"), keep=10)
+        assert bak.exists(), "installer's .bak must not be rotated away"
+        assert len(list(tmp_path.glob("omr-admin-config.json.[0-9]*"))) == 10
+
+
 # ===========================================================================
 # Shadowsocks
 # ===========================================================================

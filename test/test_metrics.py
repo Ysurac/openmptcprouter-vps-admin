@@ -3848,6 +3848,33 @@ class TestAutoLearningEndpoint:
         assert resp.json()["persisted"] is True
         repl.assert_called_once()
 
+    @pytest.mark.real_env
+    def test_persist_leaves_config_0600_and_keeps_users(self, tmp_path, monkeypatch):
+        # Persisting the toggle must not widen the secret-bearing config: a
+        # fresh tmp file is 0644, and os.replace would carry that over.
+        import stat
+        cfg = tmp_path / "omr-admin-config.json"
+        cfg.write_text(json.dumps({"users": [{"openmptcprouter": {"userid": 0, "user_password": "s"}}]}))
+        cfg.chmod(0o600)
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_FILE", str(cfg))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        assert omr_metrics._auto_set_enabled(False) is True
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+        data = json.loads(cfg.read_text())
+        assert data["auto_learning"]["enabled"] is False
+        assert "openmptcprouter" in data["users"][0]   # users preserved
+
+    @pytest.mark.real_env
+    def test_missing_config_is_not_replaced_with_a_userless_one(self, tmp_path, monkeypatch):
+        # A missing config must not be recreated without users (that would
+        # lock every router out); persistence just fails and the toggle
+        # stays a runtime-only change.
+        missing = tmp_path / "omr-admin-config.json"
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_FILE", str(missing))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        assert omr_metrics._auto_set_enabled(True) is False
+        assert not missing.exists()
+
     def test_persist_failure_still_toggles(self, admin_client):
         # Default test env discards writes and os.replace fails on the missing
         # tmp file → persistence fails but the runtime toggle must still apply.

@@ -2439,11 +2439,8 @@ def _auto_set_enabled(enabled: bool) -> bool:
     persisted = False
     try:
         with _config_write_lock():
-            try:
-                with open(OMR_CONFIG_FILE) as f:
-                    cfg_file = json.load(f)
-            except FileNotFoundError:
-                cfg_file = {}
+            with open(OMR_CONFIG_FILE) as f:
+                cfg_file = json.load(f)
             block = cfg_file.get("auto_learning") or {}
             block["enabled"] = bool(enabled)
             cfg_file["auto_learning"] = block
@@ -2457,6 +2454,12 @@ def _auto_set_enabled(enabled: bool) -> bool:
                         os.fsync(f.fileno())
                     except (OSError, ValueError, AttributeError):
                         pass  # fsync is best effort
+                # Owner-only: the config holds user passwords and VPN keys, and
+                # os.replace would otherwise give it this tmp file's 0644.
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
                 os.replace(tmp, OMR_CONFIG_FILE)
                 persisted = True
             finally:

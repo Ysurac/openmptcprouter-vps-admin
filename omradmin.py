@@ -173,12 +173,13 @@ def _write_omr_config_unlocked(data):
                 os.fsync(outfile.fileno())
             except (OSError, ValueError, AttributeError):
                 pass  # fsync is best effort
+        # The config holds every user's password and the VPN keys, and only
+        # root (omr-admin and the root-run helper scripts) ever reads it, so
+        # write it owner-only. Enforcing 0600 here rather than preserving the
+        # current mode also repairs a file another writer left world-readable:
+        # once widened, a preserved mode would otherwise stay 0644 for good.
         try:
-            mode = os.stat(OMR_CONFIG_FILE).st_mode & 0o777
-        except OSError:
-            mode = 0o600
-        try:
-            os.chmod(tmp, mode)
+            os.chmod(tmp, 0o600)
         except OSError:
             pass  # keep the default mode of the temp file
         move(tmp, OMR_CONFIG_FILE)
@@ -275,8 +276,19 @@ def delete_oldest_files(path, keep = 10):
             os.remove(sorted_files[x][0])
 
 def backup_config():
-    shutil.copy2(OMR_CONFIG_FILE, OMR_CONFIG_FILE + '.' + str(int(time.time())))
-    delete_oldest_files(OMR_CONFIG_FILE + '.*')
+    backup = OMR_CONFIG_FILE + '.' + str(int(time.time()))
+    shutil.copy2(OMR_CONFIG_FILE, backup)
+    # The config holds every user's password and VPN keys: a backup of it must
+    # not be left group/world readable even if the live file somehow was.
+    try:
+        os.chmod(backup, 0o600)
+    except OSError:
+        pass
+    # Rotate only our own timestamped backups. The glob must not match the
+    # installer's pre-upgrade `omr-admin-config.json.bak`, or this -- which
+    # runs on every config change, so its `.<epoch>` backups are always the
+    # newest -- would evict that recovery copy within ten writes.
+    delete_oldest_files(OMR_CONFIG_FILE + '.[0-9]*')
 
 # Get interface rx/tx
 def get_bytes(t, iface='eth0'):
