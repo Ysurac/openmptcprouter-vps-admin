@@ -497,6 +497,30 @@ class TestStartupConfigRecovery:
         assert stat.S_IMODE(bak.stat().st_mode) == 0o600
 
 
+class TestConfigPihole:
+    """/config must report Pi-hole v6 as installed.
+
+    The router uses the VPS Pi-hole only when pihole.state is true. Pi-hole
+    v6 keeps its settings in pihole.toml and has no setupVars.conf: its
+    migration from v5 moves that file to migration_backup_v6/.
+    """
+
+    @pytest.mark.parametrize("files, state", [
+        pytest.param(("/etc/pihole/pihole.toml",), True, id="v6"),
+        pytest.param(("/etc/pihole/setupVars.conf",), True, id="v5"),
+        pytest.param(("/etc/pihole/pihole.toml", "/etc/pihole/setupVars.conf"),
+                     True, id="both"),
+        pytest.param(("/etc/pihole/migration_backup_v6/setupVars.conf",),
+                     False, id="v5-backup-only"),
+        pytest.param((), False, id="none"),
+    ])
+    def test_pihole_state(self, user_client, files, state):
+        with patch("os.path.isfile", side_effect=_isfile_for(*files)):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        assert r.json()["pihole"]["state"] is state
+
+
 # ===========================================================================
 # Shadowsocks
 # ===========================================================================

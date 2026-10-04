@@ -3042,7 +3042,10 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     else:
         iperf3_key = ''
 
-    if os.path.isfile('/etc/pihole/setupVars.conf'):
+    # Pi-hole v6 keeps its settings in pihole.toml, and has no setupVars.conf
+    # (its migration from v5 moves that file away). Pi-hole's own installer
+    # takes either file as "Pi-hole is installed".
+    if os.path.isfile('/etc/pihole/pihole.toml') or os.path.isfile('/etc/pihole/setupVars.conf'):
         pihole = True
     else:
         pihole = False
