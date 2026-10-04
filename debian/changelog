@@ -1,3 +1,9 @@
+omr-vps-admin (0.18+20261004) unstable; urgency=medium
+
+  * Add omr-6in4-user* to NFT_VPN_IFACES, following openmptcprouter-vps's omr-vars.nft VPN_IFACES which now lists the 6in4 tunnel (omr6in4@.service) carrying the router's IPv6 (openmptcprouter#4382). The tunnel was a vpn interface under Shorewall6 but was missing from the nftables interface set, so the client2client rule rendered by omr-admin left IPv6 traffic between users' 6in4 tunnels out of the accepted VPN-to-VPN flows
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 04 Oct 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20261002) unstable; urgency=medium
 
   * Fix SIP ALG never being applied when enabled, logged only as a recurring "nft apply failed: Error: Could not process rule: No such file or directory (x2)" at every start and every /sipalg push from the router: the explicit modprobe nf_conntrack_sip added for #4361 runs inside omr-admin.service, whose CapabilityBoundingSet lacked CAP_SYS_MODULE, so it failed with EPERM, the sip_udp/sip_tcp ct helper objects were never created and the ct_helpers rules referencing them were refused. CAP_SYS_MODULE is added to the bounding set, and a failed modprobe is now logged with its own error ("SIP ALG not applied, can't load nf_conntrack_sip: ...") and stops there instead of running nft batches that can only fail

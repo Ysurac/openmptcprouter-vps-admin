@@ -1569,7 +1569,8 @@ NFT_BIN = '/usr/sbin/nft'
 # substitution local to one invocation/file, not a runtime object, so it
 # doesn't carry over between separate `nft` calls.
 NFT_VPN_IFACES = ('gt-tun*', 'gt-udp-tun*', 'mlvpn*', 'tun*', 'wg*', 'dsvpn*',
-                   'mqvpn*', 'gre-user*', 'vx-user*', 'omr-bonding', 'tap_softether')
+                   'mqvpn*', 'gre-user*', 'vx-user*', 'omr-6in4-user*', 'omr-bonding',
+                   'tap_softether')
 
 def _nft_iface_set(patterns):
     return '{ ' + ', '.join(f'"{p}"' for p in patterns) + ' }'
