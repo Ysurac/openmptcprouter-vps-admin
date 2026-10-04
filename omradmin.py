@@ -290,6 +290,57 @@ def backup_config():
     # newest -- would evict that recovery copy within ten writes.
     delete_oldest_files(OMR_CONFIG_FILE + '.[0-9]*')
 
+def _config_if_usable(path):
+    """Parse *path* the way the runtime reader does (tolerating a trailing
+    comma) and return it only if it carries at least one user; None otherwise.
+    A config with no users would let omr-admin start but reject every router."""
+    try:
+        with open(path) as f:
+            content = f.read()
+        data = json.loads(re.sub(r",\s*}", "}", content))  # pylint: disable=W1401
+    except (OSError, ValueError):
+        return None
+    users = data.get('users') if isinstance(data, dict) else None
+    if isinstance(users, list) and users and isinstance(users[0], dict) and users[0]:
+        return data
+    return None
+
+def load_startup_config():
+    """Read the config at startup, recovering from a backup if the live file
+    is missing, empty, truncated, carries a trailing comma or has lost its
+    users. Without this a single bad write (or a hand edit) makes omr-admin --
+    Restart=always, and poked by omr-service -- crash-loop on json.load and
+    never fall back to the rotated backups it keeps. The newest usable backup
+    is also written back, so later config changes (which read the live file)
+    don't fail in turn. Raises RuntimeError if nothing is usable, so the
+    failure is one clear log line, not a silent user-less start."""
+    data = _config_if_usable(OMR_CONFIG_FILE)
+    if data is not None:
+        # The live file is fine: just make sure a copy another writer (or an
+        # older release) left world-readable is tightened now, not only at the
+        # next config change. It holds every user's password and the VPN keys.
+        try:
+            if os.stat(OMR_CONFIG_FILE).st_mode & 0o077:
+                os.chmod(OMR_CONFIG_FILE, 0o600)
+        except OSError:
+            pass
+        return data
+    backups = sorted(
+        glob.glob(OMR_CONFIG_FILE + '.bak*') + glob.glob(OMR_CONFIG_FILE + '.[0-9]*'),
+        key=lambda p: os.stat(p).st_mtime, reverse=True)
+    for backup in backups:
+        data = _config_if_usable(backup)
+        if data is None:
+            continue
+        LOG.warning("config %s is unusable, recovering from backup %s", OMR_CONFIG_FILE, backup)
+        try:
+            with _omr_config_lock(exclusive=True):
+                _write_omr_config_unlocked(data)
+        except (OSError, ValueError):
+            LOG.warning("could not rewrite %s from %s; using the backup in memory", OMR_CONFIG_FILE, backup)
+        return data
+    raise RuntimeError(f"config {OMR_CONFIG_FILE} is unusable and no backup could be read")
+
 # Get interface rx/tx
 def get_bytes(t, iface='eth0'):
     try:
@@ -2050,8 +2101,7 @@ def set_lastchange(sync=0):
     return None
 
 
-with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-    omr_config_data = json.load(f)
+omr_config_data = load_startup_config()
 if 'debug' in omr_config_data and omr_config_data['debug']:
     LOG.setLevel(logging.DEBUG)
 if 'gre_tunnels' in omr_config_data and omr_config_data['gre_tunnels']:

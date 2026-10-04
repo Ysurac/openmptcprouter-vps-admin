@@ -373,6 +373,77 @@ class TestConfigWritePermissions:
         assert len(list(tmp_path.glob("omr-admin-config.json.[0-9]*"))) == 10
 
 
+class TestStartupConfigRecovery:
+    """Startup must tolerate a trailing comma and recover from a backup
+    instead of crash-looping on json.load (omr-admin is Restart=always and
+    omr-service restarts it when the API is unreachable). A config with no
+    users is treated as unusable so a good backup wins."""
+
+    _GOOD = {"users": [{"openmptcprouter": {"userid": 0, "user_password": "s"}}], "secret_key": "k"}
+
+    def _cfg(self, tmp_path, monkeypatch):
+        import json as _j
+        cfg = tmp_path / "omr-admin-config.json"
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_FILE", str(cfg))
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        return cfg
+
+    @pytest.mark.real_env
+    def test_valid_primary_is_used(self, tmp_path, monkeypatch):
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text(json.dumps(self._GOOD))
+        assert omr_admin.load_startup_config()["users"][0]["openmptcprouter"]["userid"] == 0
+
+    @pytest.mark.real_env
+    def test_world_readable_primary_is_tightened_at_startup(self, tmp_path, monkeypatch):
+        import stat
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text(json.dumps(self._GOOD))
+        cfg.chmod(0o644)
+        omr_admin.load_startup_config()
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+    @pytest.mark.real_env
+    def test_trailing_comma_is_tolerated(self, tmp_path, monkeypatch):
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text('{"users": [{"openmptcprouter": {"userid": 0},}],}')
+        assert "openmptcprouter" in omr_admin.load_startup_config()["users"][0]
+
+    @pytest.mark.real_env
+    def test_empty_primary_recovers_from_bak_and_repairs(self, tmp_path, monkeypatch):
+        import stat
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text("")                      # torn/empty write -> json.load would crash
+        (tmp_path / "omr-admin-config.json.bak").write_text(json.dumps(self._GOOD))
+        data = omr_admin.load_startup_config()
+        assert data["users"][0]["openmptcprouter"]["userid"] == 0
+        # The live file is repaired so later writes (which read it) don't fail,
+        # and stays owner-only.
+        assert json.loads(cfg.read_text())["users"][0]["openmptcprouter"]["userid"] == 0
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+    @pytest.mark.real_env
+    def test_userless_primary_recovers_from_newest_timestamped_backup(self, tmp_path, monkeypatch):
+        import time
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text(json.dumps({"users": [{}]}))     # no users -> unusable
+        old = tmp_path / "omr-admin-config.json.1700000000"
+        old.write_text(json.dumps({"users": [{"openmptcprouter": {"userid": 0, "note": "old"}}]}))
+        new = tmp_path / "omr-admin-config.json.1700000100"
+        new.write_text(json.dumps({"users": [{"openmptcprouter": {"userid": 0, "note": "new"}}]}))
+        os.utime(old, (1700000000, 1700000000))
+        os.utime(new, (1700000100, 1700000100))
+        assert omr_admin.load_startup_config()["users"][0]["openmptcprouter"]["note"] == "new"
+
+    @pytest.mark.real_env
+    def test_nothing_usable_raises(self, tmp_path, monkeypatch):
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text("")
+        (tmp_path / "omr-admin-config.json.bak").write_text("not json")
+        with pytest.raises(RuntimeError):
+            omr_admin.load_startup_config()
+
+
 # ===========================================================================
 # Shadowsocks
 # ===========================================================================
