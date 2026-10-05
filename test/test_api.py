@@ -2688,6 +2688,25 @@ class TestMqvpn:
         assert mqvpn.get("key") == MQVPN_CONFIG["users"][0]["key"]
         assert mqvpn.get("key") != MQVPN_CONFIG["auth_key"]
 
+    def test_config_returns_mqvpn_pin(self, user_client):
+        """/config carries the pin of the certificate server.json names, so the
+        router's mqvpn can authenticate the server (GHSA-qq6x-5r9f-2w3m)."""
+        pin = "R30mnbVpbENfQLjUKknDadhUtoKu+CFS/tGIsnHxsDU="
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch.object(omr_admin, "mqvpn_server_pin", return_value=pin) as server_pin,
+        ):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        assert r.json()["mqvpn"]["pinned_pubkey"] == pin
+        server_pin.assert_called_once_with(MQVPN_CONFIG["cert_file"])
+
+    def test_config_no_mqvpn_has_empty_pin(self, user_client):
+        with patch("os.path.isfile", return_value=False):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        assert r.json()["mqvpn"]["pinned_pubkey"] == ""
+
     def test_reorder_written_to_config(self, user_client):
         """POST /mqvpn with reorder must persist the reorder object."""
         capture = io.StringIO()
@@ -5174,3 +5193,50 @@ class TestSecurityHelpers:
         import re
         import omr_admin
         assert bool(re.fullmatch(omr_admin.USERNAME_PATTERN, name)) is ok
+
+
+# ---------------------------------------------------------------------------
+# mqvpn_server_pin (GHSA-qq6x-5r9f-2w3m)
+# ---------------------------------------------------------------------------
+
+def _openssl(*args, data=None):
+    import subprocess
+    return subprocess.run(["openssl", *args], input=data, capture_output=True,
+                          check=True).stdout
+
+
+@pytest.fixture
+def mqvpn_cert(tmp_path):
+    import shutil
+    if not shutil.which("openssl"):
+        pytest.skip("openssl not installed")
+    crt = tmp_path / "server.crt"
+    _openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+             "-keyout", str(tmp_path / "server.key"), "-out", str(crt), "-days", "1",
+             "-nodes", "-subj", "/CN=www.openmptcprouter.vps")
+    omr_admin._mqvpn_pin_cache.clear()
+    return crt
+
+
+@pytest.mark.real_env
+class TestMqvpnServerPin:
+    def test_matches_installer_pipeline(self, mqvpn_cert):
+        """Same value as omr_api_pin in the installer, the value mqvpn's
+        PinnedPubkey and curl --pinnedpubkey expect."""
+        pubkey = _openssl("x509", "-in", str(mqvpn_cert), "-pubkey", "-noout")
+        der = _openssl("pkey", "-pubin", "-outform", "der", data=pubkey)
+        digest = _openssl("dgst", "-sha256", "-binary", data=der)
+        expected = _openssl("enc", "-base64", data=digest).decode().strip()
+        assert omr_admin.mqvpn_server_pin(str(mqvpn_cert)) == expected
+        assert len(expected) == 44
+
+    def test_cached_until_the_certificate_changes(self, mqvpn_cert):
+        pin = omr_admin.mqvpn_server_pin(str(mqvpn_cert))
+        with patch.object(omr_admin.subprocess, "run") as run:
+            assert omr_admin.mqvpn_server_pin(str(mqvpn_cert)) == pin
+        run.assert_not_called()
+        mqvpn_cert.write_text("not a certificate")
+        assert omr_admin.mqvpn_server_pin(str(mqvpn_cert)) == ""
+
+    def test_missing_certificate(self, tmp_path):
+        assert omr_admin.mqvpn_server_pin(str(tmp_path / "absent.crt")) == ""
