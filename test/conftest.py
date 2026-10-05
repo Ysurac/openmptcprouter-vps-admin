@@ -321,7 +321,9 @@ RO_USER = omr_admin.User(
 
 def make_token(username: str) -> str:
     exp = datetime.utcnow() + timedelta(hours=2)
-    return jwt.encode({"sub": username, "exp": exp}, SECRET_KEY, algorithm=ALGORITHM)
+    password = MOCK_CONFIG["users"][0].get(username, {}).get("user_password", "")
+    return jwt.encode({"sub": username, "exp": exp, "pwd": omr_admin._password_fingerprint(password)},
+                      SECRET_KEY, algorithm=ALGORITHM)
 
 
 ADMIN_TOKEN = make_token("admin")
@@ -386,6 +388,14 @@ def pytest_configure(config):
     )
 
 
+def _fake_atomic_write(path, fill, new_mode=0o600):
+    """omr_admin._atomic_write without the temp file and rename: the content
+    goes to open(path, 'w'), which is what tests mock and inspect. The real
+    helper is tested in real_env tests."""
+    with open(path, 'w') as f:
+        fill(f)
+
+
 @pytest.fixture(autouse=True)
 def patch_env(request):
     """Prevent actual filesystem writes and subprocess calls in every test.
@@ -398,6 +408,7 @@ def patch_env(request):
         return
     with (
         patch("builtins.open", side_effect=_mock_open),
+        patch("omr_admin._atomic_write", side_effect=_fake_atomic_write),
         patch("os.system", return_value=0),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
         patch("os.popen", side_effect=_ospopen_factory),

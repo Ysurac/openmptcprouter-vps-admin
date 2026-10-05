@@ -25,7 +25,7 @@ import io
 import json
 from unittest.mock import MagicMock, patch
 
-from conftest import omr_admin  # noqa: F401  (fixture import side effect)
+from conftest import _mock_open, omr_admin  # noqa: F401  (fixture import side effect)
 
 
 def _applied_script(run_mock):
@@ -75,7 +75,7 @@ class TestRenderFwPorts:
         })
         _accept, dnat = omr_admin._render_fw_ports(config)
         assert len(dnat) == 1
-        assert dnat[0].startswith("meta nfproto ipv4 tcp dport 80 dnat ip to 10.255.220.6")
+        assert dnat[0].startswith(omr_admin._NFT_FROM_NET + " meta nfproto ipv4 tcp dport 80 dnat ip to 10.255.220.6")
 
     def test_dnat_v6_synthesizes_ula_from_userid(self):
         config = _config({
@@ -85,7 +85,7 @@ class TestRenderFwPorts:
             },
         })
         _accept, dnat = omr_admin._render_fw_ports(config)
-        assert dnat == ['meta nfproto ipv6 tcp dport 80 dnat ip6 to fd00::a05:2 comment "OMR alice redirect http tcp"']
+        assert dnat == [omr_admin._NFT_FROM_NET + ' meta nfproto ipv6 tcp dport 80 dnat ip6 to fd00::a05:2 comment "OMR alice redirect http tcp"']
 
     def test_dnat_without_known_target_is_skipped(self):
         # No vpnremoteip yet (router hasn't announced its tunnel IP) --
@@ -532,27 +532,30 @@ class TestSyncOpenvpnClientToClient:
     """
 
     def _run(self, existing_content, enabled):
-        captured = _NoCloseStringIO()
-        # Mirrors what move(tmpfile, path) really does on disk: content read
-        # back from `path` after the move reflects what was written to the
-        # tmpfile, not the pre-edit content.
-        state = {"content": existing_content}
+        # The file is replaced atomically, which the test mocks turn into
+        # open(path, 'w'): content read back from `path` afterwards is what
+        # was written, not the pre-edit content.
+        state = {"content": existing_content, "writes": 0}
+
+        class _Replacing(io.StringIO):
+            def close(self):
+                state["content"] = self.getvalue()
+                state["writes"] += 1
+                super().close()
 
         def _open(path, mode="r", *a, **kw):
             if "tun0.conf" in str(path):
+                if "w" in mode:
+                    return _Replacing()
                 content = state["content"]
                 return io.BytesIO(content.encode()) if "b" in mode else io.StringIO(content)
-            return io.BytesIO() if "b" in mode else captured  # the mkstemp() tmpfile
-
-        def _move(_src, _dst):
-            state["content"] = captured.getvalue()
+            return _mock_open(path, mode, *a, **kw)
 
         with patch("omr_admin.os.path.isfile", return_value=True), \
              patch("builtins.open", side_effect=_open), \
-             patch("omr_admin.move", side_effect=_move) as move_mock, \
              patch("subprocess.run") as run_mock:
             changed = omr_admin._sync_openvpn_client2client(enabled)
-        return changed, captured.getvalue(), move_mock, run_mock
+        return changed, state["content"], state["writes"], run_mock
 
     def test_missing_file_is_a_noop(self):
         with patch("omr_admin.os.path.isfile", return_value=False), \
@@ -561,20 +564,20 @@ class TestSyncOpenvpnClientToClient:
         run_mock.assert_not_called()
 
     def test_enable_appends_line_and_restarts(self):
-        changed, written, move_mock, run_mock = self._run("proto tcp6-server\n", True)
+        changed, written, writes, run_mock = self._run("proto tcp6-server\n", True)
         assert changed is True
         assert "client-to-client" in written
-        move_mock.assert_called_once()
+        assert writes == 1
         run_mock.assert_called_once_with(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
 
     def test_disable_removes_line_and_restarts(self):
-        changed, written, move_mock, run_mock = self._run("proto tcp6-server\nclient-to-client\n", False)
+        changed, written, _writes, run_mock = self._run("proto tcp6-server\nclient-to-client\n", False)
         assert changed is True
         assert "client-to-client" not in written
         run_mock.assert_called_once()
 
     def test_already_matching_state_is_idempotent(self):
-        changed, written, _move_mock, run_mock = self._run("proto tcp6-server\nclient-to-client\n", True)
+        changed, written, _writes, run_mock = self._run("proto tcp6-server\nclient-to-client\n", True)
         assert changed is False
         run_mock.assert_not_called()
 
@@ -782,3 +785,86 @@ class TestNftErrorSummary:
 
     def test_empty_stderr_never_logs_a_blank_message(self):
         assert omr_admin._nft_error_summary("") == "unknown error"
+
+
+# ===========================================================================
+# What one user's entry can do to the single user_accept/user_dnat flush
+# ===========================================================================
+
+
+class TestRenderHardening:
+    def test_userid_stored_as_a_string_renders(self):
+        # /add_user stores "userid": str(userid); '{:x}' refused it, which
+        # failed every sync of every user, and omr-admin's startup.
+        config = _config({"alice": {"userid": "5", "fw_ports": [
+            {"name": "http", "port": "80", "proto": "tcp", "fwtype": "DNAT", "family": 6}]}})
+        _accept, dnat = omr_admin._render_fw_ports(config)
+        assert len(dnat) == 1 and "dnat ip6 to fd00::a05:2" in dnat[0]
+
+    def test_userid_without_an_ipv6_tunnel_address_is_skipped(self):
+        config = _config({"alice": {"userid": 256, "vpnremoteip": "10.255.220.6", "fw_ports": [
+            {"name": "http", "port": "80", "proto": "tcp", "fwtype": "DNAT", "family": 6},
+            {"name": "http", "port": "80", "proto": "tcp", "fwtype": "DNAT", "family": 4}]}})
+        _accept, dnat = omr_admin._render_fw_ports(config)
+        assert len(dnat) == 1 and "dnat ip to 10.255.220.6" in dnat[0]
+
+    def test_bulk_v6_with_a_string_userid(self):
+        config = _config({"openmptcprouter": {"userid": "0"}})
+        config["bulk_redirect_v6"] = True
+        assert any("dnat ip6 to fd00::a00:2" in l for l in omr_admin._render_bulk_redirect(config))
+
+    def test_redirects_only_what_comes_from_the_internet(self):
+        # nat_prerouting sees the tunnels too: a redirect of udp/53 took the
+        # DNS of every other router.
+        config = _config({"openmptcprouter": {"userid": 0, "vpnremoteip": "10.255.220.6", "fw_ports": [
+            {"name": "dns", "port": "53", "proto": "udp", "fwtype": "DNAT", "family": 4},
+            {"name": "web", "port": "80", "proto": "tcp", "fwtype": "ACCEPT", "family": 4}]}})
+        config["bulk_redirect_v4"] = True
+        accept, dnat = omr_admin._render_fw_ports(config)
+        dnat += omr_admin._render_bulk_redirect(config)
+        assert dnat and all(l.startswith(omr_admin._NFT_FROM_NET + " ") for l in dnat)
+        assert not accept[0].startswith("iifname")
+        for iface in omr_admin.NFT_VPN_IFACES + ("client-wg*",):
+            assert f'"{iface}"' in omr_admin._NFT_FROM_NET
+
+    def test_invalid_redirect_target_is_skipped(self):
+        for target in ("10.255.220.6/8", "10.255.220.6 accept", "fd00::1"):
+            config = _config({"openmptcprouter": {"userid": 0, "vpnremoteip": target, "fw_ports": [
+                {"name": "http", "port": "80", "proto": "tcp", "fwtype": "DNAT", "family": 4}]}})
+            assert omr_admin._render_fw_ports(config) == ([], []), target
+
+    def test_entry_failing_to_render_skips_only_itself(self):
+        config = _config({
+            "alice": {"userid": 3, "fw_ports": [{"name": "a", "port": "80", "proto": "tcp", "fwtype": "ACCEPT", "family": 4}]},
+            "bob": {"userid": 4, "fw_ports": [{"name": "b", "port": "81", "proto": "tcp", "fwtype": "ACCEPT", "family": 4}]},
+        })
+        real = omr_admin._render_fw_entry
+
+        def flaky(username, udata, entry):
+            if username == "alice":
+                raise ValueError("boom")
+            return real(username, udata, entry)
+
+        with patch("omr_admin._render_fw_entry", side_effect=flaky):
+            accept, _dnat = omr_admin._render_fw_ports(config)
+        assert len(accept) == 1 and "dport 81" in accept[0]
+
+    def test_comment_is_printable_ascii_of_128_bytes_at_most(self):
+        # nft counts bytes (120 x "é" is 240) and a lone surrogate from the
+        # JSON body made script.encode() raise.
+        for text in ("é" * 120, "\ud800 x", "a\nb\"c\\d" + "z" * 300):
+            comment = omr_admin._nft_comment(text)
+            encoded = comment.encode("ascii")
+            assert len(encoded) <= 128 and '"' not in comment and "\\" not in comment and "\n" not in comment
+
+    def test_script_with_a_surrogate_does_not_raise(self):
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)) as run:
+            assert omr_admin._nft_run('add rule inet omr user_accept accept comment "\ud800"\n')
+        assert run.called
+
+    def test_netmask_forms_and_leading_zeros_refused(self):
+        # ipaddress takes them, nft does not (or reads /024 as octal).
+        for addr in ("1.2.3.4/255.255.255.0", "1.2.3.4/0.0.0.255", "1.2.3.0/024", "10.0.0.0/08", "::/0128"):
+            assert omr_admin._fw_entry_error("80", "tcp", "ACCEPT", addr) == "Invalid address", addr
+        for addr in ("1.2.3.0/24", "1.2.3.4", "2001:db8::/32", "0.0.0.0/0", "::ffff:1.2.3.4"):
+            assert omr_admin._fw_entry_error("80", "tcp", "ACCEPT", addr) is None, addr

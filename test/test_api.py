@@ -23,7 +23,10 @@ import pytest
 from conftest import (
     MOCK_CONFIG,
     MQVPN_CONFIG,
+    _ASGITestClient,
+    _fake_atomic_write,
     _mock_open,
+    app,
     omr_admin,
     user_headers,
 )
@@ -933,6 +936,556 @@ class TestXRayUnredirect:
         assert r.json()["result"] == "permission"
 
 
+class TestProxyRedirectValidation:
+    """A range forward is sent as port "a-b" and used to fail with HTTP 500 on
+    int() (vps#85); anything the daemons can't take is refused with a reason
+    instead of reaching their config."""
+
+    _PAYLOAD = {"name": "router 12345-12445", "port": "12345-12445", "proto": "tcp",
+                "destip": "192.168.1.2", "destport": "12345-12445"}
+
+    @pytest.mark.parametrize("endpoint,func", [("/v2rayredirect", "v2ray_add_port"), ("/xrayredirect", "xray_add_port")])
+    def test_range_is_applied(self, user_client, endpoint, func):
+        with patch("os.path.isfile", return_value=True), patch(f"omr_admin.{func}", return_value=None) as add:
+            r = user_client.post(endpoint, json=self._PAYLOAD)
+        assert r.status_code == 200
+        assert r.json()["result"] == "done"
+        add.assert_called_once()
+
+    @pytest.mark.parametrize("endpoint", ["/v2rayredirect", "/xrayredirect"])
+    @pytest.mark.parametrize("field,value,reason", [
+        ("port", "70000", "Invalid port"),
+        ("port", "500-400", "Invalid port"),
+        ("port", "80\nx", "Invalid port"),
+        ("port", "", "Invalid port"),
+        ("port", "64000-65100", "Ports >= 65000"),
+        ("port", "2-64999", "more than 1024 ports"),
+        ("proto", "icmp", "Invalid protocol"),
+        ("destip", "192.168.1.2\"}", "Invalid address"),
+        ("destip", "192.168.1.0/24", "Invalid address"),
+        ("destport", "abc", "Invalid destination port"),
+        ("destport", "22345-22346", "as wide as the port range"),
+    ])
+    def test_invalid_request_is_refused(self, user_client, endpoint, field, value, reason):
+        payload = dict(self._PAYLOAD, **{field: value})
+        with patch("os.path.isfile", return_value=True), \
+             patch("omr_admin.v2ray_add_port") as v2, patch("omr_admin.xray_add_port") as xr:
+            r = user_client.post(endpoint, json=payload)
+        assert r.json()["result"] == "error"
+        assert reason in r.json()["reason"]
+        v2.assert_not_called()
+        xr.assert_not_called()
+
+    @pytest.mark.parametrize("port,destport", [("8080", "80"), ("8080", ""), ("1000:1010", "1000:1010"),
+                                               ("1000-1010", "2000"), ("1000-1010", "2000-2010"),
+                                               ("1000-2023", "1000-2023")])
+    def test_valid_forwards_pass(self, port, destport):
+        assert omr_admin._proxy_redirect_error(port, "udp", "192.168.1.2", destport) is None
+
+
+class TestProxyRedirectConfig:
+    """What /v2rayredirect and /xrayredirect write to the daemons' config."""
+
+    _USER = omr_admin.User(username="openmptcprouter", userid=0, permissions="rw")
+
+    @pytest.fixture
+    def configs(self, tmp_path, monkeypatch):
+        paths = {}
+        for service in ("v2ray", "xray"):
+            p = tmp_path / f"{service}-server.json"
+            p.write_text(json.dumps({"inbounds": [{"tag": "omrin-tunnel", "port": 65228}],
+                                     "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                                                           {"type": "field", "domain": ["full:omr.lan"], "outboundTag": "OMRLan"}]}}))
+            p.chmod(0o600)
+            paths[service] = str(p)
+        monkeypatch.setattr(omr_admin, "PROXY_REDIRECT_CONFIGS", paths)
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        with patch("omr_admin._schedule_proxy_restart") as restart:
+            yield paths, restart
+
+    def _redirects(self, path):
+        data = json.loads(open(path).read())
+        return [i for i in data["inbounds"] if "_redir_" in i["tag"]], \
+               [r for r in data["routing"]["rules"] if "_redir_" in (r.get("inboundTag") or [""])[0]]
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_single_port_unchanged(self, configs, service):
+        paths, restart = configs
+        getattr(omr_admin, f"{service}_add_port")(self._USER, "8080", "tcp", "x", "192.168.1.2", "80")
+        inbounds, rules = self._redirects(paths[service])
+        assert inbounds == [{"tag": "openmptcprouter_redir_tcp_8080_to_192.168.1.2:80", "port": 8080,
+                             "protocol": "dokodemo-door",
+                             "settings": {"network": "tcp", "port": 80, "address": "192.168.1.2"}}]
+        assert rules[0]["inboundTag"] == [inbounds[0]["tag"]] and rules[0]["outboundTag"] == "OMRLan"
+        restart.assert_called_once_with(service)
+
+    @pytest.mark.real_env
+    def test_xray_range_is_one_inbound_keeping_each_port(self, configs):
+        # xray's dokodemo-door dials the port a connection came in on when
+        # its destination port is 0.
+        paths, _ = configs
+        omr_admin.xray_add_port(self._USER, "12345-12347", "tcp", "x", "192.168.1.2", "12345-12347")
+        inbounds, rules = self._redirects(paths["xray"])
+        assert [(i["port"], i["settings"]["port"]) for i in inbounds] == [("12345-12347", 0)]
+        assert len(rules) == 1
+
+    @pytest.mark.real_env
+    def test_v2ray_range_is_one_inbound_per_port(self, configs):
+        # v2ray has no port-0 fallback: it would dial port 0.
+        paths, _ = configs
+        omr_admin.v2ray_add_port(self._USER, "12345-12347", "tcp", "x", "192.168.1.2", "12345-12347")
+        inbounds, rules = self._redirects(paths["v2ray"])
+        assert [(i["port"], i["settings"]["port"]) for i in inbounds] == [(12345, 12345), (12346, 12346), (12347, 12347)]
+        assert rules[0]["inboundTag"] == [i["tag"] for i in inbounds]
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_range_moved_to_another_range(self, configs, service):
+        paths, _ = configs
+        getattr(omr_admin, f"{service}_add_port")(self._USER, "1000-1002", "udp", "x", "192.168.1.2", "2000-2002")
+        inbounds, _ = self._redirects(paths[service])
+        assert [(i["port"], i["settings"]["port"]) for i in inbounds] == [(1000, 2000), (1001, 2001), (1002, 2002)]
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_range_to_one_port(self, configs, service):
+        paths, _ = configs
+        getattr(omr_admin, f"{service}_add_port")(self._USER, "1000-1002", "tcp", "x", "192.168.1.2", "80")
+        inbounds, _ = self._redirects(paths[service])
+        assert [(i["port"], i["settings"]["port"]) for i in inbounds] == [("1000-1002", 80)]
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_resent_redirect_is_a_noop(self, configs, service):
+        # The router re-sends every forward on each sync.
+        paths, restart = configs
+        add = getattr(omr_admin, f"{service}_add_port")
+        add(self._USER, "1000-1002", "tcp", "x", "192.168.1.2", "")
+        before = open(paths[service]).read()
+        add(self._USER, "1000:1002", "tcp", "x", "192.168.1.2", "")
+        assert open(paths[service]).read() == before
+        assert restart.call_count == 1
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_unredirect_removes_every_inbound_of_a_range(self, configs, service):
+        paths, restart = configs
+        getattr(omr_admin, f"{service}_add_port")(self._USER, "1000-1002", "tcp", "x", "192.168.1.2", "2000-2002")
+        getattr(omr_admin, f"{service}_add_port")(self._USER, "8080", "tcp", "x", "192.168.1.2", "80")
+        getattr(omr_admin, f"{service}_del_port")(self._USER, "1000-1002", "tcp", "x", "192.168.1.2", "2000-2002")
+        inbounds, rules = self._redirects(paths[service])
+        assert [i["port"] for i in inbounds] == [8080]
+        assert len(rules) == 1
+        # rules without an inboundTag (the omr.lan one) are left alone
+        assert any("domain" in r for r in json.loads(open(paths[service]).read())["routing"]["rules"])
+        assert restart.call_count == 3
+
+    @pytest.mark.real_env
+    def test_unredirect_of_nothing_writes_nothing(self, configs):
+        paths, restart = configs
+        before = open(paths["xray"]).read()
+        omr_admin.xray_del_port(self._USER, "8080", "tcp", "x", "192.168.1.2", "80")
+        assert open(paths["xray"]).read() == before
+        restart.assert_not_called()
+
+    @pytest.mark.real_env
+    def test_existing_tag_with_empty_destip_still_matches(self, configs):
+        # A redirect has always been tagged with its destination, even an
+        # empty one: an upgrade must not add it a second time.
+        paths, restart = configs
+        omr_admin.xray_add_port(self._USER, "8080", "tcp", "x", "", "8080")
+        omr_admin.xray_add_port(self._USER, "8080", "tcp", "x", "", "8080")
+        inbounds, _ = self._redirects(paths["xray"])
+        assert [i["tag"] for i in inbounds] == ["openmptcprouter_redir_tcp_8080_to_:8080"]
+
+
+class TestAtomicWrite:
+    """The daemon configs are replaced atomically and keep their mode: the
+    installer keeps xray-server.json 0600, it holds the users' keys."""
+
+    @pytest.mark.real_env
+    def test_new_file_modes(self, tmp_path):
+        import stat
+        omr_admin._atomic_write_json(str(tmp_path / "server.json"), {"k": 1})
+        omr_admin._atomic_write_text(str(tmp_path / "current-vpn"), "glorytun_tcp\n")
+        assert stat.S_IMODE((tmp_path / "server.json").stat().st_mode) == 0o600
+        assert stat.S_IMODE((tmp_path / "current-vpn").stat().st_mode) == 0o644
+        assert (tmp_path / "current-vpn").read_text() == "glorytun_tcp\n"
+
+    @pytest.mark.real_env
+    def test_indent_is_kept(self, tmp_path):
+        p = tmp_path / "server.json"
+        omr_admin._atomic_write_json(str(p), {"k": 1}, indent=2)
+        assert p.read_text() == json.dumps({"k": 1}, indent=2)
+
+    def test_no_daemon_config_is_written_in_place(self):
+        # open(path, 'w') truncates first: a crash, a full disk or an
+        # exception before the end leaves the daemon an unparsable config.
+        import re
+        src = open(omr_admin.__file__).read()
+        in_place = re.findall(r"open\('(/etc/[^']+)', 'w'\)", src)
+        targets = ("/etc/v2ray/v2ray-server.json", "/etc/xray/xray-server.json", "/etc/mqvpn/server.json",
+                   "/etc/shadowsocks-libev/manager.json", "/etc/shadowsocks-go/server.json",
+                   "/etc/xray/xray-vless-reality.json", "/etc/shadowsocks-libev/local.acl",
+                   "/etc/openmptcprouter-vps-admin/omr-bypass.json",
+                   "/etc/openmptcprouter-vps-admin/current-vpn", "/etc/openmptcprouter-vps-admin/current-proxy")
+        assert [p for p in in_place if p in targets] == []
+        # Paths built at run time: the tunnel configs and keys, the OpenVPN
+        # ccd and the GRE tunnel files.
+        assert re.findall(r"open\('/etc/(?:glorytun-tcp|glorytun-udp|dsvpn|openmptcprouter-vps-admin/intf)/[^\n]*'w'\)", src) == []
+        assert re.findall(r"open\((?:dsvpn_key_file|safe_path_join\('/etc/openvpn/ccd'[^\n]*), 'w'\)", src) == []
+        # mkstemp() makes its copy in /tmp, often a tmpfs: move() then copies
+        # it over the target in place instead of renaming it.
+        assert "mkstemp(" not in src.replace("a mkstemp() copy", "")
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("mode", [0o600, 0o644])
+    def test_keeps_mode(self, tmp_path, mode):
+        import stat
+        p = tmp_path / "xray-server.json"
+        p.write_text("{}")
+        p.chmod(mode)
+        omr_admin._atomic_write_json(str(p), {"new": 1})
+        assert json.loads(p.read_text()) == {"new": 1}
+        assert stat.S_IMODE(p.stat().st_mode) == mode
+        assert not list(tmp_path.glob("*.tmp.*"))
+
+    @pytest.mark.real_env
+    def test_writes_through_the_config_json_symlink_target(self, tmp_path):
+        target = tmp_path / "xray-server.json"
+        target.write_text("{}")
+        link = tmp_path / "config.json"
+        link.symlink_to(target)
+        omr_admin._atomic_write_json(str(link), {"new": 1})
+        assert link.is_symlink()
+        assert json.loads(target.read_text()) == {"new": 1}
+
+    @pytest.mark.real_env
+    def test_failed_write_leaves_old_file(self, tmp_path):
+        p = tmp_path / "xray-server.json"
+        p.write_text('{"old": true}')
+        with pytest.raises(TypeError):
+            omr_admin._atomic_write_json(str(p), {"bad": {1, 2}})
+        assert json.loads(p.read_text()) == {"old": True}
+        assert not list(tmp_path.glob("*.tmp.*"))
+
+
+class TestTunnelFilesWrittenAtomically:
+    """The glorytun/dsvpn configs and keys, the OpenVPN ccd and the GRE tunnel
+    files are built in memory and written in one atomic step: they used to be
+    written line by line in place, so a crash or an exception halfway left a
+    tunnel with an empty key or a config missing its last lines."""
+
+    _GT_TCP = 'PORT=65001\nDEV=tun0\nLOCALIP=10.255.255.1\nREMOTEIP=10.255.255.2\nBROADCASTIP=10.255.255.3\nOPTIONS="retry count -1"\n'
+    _GT_UDP = 'BIND_PORT=65001\nDEV=tun0\nLOCALIP=10.255.254.1\nREMOTEIP=10.255.254.2\nBROADCASTIP=10.255.254.3\nOPTIONS="persist"\n'
+    _DSVPN = 'PORT=65401\nDEV=dsvpn0\nLOCALTUNIP=10.255.251.1\nREMOTETUNIP=10.255.251.2\n'
+
+    @contextlib.contextmanager
+    def _env(self, files):
+        writes = {}
+        def _open(path, mode="r", *a, **k):
+            if str(path) in files and "w" not in str(mode):
+                content = files[str(path)]
+                return io.BytesIO(content.encode()) if "b" in str(mode) else io.StringIO(content)
+            return _mock_open(path, mode, *a, **k)
+        def _write(path, text, new_mode=0o644):
+            writes[path] = (text, new_mode)
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open),
+            patch("omr_admin._atomic_write_text", side_effect=_write),
+        ):
+            yield writes
+
+    def test_add_glorytun_tcp(self):
+        with self._env({"/etc/glorytun-tcp/tun0": self._GT_TCP}) as writes:
+            omr_admin.add_glorytun_tcp(1)
+        assert writes["/etc/glorytun-tcp/tun1"] == (
+            'PORT=65001\nDEV=tun1\nOPTIONS="retry count -1"\n'
+            '\nLOCALIP=10.255.255.5\nREMOTEIP=10.255.255.6\nBROADCASTIP=10.255.255.7\n', 0o644)
+        key, mode = writes["/etc/glorytun-tcp/tun1.key"]
+        assert len(key) == 64 and key == key.upper() and mode == 0o600
+
+    def test_add_glorytun_udp_copies_the_tcp_key(self):
+        with self._env({"/etc/glorytun-udp/tun0": self._GT_UDP, "/etc/glorytun-tcp/tun1.key": "ABCD"}) as writes:
+            omr_admin.add_glorytun_udp(1)
+        assert writes["/etc/glorytun-udp/tun1"][0] == (
+            'BIND_PORT=65001\nDEV=tun1\nOPTIONS="persist"\n'
+            '\nLOCALIP=10.255.254.5\nREMOTEIP=10.255.254.6\nBROADCASTIP=10.255.254.7\n')
+        assert writes["/etc/glorytun-udp/tun1.key"] == ("ABCD", 0o600)
+
+    def test_add_dsvpn(self):
+        with self._env({"/etc/dsvpn/dsvpn0": self._DSVPN}) as writes:
+            omr_admin.add_dsvpn(1)
+        assert writes["/etc/dsvpn/dsvpn1"][0] == 'PORT=65401\nDEV=dsvpn1\nLOCALTUNIP=10.255.251.5\nREMOTETUNIP=10.255.251.6\n'
+        assert writes["/etc/dsvpn/dsvpn1.key"][1] == 0o600
+
+    def test_glorytun_update(self, user_client):
+        with self._env({"/etc/glorytun-tcp/tun0": self._GT_TCP, "/etc/glorytun-udp/tun0": self._GT_UDP}) as writes:
+            r = user_client.post("/glorytun", json={"key": "AB" * 32, "port": 65009, "chacha": True})
+        assert r.json()["result"] == "done"
+        assert writes["/etc/glorytun-tcp/tun0.key"] == ("AB" * 32, 0o600)
+        assert writes["/etc/glorytun-udp/tun0.key"] == ("AB" * 32, 0o600)
+        tcp = writes["/etc/glorytun-tcp/tun0"][0]
+        assert "PORT=65009\n" in tcp and 'OPTIONS="chacha20 retry' in tcp and "LOCALIP=10.255.255.1\n" in tcp
+        udp = writes["/etc/glorytun-udp/tun0"][0]
+        assert "BIND_PORT=65009\n" in udp and 'OPTIONS="chacha persist"\n' in udp
+
+    def test_dsvpn_update(self, user_client):
+        with self._env({"/etc/dsvpn/dsvpn0": self._DSVPN, "/etc/dsvpn/dsvpn0.key": "old"}) as writes:
+            r = user_client.post("/dsvpn", json={"key": "CD" * 32, "port": 65409})
+        assert r.json()["result"] == "done"
+        assert writes["/etc/dsvpn/dsvpn0"][0] == self._DSVPN.replace("PORT=65401", "PORT=65409")
+        assert writes["/etc/dsvpn/dsvpn0.key"] == ("CD" * 32, 0o600)
+
+    def test_lan_ccd(self, user_client):
+        config = json.loads(json.dumps(MOCK_CONFIG))
+        config["client2client"] = True
+        with (
+            self._env({"/etc/openmptcprouter-vps-admin/omr-admin-config.json": json.dumps(config),
+                       "/etc/openvpn/tun0.conf": "server 10.8.0.0 255.255.255.0\n"}) as writes,
+            patch("omr_admin.modif_config_user"),
+        ):
+            r = user_client.post("/lan", json={"lanips": ["192.168.1.0/24", "10.1.0.0/16"]})
+        assert r.json()["result"] == "done"
+        assert writes["/etc/openvpn/ccd/openmptcprouter"] == (
+            "iroute 192.168.1.0 255.255.255.0\niroute 10.1.0.0 255.255.0.0\n", 0o644)
+
+
+class TestGreIntfComplete:
+    """A GRE tunnel file is only written when missing: one cut off by an
+    earlier release must count as missing, or it would never be rewritten."""
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("content,complete", [
+        ("INTF=eth0\nLOCALIP=10.255.249.1\nUSERNAME=openmptcprouter\nUSERID=0\n", True),
+        ("INTF=eth0\nLOCALIP=10.255.249.1\n", False),
+        ("", False),
+    ])
+    def test_complete(self, tmp_path, content, complete):
+        p = tmp_path / "gre-user0-ip1"
+        p.write_text(content)
+        assert omr_admin._gre_intf_complete(str(p)) is complete
+
+    @pytest.mark.real_env
+    def test_missing(self, tmp_path):
+        assert omr_admin._gre_intf_complete(str(tmp_path / "gre-user0-ip1")) is False
+
+
+class TestTightenTunnelKeys:
+    @pytest.mark.real_env
+    def test_world_readable_keys_become_0600(self, tmp_path, monkeypatch):
+        import stat
+        (tmp_path / "dsvpn0.key").write_text("k")
+        (tmp_path / "dsvpn0.key").chmod(0o644)
+        (tmp_path / "dsvpn1.key").write_text("k")
+        (tmp_path / "dsvpn1.key").chmod(0o600)
+        (tmp_path / "dsvpn0").write_text("PORT=65401\n")
+        (tmp_path / "dsvpn0").chmod(0o644)
+        monkeypatch.setattr(omr_admin, "TUNNEL_KEY_GLOBS", (str(tmp_path / "dsvpn*.key"),))
+        omr_admin._tighten_tunnel_keys()
+        assert stat.S_IMODE((tmp_path / "dsvpn0.key").stat().st_mode) == 0o600
+        assert stat.S_IMODE((tmp_path / "dsvpn1.key").stat().st_mode) == 0o600
+        assert stat.S_IMODE((tmp_path / "dsvpn0").stat().st_mode) == 0o644   # configs untouched
+
+
+class TestDsvpnInstalledCheck:
+    """DSVPN is installed as /etc/dsvpn/dsvpn0 (+ dsvpn0.key). The checks
+    looked for /etc/dsvpn/dsvpn, which does not exist: /dsvpn always answered
+    'not installed' and /vpn_list never listed dsvpn."""
+
+    def test_vpn_list_reports_dsvpn(self):
+        with patch("os.path.isfile", _isfile_for("/etc/dsvpn/dsvpn0")):
+            assert omr_admin.VPN.dsvpn.value in omr_admin._installed_vpn_types()
+
+    def test_dsvpn_update_with_dsvpn0_only(self, user_client):
+        written = {}
+        def _open(path, mode="r", *a, **k):
+            if str(path) == "/etc/dsvpn/dsvpn0" and "w" not in mode:
+                return io.StringIO("PORT=65401\nDEV=dsvpn0\n")
+            if str(path) == "/etc/dsvpn/dsvpn0.key" and "w" not in mode:
+                return io.BytesIO(b"old")
+            return _mock_open(path, mode, *a, **k)
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/dsvpn/dsvpn0")),
+            patch("builtins.open", side_effect=_open),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, new_mode=0o644: written.update({p: t})),
+        ):
+            r = user_client.post("/dsvpn", json={"key": "CD" * 32, "port": 65409})
+        assert r.json()["result"] == "done"
+        assert written["/etc/dsvpn/dsvpn0"] == "PORT=65409\nDEV=dsvpn0\n"
+
+    def test_dsvpn_update_for_a_user_without_dsvpn(self):
+        # A rw user other than userid 0 whose dsvpn<id> was never created:
+        # a clear warning instead of an HTTP 500 on open().
+        user = omr_admin.User(username="bob", userid=3, permissions="rw", disabled=False)
+        app.dependency_overrides[omr_admin.get_current_user] = lambda: user
+        try:
+            client = _ASGITestClient(app, raise_server_exceptions=False)
+            with patch("os.path.isfile", _isfile_for("/etc/dsvpn/dsvpn0")):
+                r = client.post("/dsvpn", json={"key": "CD" * 32, "port": 65409})
+        finally:
+            app.dependency_overrides.pop(omr_admin.get_current_user, None)
+        assert r.json() == {"result": "warning", "reason": "DSVPN is not set up for this user", "route": "dsvpn"}
+
+
+class TestGlorytunUpdateRestarts:
+    """/glorytun restarts a glorytun daemon when its config or its key
+    changed (a new key alone was ignored until the next restart), and only
+    touches the variants this user has."""
+
+    _TCP = 'PORT=65001\nDEV=tun0\nOPTIONS="retry count -1 const 5000000 timeout 90000 keepalive count 5 idle 10 interval 2 buffer-size 65536 multiqueue"\n'
+    _UDP = 'BIND_PORT=65001\nDEV=tun0\nOPTIONS="persist"\n'
+
+    def _post(self, user_client, files, payload):
+        state = dict(files)
+        class _Replacing(io.StringIO):
+            def __init__(self, path):
+                super().__init__()
+                self.path = path
+            def close(self):
+                state[self.path] = self.getvalue()
+                super().close()
+        def _open(path, mode="r", *a, **k):
+            sp = str(path)
+            if sp.startswith("/etc/glorytun-"):
+                if "w" in mode:
+                    return _Replacing(sp)
+                if sp in state:
+                    return io.BytesIO(state[sp].encode()) if "b" in mode else io.StringIO(state[sp])
+                raise FileNotFoundError(sp)
+            return _mock_open(path, mode, *a, **k)
+        with (
+            patch("os.path.isfile", side_effect=lambda p: str(p) in state),
+            patch("builtins.open", side_effect=_open),
+            patch("subprocess.run") as run,
+        ):
+            r = user_client.post("/glorytun", json=payload)
+        restarted = [c.args[0][-1] for c in run.call_args_list if c.args and c.args[0][:3] == ["systemctl", "-q", "restart"]]
+        return r.json(), state, restarted
+
+    def _files(self, key):
+        return {"/etc/glorytun-tcp/tun0": self._TCP, "/etc/glorytun-tcp/tun0.key": key,
+                "/etc/glorytun-udp/tun0": self._UDP, "/etc/glorytun-udp/tun0.key": key}
+
+    def test_same_values_restart_nothing(self, user_client):
+        result, _, restarted = self._post(user_client, self._files("AB" * 32),
+                                          {"key": "AB" * 32, "port": 65001, "chacha": False})
+        assert result["result"] == "done"
+        assert restarted == []
+
+    def test_new_key_alone_restarts_both(self, user_client):
+        result, state, restarted = self._post(user_client, self._files("AB" * 32),
+                                              {"key": "CD" * 32, "port": 65001, "chacha": False})
+        assert state["/etc/glorytun-tcp/tun0.key"] == "CD" * 32
+        assert sorted(restarted) == ["glorytun-tcp@tun0", "glorytun-udp@tun0"]
+
+    def test_tcp_only_install(self, user_client):
+        files = {k: v for k, v in self._files("AB" * 32).items() if "glorytun-tcp" in k}
+        result, state, restarted = self._post(user_client, files, {"key": "CD" * 32, "port": 65002, "chacha": False})
+        assert result["result"] == "done"
+        assert "PORT=65002\n" in state["/etc/glorytun-tcp/tun0"]
+        assert not any("glorytun-udp" in p for p in state)
+        assert restarted == ["glorytun-tcp@tun0"]
+
+
+class TestTunnelRemoval:
+    def test_glorytun_tcp_removes_the_config_too(self):
+        with patch("os.path.isfile", return_value=True), patch("os.remove") as rm, patch("subprocess.run"):
+            omr_admin.remove_glorytun_tcp(3)
+        assert sorted(c.args[0] for c in rm.call_args_list) == ["/etc/glorytun-tcp/tun3", "/etc/glorytun-tcp/tun3.key"]
+
+    def test_glorytun_udp_deletes_its_persistent_interface(self):
+        with patch("os.path.isfile", return_value=True), patch("os.remove"), patch("subprocess.run") as run:
+            omr_admin.remove_glorytun_udp(3)
+        assert ["ip", "link", "del", "gt-udp-tun3"] in [c.args[0] for c in run.call_args_list]
+
+    @pytest.mark.parametrize("func", ["remove_glorytun_tcp", "remove_glorytun_udp", "remove_dsvpn"])
+    def test_userid_0_template_is_never_removed(self, func):
+        with patch("os.path.isfile", return_value=True), patch("os.remove") as rm, patch("subprocess.run") as run:
+            getattr(omr_admin, func)(0)
+        rm.assert_not_called()
+        run.assert_not_called()
+
+
+class TestProxyRestartCoalescing:
+    """The forwards of one router sync cost one v2ray/xray restart, not one
+    each: every restart drops every proxied connection of every user. The
+    requests land on any uvicorn worker, so the workers share the pending
+    restart through a marker file."""
+
+    @pytest.fixture
+    def timers(self, tmp_path, monkeypatch):
+        created = []
+
+        class FakeTimer:
+            def __init__(self, delay, fn, args=()):
+                self.delay, self.fn, self.args, self.cancelled = delay, fn, args, False
+                created.append(self)
+            def start(self):
+                pass
+            def cancel(self):
+                self.cancelled = True
+
+        monkeypatch.setattr(omr_admin, "PROXY_RESTART_DELAY", 5.0)
+        monkeypatch.setattr(omr_admin, "PROXY_RESTART_MARKER", str(tmp_path / "{}-restart"))
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        monkeypatch.setattr(omr_admin.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(omr_admin, "_proxy_restart_timers", {})
+        return created, tmp_path / "v2ray-restart"
+
+    @staticmethod
+    def _age(marker, seconds):
+        t = os.stat(marker).st_mtime - seconds
+        os.utime(marker, (t, t))
+
+    @pytest.mark.real_env
+    def test_burst_restarts_once(self, timers):
+        created, marker = timers
+        for _ in range(3):
+            omr_admin._schedule_proxy_restart("v2ray")
+        assert [t.cancelled for t in created] == [True, True, False]
+        self._age(marker, 6)
+        with patch("subprocess.run") as run:
+            created[-1].fn(*created[-1].args)
+        run.assert_called_once_with(["systemctl", "-q", "restart", "v2ray"], check=False)
+        assert not marker.exists()
+
+    @pytest.mark.real_env
+    def test_change_from_another_worker_postpones_the_restart(self, timers):
+        created, marker = timers
+        omr_admin._schedule_proxy_restart("v2ray")
+        self._age(marker, 3)   # another worker touched it 3s ago
+        with patch("subprocess.run") as run:
+            created[-1].fn(*created[-1].args)
+        run.assert_not_called()
+        assert created[-1].delay == pytest.approx(2, abs=0.5)  # re-armed for the other 2s
+        assert marker.exists()
+
+    @pytest.mark.real_env
+    def test_second_worker_finds_the_restart_done(self, timers):
+        created, marker = timers
+        omr_admin._schedule_proxy_restart("v2ray")
+        marker.unlink()        # the other worker restarted it
+        with patch("subprocess.run") as run:
+            created[-1].fn(*created[-1].args)
+        run.assert_not_called()
+
+    @pytest.mark.real_env
+    def test_pending_restart_resumes_at_startup(self, timers, monkeypatch):
+        created, marker = timers
+        marker.touch()
+        omr_admin.resume_proxy_restarts()
+        assert [t.args for t in created] == [("v2ray",)]
+
+    def test_zero_delay_restarts_inline(self, monkeypatch):
+        monkeypatch.setattr(omr_admin, "PROXY_RESTART_DELAY", 0)
+        with patch("subprocess.run") as run:
+            omr_admin._schedule_proxy_restart("xray")
+        run.assert_called_once_with(["systemctl", "-q", "restart", "xray"], check=False)
+
+
 # ===========================================================================
 # MPTCP
 # ===========================================================================
@@ -1406,10 +1959,10 @@ class TestLoadMptcpBpfSchedulers:
         stale_conf = "net.mptcp.scheduler=mptcp_bpf_red\nnet.ipv4.tcp_congestion_control=bbr\n"
 
         def _open_conf(p, mode="r", *a, **kw):
-            if str(p) == "/etc/sysctl.d/90-shadowsocks.conf":
-                return io.StringIO(stale_conf)
             if "w" in mode:
                 return _CapturingFile()
+            if str(p) == "/etc/sysctl.d/90-shadowsocks.conf":
+                return io.StringIO(stale_conf)
             return _mock_open(p, mode, *a, **kw)
 
         with (
@@ -1420,7 +1973,6 @@ class TestLoadMptcpBpfSchedulers:
             patch("subprocess.run", side_effect=_run),
             patch("os.path.isfile", return_value=True),
             patch("builtins.open", side_effect=_open_conf),
-            patch("omr_admin.move") as mock_move,
         ):
             omr_admin.load_mptcp_bpf_schedulers()
 
@@ -1429,7 +1981,6 @@ class TestLoadMptcpBpfSchedulers:
         sysctl_only = [" ".join(c) for c in sysctl_calls if c and c[0] == "sysctl"]
         assert any("net.mptcp.scheduler=bpf_red" in c for c in sysctl_only)
         assert not any("mptcp_bpf_red" in c for c in sysctl_only)
-        mock_move.assert_called_once()
         assert "net.mptcp.scheduler=bpf_red" in written.get("content", "")
         assert "mptcp_bpf_red" not in written.get("content", "")
 
@@ -1638,10 +2189,10 @@ class TestMPTCPPathManagerNormalization:
 
         def _open(path, mode="r", *a, **kw):
             sp = str(path)
-            if sp == self._CONF and "b" not in str(mode):
-                return io.StringIO("net.mptcp.path_manager=fullmesh\n")
             if "w" in str(mode) or "a" in str(mode):
                 return written
+            if sp == self._CONF and "b" not in str(mode):
+                return io.StringIO("net.mptcp.path_manager=fullmesh\n")
             return _mock_open(path, mode, *a, **kw)
 
         with (
@@ -2545,6 +3096,7 @@ class TestWireGuard:
             assert not move.called, peer
 
     _KEY2 = "uKU1qOpAj/4jKsjk3ZqdpQ6GNZpI7mGTWArxpvzSg1I="
+    _KEY3 = "8M3Pm2kz4tXyq0bQK7y1VH3WbJ5dL2bF7hYQqkq0z0A="
 
     def _config(self, **peers):
         config = json.loads(json.dumps(MOCK_CONFIG))
@@ -2586,51 +3138,58 @@ class TestWireGuard:
         for peer, reason in (
             ({"ip": "10.255.247.2", "key": self._KEY2}, "Key already used by another user"),
             ({"ip": "10.255.247.3", "key": self._KEY}, "Address already used by another user"),
-            ({"ip": "10.255.247.0/24", "key": self._KEY}, "Address already used by another user"),
+            ({"ip": "10.255.247.3/32", "key": self._KEY}, "Address already used by another user"),
         ):
             r, modif, write_conf = self._post(user_client, config, [peer])
             assert r.json() == {"result": "error", "reason": reason, "route": "wireguard"}, peer
             assert not modif.called and not write_conf.called, peer
 
-    def test_other_family_does_not_conflict(self, user_client):
-        config = self._config(bob=[{"ip": "10.255.247.3", "key": self._KEY2}])
-        r, _modif, _write = self._post(user_client, config, [{"ip": "fd00::3/128", "key": self._KEY}])
-        assert r.json()["result"] == "done"
+    def test_peer_outside_the_vpn_is_skipped(self, user_client):
+        # wg-quick routes each AllowedIPs over wg0: only one router address
+        # of 10.255.247.0/24 is a peer; the router also sends the addresses
+        # of its WireGuard interfaces to other servers, dropped, not refused.
+        for ip in ("0.0.0.0/0", "10.255.247.0/24", "8.8.8.8", "10.255.252.2", "10.255.247.1",
+                   "10.255.247.255", "10.255.247.2, 10.255.252.2", "fd00::3/128"):
+            config = self._config(bob=[{"ip": "10.255.247.3", "key": self._KEY2}])
+            r, modif, _write = self._post(user_client, config, [{"ip": ip, "key": self._KEY},
+                                                                 {"ip": "10.255.247.5", "key": self._KEY3}])
+            assert r.json()["result"] == "done", ip
+            modif.assert_called_once_with("openmptcprouter", {"wireguard_peers": [{"ip": "10.255.247.5", "key": self._KEY3}]})
 
     def test_conf_rendered_from_every_users_peers(self):
         wg_conf = ("[Interface]\nListenPort = 65311\nPrivateKey = " + self._KEY + "\n"
                    "\n[Peer]\nPublicKey  = " + self._KEY2 + "\nAllowedIPs = 10.255.247.9\n")
         config = self._config(
             openmptcprouter=[{"ip": "10.255.247.2", "key": self._KEY}],
-            bob=[{"ip": "10.255.247.3/32, fd00::3/128", "key": self._KEY2},
+            bob=[{"ip": "10.255.247.3/32", "key": self._KEY2},
+                 {"ip": "0.0.0.0/0", "key": self._KEY2},
                  {"ip": "10.255.247.4\n[Interface]\nPostUp = id", "key": self._KEY2}],
         )
         tmp = io.StringIO()
         tmp.close = lambda: None
 
         def _open(path, mode="r", *args, **kwargs):
-            if str(path) == "/etc/wireguard/wg0.conf":
+            if str(path) == "/etc/wireguard/wg0.conf" and "w" not in mode:
                 return io.StringIO(wg_conf)
             return tmp
 
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.mkstemp", return_value=(-1, "/tmp/wg")),
-            patch("os.close"),
             patch("builtins.open", side_effect=_open),
             patch("omr_admin.file_as_bytes", side_effect=[b"old", b"new"]),
-            patch("omr_admin.move") as move,
+            patch("omr_admin._atomic_write", side_effect=_fake_atomic_write) as write,
             patch("subprocess.run") as run,
         ):
             assert omr_admin._write_wireguard_conf(config)
         out = tmp.getvalue()
         assert out.startswith("[Interface]\nListenPort = 65311\nPrivateKey = " + self._KEY + "\n")
         assert "AllowedIPs = 10.255.247.2\n" in out
-        assert "AllowedIPs = 10.255.247.3/32, fd00::3/128\n" in out
-        # the unowned peer of an earlier release and the invalid stored one are gone
-        assert "10.255.247.9" not in out and "PostUp" not in out
+        assert "AllowedIPs = 10.255.247.3/32\n" in out
+        # the unowned peer of an earlier release and the invalid stored ones are gone
+        assert "10.255.247.9" not in out and "PostUp" not in out and "0.0.0.0/0" not in out
         assert out.count("[Peer]") == 2
-        move.assert_called_once_with("/tmp/wg", "/etc/wireguard/wg0.conf")
+        assert write.call_args.args[0] == "/etc/wireguard/wg0.conf"
+        assert write.call_args.args[2] == 0o600   # it holds the server's private key
         run.assert_called_once_with(["wg", "setconf", "wg0", "/etc/wireguard/wg0.conf"], check=False)
 
     def test_requires_auth(self, unauth_client):
@@ -2692,13 +3251,36 @@ class TestWan:
         # The router posts its public IPv4 and IPv6, one per line.
         acl = io.StringIO()
         acl.close = lambda: None
+        config = json.loads(json.dumps(MOCK_CONFIG))
         with (
             patch("os.path.isfile", return_value=True),
             patch("builtins.open", return_value=acl),
+            patch("omr_admin.modif_config_user"),
+            patch("omr_admin.read_omr_config", return_value=config),
         ):
+            config["users"][0]["openmptcprouter"]["wanips"] = ["203.0.113.1", "2001:db8::1"]
             r = user_client.post("/wan", json={"ips": "203.0.113.1\n2001:db8::1\n"})
         assert r.json()["result"] == "done"
         assert acl.getvalue() == "[white_list]\n203.0.113.1\n2001:db8::1\n"
+
+    def test_acl_lists_every_users_wan_ips(self, user_client):
+        # local.acl is every user's: a router's /wan no longer drops the
+        # others' addresses (nor keeps an invalid one stored before).
+        acl = io.StringIO()
+        acl.close = lambda: None
+        config = json.loads(json.dumps(MOCK_CONFIG))
+        config["users"][0]["openmptcprouter"]["wanips"] = ["203.0.113.1"]
+        config["users"][0]["readonly"]["wanips"] = ["198.51.100.7", "0.0.0.0/0 x"]
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", return_value=acl),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("omr_admin.read_omr_config", return_value=config),
+        ):
+            r = user_client.post("/wan", json={"ips": "203.0.113.1"})
+        assert r.json()["result"] == "done"
+        modif.assert_called_once_with("openmptcprouter", {"wanips": ["203.0.113.1"]})
+        assert acl.getvalue() == "[white_list]\n203.0.113.1\n198.51.100.7\n"
 
     def test_acl_injection_refused(self, user_client):
         # local.acl is shared by every user of the VPS.
@@ -2739,10 +3321,10 @@ class TestLan:
             sp = str(path)
             if sp == "/etc/openmptcprouter-vps-admin/omr-admin-config.json":
                 return io.StringIO(json.dumps(config))
+            if sp == "/etc/openvpn/tun0.conf" and "w" in str(mode):
+                return rewritten
             if sp == "/etc/openvpn/tun0.conf":
                 return io.BytesIO(tun_config.encode()) if "b" in str(mode) else io.StringIO(tun_config)
-            if "a" in str(mode):
-                return rewritten
             return _mock_open(path, mode, *args, **kwargs)
 
         with (
@@ -2872,6 +3454,25 @@ class TestBackupPost:
         r = user_client.post("/backuppost", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
 
+    def test_matching_sha256sum_is_accepted(self, user_client):
+        payload = dict(self._PAYLOAD, sha256sum=__import__("hashlib").sha256(b"fake-tar-gz-data").hexdigest().upper())
+        r = user_client.post("/backuppost", json=payload)
+        assert r.json()["result"] == "done"
+
+    def test_sha256sum_mismatch_is_rejected_before_files_are_opened(self, user_client):
+        opened_for_write = []
+
+        def track_open(path, mode="r", *args, **kwargs):
+            if str(path).startswith("/var/opt/openmptcprouter/") and "w" in mode:
+                opened_for_write.append(str(path))
+            return _mock_open(path, mode, *args, **kwargs)
+
+        payload = dict(self._PAYLOAD, sha256sum="0" * 64)
+        with patch("builtins.open", side_effect=track_open):
+            r = user_client.post("/backuppost", json=payload)
+        assert r.json() == {"result": "error", "reason": "Backup checksum mismatch", "route": "backuppost"}
+        assert opened_for_write == []
+
 
 class TestConfigConcurrency:
     def test_concurrent_mutations_preserve_every_update(self, tmp_path):
@@ -2913,6 +3514,13 @@ class TestBackupGet:
         with patch("os.path.isfile", return_value=True):
             r = user_client.get("/backupget")
         assert "data" in r.json()
+
+    def test_returns_sha256sum_of_the_decoded_data(self, user_client):
+        import base64, hashlib
+        with patch("os.path.isfile", return_value=True):
+            r = user_client.get("/backupget")
+        body = r.json()
+        assert body["sha256sum"] == hashlib.sha256(base64.b64decode(body["data"])).hexdigest()
 
 
 class TestBackupList:

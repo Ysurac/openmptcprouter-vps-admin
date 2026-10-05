@@ -328,8 +328,8 @@ class TestVxlanEndpoint:
             patch("omr_admin.write_vxlan_conf"),
             patch("omr_admin.modif_config_user") as modif,
         ):
-            r = user_client.post("/vxlan", json={"enable": True, "localip": "10.255.240.1/30",
-                                                 "remoteip": "10.255.240.2/30",
+            r = user_client.post("/vxlan", json={"enable": True, "localip": "10.255.239.1/30",
+                                                 "remoteip": "10.255.239.2/30",
                                                  "localip6": "fd00::b00:1/126", "remoteip6": "fd00::b00:2/126"})
         assert r.json()["result"] == "done"
         _, changes = modif.call_args[0]
