@@ -5546,12 +5546,51 @@ class WireGuardPeer(BaseModel):
 class WireGuard(BaseModel):
     peers: List[WireGuardPeer] = []
 
-@app.post('/wireguard', summary="Modify Wireguard configuration")
-def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_user)):
-    if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'wireguard'}
+def _wireguard_peer_error(key, ip):
+    """None if a peer can be written into wg0.conf, else the reason it can't.
+    The file is one `Key = value` per line and wg-quick runs the hook
+    directives of an [Interface] section as root, so a newline in either
+    value would add one."""
+    try:
+        valid_key = isinstance(key, str) and len(key) == 44 and len(base64.b64decode(key, validate=True)) == 32
+    except (binascii.Error, ValueError):
+        valid_key = False
+    if not valid_key:
+        return 'Invalid key'
+    if _wireguard_peer_nets(ip) is None:
+        return 'Invalid ip'
+    return None
+
+def _wireguard_peer_nets(ip):
+    """Networks of a peer's AllowedIPs, None if one isn't an address or prefix.
+    The router sends one address, wg takes a comma-separated list."""
+    if not isinstance(ip, str):
+        return None
+    nets = [_ip_network(part.strip()) for part in ip.split(',')]
+    return None if None in nets else nets
+
+def _wireguard_peers_conflict(peers, others):
+    """Reason the caller's *peers* can't be applied next to *others* (the peers
+    every other user owns), None if they can. wg0.conf is shared, and
+    WireGuard gives an address to the last peer claiming it, so a peer on
+    another user's key or address would take that user's traffic."""
+    other_keys = {peer['key'] for peer in others}
+    other_nets = [net for peer in others for net in (_wireguard_peer_nets(peer['ip']) or [])]
+    for peer in peers:
+        if peer['key'] in other_keys:
+            return 'Key already used by another user'
+        for net in _wireguard_peer_nets(peer['ip']):
+            if any(net.version == other.version and net.overlaps(other) for other in other_nets):
+                return 'Address already used by another user'
+    return None
+
+def _write_wireguard_conf(config_data, current_user=None):
+    """Rewrite wg0.conf from the WireGuard peers every user owns (each user's
+    'wireguard_peers'), keeping its [Interface], and apply it when it changed.
+    Peers nobody owns -- a release before per-user peers kept only the last
+    caller's -- are dropped: each router re-posts its own at every sync."""
     if not os.path.isfile('/etc/wireguard/wg0.conf'):
-        return {'result': 'error', 'reason': 'Wireguard config not found', 'route': 'wireguard'}
+        return False
     wg_config = configparser.ConfigParser(strict=False)
     with open(r'/etc/wireguard/wg0.conf') as conf_file:
         wg_config.read_file(conf_file)
@@ -5564,17 +5603,49 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
         n.write('[Interface]\n')
         n.write('ListenPort = ' + wg_port + '\n')
         n.write('PrivateKey = ' + wg_key + '\n')
-        for peer in params.peers:
-            n.write('\n')
-            n.write('[Peer]\n')
-            n.write('PublicKey  = ' + peer.key + '\n')
-            n.write('AllowedIPs = ' + peer.ip + '\n')
+        for username, user_config in config_data.get('users', [{}])[0].items():
+            for peer in user_config.get('wireguard_peers', []):
+                if _wireguard_peer_error(peer.get('key'), peer.get('ip')):
+                    LOG.warning("Ignoring invalid WireGuard peer of user %s", log_safe(username))
+                    continue
+                n.write('\n')
+                n.write('[Peer]\n')
+                n.write('PublicKey  = ' + peer['key'] + '\n')
+                n.write('AllowedIPs = ' + peer['ip'] + '\n')
+    os.close(fd)
     move(tmpfile, '/etc/wireguard/wg0.conf')
     final_md5 = hashlib.md5(file_as_bytes('/etc/wireguard/wg0.conf')).hexdigest()
     if initial_md5 != final_md5:
         subprocess.run(["wg", "setconf", "wg0", "/etc/wireguard/wg0.conf"], check=False)
-        shorewall_add_port(current_user, str(wg_port), 'udp', 'wireguard')
-        #set_lastchange()
+        if current_user is not None:
+            shorewall_add_port(current_user, str(wg_port), 'udp', 'wireguard')
+    return True
+
+@app.post('/wireguard', summary="Modify Wireguard configuration")
+def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'wireguard'}
+    peers = [{'ip': peer.ip, 'key': peer.key} for peer in params.peers]
+    for peer in peers:
+        error = _wireguard_peer_error(peer['key'], peer['ip'])
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'wireguard'}
+    if not os.path.isfile('/etc/wireguard/wg0.conf'):
+        return {'result': 'error', 'reason': 'Wireguard config not found', 'route': 'wireguard'}
+    config_data = read_omr_config()
+    if not config_data or current_user.username not in config_data['users'][0]:
+        return {'result': 'error', 'reason': 'Config file not readable', 'route': 'wireguard'}
+    # wg0.conf is shared by every user: the caller replaces its own peers only.
+    users = config_data['users'][0]
+    others = [peer for username, user_config in users.items() if username != current_user.username
+              for peer in user_config.get('wireguard_peers', [])]
+    error = _wireguard_peers_conflict(peers, others)
+    if error:
+        return {'result': 'error', 'reason': error, 'route': 'wireguard'}
+    if users[current_user.username].get('wireguard_peers') != peers:
+        modif_config_user(current_user.username, {'wireguard_peers': peers})
+        users[current_user.username]['wireguard_peers'] = peers
+    _write_wireguard_conf(config_data, current_user)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wireguard'}
 
 class ByPass(BaseModel):
@@ -6084,6 +6155,10 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         remove_mqvpn(params.username)
     if os.path.isfile('/var/lib/softether/vpn_server.config'):
         remove_softether_user(params.username)
+    if content['users'][0][params.username].get('wireguard_peers'):
+        # its peers would otherwise stay in wg0.conf until another user's
+        # next /wireguard call, still holding their addresses
+        _write_wireguard_conf(read_omr_config())
     LOG.info("User admin (IP: " + request.client.host + ") removed user " + log_safe(params.username))
     return {'result': 'done', 'reason': 'user removed', 'route': 'remove_user'}
 

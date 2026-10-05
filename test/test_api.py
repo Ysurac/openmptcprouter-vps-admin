@@ -2524,6 +2524,114 @@ class TestSoftEtherVpn:
 
 class TestWireGuard:
     _PAYLOAD = {"peers": [{"ip": "10.0.0.2", "key": "base64key=="}]}
+    _KEY = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
+
+    def test_peer_injection_refused(self, user_client):
+        # wg-quick runs an [Interface] section's hook directives as root
+        for peer, reason in (
+            ({"ip": "10.0.0.2", "key": "base64key=="}, "Invalid key"),
+            ({"ip": "10.0.0.2", "key": self._KEY + "\n[Interface]\nPostUp = id"}, "Invalid key"),
+            ({"ip": "10.0.0.2", "key": self._KEY[:-1] + "!"}, "Invalid key"),
+            ({"ip": "10.0.0.2\n[Interface]\nPostUp = id", "key": self._KEY}, "Invalid ip"),
+            ({"ip": "10.0.0.2 x", "key": self._KEY}, "Invalid ip"),
+            ({"ip": "", "key": self._KEY}, "Invalid ip"),
+        ):
+            with (
+                patch("os.path.isfile", return_value=True),
+                patch("omr_admin.move") as move,
+            ):
+                r = user_client.post("/wireguard", json={"peers": [peer]})
+            assert r.json() == {"result": "error", "reason": reason, "route": "wireguard"}, peer
+            assert not move.called, peer
+
+    _KEY2 = "uKU1qOpAj/4jKsjk3ZqdpQ6GNZpI7mGTWArxpvzSg1I="
+
+    def _config(self, **peers):
+        config = json.loads(json.dumps(MOCK_CONFIG))
+        config["users"][0]["bob"] = {"userid": 3, "username": "bob", "user_password": "x"}
+        for username, user_peers in peers.items():
+            config["users"][0][username]["wireguard_peers"] = user_peers
+        return config
+
+    def _post(self, user_client, config, peers):
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.read_omr_config", return_value=config),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("omr_admin._write_wireguard_conf") as write_conf,
+        ):
+            r = user_client.post("/wireguard", json={"peers": peers})
+        return r, modif, write_conf
+
+    def test_caller_replaces_only_its_own_peers(self, user_client):
+        # wg0.conf is shared: another user's peers must survive this call
+        config = self._config(bob=[{"ip": "10.255.247.3", "key": self._KEY2}])
+        r, modif, write_conf = self._post(user_client, config, [{"ip": "10.255.247.2", "key": self._KEY}])
+        assert r.json()["result"] == "done"
+        modif.assert_called_once_with("openmptcprouter", {"wireguard_peers": [{"ip": "10.255.247.2", "key": self._KEY}]})
+        written = write_conf.call_args.args[0]["users"][0]
+        assert written["bob"]["wireguard_peers"] == [{"ip": "10.255.247.3", "key": self._KEY2}]
+        assert written["openmptcprouter"]["wireguard_peers"] == [{"ip": "10.255.247.2", "key": self._KEY}]
+
+    def test_unchanged_peers_not_rewritten_in_config(self, user_client):
+        peers = [{"ip": "10.255.247.2", "key": self._KEY}]
+        r, modif, write_conf = self._post(user_client, self._config(openmptcprouter=peers), peers)
+        assert r.json()["result"] == "done"
+        assert not modif.called
+        assert write_conf.called
+
+    def test_another_users_key_or_address_refused(self, user_client):
+        # WireGuard gives an address to the last peer claiming it
+        config = self._config(bob=[{"ip": "10.255.247.3", "key": self._KEY2}])
+        for peer, reason in (
+            ({"ip": "10.255.247.2", "key": self._KEY2}, "Key already used by another user"),
+            ({"ip": "10.255.247.3", "key": self._KEY}, "Address already used by another user"),
+            ({"ip": "10.255.247.0/24", "key": self._KEY}, "Address already used by another user"),
+        ):
+            r, modif, write_conf = self._post(user_client, config, [peer])
+            assert r.json() == {"result": "error", "reason": reason, "route": "wireguard"}, peer
+            assert not modif.called and not write_conf.called, peer
+
+    def test_other_family_does_not_conflict(self, user_client):
+        config = self._config(bob=[{"ip": "10.255.247.3", "key": self._KEY2}])
+        r, _modif, _write = self._post(user_client, config, [{"ip": "fd00::3/128", "key": self._KEY}])
+        assert r.json()["result"] == "done"
+
+    def test_conf_rendered_from_every_users_peers(self):
+        wg_conf = ("[Interface]\nListenPort = 65311\nPrivateKey = " + self._KEY + "\n"
+                   "\n[Peer]\nPublicKey  = " + self._KEY2 + "\nAllowedIPs = 10.255.247.9\n")
+        config = self._config(
+            openmptcprouter=[{"ip": "10.255.247.2", "key": self._KEY}],
+            bob=[{"ip": "10.255.247.3/32, fd00::3/128", "key": self._KEY2},
+                 {"ip": "10.255.247.4\n[Interface]\nPostUp = id", "key": self._KEY2}],
+        )
+        tmp = io.StringIO()
+        tmp.close = lambda: None
+
+        def _open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/wireguard/wg0.conf":
+                return io.StringIO(wg_conf)
+            return tmp
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.mkstemp", return_value=(-1, "/tmp/wg")),
+            patch("os.close"),
+            patch("builtins.open", side_effect=_open),
+            patch("omr_admin.file_as_bytes", side_effect=[b"old", b"new"]),
+            patch("omr_admin.move") as move,
+            patch("subprocess.run") as run,
+        ):
+            assert omr_admin._write_wireguard_conf(config)
+        out = tmp.getvalue()
+        assert out.startswith("[Interface]\nListenPort = 65311\nPrivateKey = " + self._KEY + "\n")
+        assert "AllowedIPs = 10.255.247.2\n" in out
+        assert "AllowedIPs = 10.255.247.3/32, fd00::3/128\n" in out
+        # the unowned peer of an earlier release and the invalid stored one are gone
+        assert "10.255.247.9" not in out and "PostUp" not in out
+        assert out.count("[Peer]") == 2
+        move.assert_called_once_with("/tmp/wg", "/etc/wireguard/wg0.conf")
+        run.assert_called_once_with(["wg", "setconf", "wg0", "/etc/wireguard/wg0.conf"], check=False)
 
     def test_requires_auth(self, unauth_client):
         r = unauth_client.post("/wireguard", json=self._PAYLOAD)
@@ -3779,6 +3887,42 @@ class TestAddUserSideEffects:
 
 class TestRemoveUserSideEffects:
     """Verify that remove_user triggers the right cleanup calls."""
+
+    def test_rewrites_wireguard_conf_when_user_had_peers(self, admin_client):
+        # its peers would otherwise keep their addresses in the shared wg0.conf
+        config = json.loads(json.dumps(MOCK_CONFIG))
+        config["users"][0]["readonly"]["wireguard_peers"] = [
+            {"ip": "10.255.247.3", "key": "uKU1qOpAj/4jKsjk3ZqdpQ6GNZpI7mGTWArxpvzSg1I="}]
+        after = json.loads(json.dumps(config))
+        del after["users"][0]["readonly"]
+
+        import builtins
+        current_open = builtins.open
+
+        def _open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/openmptcprouter-vps-admin/omr-admin-config.json":
+                return io.StringIO(json.dumps(config))
+            return current_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("builtins.open", side_effect=_open),
+            patch("omr_admin._mutate_omr_config"),
+            patch("omr_admin.read_omr_config", return_value=after),
+            patch("omr_admin._write_wireguard_conf") as write_conf,
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+        assert r.json()["result"] == "done"
+        write_conf.assert_called_once_with(after)
+
+    def test_leaves_wireguard_conf_alone_without_peers(self, admin_client):
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin._write_wireguard_conf") as write_conf,
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+        assert r.json()["result"] == "done"
+        assert not write_conf.called
 
     def test_removes_shadowsocks_port_when_installed(self, admin_client):
         ss_calls = []
