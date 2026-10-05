@@ -356,6 +356,28 @@ class TestConfigWritePermissions:
         assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
 
     @pytest.mark.real_env
+    def test_temp_copy_is_created_0600_not_just_chmod_ed(self, tmp_path, monkeypatch):
+        # The temp copy holds the secrets as soon as it is written: it must be
+        # created 0600, not created with the umask (0644) and tightened later.
+        import stat
+        cfg = tmp_path / "omr-admin-config.json"
+        cfg.write_text(json.dumps({"users": [{"openmptcprouter": {"userid": 0}}]}))
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_FILE", str(cfg))
+        real_chmod = os.chmod
+        modes_before_chmod = []
+        def spy_chmod(p, mode, *a, **kw):
+            modes_before_chmod.append(stat.S_IMODE(os.stat(p).st_mode))
+            return real_chmod(p, mode, *a, **kw)
+        monkeypatch.setattr(os, "chmod", spy_chmod)
+        old_umask = os.umask(0o022)
+        try:
+            omr_admin._write_omr_config_unlocked({"users": [{"openmptcprouter": {"userid": 0}}]})
+        finally:
+            os.umask(old_umask)
+        assert modes_before_chmod == [0o600]
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+    @pytest.mark.real_env
     def test_rotation_keeps_installer_bak(self, tmp_path):
         # The installer's pre-upgrade copy has an old mtime, so a naive
         # "keep the 10 newest of .*" rotation would evict it first. The
@@ -442,6 +464,37 @@ class TestStartupConfigRecovery:
         (tmp_path / "omr-admin-config.json.bak").write_text("not json")
         with pytest.raises(RuntimeError):
             omr_admin.load_startup_config()
+
+    @pytest.mark.real_env
+    def test_world_readable_backups_are_tightened_at_startup(self, tmp_path, monkeypatch):
+        # Backups an older release left 0644 (and the installer's `.bak`, now
+        # kept rather than rotated away) hold the same secrets as the live file.
+        import stat
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text(json.dumps(self._GOOD))
+        cfg.chmod(0o600)
+        bak = tmp_path / "omr-admin-config.json.bak"
+        ts = tmp_path / "omr-admin-config.json.1700000000"
+        other = tmp_path / "omr-admin-config.json.tmp.1.2"
+        for f in (bak, ts, other):
+            f.write_text(json.dumps(self._GOOD))
+            f.chmod(0o644)
+        omr_admin.load_startup_config()
+        assert stat.S_IMODE(bak.stat().st_mode) == 0o600
+        assert stat.S_IMODE(ts.stat().st_mode) == 0o600
+        # Only backups are touched, nothing else next to the config.
+        assert stat.S_IMODE(other.stat().st_mode) == 0o644
+
+    @pytest.mark.real_env
+    def test_backups_are_tightened_when_recovering_too(self, tmp_path, monkeypatch):
+        import stat
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.write_text("")
+        bak = tmp_path / "omr-admin-config.json.bak"
+        bak.write_text(json.dumps(self._GOOD))
+        bak.chmod(0o644)
+        omr_admin.load_startup_config()
+        assert stat.S_IMODE(bak.stat().st_mode) == 0o600
 
 
 # ===========================================================================

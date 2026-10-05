@@ -2446,7 +2446,8 @@ def _auto_set_enabled(enabled: bool) -> bool:
             cfg_file["auto_learning"] = block
             tmp = '{}.tmp.{}.{}'.format(OMR_CONFIG_FILE, os.getpid(), threading.get_ident())
             try:
-                with open(tmp, 'w') as f:
+                # Created 0600: never group/world readable, not even before the chmod.
+                with open(tmp, 'w', opener=lambda file, flags: os.open(file, flags, 0o600)) as f:
                     json.dump(cfg_file, f, indent=4)
                     f.write('\n')
                     try:

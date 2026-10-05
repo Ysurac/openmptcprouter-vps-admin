@@ -161,11 +161,18 @@ def _read_omr_config_unlocked():
     return json.loads(content)
 
 
+def _owner_only_opener(file, flags):
+    """open() opener creating the file 0600 from the start: the config holds
+    every user's password and the VPN keys, so its temp copy must not be
+    group/world readable even in the moment before it is chmod-ed."""
+    return os.open(file, flags, 0o600)
+
+
 def _write_omr_config_unlocked(data):
     """Atomically replace the config; caller must hold the exclusive lock."""
     tmp = '{}.tmp.{}.{}'.format(OMR_CONFIG_FILE, os.getpid(), threading.get_ident())
     try:
-        with open(tmp, 'w') as outfile:
+        with open(tmp, 'w', opener=_owner_only_opener) as outfile:
             json.dump(data, outfile, indent=4)
             outfile.write('\n')
             try:
@@ -305,6 +312,18 @@ def _config_if_usable(path):
         return data
     return None
 
+def _tighten_config_backups():
+    """chmod 0600 the config backups an older release (or the installer's
+    `mv` of a widened live file to `.bak`) left group/world readable. They
+    hold the same passwords and VPN keys as the live file, and the installer's
+    `.bak` is no longer rotated away, so it would otherwise stay readable."""
+    for backup in glob.glob(OMR_CONFIG_FILE + '.bak*') + glob.glob(OMR_CONFIG_FILE + '.[0-9]*'):
+        try:
+            if os.stat(backup).st_mode & 0o077:
+                os.chmod(backup, 0o600)
+        except OSError:
+            pass
+
 def load_startup_config():
     """Read the config at startup, recovering from a backup if the live file
     is missing, empty, truncated, carries a trailing comma or has lost its
@@ -314,6 +333,7 @@ def load_startup_config():
     is also written back, so later config changes (which read the live file)
     don't fail in turn. Raises RuntimeError if nothing is usable, so the
     failure is one clear log line, not a silent user-less start."""
+    _tighten_config_backups()
     data = _config_if_usable(OMR_CONFIG_FILE)
     if data is not None:
         # The live file is fine: just make sure a copy another writer (or an

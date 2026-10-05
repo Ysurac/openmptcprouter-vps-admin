@@ -3865,6 +3865,29 @@ class TestAutoLearningEndpoint:
         assert "openmptcprouter" in data["users"][0]   # users preserved
 
     @pytest.mark.real_env
+    def test_persist_creates_temp_copy_0600(self, tmp_path, monkeypatch):
+        # The temp copy must be created 0600, not created 0644 (umask) and only
+        # tightened by the chmod just before the rename.
+        import stat
+        cfg = tmp_path / "omr-admin-config.json"
+        cfg.write_text(json.dumps({"users": [{"openmptcprouter": {"userid": 0}}]}))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_FILE", str(cfg))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        real_chmod = os.chmod
+        modes_before_chmod = []
+        def spy_chmod(p, mode, *a, **kw):
+            modes_before_chmod.append(stat.S_IMODE(os.stat(p).st_mode))
+            return real_chmod(p, mode, *a, **kw)
+        monkeypatch.setattr(os, "chmod", spy_chmod)
+        old_umask = os.umask(0o022)
+        try:
+            assert omr_metrics._auto_set_enabled(True) is True
+        finally:
+            os.umask(old_umask)
+        assert modes_before_chmod == [0o600]
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+    @pytest.mark.real_env
     def test_missing_config_is_not_replaced_with_a_userless_one(self, tmp_path, monkeypatch):
         # A missing config must not be recreated without users (that would
         # lock every router out); persistence just fails and the toggle
