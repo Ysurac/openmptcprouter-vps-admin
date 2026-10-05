@@ -753,6 +753,13 @@ def write_vxlan_conf(username, userid):
             # VNI lands on the same server-side bridge (shared L2 segment)
             n.write('BRIDGE=br-vxlan' + str(vxlan_config['vni']) + "\n")
         else:
+            # Stored values are written again on every call, and older
+            # releases stored them unchecked: never let one that isn't an
+            # address into the file omr-vxlan-run reads as root.
+            for key, family in (('localip', 4), ('localip6', 6)):
+                if vxlan_config[key] and _addr_family(vxlan_config[key]) != family:
+                    LOG.warning("Ignoring invalid VXLAN %s of user %s", key, log_safe(username))
+                    vxlan_config[key] = None
             if vxlan_config['localip']:
                 n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
             if vxlan_config['localip6']:
@@ -1754,6 +1761,16 @@ def _addr_family(value):
     (empty, hostname, interface name, comma-separated list, scope ID...)."""
     net = _ip_network(value)
     return net.version if net else None
+
+def _ip_field_error(fields, route):
+    """API error for the first of `fields` ((name, value, family) tuples) that
+    is set but isn't an IPv<family> address, with or without a /prefix --
+    these end up as KEY=value lines of files root scripts read, so anything
+    else could carry more than an address. None if they are all fine."""
+    for name, value, family in fields:
+        if value and _addr_family(value) != family:
+            return {'result': 'error', 'reason': f'Invalid {name}', 'route': route}
+    return None
 
 # Ports from 65000 up carry the server's own services (Glorytun 65001,
 # Shadowsocks 65101, SSH 65222, this API 65500...): a redirect there would
@@ -4741,6 +4758,10 @@ def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user))
     userid = int(userid)
     if vxlanconfig.vni is not None and current_user.permissions != "admin":
         return {'result': 'permission', 'reason': 'VNI is admin-assigned, ask your administrator', 'route': 'vxlan'}
+    error = _ip_field_error((('localip', vxlanconfig.localip, 4), ('remoteip', vxlanconfig.remoteip, 4),
+                             ('localip6', vxlanconfig.localip6, 6), ('remoteip6', vxlanconfig.remoteip6, 6)), 'vxlan')
+    if error:
+        return error
     mode = vxlanconfig.mode if vxlanconfig.mode in ('l2', 'l3') else None
     vxlan_user_config = _merge_vxlan_config(
         current_user.username, userid,
@@ -5428,6 +5449,8 @@ def mqvpn_weight(*, params: MQVPNWeightParams, current_user: User = Depends(get_
 
 
 # Set OpenVPN config
+_OPENVPN_CIPHER_RE = re.compile(r'[A-Za-z0-9-]{1,64}')
+
 class OpenVPN(BaseModel):
     port: int = Query(..., gt=0, lt=65535)
     cipher: str = "AES-256-CBC"
@@ -5437,6 +5460,11 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         #set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'openvpn'}
+    # A cipher name (AES-256-GCM, CHACHA20-POLY1305...): tun0.conf is one
+    # directive per line, so anything more would add directives of its own,
+    # script hooks run as root included.
+    if not _OPENVPN_CIPHER_RE.fullmatch(params.cipher):
+        return {'result': 'error', 'reason': 'Invalid cipher', 'route': 'openvpn'}
     if not os.path.isfile('/etc/openvpn/tun0.conf'):
         return {'result': 'warning', 'reason': 'OpenVPN is not installed', 'route': 'openvpn'}
     initial_md5 = hashlib.md5(file_as_bytes('/etc/openvpn/tun0.conf')).hexdigest()
@@ -5686,6 +5714,13 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     ula = vpnconfig.ula
     if not remoteip or not localip:
         return {'result': 'done', 'reason': 'No changes', 'route': 'vpnips'}
+    # Written into omr-6in4/user<id>, which omr-6in4-run reads as root. The
+    # router sends its ULA prefix (network.globals.ula_prefix), possibly
+    # 'auto'; localip6/remoteip6 default to the fd00::a0<id>:1|2/126 pair.
+    error = _ip_field_error((('localip6', localip6, 6), ('remoteip6', remoteip6, 6),
+                             ('ula', '' if ula == 'auto' else ula, 6)), 'vpnips')
+    if error:
+        return error
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
     if 'vpnremoteip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnremoteip'] == remoteip and 'vpnlocalip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnlocalip'] == localip and ula and ('ula' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['ula'] == ula):

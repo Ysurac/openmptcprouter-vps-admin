@@ -2491,6 +2491,24 @@ class TestOpenVpn:
             r = user_client.post("/openvpn", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
 
+    def test_cipher_injection_refused(self, user_client):
+        # tun0.conf is one directive per line, script hooks run as root
+        for cipher in ("AES-256-GCM\nup /tmp/x", "AES-256-GCM up", "", "AES#x", "A" * 65):
+            with (
+                patch("os.path.isfile", return_value=True),
+                patch("omr_admin.move") as move,
+                patch("subprocess.run") as run,
+            ):
+                r = user_client.post("/openvpn", json={**self._PAYLOAD, "cipher": cipher})
+            assert r.json() == {"result": "error", "reason": "Invalid cipher", "route": "openvpn"}, cipher
+            assert not move.called and not run.called, cipher
+
+    def test_usual_ciphers_accepted(self, user_client):
+        for cipher in ("AES-256-CBC", "BF-CBC", "CHACHA20-POLY1305", "none"):
+            with patch("os.path.isfile", return_value=True):
+                r = user_client.post("/openvpn", json={**self._PAYLOAD, "cipher": cipher})
+            assert r.json()["result"] == "done", cipher
+
 
 class TestSoftEtherVpn:
     _PAYLOAD = {"cipher": "AES-256-GCM", "password": "testpass"}
@@ -2654,6 +2672,35 @@ class TestVpnIps:
         with patch("os.path.isfile", return_value=True):
             r = user_client.post("/vpnips", json=self._PAYLOAD)
         assert r.json()["result"] in ("done", "error")
+
+    def test_ipv6_fields_must_be_ipv6_addresses(self, user_client):
+        # Written into omr-6in4/user<id>, which omr-6in4-run reads as root.
+        for field, value in (
+            ("localip6", "fd00::a00:1/126\nX=$(id)"),
+            ("remoteip6", "fd00::a00:2/126;id"),
+            ("remoteip6", "10.255.255.2"),
+            ("ula", "fd12:3456:789a::/48 $(id)"),
+            ("ula", "fe80::1%eth0"),
+        ):
+            with (
+                patch("os.path.isfile", return_value=True),
+                patch("omr_admin.modif_config_user") as modif,
+                patch("subprocess.run") as run,
+            ):
+                r = user_client.post("/vpnips", json={**self._PAYLOAD, field: value})
+            assert r.json() == {"result": "error", "reason": f"Invalid {field}", "route": "vpnips"}, field
+            assert not modif.called and not run.called, field
+
+    def test_ula_prefix_and_auto_accepted(self, user_client):
+        for ula in ("fd12:3456:789a::/48", "auto"):
+            with (
+                patch("os.path.isfile", return_value=True),
+                patch("omr_admin.modif_config_user"),
+                patch("subprocess.run"),
+            ):
+                r = user_client.post("/vpnips", json={**self._PAYLOAD, "ula": ula,
+                                                      "localip6": "fd00::a00:1/126"})
+            assert r.json().get("reason") not in ("Invalid ula", "Invalid localip6"), ula
 
 
 # ===========================================================================

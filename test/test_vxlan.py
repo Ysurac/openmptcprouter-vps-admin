@@ -224,6 +224,16 @@ class TestWriteVxlanConf:
             omr_admin.write_vxlan_conf("openmptcprouter", 0)
         assert _VXLAN_FILE not in env.written
 
+    def test_invalid_stored_tunnel_ips_are_not_written(self):
+        # Stored unchecked by an older release, and omr-vxlan-run reads the
+        # file as root: such a value must never reach it.
+        env, _, _ = self._run({"enabled": True, "mode": "l3", "vni": 5,
+                               "localip": "10.0.0.1/30\nX=$(id)", "localip6": "fd00::1;id"})
+        written = env.written[_VXLAN_FILE]
+        assert "$(id)" not in written and ";id" not in written
+        assert "LOCALTUNIP" not in written
+        assert "MODE=l3" in written
+
     def test_l3_past_derived_pools_omits_tunnel_ips_but_still_writes(self):
         env = _FileEnv({_CONFIG_PATH: _config(userid=5000, vxlan={"enabled": True, "mode": "l3"})})
         with (
@@ -295,6 +305,35 @@ class TestVxlanEndpoint:
             r = user_client.post("/vxlan", json={"enable": False})
         assert r.json()["result"] == "done"
         write_conf.assert_called_once()
+
+    def test_tunnel_ips_must_be_addresses_of_their_family(self, user_client):
+        for field, value in (
+            ("localip", "10.0.0.1/30\nX=$(id)"),
+            ("localip", "fd00::1/126"),
+            ("remoteip", "10.0.0.2 x"),
+            ("localip6", "fd00::1/126;id"),
+            ("localip6", "10.0.0.1/30"),
+            ("remoteip6", "fe80::1%eth0"),
+        ):
+            with (
+                patch("omr_admin.write_vxlan_conf") as write_conf,
+                patch("omr_admin.modif_config_user") as modif,
+            ):
+                r = user_client.post("/vxlan", json={"enable": True, field: value})
+            assert r.json() == {"result": "error", "reason": f"Invalid {field}", "route": "vxlan"}, field
+            assert not modif.called and not write_conf.called, field
+
+    def test_valid_tunnel_ips_accepted(self, user_client):
+        with (
+            patch("omr_admin.write_vxlan_conf"),
+            patch("omr_admin.modif_config_user") as modif,
+        ):
+            r = user_client.post("/vxlan", json={"enable": True, "localip": "10.255.240.1/30",
+                                                 "remoteip": "10.255.240.2/30",
+                                                 "localip6": "fd00::b00:1/126", "remoteip6": "fd00::b00:2/126"})
+        assert r.json()["result"] == "done"
+        _, changes = modif.call_args[0]
+        assert changes["vxlan"]["localip6"] == "fd00::b00:1/126"
 
     def test_non_admin_cannot_set_vni(self, user_client):
         r = user_client.post("/vxlan", json={"enable": True, "vni": 999})
