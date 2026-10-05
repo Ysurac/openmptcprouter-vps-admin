@@ -151,6 +151,79 @@ class TestRenderFwPorts:
         accept, _dnat = omr_admin._render_fw_ports(config)
         assert 'comment "OMR bob open openvpn udp"' in accept[0]
 
+    def test_invalid_stored_entries_are_skipped(self):
+        # Entries stored before omr-admin validated them: a newline in the
+        # port would add nft commands of its own, a DNAT on a server port
+        # would send SSH/the API to the router. Only the sane entry renders.
+        config = _config({
+            "openmptcprouter": {"userid": 0, "vpnremoteip": "10.255.220.6", "fw_ports": [
+                {"name": "evil", "port": "80 accept\nflush ruleset", "proto": "tcp", "fwtype": "ACCEPT", "family": 4},
+                # GHSA-p7h3-26vj-4wg3 proof of concept, as stored by an earlier release
+                {"name": "poc", "port": '22 accept comment "poc"\nadd chain inet omr OMRPOC\n#',
+                 "proto": "tcp", "fwtype": "ACCEPT", "family": 4},
+                {"name": "ssh", "port": "65222", "proto": "tcp", "fwtype": "DNAT", "family": 4},
+                {"name": "bad", "port": "81", "proto": "tcp accept", "fwtype": "ACCEPT", "family": 4},
+                {"name": "https", "port": "443", "proto": "tcp", "fwtype": "DNAT", "family": 4},
+            ]},
+        })
+        accept, dnat = omr_admin._render_fw_ports(config)
+        assert accept == []
+        assert len(dnat) == 1 and "dport 443 " in dnat[0]
+
+    def test_shorewall_colon_range_renders_as_nft_range(self):
+        config = _config({
+            "openmptcprouter": {"userid": 0, "fw_ports": [
+                {"name": "range", "port": "1000:2000", "proto": "udp", "fwtype": "ACCEPT", "family": 4},
+            ]},
+        })
+        accept, _dnat = omr_admin._render_fw_ports(config)
+        assert accept[0].startswith("meta nfproto ipv4 udp dport 1000-2000 accept")
+
+    def test_comment_cannot_break_out_of_the_line(self):
+        config = _config({
+            "bob": {"userid": 1, "fw_ports": [
+                {"name": 'x\nflush ruleset\\"', "port": "80", "proto": "tcp", "fwtype": "ACCEPT", "family": 4},
+            ]},
+        })
+        accept, _dnat = omr_admin._render_fw_ports(config)
+        assert len(accept) == 1
+        assert "\n" not in accept[0] and "\\" not in accept[0]
+        assert accept[0].endswith('comment "OMR bob open x flush ruleset \' tcp"')
+
+
+# ===========================================================================
+# _fw_entry_error
+# ===========================================================================
+
+
+class TestFwEntryError:
+    def test_valid_entries(self):
+        for port in ("80", "1", "2-64999", "1000:2000", "65535"):
+            assert omr_admin._fw_entry_error(port, "tcp", "ACCEPT") is None
+        assert omr_admin._fw_entry_error("64999", "udp", "DNAT") is None
+        assert omr_admin._fw_entry_error("80", "tcp", "DNAT", "203.0.113.5", "2001:db8::/32") is None
+
+    def test_invalid_port(self):
+        for port in ("", "0", "65536", "abc", "80,443", "90-80", "80\n", "80 accept", "-1"):
+            assert omr_admin._fw_entry_error(port, "tcp", "ACCEPT") == "Invalid port", port
+
+    def test_dnat_refused_from_65000(self):
+        for port in ("65000", "65222", "65500", "2-65000", "64000:65535"):
+            assert "65000" in omr_admin._fw_entry_error(port, "tcp", "DNAT"), port
+        # opening them stays allowed: that is how the services are opened
+        assert omr_admin._fw_entry_error("65222", "tcp", "ACCEPT") is None
+
+    def test_invalid_proto(self):
+        for proto in ("", "all", "tcp udp", "icmp", "tcp\n"):
+            assert omr_admin._fw_entry_error("80", proto, "ACCEPT") == "Invalid protocol", proto
+
+    def test_invalid_address(self):
+        for addr in ("eth0", "1.2.3.4 5.6.7.8", "!1.2.3.4", "1.2.3.4\nflush ruleset",
+                     # ipaddress takes an IPv6 scope ID, and anything after '%'
+                     "fe80::1%eth0", "fe80::1%x\nflush ruleset"):
+            assert omr_admin._fw_entry_error("80", "tcp", "ACCEPT", addr, "") == "Invalid address", addr
+            assert omr_admin._fw_entry_error("80", "tcp", "ACCEPT", "", addr) == "Invalid address", addr
+
 
 # ===========================================================================
 # _fw_port_add / _fw_port_del
@@ -186,6 +259,17 @@ class TestFwPortState:
             patch("omr_admin._nft_sync_ports") as sync,
         ):
             omr_admin._fw_port_add("openmptcprouter", "21", "tcp", "router 21", "REDIRECT", 4, "", "", "default", "")
+        assert not modif.called
+        assert not sync.called
+
+    def test_add_refuses_dnat_of_a_server_port(self):
+        config = _config({"openmptcprouter": {"fw_ports": []}})
+        with (
+            patch("builtins.open", side_effect=_open_config(config)),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("omr_admin._nft_sync_ports") as sync,
+        ):
+            omr_admin._fw_port_add("openmptcprouter", "65222", "tcp", "router 65222", "DNAT", 4, "", "", "default", "")
         assert not modif.called
         assert not sync.called
 

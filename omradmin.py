@@ -1660,8 +1660,9 @@ def _nft_iface_set(patterns):
 
 def _nft_comment(text):
     """nft rule comments are a quoted string (max 128 bytes) -- keep ours
-    short and strip anything that would break out of the quotes."""
-    return text.replace('"', "'")[:128]
+    short and strip anything that would break out of the quotes, or out of
+    the line: the scripts are fed to `nft -f -`, one command per line."""
+    return re.sub(r'[\x00-\x1f\x7f\\]', ' ', text).replace('"', "'")[:128]
 
 _NFT_ERR_LOCATION = re.compile(r'^\S*:\d+:\d+(?:-\d+)?:\s*')
 
@@ -1733,15 +1734,57 @@ def _nft_flush_chain(chain, rule_lines):
 
 # --- per-user opened/redirected ports (user_accept / user_dnat chains) ---
 
-def _addr_family(value):
-    """4 or 6 for an IP address or CIDR literal, None for anything else
-    (empty, hostname, interface name, comma-separated list...)."""
-    if not value:
+_IP_LITERAL_RE = re.compile(r'[0-9A-Fa-f:./]+')
+
+def _ip_network(value):
+    """ipaddress network for a plain IP address or CIDR literal, None for
+    anything else. ipaddress also accepts an IPv6 scope ID (fe80::1%eth0)
+    whose text after '%' may be anything, newlines included, and str()
+    keeps it -- so such a value would carry arbitrary text into the
+    `nft -f -` scripts these literals are rendered into."""
+    if not isinstance(value, str) or not _IP_LITERAL_RE.fullmatch(value):
         return None
     try:
-        return ipaddress.ip_network(value, strict=False).version
+        return ipaddress.ip_network(value, strict=False)
     except ValueError:
         return None
+
+def _addr_family(value):
+    """4 or 6 for an IP address or CIDR literal, None for anything else
+    (empty, hostname, interface name, comma-separated list, scope ID...)."""
+    net = _ip_network(value)
+    return net.version if net else None
+
+# Ports from 65000 up carry the server's own services (Glorytun 65001,
+# Shadowsocks 65101, SSH 65222, this API 65500...): a redirect there would
+# send them to the router and lock the VPS out. The router refuses them too
+# (_vps_firewall_redirect_port), and the /shorewall bulk redirect stops at
+# 64999 for the same reason. Opening (ACCEPT) them stays allowed: that is
+# how the services themselves are opened.
+FW_DNAT_MAX_PORT = 64999
+_FW_PORT_RE = re.compile(r'(\d{1,5})(?:[-:](\d{1,5}))?')
+_FW_PROTOS = ('tcp', 'udp', 'sctp')
+
+def _fw_entry_error(port, proto, fwtype, source_dip='', dest_ip=''):
+    """None if a firewall entry is safe to render, else the reason it isn't.
+    Every one of these values ends up verbatim in the `nft -f -` script
+    _render_fw_ports feeds, one command per line, so anything but a port or
+    range, a known protocol and an IP/CIDR literal would either break the
+    whole user_accept/user_dnat flush or inject commands of its own."""
+    m = _FW_PORT_RE.fullmatch(str(port))
+    if not m:
+        return 'Invalid port'
+    first = int(m.group(1))
+    last = int(m.group(2) or first)
+    if not 1 <= first <= last <= 65535:
+        return 'Invalid port'
+    if fwtype == 'DNAT' and last > FW_DNAT_MAX_PORT:
+        return "Ports >= 65000 can't be redirected, they are needed by OpenMPTCProuter server part"
+    if proto not in _FW_PROTOS:
+        return 'Invalid protocol'
+    if any(addr and _addr_family(addr) is None for addr in (source_dip, dest_ip)):
+        return 'Invalid address'
+    return None
 
 def _render_fw_ports(config_data):
     """Pure: (accept_rules, dnat_rules) from every user's fw_ports entries."""
@@ -1758,6 +1801,15 @@ def _render_fw_ports(config_data):
             dest_ip = entry.get('dest_ip', '')
             vpn = entry.get('vpn', 'default')
             comment = entry.get('comment', '')
+            error = _fw_entry_error(port, proto, fwtype, source_dip, dest_ip)
+            if error:
+                # Stored by a release that did not validate entries: skip it
+                # rather than fail (or extend) the single nft transaction.
+                LOG.warning("skipping firewall entry %s %s/%s of user %s: %s",
+                            log_safe(name), log_safe(proto), log_safe(port), log_safe(username), error)
+                continue
+            # Shorewall's a:b range is nft's a-b (the router already sends a-b).
+            port = str(port).replace(':', '-')
             if any(af not in (None, family) for af in (_addr_family(source_dip), _addr_family(dest_ip))):
                 # An address restriction from the other family renders nft
                 # syntax that does not parse (`meta nfproto ipv6 ip6 daddr
@@ -1830,6 +1882,11 @@ def _fw_port_add(username, port, proto, name, fwtype, family, source_dip, dest_i
         # nothing but bloated fw_ports forever.
         LOG.debug("ignoring firewall entry with unsupported fwtype %s (%s %s/%s)",
                   log_safe(fwtype), log_safe(name), log_safe(proto), log_safe(port))
+        return
+    error = _fw_entry_error(port, proto, fwtype, source_dip, dest_ip)
+    if error:
+        LOG.warning("refusing firewall entry %s %s/%s of user %s: %s",
+                    log_safe(name), log_safe(proto), log_safe(port), log_safe(username), error)
         return
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         data = json.load(f)
@@ -1982,9 +2039,8 @@ def _dscp_classify_by_class(entries):
         cidr = entry.get('cidr')
         if dscp not in DSCP_CLASSIFY_CLASSES:
             continue
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
-        except (ValueError, TypeError):
+        net = _ip_network(cidr)
+        if net is None:
             continue
         by_class[dscp][net.version].append(str(net))
     return by_class
@@ -3901,6 +3957,11 @@ def _firewall_open(params, current_user, route):
     vpn = "default"
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
+    if fwtype in ('ACCEPT', 'DNAT'):
+        # Unsupported fwtypes are ignored further down, as they always were.
+        error = _fw_entry_error(port, proto, fwtype, source_dip, source_ip)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': route}
     families = _fw_families(params.ipproto)
     if params.ipproto == IPPROTO.any:
         # 'any' means "whatever applies", not "write a broken rule": an
@@ -4486,9 +4547,8 @@ def dscp_classify(*, params: DscpClassifyParams, current_user: User = Depends(ge
     for entry in params.entries:
         if entry.dscp not in DSCP_CLASSIFY_CLASSES:
             return {'result': 'error', 'reason': f'Invalid dscp {entry.dscp!r}', 'route': 'dscp_classify'}
-        try:
-            net = ipaddress.ip_network(entry.cidr, strict=False)
-        except ValueError:
+        net = _ip_network(entry.cidr)
+        if net is None:
             return {'result': 'error', 'reason': f'Invalid cidr {entry.cidr!r}', 'route': 'dscp_classify'}
         by_class[entry.dscp][net.version].append(str(net))
     # Persist so _nft_resync_dscp_classify() can replay this after an

@@ -293,6 +293,27 @@ class TestDscpClassifyEndpoint:
             )
         assert r.json()["result"] == "error"
 
+    def test_ipv6_scope_id_cidr_errors(self, user_client):
+        # ipaddress accepts fe80::1%<anything>, newlines included, and keeps
+        # it in str(): that text would land in the `nft -f -` element list.
+        with (
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_apply_dscp_classify") as apply,
+        ):
+            r = user_client.post(
+                "/dscp_classify",
+                json={"entries": [{"dscp": "cs4", "cidr": "fe80::1%x\nflush ruleset"}]},
+            )
+        assert r.json()["result"] == "error"
+        assert not apply.called
+
+    def test_replay_skips_ipv6_scope_id(self):
+        by_class = omr_admin._dscp_classify_by_class([
+            {"dscp": "cs4", "cidr": "fe80::1%x\nflush ruleset"},
+            {"dscp": "cs4", "cidr": "2001:db8::/32"},
+        ])
+        assert by_class["cs4"][6] == ["2001:db8::/32"]
+
     def test_success_dispatches_normalized_cidrs_per_class_and_family(self, user_client):
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),

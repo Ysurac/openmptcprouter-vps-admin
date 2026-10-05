@@ -705,6 +705,48 @@ class TestShorewallOpen:
         assert add4.called
         assert not add6.called
 
+    def test_dnat_of_a_server_port_refused(self, user_client):
+        # 65000+ carry the server's own services (SSH 65222, this API
+        # 65500...): redirecting them to the router locks the VPS out.
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port") as add4,
+            patch("omr_admin.shorewall6_add_port") as add6,
+        ):
+            r = user_client.post(
+                "/shorewallopen",
+                json={**self._PAYLOAD, "port": "2-65222", "fwtype": "DNAT", "ipproto": "any"},
+            )
+        assert r.json()["result"] == "error"
+        assert "65000" in r.json()["reason"]
+        assert not add4.called and not add6.called
+
+    def test_accept_of_a_server_port_allowed(self, user_client):
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port") as add4,
+        ):
+            r = user_client.post("/firewallopen", json={**self._PAYLOAD, "port": "65222"})
+        assert r.json()["result"] == "done"
+        assert add4.called
+
+    def test_nft_injection_refused(self, user_client):
+        for field, value, reason in (
+            ("port", "80 accept\nflush ruleset", "Invalid port"),
+            # GHSA-p7h3-26vj-4wg3 proof of concept
+            ("port", '22 accept comment "poc"\nadd chain inet omr OMRPOC\n#', "Invalid port"),
+            ("proto", "tcp dport 22 accept\nflush ruleset\nadd rule inet omr user_accept tcp", "Invalid protocol"),
+            ("source_dip", "1.2.3.4\nflush ruleset", "Invalid address"),
+            ("source_ip", "1.2.3.4 accept", "Invalid address"),
+        ):
+            with (
+                patch("os.path.isfile", return_value=True),
+                patch("omr_admin.shorewall_add_port") as add4,
+            ):
+                r = user_client.post("/firewallopen", json={**self._PAYLOAD, field: value})
+            assert r.json() == {"result": "error", "reason": reason, "route": "firewallopen"}, field
+            assert not add4.called, field
+
 class TestShorewallClose:
     _PAYLOAD = {
         "name": "http",
