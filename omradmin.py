@@ -4278,6 +4278,23 @@ def xray_unredirect(*, params: Xrayparams, current_user: User = Depends(get_curr
     xray_del_port(current_user, port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
 
+# A kernel registered name (MPTCP scheduler/path manager, TCP congestion
+# control): the kernel caps them at 16 characters, the router's v0 names and
+# BPF object stems at a few more.
+_KERNEL_NAME_RE = re.compile(r'[A-Za-z0-9_-]{1,32}')
+
+def _mptcp_params_error(params):
+    """None if the /mptcp values can be persisted, else the reason they can't.
+    They are written as key=value lines into /etc/sysctl.d/90-shadowsocks.conf,
+    applied as root at every boot, so a newline in one of them would persist
+    any other kernel setting."""
+    if params.checksum not in ('0', '1'):
+        return 'Invalid checksum'
+    for field in ('path_manager', 'scheduler', 'congestion_control'):
+        if not _KERNEL_NAME_RE.fullmatch(getattr(params, field)):
+            return f'Invalid {field}'
+    return None
+
 # Set MPTCP config
 class MPTCPparams(BaseModel):
     checksum: str
@@ -4334,6 +4351,9 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     syn_retrans_before_tcp_fallback = params.syn_retrans_before_tcp_fallback
     if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'mptcp'}
+    error = _mptcp_params_error(params)
+    if error:
+        return {'result': 'error', 'reason': error, 'route': 'mptcp'}
     if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
         subprocess.run(["sysctl", "-qw", f"net.mptcp.mptcp_checksum={checksum}"], check=False)
         subprocess.run(["sysctl", "-qw", f"net.mptcp.mptcp_path_manager={path_manager}"], check=False)
@@ -5572,12 +5592,18 @@ def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
     ips = wanips.ips
     if not ips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'wan'}
+    # The router sends its public IPv4/IPv6 addresses one per line, and they
+    # go verbatim into shadowsocks' ACL, shared by every user: anything else
+    # would add rules of its own to it.
+    ips = [ip.strip() for ip in ips.splitlines() if ip.strip()]
+    if not ips or any(_ip_network(ip) is None for ip in ips):
+        return {'result': 'error', 'reason': 'Invalid IP', 'route': 'wan'}
     if not os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         return {'result': 'warning', 'reason': 'Shadowsocks-libev is not installed', 'route': 'wan'}
 
     with open('/etc/shadowsocks-libev/local.acl', 'w') as outfile:
         outfile.write('[white_list]\n')
-        outfile.write(ips)
+        outfile.write('\n'.join(ips) + '\n')
     #modif_config_user(current_user.username,{'wanips': wanip})
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wan'}
 

@@ -982,6 +982,31 @@ class TestMPTCP:
         assert r.status_code == 200
         assert r.json()["result"] == "done"
 
+    def test_sysctl_injection_refused(self, user_client):
+        # The values become key=value lines of /etc/sysctl.d/90-shadowsocks.conf,
+        # applied as root at every boot: a newline would persist any sysctl.
+        for field, value in (
+            ("checksum", "0\nnet.ipv4.ip_forward=0"),
+            ("checksum", "2"),
+            ("path_manager", "default\nkernel.sysrq=1"),
+            ("scheduler", "default\nkernel.sysrq=1"),
+            ("scheduler", "bpf red"),
+            ("congestion_control", "bbr\nnet.ipv4.ip_forward=0"),
+            ("congestion_control", "x" * 33),
+        ):
+            with (
+                patch("subprocess.run") as run,
+                patch("omr_admin.move") as move,
+            ):
+                r = user_client.post("/mptcp", json={**self._PAYLOAD, field: value})
+            assert r.json() == {"result": "error", "reason": f"Invalid {field}", "route": "mptcp"}, field
+            assert not run.called and not move.called, field
+
+    def test_bpf_scheduler_names_accepted(self, user_client):
+        for scheduler in ("bpf_red", "mptcp_bpf_burst", "redundant", "blest"):
+            r = user_client.post("/mptcp", json={**self._PAYLOAD, "scheduler": scheduler, "checksum": "1"})
+            assert r.json()["result"] == "done", scheduler
+
     def test_blank_syn_retries_falls_back_to_invalid_parameters(self, user_client):
         # syn_retries has no default (required, non-zero) -- blank should
         # reach the route's own "Invalid parameters" check, not a 422.
@@ -2536,6 +2561,30 @@ class TestWan:
         with patch("os.path.isfile", return_value=True):
             r = user_client.post("/wan", json={"ips": "203.0.113.1"})
         assert r.json()["result"] == "done"
+
+    def test_ipv4_and_ipv6_lines_written(self, user_client):
+        # The router posts its public IPv4 and IPv6, one per line.
+        acl = io.StringIO()
+        acl.close = lambda: None
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", return_value=acl),
+        ):
+            r = user_client.post("/wan", json={"ips": "203.0.113.1\n2001:db8::1\n"})
+        assert r.json()["result"] == "done"
+        assert acl.getvalue() == "[white_list]\n203.0.113.1\n2001:db8::1\n"
+
+    def test_acl_injection_refused(self, user_client):
+        # local.acl is shared by every user of the VPS.
+        for ips in ("203.0.113.1\n[black_list]\n0.0.0.0/0", "0.0.0.0/0 x", "example.com",
+                    "fe80::1%eth0", "\n\n"):
+            with (
+                patch("os.path.isfile", return_value=True),
+                patch("builtins.open") as opened,
+            ):
+                r = user_client.post("/wan", json={"ips": ips})
+            assert r.json() == {"result": "error", "reason": "Invalid IP", "route": "wan"}, ips
+            assert not opened.called, ips
 
 
 class TestLan:
