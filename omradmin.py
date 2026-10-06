@@ -3077,13 +3077,16 @@ BACKUP_MAX_SIZE = 16 * 1024 * 1024
 class _BodySizeLimit:
     """Refuse, with a 413, a request body bigger than the limit of its path:
     FastAPI reads a JSON body whole, and then decodes it, before the endpoint
-    can look at its size."""
-    def __init__(self, app, limits):
+    can look at its size. That happens before the authentication dependency
+    runs, so every path has a limit: without a token, a multi-GB body was
+    still read and parsed, in a root process."""
+    def __init__(self, app, limits, default=None):
         self.app = app
         self.limits = limits
+        self.default = default
 
     async def __call__(self, scope, receive, send):
-        limit = self.limits.get(scope.get('path')) if scope['type'] == 'http' else None
+        limit = self.limits.get(scope.get('path'), self.default) if scope['type'] == 'http' else None
         if limit is None:
             await self.app(scope, receive, send)
             return
@@ -3104,8 +3107,15 @@ class _BodySizeLimit:
 
         await self.app(scope, limited_receive, send)
 
-# base64 is 4/3 of the data, plus the JSON around it.
-app.add_middleware(_BodySizeLimit, limits={'/backuppost': BACKUP_MAX_SIZE * 4 // 3 + 64 * 1024})
+# base64 is 4/3 of the data, plus the JSON around it. /dscp_classify carries
+# the router's bypass destination lists, which can be long. The upload
+# speedtest (None: no limit) streams the body, only counted, and only once
+# the caller is authenticated.
+REQUEST_MAX_SIZE = 1024 * 1024
+app.add_middleware(_BodySizeLimit, limits={'/backuppost': BACKUP_MAX_SIZE * 4 // 3 + 64 * 1024,
+                                           '/dscp_classify': 16 * 1024 * 1024,
+                                           '/speedtest': None},
+                   default=REQUEST_MAX_SIZE)
 
 
 def sync_ss_go_users():

@@ -216,3 +216,31 @@ class TestConfigSecrets:
 # ---------------------------------------------------------------------------
 # Request bodies
 # ---------------------------------------------------------------------------
+
+class TestBodyLimit:
+    def _run(self, path, size):
+        limit = next(m for m in app.user_middleware if m.cls is omr_admin._BodySizeLimit)
+        middleware = omr_admin._BodySizeLimit(lambda *a: asyncio.sleep(0), **limit.kwargs)
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {"type": "http", "path": path, "headers": [(b"content-length", str(size).encode())]}
+        asyncio.run(middleware(scope, receive, send))
+        return sent[0]["status"] if sent else None
+
+    def test_every_path_has_a_limit(self):
+        assert self._run("/add_user", omr_admin.REQUEST_MAX_SIZE + 1) == 413
+        assert self._run("/add_user", omr_admin.REQUEST_MAX_SIZE) is None
+
+    def test_streamed_speedtest_upload_is_not_limited(self):
+        assert self._run("/speedtest", 50 * 1024 * 1024) is None
+
+
+# ---------------------------------------------------------------------------
+# WireGuard
+# ---------------------------------------------------------------------------
