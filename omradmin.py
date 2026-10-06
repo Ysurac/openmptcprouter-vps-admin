@@ -2884,6 +2884,23 @@ class UserInDB(User):
     user_password: str
 
 # Add support for auth before seeing doc
+DOCS_COOKIE_MAX_AGE = 1800
+
+def _cookie_auth_allowed(request):
+    """True if the /login_basic cookie may authenticate *request*. A browser
+    sends it with any request to the VPS, a link or a form on another site
+    included: GET /update or a POST of the admin's would have been made for
+    whoever lured the admin there. The docs pages themselves only read, and
+    their "Try it out" requests are made from the page, same origin."""
+    if request.url.path in ('/docs', '/openapi.json'):
+        return True
+    site = request.headers.get('sec-fetch-site')
+    if site is not None:
+        return site == 'same-origin'
+    # A browser too old for Fetch Metadata: the page the request comes from.
+    referer = urllib.parse.urlsplit(request.headers.get('referer', ''))
+    return bool(referer.netloc) and referer.netloc == request.headers.get('host')
+
 class OAuth2PasswordBearerCookie(OAuth2):
     def __init__(
             self,
@@ -2913,7 +2930,7 @@ class OAuth2PasswordBearerCookie(OAuth2):
             scheme = header_scheme
             param = header_param
 
-        elif cookie_scheme.lower() == "bearer":
+        elif cookie_scheme.lower() == "bearer" and _cookie_auth_allowed(request):
             authorization = True
             scheme = cookie_scheme
             param = cookie_param
@@ -3319,8 +3336,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except PyJWTError:
         LOG.debug("PyJWTError")
         raise credentials_exception
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        omr_config_data = json.load(f)
+    # The reader startup and every route use: a config with a trailing comma
+    # started, then every login and every call answered 500.
+    omr_config_data = read_omr_config()
     users = omr_config_data.get('users')
     if not users:
         raise credentials_exception
@@ -3359,9 +3377,7 @@ async def homepage():
 # function is used to actually generate the token
 @app.post('/token', response_model=Token)
 async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        omr_config_data = json.load(f)
-    fake_users_db = omr_config_data['users'][0]
+    fake_users_db = (read_omr_config().get('users') or [{}])[0]
 
     user = authenticate_user(fake_users_db, form_data.username, form_data.password)
     if not user:
@@ -3397,9 +3413,7 @@ async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
     try:
         decoded = base64.b64decode(auth).decode("ascii")
         username, _, password = decoded.partition(":")
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-            omr_config_data = json.load(f)
-            fake_users_db = omr_config_data['users'][0]
+        fake_users_db = (read_omr_config().get('users') or [{}])[0]
 
         user = authenticate_user(fake_users_db, username, password)
         if not user:
@@ -3409,7 +3423,9 @@ async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
         if user.disabled:
             raise inactive_user_exception()
 
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        # As long as the cookie: a token taken from it (any port of the VPS
+        # gets the cookie) was valid for a day.
+        access_token_expires = timedelta(seconds=DOCS_COOKIE_MAX_AGE)
         access_token = create_access_token(
             data={"sub": username, "pwd": _password_fingerprint(user.user_password)},
             expires_delta=access_token_expires
@@ -3422,8 +3438,8 @@ async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
             "Authorization",
             value=f"Bearer {token}",
             httponly=True,
-            max_age=1800,
-            expires=1800,
+            max_age=DOCS_COOKIE_MAX_AGE,
+            expires=DOCS_COOKIE_MAX_AGE,
             secure=(request.url.scheme == "https"),
             samesite="lax",
         )

@@ -477,6 +477,24 @@ class TestSharedDaemons:
 # Small ones
 # ---------------------------------------------------------------------------
 
+class TestCookieAuth:
+    def _request(self, path, headers):
+        return MagicMock(url=MagicMock(path=path), headers=headers)
+
+    def test_cross_site_refused(self):
+        assert not omr_admin._cookie_auth_allowed(self._request("/update", {"sec-fetch-site": "cross-site"}))
+        assert not omr_admin._cookie_auth_allowed(self._request("/update", {"sec-fetch-site": "same-site"}))
+        assert not omr_admin._cookie_auth_allowed(self._request("/update", {}))
+        assert not omr_admin._cookie_auth_allowed(self._request(
+            "/update", {"referer": "https://evil.example/", "host": "vps:65500"}))
+
+    def test_docs_and_same_origin_allowed(self):
+        assert omr_admin._cookie_auth_allowed(self._request("/docs", {"sec-fetch-site": "cross-site"}))
+        assert omr_admin._cookie_auth_allowed(self._request("/status", {"sec-fetch-site": "same-origin"}))
+        assert omr_admin._cookie_auth_allowed(self._request(
+            "/status", {"referer": "https://vps:65500/docs", "host": "vps:65500"}))
+
+
 class TestV2rayDelUser:
     def test_user_it_never_had_changes_nothing(self):
         config = {"inbounds": [{"tag": "omrin-tunnel", "settings": {"clients": [{"email": "openmptcprouter"}]}}],
