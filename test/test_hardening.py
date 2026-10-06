@@ -181,3 +181,38 @@ class TestWildcardDnat:
 # ---------------------------------------------------------------------------
 # /config secrets
 # ---------------------------------------------------------------------------
+
+class TestConfigSecrets:
+    def _get(self, client):
+        files = {"/etc/wireguard/vpn-client-private.key": "CLIENT-PRIVATE-KEY"}
+        real_isfile = os.path.isfile
+        with (
+            patch("builtins.open", side_effect=_open_with(files)),
+            patch("os.path.isfile", side_effect=lambda p: p in files or p == "/etc/mlvpn/mlvpn0.conf" or real_isfile(p)),
+        ):
+            return client.get("/config").json()
+
+    def test_main_router_gets_them(self, primary_client):
+        body = self._get(primary_client)
+        assert body["mlvpn"]["key"] == "oldpassword"
+        assert body["wireguard"]["client_key"] == "CLIENT-PRIVATE-KEY"
+        assert "mlvpn" in body["vpn"]["available"]
+
+    def test_other_router_does_not(self, other_client):
+        body = self._get(other_client)
+        assert body["mlvpn"]["key"] == ""
+        assert body["wireguard"]["client_key"] == ""
+        assert "mlvpn" not in body["vpn"]["available"]
+
+    def test_bulk_redirect_state(self, primary_client):
+        for state, expected in ((True, "enable"), (False, "disable")):
+            config = _config()
+            config["bulk_redirect_v4"] = state
+            with patch("builtins.open", side_effect=_open_with({CONFIG_PATH: json.dumps(config)})):
+                body = primary_client.get("/config").json()
+            assert body["shorewall"]["redirect_ports"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Request bodies
+# ---------------------------------------------------------------------------

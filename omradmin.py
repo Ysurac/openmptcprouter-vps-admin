@@ -3756,7 +3756,10 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     softether_client_ip = 'dhcp'
 
     LOG.debug('Get config... mlvpn')
-    if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
+    # mlvpn0 is the only MLVPN instance, the openmptcprouter router's: its
+    # password is the whole authentication, any other router given it could
+    # connect as that one.
+    if username == 'openmptcprouter' and os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
         mlvpn_config = configparser.ConfigParser()
         with open(r'/etc/mlvpn/mlvpn0.conf') as conf_file:
             mlvpn_config.read_file(conf_file)
@@ -3832,7 +3835,9 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     wireguard_port = '65311'
 
     LOG.debug('Get config... wireguard for external clients')
-    if os.path.isfile('/etc/wireguard/vpn-client-private.key'):
+    # The single external client peer (client-wg0), which reaches the
+    # routers' tunnels: only the openmptcprouter router hands it out.
+    if username == 'openmptcprouter' and os.path.isfile('/etc/wireguard/vpn-client-private.key'):
         with open('/etc/wireguard/vpn-client-private.key', "rb") as wgkey_file:
             wireguard_client_key = wgkey_file.read()
     else:
@@ -4130,7 +4135,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
             if 'lanips' in omr_config_data['users'][0][users] and users != username and omr_config_data['users'][0][users]['lanips'][0] not in alllanips:
                 alllanips.append(omr_config_data['users'][0][users]['lanips'][0])
 
-    shorewall_redirect = "disable" if omr_config_data.get('bulk_redirect_v4') else "enable"
+    shorewall_redirect = "enable" if omr_config_data.get('bulk_redirect_v4') else "disable"
     LOG.debug('Get config: done')
     return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules, 'pinned_pubkey': mqvpn_pinned_pubkey}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'vxlan': get_vxlan_config(username, userid), 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
