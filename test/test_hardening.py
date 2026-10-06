@@ -295,3 +295,116 @@ class TestPkiRetire:
 # ---------------------------------------------------------------------------
 # Users
 # ---------------------------------------------------------------------------
+
+class TestSharedDaemons:
+    def test_shadowsocks_key_with_a_quote_refused(self, other_client):
+        with patch("os.path.isfile", return_value=True):
+            r = other_client.post("/shadowsocks", json={"port": 65102, "method": "chacha20", "fast_open": True,
+                                                       "reuse_port": True, "no_delay": True,
+                                                       "key": 'x","plugin":"/bin/sh'})
+        assert r.json()["reason"] == "Invalid key"
+
+    def test_shadowsocks_key_change_of_a_router_restarts_its_port_only(self, other_client):
+        manager = {"port_conf": {"65102": {"key": "old", "userid": 2}}}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/shadowsocks-libev/manager.json": json.dumps(manager)})),
+            patch("omr_admin.file_as_bytes", side_effect=[b"a", b"b"]),
+            patch("omr_admin._iface_global_addr", return_value=""),
+            patch("omr_admin._ss_manager_command") as command,
+            patch("subprocess.run") as run,
+        ):
+            r = other_client.post("/shadowsocks", json={"port": 65102, "method": "chacha20", "fast_open": True,
+                                                       "reuse_port": True, "no_delay": True, "key": "new"})
+        assert r.json()["reason"] == "changes applied"
+        assert [c.args[0].split(":")[0] for c in command.call_args_list] == ["remove", "add"]
+        assert not any("shadowsocks-libev-manager" in str(c) for c in run.call_args_list)
+
+    def test_v2ray_redirect_of_an_xray_port_refused(self, tmp_path):
+        xray = {"inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": 10086, "protocol": "dokodemo-door",
+                              "settings": {"network": "tcp"}}]}
+        with (
+            patch("builtins.open", side_effect=_open_with({"/etc/xray/xray-server.json": json.dumps(xray)})),
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/xray/xray-server.json"),
+        ):
+            assert omr_admin._proxy_port_elsewhere("v2ray", "tcp", 10080, 10090) == "xray api"
+            assert omr_admin._proxy_port_elsewhere("v2ray", "udp", 10080, 10090) is None
+            assert omr_admin._proxy_port_elsewhere("xray", "tcp", 10080, 10090) is None
+
+    def test_mqvpn_pins_capped_and_iface_checked(self, other_client):
+        with patch("os.path.isfile", return_value=True):
+            r = other_client.post("/mqvpn_weight", json={"weights": [{"iface": f"wan{i}", "weight": 1}
+                                                                     for i in range(omr_admin.MQVPN_MAX_PINS + 1)]})
+            assert r.json()["reason"] == "Too many interfaces"
+            r = other_client.post("/mqvpn_dscp", json={"pins": [{"iface": "wan\n1", "dscp": ["cs1"]}]})
+            assert r.json()["result"] == "error"
+
+    def test_glorytun_port_of_another_user_refused(self, other_client):
+        tunnels = {"/etc/glorytun-tcp/tun0": "PORT=65001\n", "/etc/glorytun-tcp/tun2": "PORT=65002\n"}
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in tunnels),
+            patch("glob.glob", side_effect=lambda pattern: [p for p in tunnels if pattern.startswith("/etc/glorytun-tcp")]),
+            patch("builtins.open", side_effect=_open_with(tunnels)),
+        ):
+            r = other_client.post("/glorytun", json={"key": "k" * 64, "port": 65001, "chacha": True})
+            assert r.json()["reason"] == "Port already used by another user"
+            r = other_client.post("/glorytun", json={"key": "k" * 64, "port": 65500, "chacha": True})
+            assert r.json()["reason"] == "Port used by the server"
+
+    def test_glorytun_empty_key_refused(self, other_client):
+        with patch("os.path.isfile", return_value=True):
+            r = other_client.post("/glorytun", json={"key": "", "port": 65002, "chacha": True})
+        assert r.json()["reason"] == "Invalid key"
+
+    def test_dsvpn_port_change_alone_restarts(self, primary_client):
+        files = {"/etc/dsvpn/dsvpn0": "PORT=65401\n", "/etc/dsvpn/dsvpn0.key": "samekey"}
+        written = dict(files)
+
+        def _write(p, t, new_mode=0o644):
+            written[p] = t
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with(files)),
+            patch("omr_admin.file_as_bytes", side_effect=lambda p: written[p].encode()),
+            patch("omr_admin._atomic_write_text", side_effect=_write),
+            patch("omr_admin.shorewall_add_port", return_value=None),
+            patch("omr_admin.shorewall_del_port") as close,
+            patch("subprocess.run") as run,
+        ):
+            r = primary_client.post("/dsvpn", json={"key": "samekey", "port": 65409})
+        assert r.json()["result"] == "done"
+        assert any("dsvpn-server@dsvpn0" in str(c) for c in run.call_args_list)
+        close.assert_called_once_with("openmptcprouter", "65401", "tcp", "dsvpn")
+
+
+# ---------------------------------------------------------------------------
+# Small ones
+# ---------------------------------------------------------------------------
+
+class TestV2rayDelUser:
+    def test_user_it_never_had_changes_nothing(self):
+        config = {"inbounds": [{"tag": "omrin-tunnel", "settings": {"clients": [{"email": "openmptcprouter"}]}}],
+                  "routing": {"rules": []}}
+        with (
+            patch("shutil.which", return_value="/usr/bin/v2ray"),
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/v2ray/v2ray-server.json": json.dumps(config)})),
+            patch("omr_admin._atomic_write_json") as write,
+            patch("subprocess.run") as run,
+        ):
+            omr_admin.v2ray_del_user("audituser")
+        assert not write.called and not run.called
+
+    def test_user_removed_restarts(self):
+        config = {"inbounds": [{"tag": "omrin-tunnel", "settings": {"clients": [{"email": "bob"}]}}],
+                  "routing": {"rules": []}}
+        with (
+            patch("shutil.which", return_value="/usr/bin/v2ray"),
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/v2ray/v2ray-server.json": json.dumps(config)})),
+            patch("omr_admin._atomic_write_json") as write,
+            patch("subprocess.run") as run,
+        ):
+            omr_admin.v2ray_del_user("bob")
+        assert write.called and run.called

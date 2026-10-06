@@ -913,6 +913,12 @@ def write_vxlan_conf(username, userid):
         subprocess.run(["systemctl", "-q", "restart", f"omr-vxlan@user{userid}"], check=False)
 
 def add_ss_user(port, key, userid=0, ip=''):
+    # manager.json is read, changed and written back: under the lock, as
+    # every other writer of it.
+    with _omr_config_lock():
+        return _add_ss_user_locked(port, key, userid, ip)
+
+def _add_ss_user_locked(port, key, userid, ip):
     try:
         f_ss = open('/etc/shadowsocks-libev/manager.json')
     except FileNotFoundError:
@@ -955,6 +961,10 @@ def add_ss_user(port, key, userid=0, ip=''):
     return port
 
 def remove_ss_user(port):
+    with _omr_config_lock():
+        _remove_ss_user_locked(port)
+
+def _remove_ss_user_locked(port):
     try:
         f_ss = open('/etc/shadowsocks-libev/manager.json')
     except FileNotFoundError:
@@ -1175,9 +1185,11 @@ def v2ray_del_user(user, restart=1):
         return
     if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
         return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
     with open('/etc/v2ray/v2ray-server.json') as f:
         data = json.load(f)
+        # The content, not the file: a file written with another layout was
+        # rewritten, and v2ray restarted for every user, for a user it never had.
+        initial = copy.deepcopy(data)
         _proxy_drop_user('v2ray', data, user)
         for inbounds in data['inbounds']:
             if inbounds['tag'] == 'omrin-tunnel':
@@ -1196,9 +1208,10 @@ def v2ray_del_user(user, restart=1):
                 for v2rayuser in list(inbounds['settings']['accounts']):
                     if v2rayuser['user'] == user:
                         inbounds['settings']['accounts'].remove(v2rayuser)
+    if data == initial:
+        return
     _atomic_write_json('/etc/v2ray/v2ray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
+    if restart == 1:
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
 
 def xray_del_user(user, restart=1):
@@ -1672,6 +1685,13 @@ def mqvpn_server_pin(cert_file='/etc/mqvpn/server.crt'):
     return pin
 
 def add_mqvpn(username, fixed_ip=None):
+    # server.json is read, changed and written back by several routes: a
+    # writer racing another brought a removed user's key back, or lost a
+    # new one's.
+    with _omr_config_lock():
+        _add_mqvpn_locked(username, fixed_ip)
+
+def _add_mqvpn_locked(username, fixed_ip):
     try:
         with open('/etc/mqvpn/server.json') as f:
             mqvpn_config = json.load(f)
@@ -1700,10 +1720,14 @@ def remove_mqvpn(username):
         LOG.warning("MQVPN control API remove_user failed for %s: %s",
                     log_safe(username), log_safe(api_result.get('error', api_result)))
     try:
-        with open('/etc/mqvpn/server.json') as f:
-            mqvpn_config = json.load(f)
-        mqvpn_config['users'] = [u for u in mqvpn_config.get('users', []) if u.get('name') != username]
-        _atomic_write_json('/etc/mqvpn/server.json', mqvpn_config, indent=2)
+        with _omr_config_lock():
+            with open('/etc/mqvpn/server.json') as f:
+                mqvpn_config = json.load(f)
+            mqvpn_config['users'] = [u for u in mqvpn_config.get('users', []) if u.get('name') != username]
+            # its per-path policy too: a re-added name got it back
+            if 'path_policy' in mqvpn_config:
+                mqvpn_config['path_policy'] = [e for e in mqvpn_config['path_policy'] if e.get('user') != username]
+            _atomic_write_json('/etc/mqvpn/server.json', mqvpn_config, indent=2)
     except Exception as e:
         LOG.debug("MQVPN remove user json error (" + str(e) + ")")
 
@@ -1925,6 +1949,33 @@ def _proxy_redirect_owner(inbound_tag):
     m = _PROXY_REDIRECT_TAG_RE.fullmatch(inbound_tag)
     return m.group('user') if m else None
 
+def _proxy_port_elsewhere(service, proto, first, last):
+    """The tag of an inbound of the *other* proxies (v2ray for xray and the
+    other way round) listening on a port of first-last with *proto*, or
+    'mqvpn' for MQVPN's udp port, None if none: both daemons listen on every
+    address, and a port taken by one stopped the other, for every user."""
+    for other, config in PROXY_REDIRECT_CONFIGS.items():
+        if other == service or not os.path.isfile(config):
+            continue
+        try:
+            with open(config) as f:
+                inbounds = json.load(f).get('inbounds', [])
+        except (OSError, ValueError, AttributeError):
+            continue
+        for inbound in inbounds:
+            if proto in _proxy_inbound_networks(inbound) and \
+               any(a <= last and first <= b for a, b in _proxy_inbound_ports(inbound)):
+                return '{} {}'.format(other, inbound.get('tag', ''))
+    if proto == 'udp' and os.path.isfile('/etc/mqvpn/server.json'):
+        try:
+            with open('/etc/mqvpn/server.json') as f:
+                mqvpn_port = int(str(json.load(f).get('listen', '0.0.0.0:443')).rsplit(':', 1)[-1])
+        except (OSError, ValueError, AttributeError):
+            mqvpn_port = None
+        if mqvpn_port is not None and first <= mqvpn_port <= last:
+            return 'mqvpn'
+    return None
+
 def _proxy_add_port(service, user, port, proto, destip, destport):
     """Add the redirect, None once done (or if already there), else why it
     can't be."""
@@ -1939,6 +1990,11 @@ def _proxy_add_port(service, user, port, proto, destip, destport):
             data = json.load(f)
         if any(_proxy_tag_matches(inbound.get('tag', ''), tag) for inbound in data['inbounds']):
             return None
+        elsewhere = _proxy_port_elsewhere(service, proto, first, last)
+        if elsewhere:
+            LOG.warning("refusing the %s redirect of %s/%s for user %s: in use by %s",
+                        service, proto, port, log_safe(user.username), log_safe(elsewhere))
+            return 'Port already in use on the server'
         # Two listeners on one port stop the daemon, for every user: refuse a
         # port another user, or the server itself (the proxies, VLESS Reality
         # on 443, the API inbound), already listens on. The same user's
@@ -2633,6 +2689,17 @@ def _nft_resync_all():
                  NFT_FAMILY, NFT_TABLE)
     # Unrelated to nftables state (a plain config file), so always resync.
     _sync_openvpn_client2client(bool(config_data.get('client2client', False)) if config_data else False)
+
+def _fw_service_port_del(port, proto, name):
+    """Close the old port of a server-wide service (mqvpn, openvpn...) in
+    both families, whoever opened it: the installer opened it as the main
+    router, the last change as whoever made it."""
+    users = (read_omr_config().get('users') or [{}])[0]
+    for username, udata in users.items():
+        if any(entry.get('name') == name and str(entry.get('port')) == str(port) and entry.get('proto') == proto
+               for entry in udata.get('fw_ports') or []):
+            shorewall_del_port(username, str(port), proto, name)
+            shorewall6_del_port(username, str(port), proto, name)
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
     return _fw_port_add(user.username, str(port), proto, name, fwtype, 4, source_dip, dest_ip, vpn, gencomment)
@@ -3765,10 +3832,11 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         with open('/etc/openvpn/tun0.conf', "r") as openvpn_file:
             for line in openvpn_file:
-                if 'port ' in line:
-                    openvpn_port = line.replace(line[:5], '').rstrip()
-                if 'cipher ' in line:
-                    openvpn_cipher = line.replace(line[:7], '').rstrip()
+                words = line.split()
+                if len(words) > 1 and words[0] == 'port':
+                    openvpn_port = words[1]
+                if len(words) > 1 and words[0] == 'cipher':
+                    openvpn_cipher = words[1]
     openvpn_host_ip = '10.255.252.1'
     #openvpn_client_ip = '10.255.252.2'
     openvpn_client_ip = 'dhcp'
@@ -3977,23 +4045,24 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     ss_go_rx = 0
     if os.path.isfile('/etc/shadowsocks-go/server.json'):
         shadowsocks_go = True
-        if not 'shadowsocks-go' in omr_config_data['users'][0][username]:
+        # Read from server.json each time: a copy kept per user was only
+        # refreshed for whoever called /shadowsocks-go, and every other
+        # router kept being given the old port and protocol.
+        try:
             with open('/etc/shadowsocks-go/server.json') as _f:
                 _sg = json.load(_f)
-            _srv = next((s for s in _sg.get('servers', []) if s.get('name') == 'ss-2022'), {})
-            shadowsocks_go_psk = _srv.get('psk', '')
-            _listeners = _srv.get('tcpListeners', [{}])
-            shadowsocks_go_port = _listeners[0].get('address', ':').rsplit(':', 1)[-1] if _listeners else ''
-            shadowsocks_go_protocol = _srv.get('protocol', '')
-            shadowsocks_go_upsk = ''
-            if os.path.isfile('/etc/shadowsocks-go/upsks.json'):
-                with open('/etc/shadowsocks-go/upsks.json') as _f:
-                    shadowsocks_go_upsk = json.load(_f).get(username, '')
-            shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': shadowsocks_go_port, 'protocol': shadowsocks_go_protocol }
-            LOG.debug("modif_config_user for shadowsocks-go")
-            modif_config_user(username, {'shadowsocks-go': shadowsocks_go_conf})
-        else:
-            shadowsocks_go_conf = omr_config_data['users'][0][username]['shadowsocks-go']
+        except (OSError, ValueError):
+            _sg = {}
+        _srv = next((s for s in _sg.get('servers', []) if s.get('name') == 'ss-2022'), {})
+        shadowsocks_go_psk = _srv.get('psk', '')
+        _listeners = _srv.get('tcpListeners', [{}])
+        shadowsocks_go_port = _listeners[0].get('address', ':').rsplit(':', 1)[-1] if _listeners else ''
+        shadowsocks_go_protocol = _srv.get('protocol', '')
+        shadowsocks_go_upsk = ''
+        if os.path.isfile('/etc/shadowsocks-go/upsks.json'):
+            with open('/etc/shadowsocks-go/upsks.json') as _f:
+                shadowsocks_go_upsk = json.load(_f).get(username, '')
+        shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': shadowsocks_go_port, 'protocol': shadowsocks_go_protocol }
         ss_go_txrx = get_bytes_ss_go(username)
         ss_go_tx = int(ss_go_txrx['downlinkBytes'])
         ss_go_rx = int(ss_go_txrx['uplinkBytes'])
@@ -4219,6 +4288,32 @@ def _shadowsocks_port_error(data, user, port):
             return 'Port not set up for this user'
     return None
 
+def _ss_manager_command(command):
+    """Send one command to ss-manager's UDP control socket."""
+    try:
+        ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ss_socket.settimeout(1)
+        ss_socket.sendto(command.encode(), ("127.0.0.1", 8839))
+    except socket.timeout as err:
+        LOG.debug("Shadowsocks manager timeout (" + str(err) + ")")
+    except socket.error as err:
+        LOG.debug("Shadowsocks manager error (" + str(err) + ")")
+
+def _ss_manager_readd(port, conf):
+    """Restart the ss-server of one port with its new key (conf: its
+    port_conf entry, or just the key), not ss-manager and every user's."""
+    if not isinstance(conf, dict):
+        conf = {'key': conf}
+    _ss_manager_command('remove: ' + json.dumps({'server_port': int(port)}))
+    command = {'server_port': int(port), 'key': conf.get('key', '')}
+    if conf.get('local_address'):
+        command['local_addr'] = conf['local_address']
+    _ss_manager_command('add: ' + json.dumps(command))
+
+# OMR's ss-manager writes the key back into each ss-server's JSON config
+# without escaping it: a '"' would add keys (plugin, acl...) of its own.
+_SS_KEY_RE = re.compile(r'[^"\\\x00-\x1f\x7f]{1,256}')
+
 @app.post('/shadowsocks', summary="Modify Shadowsocks-libev configuration")
 def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
@@ -4226,7 +4321,14 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks'}
     if not os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         return {'result': 'warning', 'reason': 'Shadowsocks-lib not installed', 'route': 'shadowsocks'}
+    if params.key is not None and not _SS_KEY_RE.fullmatch(params.key):
+        return {'result': 'error', 'reason': 'Invalid key', 'route': 'shadowsocks'}
+    # manager.json is every user's, and /add_user, /remove_user write it
+    # too: two writers each lost the other's key or port.
+    with _omr_config_lock():
+        return _shadowsocks_locked(params, current_user)
 
+def _shadowsocks_locked(params, current_user):
     ipv6_network = _iface_global_addr(IFACE6, 6)
     initial_md5 = hashlib.md5(file_as_bytes('/etc/shadowsocks-libev/manager.json')).hexdigest()
     with open('/etc/shadowsocks-libev/manager.json') as f:
@@ -4275,15 +4377,31 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         _atomic_write_json('/etc/shadowsocks-libev/manager.json', data)
         if hashlib.md5(file_as_bytes('/etc/shadowsocks-libev/manager.json')).hexdigest() == initial_md5:
             return {'result': 'done', 'reason': 'no changes', 'route': 'shadowsocks'}
-        subprocess.run(["systemctl", "-q", "restart", "shadowsocks-libev-manager@manager.service"], check=False)
+        # Its own port only: a restart of ss-manager cut every user's
+        # connections, as often as a router posted a new key.
+        _ss_manager_readd(port, (data.get('port_conf') or {}).get(str(port)) or key)
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks'}
+    if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shadowsocks'}
+    if 'port_key' not in data and 'port_conf' not in data:
+        return {'result': 'error', 'reason': 'Config file not readable', 'route': 'shadowsocks'}
+    omr_config_data = read_omr_config()
+    users = (omr_config_data.get('users') or [{}])[0]
+    old_port = (users.get(current_user.username) or {}).get('shadowsocks_port')
+    if old_port is not None and str(old_port) != str(port) and \
+       not any(other != current_user.username and str(ucfg.get('shadowsocks_port')) == str(old_port)
+               for other, ucfg in users.items()):
+        # The old port kept listening with the old key.
+        if 'port_key' in data:
+            portkey.pop(str(old_port), None)
+        if 'port_conf' in data:
+            old_conf = portconf.get(str(old_port))
+            if isinstance(old_conf, dict) and str(old_conf.get('userid')) in ('None', str(current_user.userid)):
+                portconf.pop(str(old_port), None)
+    else:
+        old_port = None
     LOG.debug("modif_config_user for shadowsocks_port")
     modif_config_user(current_user.username, {'shadowsocks_port': port})
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        try:
-            omr_config_data = json.load(f)
-        except ValueError as e:
-            omr_config_data = {}
 
     #ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
     if 'hostname' in omr_config_data:
@@ -4296,8 +4414,6 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         if vps_domain:
             set_global_param('hostname', vps_domain)
 
-    if port is None or method is None or fast_open is None or reuse_port is None or no_delay is None or key is None:
-        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shadowsocks'}
     if 'port_key' in data:
         if ipv6_network == '':
             if obfs:
@@ -4385,6 +4501,9 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     final_md5 = hashlib.md5(file_as_bytes('/etc/shadowsocks-libev/manager.json')).hexdigest()
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", "shadowsocks-libev-manager@manager.service"], check=False)
+        if old_port is not None:
+            shorewall_del_port(current_user.username, str(old_port), 'tcp', 'shadowsocks')
+            shorewall_del_port(current_user.username, str(old_port), 'udp', 'shadowsocks')
         shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks')
         shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks')
         #set_lastchange()
@@ -4436,6 +4555,7 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
             shadowsocks_go_upsk = json.load(_f).get(current_user.username, '')
     shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': port, 'protocol': method }
     modif_config_user(current_user.username, {'shadowsocks-go': shadowsocks_go_conf})
+    old_port = str(data["servers"][0]["tcpListeners"][0].get("address", ":")).rsplit(':', 1)[-1]
     data["servers"][0]["tcpListeners"][0]["address"] = ":" + str(port)
     data["servers"][0]["tcpListeners"][0]["fastOpen"] = fast_open
     data["servers"][0]["listenerTFO"] = fast_open
@@ -4449,6 +4569,9 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
         subprocess.run(["systemctl", "-q", "restart", "shadowsocks-go.service"], check=False)
         shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks-go')
         shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks-go')
+        if old_port.isdigit() and old_port != str(port):
+            _fw_service_port_del(old_port, 'tcp', 'shadowsocks-go')
+            _fw_service_port_del(old_port, 'udp', 'shadowsocks-go')
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks-go'}
     else:
@@ -5093,6 +5216,14 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     xray_config = json.loads(_initial_bytes)
 
     chk_vless_reality = any(ib.get('tag') == 'omrin-vless-reality' for ib in xray_config['inbounds'])
+    if params.vless_reality and not chk_vless_reality:
+        # Reality listens on tcp/443: a redirect of that port already there
+        # (xray's or v2ray's) made xray, or v2ray, fail to start.
+        taken = _proxy_port_elsewhere('xray', 'tcp', 443, 443) or next(
+            (ib.get('tag', '') for ib in xray_config['inbounds']
+             if 'tcp' in _proxy_inbound_networks(ib) and any(a <= 443 <= b for a, b in _proxy_inbound_ports(ib))), None)
+        if taken:
+            return {'result': 'error', 'reason': 'Port 443 already in use on the server', 'route': 'xray'}
     xray_reverse_key = xray_ensure_reverse_client(xray_config, _proxy_reverse_tag(current_user.username, _router_userid(current_user)))
     vr_inbound = xray_fix_reality_keys() if params.vless_reality else None
     if params.vless_reality and not chk_vless_reality:
@@ -5744,6 +5875,14 @@ def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user))
     userid = int(userid)
     if vxlanconfig.vni is not None and current_user.permissions != "admin":
         return {'result': 'permission', 'reason': 'VNI is admin-assigned, ask your administrator', 'route': 'vxlan'}
+    # The kernel binds the VXLAN port on every address: a router picking
+    # e.g. shadowsocks' 65101 took its UDP from every user at boot. VXLAN
+    # ports (the user's own, another user's) are shared by the kernel.
+    if vxlanconfig.port is not None and current_user.permissions != "admin" and \
+       vxlanconfig.port != get_vxlan_config(current_user.username, userid)['port'] and \
+       vxlanconfig.port not in {a['port'] for a in _vxlan_assignments(current_user.username).values()} and \
+       any(a <= vxlanconfig.port <= b for a, b in _server_ports('udp')):
+        return {'result': 'error', 'reason': 'Port used by the server', 'route': 'vxlan'}
     error = _vxlan_tunnel_ip_error(current_user.username, vxlanconfig)
     if error:
         return error
@@ -5902,6 +6041,42 @@ def proxy_list(current_user: User = Depends(get_current_user)):
     return {'result': 'done', 'proxy': _installed_proxy_types()}
 
 
+_TUNNEL_PORT_FILES = ('/etc/glorytun-tcp/tun*', '/etc/glorytun-udp/tun*', '/etc/dsvpn/dsvpn*')
+_TUNNEL_PORT_RE = re.compile(r'(?:BIND_)?PORT=(\d+)\s*$')
+
+def _tunnel_file_ports(path):
+    """The PORT=/BIND_PORT= values of a glorytun or dsvpn config."""
+    ports = set()
+    try:
+        with open(path) as f:
+            for line in f:
+                m = _TUNNEL_PORT_RE.match(line.strip())
+                if m:
+                    ports.add(int(m.group(1)))
+    except OSError:
+        pass  # no such tunnel
+    return ports
+
+def _tunnel_port_error(user, port, protos, own_files):
+    """Why *user* can't move its glorytun/dsvpn daemon(s) (configs
+    *own_files*) to *port*, None if it can. These daemons listen on every
+    address and restart forever: on a port of the server (this API, SSH...)
+    or of another user's tunnel, whichever started first took it from the
+    other, at each boot. The administrator and the main router pick any."""
+    if _is_server_admin(user):
+        return None
+    own = set().union(*(_tunnel_file_ports(conf) for conf in own_files)) if own_files else set()
+    if port in own:
+        return None
+    for pattern in _TUNNEL_PORT_FILES:
+        for conf in glob.glob(pattern):
+            if conf not in own_files and not conf.endswith(".key") and port in _tunnel_file_ports(conf):
+                return 'Port already used by another user'
+    api_port = read_omr_config().get('port', 65500)
+    if port == api_port or any(a <= port <= b for proto in protos for a, b in _server_ports(proto)):
+        return 'Port used by the server'
+    return None
+
 class GlorytunConfig(BaseModel):
     key: str
     port: int = Query(..., gt=0, lt=65535, title="Glorytun TCP and UDP port")
@@ -5926,6 +6101,15 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     key = glorytunconfig.key
     port = glorytunconfig.port
     chacha = glorytunconfig.chacha
+    if not key or any(c.isspace() for c in key):
+        # an empty key file broke the tunnel
+        return {'result': 'error', 'reason': 'Invalid key', 'route': 'glorytun'}
+    own_files = [conf for conf in ('/etc/glorytun-tcp/tun' + str(userid), '/etc/glorytun-udp/tun' + str(userid))
+                 if os.path.isfile(conf)]
+    error = _tunnel_port_error(current_user, port, ('tcp', 'udp'), own_files)
+    if error:
+        return {'result': 'error', 'reason': error, 'route': 'glorytun'}
+    old_ports = set().union(*(_tunnel_file_ports(conf) for conf in own_files)) if own_files else set()
     def _snapshot(*paths):
         # What a glorytun daemon reads: a change of either its config or its
         # key needs a restart. Only the configs were compared, so a new key
@@ -5982,6 +6166,10 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
             subprocess.run(["systemctl", "-q", "restart", f"glorytun-udp@tun{userid}"], check=False)
     shorewall_add_port(current_user, str(port), 'tcp', 'glorytun')
     shorewall_add_port(current_user, str(port), 'udp', 'glorytun')
+    for old_port in old_ports - {port}:
+        # the old port stayed open
+        shorewall_del_port(current_user.username, str(old_port), 'tcp', 'glorytun')
+        shorewall_del_port(current_user.username, str(old_port), 'udp', 'glorytun')
     #set_lastchange()
     return {'result': 'done'}
 
@@ -6013,23 +6201,32 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     port = params.port
     if not key or port is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'dsvpn'}
+    dsvpn_conf = '/etc/dsvpn/dsvpn' + str(userid)
+    error = _tunnel_port_error(current_user, port, ('tcp',), [dsvpn_conf])
+    if error:
+        return {'result': 'error', 'reason': error, 'route': 'dsvpn'}
+    old_ports = _tunnel_file_ports(dsvpn_conf)
 
+    dsvpn_key_file = dsvpn_conf + '.key'
+    # Both files, before either is written: the config was rewritten before
+    # the snapshot, and only the key was compared, so a new port alone was
+    # saved but never used.
+    before = [hashlib.md5(file_as_bytes(conf)).hexdigest() for conf in (dsvpn_conf, dsvpn_key_file)]
     lines = []
-    with open('/etc/dsvpn/dsvpn' + str(userid), 'r') as f:
+    with open(dsvpn_conf, 'r') as f:
         for line in f:
             if 'PORT=' in line:
                 lines.append('PORT=' + str(port) + '\n')
             else:
                 lines.append(line)
-    _atomic_write_text('/etc/dsvpn/dsvpn' + str(userid), ''.join(lines))
-
-    dsvpn_key_file = '/etc/dsvpn/dsvpn' + str(userid) + '.key'
-    initial_md5 = hashlib.md5(file_as_bytes(dsvpn_key_file)).hexdigest()
+    _atomic_write_text(dsvpn_conf, ''.join(lines))
     _atomic_write_text(dsvpn_key_file, key, new_mode=0o600)
-    final_md5 = hashlib.md5(file_as_bytes(dsvpn_key_file)).hexdigest()
-    if initial_md5 != final_md5:
+    after = [hashlib.md5(file_as_bytes(conf)).hexdigest() for conf in (dsvpn_conf, dsvpn_key_file)]
+    if before != after:
         subprocess.run(["systemctl", "-q", "restart", f"dsvpn-server@dsvpn{userid}"], check=False)
     shorewall_add_port(current_user, str(port), 'tcp', 'dsvpn')
+    for old_port in old_ports - {port}:
+        shorewall_del_port(current_user.username, str(old_port), 'tcp', 'dsvpn')
     #set_lastchange()
     return {'result': 'done'}
 
@@ -6192,6 +6389,10 @@ def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_
         return _server_wide_refusal('mqvpn')
     if not os.path.isfile('/etc/mqvpn/server.json'):
         return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn'}
+    with _omr_config_lock():
+        return _mqvpn_set_config_locked(params, current_user)
+
+def _mqvpn_set_config_locked(params, current_user):
     initial_md5 = hashlib.md5(file_as_bytes('/etc/mqvpn/server.json')).hexdigest()
     with open('/etc/mqvpn/server.json') as f:
         mqvpn_cfg = json.load(f)
@@ -6215,8 +6416,7 @@ def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_
     if str(params.port) != old_port:
         shorewall_add_port(current_user, str(params.port), 'udp', 'mqvpn')
         shorewall6_add_port(current_user, str(params.port), 'udp', 'mqvpn')
-        shorewall_del_port(current_user.username, old_port, 'udp', 'mqvpn')
-        shorewall6_del_port(current_user.username, old_port, 'udp', 'mqvpn')
+        _fw_service_port_del(old_port, 'udp', 'mqvpn')
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", "mqvpn"], check=False)
         #set_lastchange()
@@ -6233,6 +6433,10 @@ def mqvpn_user_set_config(*, params: MQVPNUser, current_user: User = Depends(get
         return {'result': 'permission', 'reason': 'Admin only', 'route': 'mqvpn_user'}
     if not os.path.isfile('/etc/mqvpn/server.json'):
         return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn_user'}
+    with _omr_config_lock():
+        return _mqvpn_user_set_config_locked(params)
+
+def _mqvpn_user_set_config_locked(params):
     initial_md5 = hashlib.md5(file_as_bytes('/etc/mqvpn/server.json')).hexdigest()
     with open('/etc/mqvpn/server.json') as f:
         mqvpn_cfg = json.load(f)
@@ -6348,6 +6552,10 @@ DSCP_CODEPOINTS = {
     'ef': 46,
 }
 MQVPN_PATH_LABEL_IFACE_MAX = 15  # mqvpn's src/mqvpn_path_label.h iface cap
+# A router has a few WANs. Each pin is a control API round trip, made with
+# server.json locked, and an entry kept in its path_policy for good.
+MQVPN_MAX_PINS = 32
+_MQVPN_IFACE_RE = re.compile(r'[A-Za-z0-9_.@-]{1,%d}' % MQVPN_PATH_LABEL_IFACE_MAX)
 
 def _mqvpn_path_policy_ifaces_with(policy, username, field):
     """ifaces in server.json's path_policy list that currently have `field` set for username."""
@@ -6385,9 +6593,11 @@ def mqvpn_dscp(*, params: MQVPNDscpParams, current_user: User = Depends(get_curr
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'mqvpn_dscp'}
     if not os.path.isfile('/etc/mqvpn/server.json'):
         return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn_dscp'}
+    if len(params.pins) > MQVPN_MAX_PINS:
+        return {'result': 'error', 'reason': 'Too many interfaces', 'route': 'mqvpn_dscp'}
     desired = {}
     for pin in params.pins:
-        if not pin.iface or len(pin.iface) > MQVPN_PATH_LABEL_IFACE_MAX:
+        if not _MQVPN_IFACE_RE.fullmatch(pin.iface):
             return {'result': 'error', 'reason': f'Invalid iface {pin.iface!r}', 'route': 'mqvpn_dscp'}
         mask = 0
         for dscp in pin.dscp:
@@ -6396,24 +6606,25 @@ def mqvpn_dscp(*, params: MQVPNDscpParams, current_user: User = Depends(get_curr
             mask |= 1 << DSCP_CODEPOINTS[dscp]
         desired[pin.iface] = mask
     username = current_user.username
-    with open('/etc/mqvpn/server.json') as f:
-        mqvpn_cfg = json.load(f)
-    policy = mqvpn_cfg.setdefault('path_policy', [])
-    initial_policy = json.dumps(policy, sort_keys=True)
-    previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'dscp_mask')
-    warnings = []
-    for iface in previous_ifaces - set(desired.keys()):
-        resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': 0})
-        if not resp.get('ok'):
-            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
-        _mqvpn_path_policy_clear(policy, username, iface, 'dscp_mask')
-    for iface, mask in desired.items():
-        resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': mask})
-        if not resp.get('ok'):
-            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
-        _mqvpn_path_policy_set(policy, username, iface, 'dscp_mask', mask)
-    if json.dumps(policy, sort_keys=True) != initial_policy:
-        _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg)
+    with _omr_config_lock():
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_cfg = json.load(f)
+        policy = mqvpn_cfg.setdefault('path_policy', [])
+        initial_policy = json.dumps(policy, sort_keys=True)
+        previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'dscp_mask')
+        warnings = []
+        for iface in previous_ifaces - set(desired.keys()):
+            resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': 0})
+            if not resp.get('ok'):
+                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            _mqvpn_path_policy_clear(policy, username, iface, 'dscp_mask')
+        for iface, mask in desired.items():
+            resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': mask})
+            if not resp.get('ok'):
+                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            _mqvpn_path_policy_set(policy, username, iface, 'dscp_mask', mask)
+        if json.dumps(policy, sort_keys=True) != initial_policy:
+            _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg)
     if warnings:
         return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_dscp'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_dscp'}
@@ -6431,34 +6642,37 @@ def mqvpn_weight(*, params: MQVPNWeightParams, current_user: User = Depends(get_
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'mqvpn_weight'}
     if not os.path.isfile('/etc/mqvpn/server.json'):
         return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn_weight'}
+    if len(params.weights) > MQVPN_MAX_PINS:
+        return {'result': 'error', 'reason': 'Too many interfaces', 'route': 'mqvpn_weight'}
     desired = {}
     for pin in params.weights:
-        if not pin.iface or len(pin.iface) > MQVPN_PATH_LABEL_IFACE_MAX:
+        if not _MQVPN_IFACE_RE.fullmatch(pin.iface):
             return {'result': 'error', 'reason': f'Invalid iface {pin.iface!r}', 'route': 'mqvpn_weight'}
         if not (0 <= pin.weight <= 65535):
             return {'result': 'error', 'reason': f'Invalid weight {pin.weight!r}', 'route': 'mqvpn_weight'}
         desired[pin.iface] = pin.weight
     username = current_user.username
-    with open('/etc/mqvpn/server.json') as f:
-        mqvpn_cfg = json.load(f)
-    policy = mqvpn_cfg.setdefault('path_policy', [])
-    initial_policy = json.dumps(policy, sort_keys=True)
-    previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'weight')
-    warnings = []
-    for iface in previous_ifaces - set(desired.keys()):
-        # 0 resets to the scheduler's default weight (1) -- see mqvpn's
-        # src/path_entry_internal.h path_entry_t.weight doc comment.
-        resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': 0})
-        if not resp.get('ok'):
-            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
-        _mqvpn_path_policy_clear(policy, username, iface, 'weight')
-    for iface, weight in desired.items():
-        resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': weight})
-        if not resp.get('ok'):
-            warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
-        _mqvpn_path_policy_set(policy, username, iface, 'weight', weight)
-    if json.dumps(policy, sort_keys=True) != initial_policy:
-        _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg)
+    with _omr_config_lock():
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_cfg = json.load(f)
+        policy = mqvpn_cfg.setdefault('path_policy', [])
+        initial_policy = json.dumps(policy, sort_keys=True)
+        previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'weight')
+        warnings = []
+        for iface in previous_ifaces - set(desired.keys()):
+            # 0 resets to the scheduler's default weight (1) -- see mqvpn's
+            # src/path_entry_internal.h path_entry_t.weight doc comment.
+            resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': 0})
+            if not resp.get('ok'):
+                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            _mqvpn_path_policy_clear(policy, username, iface, 'weight')
+        for iface, weight in desired.items():
+            resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': weight})
+            if not resp.get('ok'):
+                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            _mqvpn_path_policy_set(policy, username, iface, 'weight', weight)
+        if json.dumps(policy, sort_keys=True) != initial_policy:
+            _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg)
     if warnings:
         return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_weight'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_weight'}
@@ -6487,11 +6701,16 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
         return {'result': 'warning', 'reason': 'OpenVPN is not installed', 'route': 'openvpn'}
     initial_md5 = hashlib.md5(file_as_bytes('/etc/openvpn/tun0.conf')).hexdigest()
     n = io.StringIO()
+    old_port = None
     with open('/etc/openvpn/tun0.conf', 'r') as f:
         for line in f:
-            if 'cipher ' in line:
+            # The directive itself: a substring test also rewrote e.g. a
+            # comment, or a push "route ..." line naming a port.
+            words = line.split()
+            if words and words[0] == 'cipher':
                 n.write('cipher ' + params.cipher + '\n')
-            elif 'port ' in line:
+            elif words and words[0] == 'port':
+                old_port = words[1] if len(words) > 1 else None
                 n.write('port ' + str(params.port) + '\n')
             else:
                 n.write(line)
@@ -6501,6 +6720,8 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     if initial_md5 != final_md5:
         subprocess.run(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
         shorewall_add_port(current_user, str(params.port), 'tcp', 'openvpn')
+        if old_port is not None and old_port != str(params.port):
+            _fw_service_port_del(old_port, 'tcp', 'openvpn')
         #set_lastchange()
     return {'result': 'done'}
 

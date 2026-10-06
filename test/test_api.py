@@ -1303,7 +1303,8 @@ class TestDsvpnInstalledCheck:
         written = {}
         def _open(path, mode="r", *a, **k):
             if str(path) == "/etc/dsvpn/dsvpn0" and "w" not in mode:
-                return io.StringIO("PORT=65401\nDEV=dsvpn0\n")
+                text = "PORT=65401\nDEV=dsvpn0\n"
+                return io.BytesIO(text.encode()) if "b" in mode else io.StringIO(text)
             if str(path) == "/etc/dsvpn/dsvpn0.key" and "w" not in mode:
                 return io.BytesIO(b"old")
             return _mock_open(path, mode, *a, **k)
@@ -2540,7 +2541,7 @@ class TestDsvpn:
                     return io.StringIO()
                 return io.BytesIO(b"old-key")
             if sp == "/etc/dsvpn/dsvpn0":
-                return io.StringIO("PORT=65400\n")
+                return io.BytesIO(b"PORT=65400\n") if "b" in str(mode) else io.StringIO("PORT=65400\n")
             return _mock_open(path, mode, *args, **kwargs)
 
         with (
@@ -2621,20 +2622,18 @@ class TestMqvpn:
         """Changing the port must open the new port and close the old one (v4+v6)."""
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.shorewall_add_port") as add4,
-            patch("omr_admin.shorewall6_add_port") as add6,
-            patch("omr_admin.shorewall_del_port") as del4,
-            patch("omr_admin.shorewall6_del_port") as del6,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
+            patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
+            patch("omr_admin._fw_service_port_del") as close,
         ):
             # fixture listen is 0.0.0.0:443 → move to 65443
             r = user_client.post("/mqvpn", json={**self._PAYLOAD, "port": 65443})
         assert r.json()["result"] == "done"
         add4.assert_called_once()
         add6.assert_called_once()
-        del4.assert_called_once()
-        del6.assert_called_once()
         assert add4.call_args[0][1:] == ("65443", "udp", "mqvpn")
-        assert del4.call_args[0][1:] == ("443", "udp", "mqvpn")
+        # closed for whoever opened it (v4 and v6), not just the caller
+        close.assert_called_once_with("443", "udp", "mqvpn")
 
     def test_same_port_does_not_touch_firewall(self, user_client):
         """No firewall changes when the port stays the same."""
