@@ -28,6 +28,7 @@ omr-vps-admin (0.18+20261006) unstable; urgency=medium
   * omr_metrics: train the shared decision model only on the admin's and the main router's metrics (any user's self-reported ones steered every user's weights), bound the torch forecasts (8 interfaces per request, 2 requests at once per worker, the linear estimate otherwise), refuse disabled users on the GET routes too, and fix the training loss, which was divided by the number of interfaces
   * omr_metrics_standalone and docker-compose: refuse to start without a real OMR_PASS (it defaulted to "changeme") and publish the port on 127.0.0.1 unless OMR_BIND says otherwise
   * omr-admin.service: NoNewPrivileges=yes and ProtectHome=yes (nothing it runs needs a setuid binary or a home directory; checked on the test VPS)
+  * CI: read-only token permissions, actions/checkout@v4, and the deploy actions pinned to a commit
   * Add tests for the above (test/test_hardening.py, test/test_metrics.py) and adapt the firewall, MQVPN, dsvpn, user and XRay reverse tests to the new behaviour
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 06 Oct 2026 00:00:00 +0200
