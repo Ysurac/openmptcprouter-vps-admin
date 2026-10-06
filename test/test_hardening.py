@@ -244,3 +244,19 @@ class TestBodyLimit:
 # ---------------------------------------------------------------------------
 # WireGuard
 # ---------------------------------------------------------------------------
+
+class TestWireGuardNewline:
+    _KEY = "uKU1qOpAj/4jKsjk3ZqdpQ6GNZpI7mGTWArxpvzSg1I="
+
+    def test_newline_in_allowed_ips_refused(self):
+        assert omr_admin._wireguard_peer_nets("10.255.247.5,\n10.255.247.6") is None
+        assert omr_admin._wireguard_peer_nets("10.255.247.5, 10.255.247.6") is not None
+
+    def test_endpoint_refuses_it(self, other_client):
+        r = other_client.post("/wireguard", json={"peers": [{"ip": "10.255.247.5,\n10.255.247.6", "key": self._KEY}]})
+        assert r.json()["reason"] == "Invalid ip"
+
+
+# ---------------------------------------------------------------------------
+# OpenVPN certificates
+# ---------------------------------------------------------------------------

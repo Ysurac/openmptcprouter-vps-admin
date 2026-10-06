@@ -6558,7 +6558,10 @@ def _wireguard_peer_nets(ip):
     The router sends one address, wg takes a comma-separated list."""
     if not isinstance(ip, str):
         return None
-    nets = [_ip_network(part.strip()) for part in ip.split(',')]
+    # Spaces only: wg0.conf is line based, and a newline kept in the value
+    # (strip() let one through) wrote a line of its own, which broke the
+    # whole file for every user.
+    nets = [_ip_network(part.strip(' ')) for part in ip.split(',')]
     return None if None in nets else nets
 
 # The routers' end of the WireGuard VPN: the server is 10.255.247.1 (the
@@ -6619,7 +6622,8 @@ def _write_wireguard_conf(config_data, current_user=None):
             n.write('\n')
             n.write('[Peer]\n')
             n.write('PublicKey  = ' + peer['key'] + '\n')
-            n.write('AllowedIPs = ' + peer['ip'] + '\n')
+            # The validated parts, not the raw value (see _wireguard_peer_nets).
+            n.write('AllowedIPs = ' + ', '.join(part.strip(' ') for part in peer['ip'].split(',')) + '\n')
     # wg0.conf holds the server's private key: 0600 if it is ever created.
     _atomic_write_text('/etc/wireguard/wg0.conf', n.getvalue(), new_mode=0o600)
     final_md5 = hashlib.md5(file_as_bytes('/etc/wireguard/wg0.conf')).hexdigest()
@@ -6643,20 +6647,24 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
     peers = [peer for peer in peers if _wireguard_peer_in_vpn(peer['ip'])]
     if not os.path.isfile('/etc/wireguard/wg0.conf'):
         return {'result': 'error', 'reason': 'Wireguard config not found', 'route': 'wireguard'}
-    config_data = read_omr_config()
-    if not config_data or current_user.username not in config_data['users'][0]:
-        return {'result': 'error', 'reason': 'Config file not readable', 'route': 'wireguard'}
-    # wg0.conf is shared by every user: the caller replaces its own peers only.
-    users = config_data['users'][0]
-    others = [peer for username, user_config in users.items() if username != current_user.username
-              for peer in user_config.get('wireguard_peers', [])]
-    error = _wireguard_peers_conflict(peers, others)
-    if error:
-        return {'result': 'error', 'reason': error, 'route': 'wireguard'}
-    if users[current_user.username].get('wireguard_peers') != peers:
-        modif_config_user(current_user.username, {'wireguard_peers': peers})
-        users[current_user.username]['wireguard_peers'] = peers
-    _write_wireguard_conf(config_data, current_user)
+    # The conflict check, the store and wg0.conf in one go: two routers
+    # syncing together could otherwise both pass the check, or render the
+    # file without the other's new peers.
+    with _omr_config_lock():
+        config_data = read_omr_config()
+        if not config_data or current_user.username not in config_data['users'][0]:
+            return {'result': 'error', 'reason': 'Config file not readable', 'route': 'wireguard'}
+        # wg0.conf is shared by every user: the caller replaces its own peers only.
+        users = config_data['users'][0]
+        others = [peer for username, user_config in users.items() if username != current_user.username
+                  for peer in user_config.get('wireguard_peers', [])]
+        error = _wireguard_peers_conflict(peers, others)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'wireguard'}
+        if users[current_user.username].get('wireguard_peers') != peers:
+            modif_config_user(current_user.username, {'wireguard_peers': peers})
+            users[current_user.username]['wireguard_peers'] = peers
+        _write_wireguard_conf(config_data, current_user)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wireguard'}
 
 class ByPass(BaseModel):
