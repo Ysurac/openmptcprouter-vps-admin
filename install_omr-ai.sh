@@ -37,6 +37,10 @@ CREDS_FILE="/etc/influxdb3/omr-influxdb.env"
 # Set to "false" to skip PyTorch + decision-model init (~250 MB if pip fallback).
 INSTALL_AI="${INSTALL_AI:-true}"
 
+# Commit (or branch) omr_metrics.py is downloaded from. The VPS installer sets
+# it to its OMR_ADMIN_VERSION so omr_metrics.py matches the installed omradmin.py.
+OMR_ADMIN_VERSION="${OMR_ADMIN_VERSION:-develop}"
+
 # ---------------------------------------------------------------------------
 
 ARCH="$(dpkg --print-architecture)"
@@ -322,7 +326,7 @@ fi
 step "Downloading omr_metrics.py..."
 dest=/usr/share/omr-admin/omr_metrics.py
 mkdir -p /usr/share/omr-admin
-curl -fsSL "https://raw.githubusercontent.com/Ysurac/openmptcprouter-vps-admin/refs/heads/develop/omr_metrics.py" \
+curl -fsSL "https://raw.githubusercontent.com/Ysurac/openmptcprouter-vps-admin/${OMR_ADMIN_VERSION}/omr_metrics.py" \
     -o "$dest"
 log "  -> ${dest}"
 systemctl restart omr-admin 2>/dev/null || true
