@@ -501,7 +501,11 @@ def get_bytes_openvpn(user):
         ovpn_stats = []
         while True:
             line = fd.readline()
-            ovpn_stats.append(line.decode())
+            if not line:
+                # closed before END (OpenVPN restarting): readline() then
+                # returns b'' forever, this looped at 100% CPU
+                break
+            ovpn_stats.append(line.decode(errors='replace'))
             if line.strip() == 'END'.encode():
                 break
         ovpn_socket.close()
@@ -526,16 +530,22 @@ def get_bytes_ss(port):
         ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         ss_socket.settimeout(1)
         ss_socket.sendto('ping'.encode(), ("127.0.0.1", 8839))
-        ss_recv = ss_socket.recv(1024)
+        # one datagram, the stats of every port: 1024 bytes cut it at about
+        # 50 ports, and the truncated JSON made /status answer 500
+        ss_recv = ss_socket.recv(65535)
     except socket.timeout as err:
         LOG.debug("Shadowsocks stats timeout (" + str(err) + ")")
         return 0
     except socket.error as err:
         LOG.debug("Shadowsocks stats error (" + str(err) + ")")
         return 0
-    json_txt = ss_recv.decode("utf-8").replace('stat: ', '')
-    result = json.loads(json_txt)
-    if str(port) in result:
+    json_txt = ss_recv.decode("utf-8", errors='replace').replace('stat: ', '')
+    try:
+        result = json.loads(json_txt)
+    except ValueError:
+        LOG.debug("Shadowsocks stats unreadable")
+        return 0
+    if isinstance(result, dict) and str(port) in result:
         return result[str(port)]
     return 0
 
@@ -645,7 +655,7 @@ def get_bytes_softether(user):
         },
     }
     try:
-        r = requests.post(url="http://127.0.0.1:65390/api", json=createBytesPayload, headers=softethervpnPassword)
+        r = requests.post(url="http://127.0.0.1:65390/api", json=createBytesPayload, headers=softethervpnPassword, timeout=5)
     except requests.exceptions.Timeout:
         LOG.debug("SoftEther VPN get bytes timeout")
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
@@ -741,6 +751,15 @@ def get_userid_from_username(username):
     return int(data['users'][0][username]['userid'])
 
 def check_username_serial(username, serial):
+    """True if a router of *username* sending *serial* (None if it sent
+    none) may go on. With serial_enforce, a router sending no serial was
+    never checked."""
+    data = read_omr_config()
+    if not data or not data.get('serial_enforce'):
+        return bool(data)
+    if serial is None:
+        return False
+
     def mutate(data):
         if not data or 'serial_enforce' not in data or data['serial_enforce'] is False:
             return bool(data)
@@ -756,7 +775,9 @@ def check_username_serial(username, serial):
         return False
 
     try:
-        return _mutate_omr_config(mutate)
+        # A counter, not a change worth a backup: ten wrong serials rotated
+        # every dated backup away.
+        return _mutate_omr_config(mutate, make_backup=False)
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
@@ -995,12 +1016,12 @@ def add_ss_go_user(user, key=''):
     if not os.path.exists('/etc/shadowsocks-go/server.json'):
         return key
     try:
-        requests.post(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
+        requests.post(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key}, timeout=5)
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go add timeout")
     except requests.exceptions.RequestException as err:
         try:
-            requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key})
+            requests.post(url="http://127.0.0.1:65279/v1/servers/ss-2022/users", json= {'username': user,'uPSK': key}, timeout=5)
         except requests.exceptions.Timeout:
             LOG.debug("Shadowsocks go add timeout")
         except requests.exceptions.RequestException as err:
@@ -1015,12 +1036,12 @@ def remove_ss_go_user(user):
         return
     user = urllib.parse.quote(user, safe='')
     try:
-        requests.delete(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users/" + user)
+        requests.delete(url="http://127.0.0.1:65279/api/ssm/v1/servers/ss-2022/users/" + user, timeout=5)
     except requests.exceptions.Timeout:
         LOG.debug("Shadowsocks go remove timeout")
     except requests.exceptions.RequestException as err:
         try:
-            requests.delete(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user)
+            requests.delete(url="http://127.0.0.1:65279/v1/servers/ss-2022/users/" + user, timeout=5)
         except requests.exceptions.Timeout:
             LOG.debug("Shadowsocks go remove timeout")
         except requests.exceptions.RequestException as err:
@@ -1039,7 +1060,7 @@ def add_softether_user(user, password):
         },
     }
     try:
-        requests.post(url="http://127.0.0.1:65390/api", json=createUserPayload, headers=softethervpnPassword)
+        requests.post(url="http://127.0.0.1:65390/api", json=createUserPayload, headers=softethervpnPassword, timeout=5)
     except requests.exceptions.Timeout:
         LOG.debug("SoftEther VPN add timeout")
     except requests.exceptions.RequestException as err:
@@ -1057,7 +1078,7 @@ def remove_softether_user(user):
         },
     }
     try:
-        requests.post(url="http://127.0.0.1:65390/api", json=removeUserPayload, headers=softethervpnPassword)
+        requests.post(url="http://127.0.0.1:65390/api", json=removeUserPayload, headers=softethervpnPassword, timeout=5)
     except requests.exceptions.Timeout:
         LOG.debug("SoftEther VPN remove timeout")
     except requests.exceptions.RequestException as err:
@@ -3497,6 +3518,18 @@ def _mptcp_connections():
         cache.update(time=time.monotonic(), proc=proc, ss=ss_output)
         return proc, ss_output
 
+def _mptcp_peer_present(ip):
+    """True if an MPTCP connection with IPv4 address *ip* (a string) is
+    open. The address itself: a substring test also found 1.2.3.4 in
+    11.2.3.45, and its hex form in a longer hex field."""
+    proc, ss_output = _mptcp_connections()
+    if proc is not None:
+        iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, reversed(ip.split('.'))))
+        return re.search(r'(?<![0-9A-Fa-f])' + iptohex + r':', proc) is not None
+    text = ss_output.decode(errors='replace') if isinstance(ss_output, bytes) else str(ss_output)
+    # a.b.c.d:port, or [::ffff:a.b.c.d]:port for an IPv4 client of a v6 socket
+    return re.search(r'(?<![0-9.])' + re.escape(ip) + r'\]?:', text) is not None
+
 @app.get('/mptcpsupport')
 def mptcpsupport(request: Request):
     ip = request.client.host
@@ -3510,20 +3543,12 @@ def mptcpsupport(request: Request):
             return {"mptcp": "check only support IPv4"}
         ip = str(mapped)
     if type(ip_address(ip)) is IPv4Address:
-        ipr = list(reversed(ip.split('.')))
-        iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, ipr))
-        proc, ss_output = _mptcp_connections()
-        if proc is not None:
-            if iptohex in proc:
-                return {"mptcp": "working"}
-        elif ip.encode() in ss_output:
-            return {"mptcp": "working"}
-        return {"mptcp": "not working"}
+        return {"mptcp": "working" if _mptcp_peer_present(ip) else "not working"}
     return {"mptcp": "check only support IPv4"}
 
 # Get VPS status
 @app.get('/status', summary="Get current server load average, uptime and release")
-async def status(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
+def status(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get status...')
     if not current_user.permissions == "admin":
         userid = current_user.userid
@@ -3540,7 +3565,7 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
     username = get_username_from_userid(userid)
     if not isinstance(username, str) or not username:
         return {'error': 'Unknown user', 'route': 'status'}
-    if not current_user.permissions == "admin" and serial is not None:
+    if not current_user.permissions == "admin":
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
     vps_loadavg = ' '.join(read_proc('/proc/loadavg').split()[:3])
@@ -3644,7 +3669,7 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
 
 # Get VPS config
 @app.get('/config', summary="Get full server configuration for current user")
-async def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
+def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get config...')
     if not current_user.permissions == "admin":
         userid = current_user.userid
@@ -3662,7 +3687,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     username = get_username_from_userid(userid)
     if not username:
         return {'error': 'Unknown user', 'route': 'config'}
-    if not current_user.permissions == "admin" and serial is not None:
+    if not current_user.permissions == "admin":
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
     omr_config_data = read_omr_config()
@@ -5131,6 +5156,7 @@ def _proxy_isolate_reverse(service, config, users):
     else:
         # Until now /config gave every user the uuid of the shared client:
         # replace it once, the primary router gets the new one from /config.
+        # The caller records it done once the config is written.
         if not read_omr_config().get('xray_reverse_per_user'):
             for ib in config.get('inbounds', []):
                 if ib.get('tag') == 'omrin-tunnel':
@@ -5138,7 +5164,6 @@ def _proxy_isolate_reverse(service, config, users):
                         if c.get('reverse', {}).get('tag') == 'OMRLan':
                             c['id'] = str(uuid.uuid4())
                             changed = True
-            set_global_param('xray_reverse_per_user', True)
     return changed
 
 def _proxy_drop_user(service, config, username):
@@ -5180,6 +5205,10 @@ def proxy_isolate_reverse_tunnels():
                 if not _proxy_isolate_reverse(service, config, users):
                     continue
                 _atomic_write_json(config_path, config)
+                if service == 'xray' and not read_omr_config().get('xray_reverse_per_user'):
+                    # Only now: recorded before the write, a failed write
+                    # left the shared uuid every user had for good.
+                    set_global_param('xray_reverse_per_user', True)
             _schedule_proxy_restart(service)
         except Exception:
             LOG.exception("can't set up the per-user %s reverse tunnels", service)
@@ -6798,7 +6827,10 @@ def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_curre
             "params": {
                 "HubName_str": "OMRVPN",
                 "Name_str": current_user.username,
-                "Auth_Password_str": params.password 
+                # SetUser replaces the whole user: without it the AuthType
+                # read as 0, anonymous, as add_softether_user's 1 is password.
+                "AuthType_u32": 1,
+                "Auth_Password_str": params.password
             }
         }
         try:
@@ -6987,6 +7019,9 @@ class Wanips(BaseModel):
     ips: str
 
 # Set WANIP
+WAN_MAX_IPS = 32
+WAN_MIN_PREFIX = {4: 24, 6: 48}
+
 @app.post('/wan', summary="Set WAN IPs")
 def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
     #if current_user.permissions == "ro":
@@ -6999,6 +7034,10 @@ def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
     # would add rules of its own to it.
     ips = [ip.strip() for ip in ips.splitlines() if ip.strip()]
     if not ips or any(_ip_network(ip) is None for ip in ips):
+        return {'result': 'error', 'reason': 'Invalid IP', 'route': 'wan'}
+    # A router's own addresses: 0.0.0.0/0 would have listed every client
+    # of every user, and the list is in the ACL of every user.
+    if len(ips) > WAN_MAX_IPS or any(_ip_network(ip).prefixlen < WAN_MIN_PREFIX[_ip_network(ip).version] for ip in ips):
         return {'result': 'error', 'reason': 'Invalid IP', 'route': 'wan'}
     if not os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         return {'result': 'warning', 'reason': 'Shadowsocks-libev is not installed', 'route': 'wan'}
@@ -7764,7 +7803,9 @@ async def speedtest(request: Request, size: Optional[int] = Query(10), current_u
     size_bytes = min(max(size, 1), 100) * 1024 * 1024
     chunk = b'\x00' * 65536
 
-    mptcp = _mptcp_status_for_ip(request.client.host)
+    # ss and /proc, not on the event loop every other request of the worker
+    # (/token included) waits on
+    mptcp = await asyncio.to_thread(_mptcp_status_for_ip, request.client.host)
 
     async def generate():
         remaining = size_bytes
@@ -7786,7 +7827,7 @@ async def speedtest(request: Request, size: Optional[int] = Query(10), current_u
 
 @app.post('/speedtest', summary="Test upload speed from the server")
 async def speedtestul(request: Request, current_user: User = Depends(get_current_user)):
-    mptcp = _mptcp_status_for_ip(request.client.host)
+    mptcp = await asyncio.to_thread(_mptcp_status_for_ip, request.client.host)
 
     start = time.time()
     size = 0
@@ -7823,17 +7864,9 @@ def _mptcp_status_for_ip(client_ip: str) -> str:
             addr = mapped
         if not isinstance(addr, IPv4Address):
             return 'unknown'
-        ipr = list(reversed(str(addr).split('.')))
-        iptohex = '{:02X}{:02X}{:02X}{:02X}'.format(*map(int, ipr))
-        if path.exists('/proc/net/mptcp_net/mptcp'):
-            with open('/proc/net/mptcp_net/mptcp') as f:
-                return 'active' if iptohex in f.read() else 'inactive'
-        # Kernel ≥ 5.6 path
-        result = subprocess.run(
-            ['ss', '-MtnH'],
-            capture_output=True, text=True, timeout=2
-        )
-        return 'active' if str(addr) in result.stdout else 'inactive'
+        # The cached `ss -M` of /mptcpsupport: one run every 2 s at most,
+        # whatever the number of speedtests.
+        return 'active' if _mptcp_peer_present(str(addr)) else 'inactive'
     except Exception:
         return 'unknown'
 

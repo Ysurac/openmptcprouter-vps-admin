@@ -334,7 +334,8 @@ class TestProxyRedirectIsolation:
         data = self._load(paths["xray"])
         with patch("omr_admin.read_omr_config", return_value={}), patch("omr_admin.set_global_param") as set_param:
             assert omr_admin._proxy_isolate_reverse("xray", data, _USERS)
-        set_param.assert_called_once_with("xray_reverse_per_user", True)
+        # recorded by proxy_isolate_reverse_tunnels once the config is written
+        set_param.assert_not_called()
         assert omr_admin.xray_reverse_client_id(data) not in ("", "rev0")
         assert omr_admin.xray_reverse_client_id(data, "OMRLan-readonly")
         rotated = omr_admin.xray_reverse_client_id(data)

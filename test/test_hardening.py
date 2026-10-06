@@ -477,6 +477,19 @@ class TestSharedDaemons:
 # Small ones
 # ---------------------------------------------------------------------------
 
+class TestWan:
+    def test_wide_prefix_refused(self, other_client):
+        with patch("os.path.isfile", return_value=True):
+            r = other_client.post("/wan", json={"ips": "0.0.0.0/0"})
+        assert r.json()["reason"] == "Invalid IP"
+
+    def test_too_many_refused(self, other_client):
+        ips = "\n".join(f"203.0.113.{i}" for i in range(omr_admin.WAN_MAX_IPS + 1))
+        with patch("os.path.isfile", return_value=True):
+            r = other_client.post("/wan", json={"ips": ips})
+        assert r.json()["reason"] == "Invalid IP"
+
+
 class TestCookieAuth:
     def _request(self, path, headers):
         return MagicMock(url=MagicMock(path=path), headers=headers)
@@ -493,6 +506,55 @@ class TestCookieAuth:
         assert omr_admin._cookie_auth_allowed(self._request("/status", {"sec-fetch-site": "same-origin"}))
         assert omr_admin._cookie_auth_allowed(self._request(
             "/status", {"referer": "https://vps:65500/docs", "host": "vps:65500"}))
+
+
+class TestMptcpPeer:
+    def test_ss_address_matched_exactly(self):
+        output = b"ESTAB 0 0 [::ffff:51.15.1.1]:65500 [::ffff:11.2.3.45]:40000\n"
+        with patch("omr_admin._mptcp_connections", return_value=(None, output)):
+            assert not omr_admin._mptcp_peer_present("1.2.3.4")
+            assert omr_admin._mptcp_peer_present("11.2.3.45")
+
+    def test_proc_address_matched_exactly(self):
+        # 1.2.3.4 is 04030201; a longer hex field ending with it is another address
+        with patch("omr_admin._mptcp_connections", return_value=("A04030201:1F90 0100007F:1F90\n", b"")):
+            assert not omr_admin._mptcp_peer_present("1.2.3.4")
+            assert omr_admin._mptcp_peer_present("127.0.0.1")
+
+
+class TestSerialEnforce:
+    def test_missing_serial_refused_when_enforced(self):
+        config = _config()
+        config["serial_enforce"] = True
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin._mutate_omr_config") as mutate:
+            assert not omr_admin.check_username_serial("readonly", None)
+        assert not mutate.called
+
+    def test_not_enforced(self):
+        with patch("omr_admin.read_omr_config", return_value=_config()):
+            assert omr_admin.check_username_serial("readonly", None)
+
+
+class TestOpenvpnStats:
+    def test_socket_closed_before_end(self):
+        sock = MagicMock()
+        sock.makefile.return_value = io.BytesIO(b">INFO:OpenVPN Management Interface\nbob,1.2.3.4:1,5,6\n")
+        with patch("socket.socket", return_value=sock):
+            assert omr_admin.get_bytes_openvpn("bob") == {"downlinkBytes": 5, "uplinkBytes": 6}
+
+
+class TestXrayReverseMigration:
+    def test_recorded_only_once_written(self):
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/xray/xray-server.json"),
+            patch("builtins.open", side_effect=_open_with({"/etc/xray/xray-server.json": "{}"})),
+            patch("omr_admin._proxy_isolate_reverse", return_value=True),
+            patch("omr_admin._atomic_write_json", side_effect=OSError("disk full")),
+            patch("omr_admin.set_global_param") as set_param,
+        ):
+            omr_admin.proxy_isolate_reverse_tunnels()
+        assert not set_param.called
 
 
 class TestV2rayDelUser:
