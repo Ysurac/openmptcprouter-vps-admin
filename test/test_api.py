@@ -4521,6 +4521,12 @@ class TestRemoveUserSideEffects:
             {"ip": "10.255.247.3", "key": "uKU1qOpAj/4jKsjk3ZqdpQ6GNZpI7mGTWArxpvzSg1I="}]
         after = json.loads(json.dumps(config))
         del after["users"][0]["readonly"]
+        reads = []
+
+        def _read():
+            # the config before the removal, then after it
+            reads.append(1)
+            return config if len(reads) == 1 else after
 
         import builtins
         current_open = builtins.open
@@ -4534,7 +4540,7 @@ class TestRemoveUserSideEffects:
             patch("os.path.isfile", return_value=False),
             patch("builtins.open", side_effect=_open),
             patch("omr_admin._mutate_omr_config"),
-            patch("omr_admin.read_omr_config", return_value=after),
+            patch("omr_admin.read_omr_config", side_effect=_read),
             patch("omr_admin._write_wireguard_conf") as write_conf,
         ):
             r = admin_client.post("/remove_user", json={"username": "readonly"})
@@ -4968,10 +4974,10 @@ class TestModifyUser:
             real_json_dump(data, f, **kw)
 
         with patch("omr_admin.json.dump", side_effect=_capture_write):
-            r = admin_client.post("/modify_user", json={"username": "readonly", "user_password": "newpass"})
+            r = admin_client.post("/modify_user", json={"username": "readonly", "user_password": "newpass-1234"})
 
         assert r.json()["result"] == "done"
-        assert written.get("users", [{}])[0].get("readonly", {}).get("user_password") == "newpass"
+        assert written.get("users", [{}])[0].get("readonly", {}).get("user_password") == "newpass-1234"
 
     def test_disabled_true_stored_as_string_true(self, admin_client):
         written = {}
@@ -5040,7 +5046,7 @@ class TestModifyUser:
         with patch("omr_admin.json.dump", side_effect=_capture_write):
             r = admin_client.post("/modify_user", json={
                 "username": "readonly",
-                "user_password": "newpass",
+                "user_password": "newpass-1234",
                 "disabled": True,
                 "vpn": "glorytun_udp",
                 "proxy": "v2ray",
@@ -5048,7 +5054,7 @@ class TestModifyUser:
 
         assert r.json()["result"] == "done"
         user = written.get("users", [{}])[0].get("readonly", {})
-        assert user.get("user_password") == "newpass"
+        assert user.get("user_password") == "newpass-1234"
         assert user.get("disabled") == "true"
         assert user.get("vpn") == "glorytun_udp"
         assert user.get("proxy") == "v2ray"

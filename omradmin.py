@@ -90,6 +90,9 @@ ALGORITHM = "HS256"
 # Usernames end up in file names (OpenVPN ccd/PKI, backups), so a leading dot
 # is refused: it would allow '.' and '..' as usernames.
 USERNAME_PATTERN = r'^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,255}$'
+# For a new user: the name is in file names (backups, keys, NAME_MAX 255).
+USERNAME_MAX_LEN = 64
+USERID_MAX = 63
 
 def safe_path_join(base_dir, *parts):
     """Join parts onto base_dir, refusing any result that escapes base_dir."""
@@ -2734,6 +2737,18 @@ TEMPLATE_PASSWORDS = ('MySecretKey', 'AdminMySecretKey')
 def _has_template_password(user_password):
     return user_password in TEMPLATE_PASSWORDS
 
+USER_PASSWORD_MIN_LEN = 8
+
+def _user_password_error(user_password):
+    """Why a password can't be given to a user, None if it can. An empty
+    one logged in with an empty password (`user:` in /login_basic), and a
+    template one can never log in."""
+    if not isinstance(user_password, str) or len(user_password) < USER_PASSWORD_MIN_LEN:
+        return 'Password too short, {} characters at least'.format(USER_PASSWORD_MIN_LEN)
+    if _has_template_password(user_password):
+        return 'Template password'
+    return None
+
 def warn_template_passwords(config_data):
     """At startup: name the users that can't log in for having the template's
     password, so that the reason shows in the journal."""
@@ -2788,6 +2803,10 @@ def authenticate_user(fake_db, username: str, password: str):
         return False
     if _has_template_password(user.user_password):
         LOG.debug("template password")
+        return False
+    if not user.user_password:
+        # an empty stored password matched an empty one
+        LOG.debug("empty password")
         return False
     if not verify_password(password, user.user_password):
         LOG.debug("wrong password")
@@ -7351,20 +7370,49 @@ class NewUser(BaseModel):
 def add_user(*, params: NewUser, current_user: User = Depends(get_current_user), request: Request):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
+    content = read_omr_config()
+    if not content:
+        return {'result': 'error', 'reason': 'Config file not readable', 'route': 'add_user'}
+    users = content['users'][0]
+    # An existing user (admin, openmptcprouter included) was overwritten:
+    # new password and userid, its keys and ports left behind. /modify_user
+    # changes a user.
+    if params.username in users:
+        return {'result': 'error', 'reason': 'User already exists', 'route': 'add_user'}
+    # DEFAULT is the ccd OpenVPN uses for every client without its own.
+    if len(params.username) > USERNAME_MAX_LEN or params.username == 'DEFAULT':
+        return {'result': 'error', 'reason': 'Invalid username', 'route': 'add_user'}
+    used_userids = set()
+    for ucfg in users.values():
+        try:
+            used_userids.add(int(ucfg['userid']))
+        except (KeyError, TypeError, ValueError):
+            pass
     userid = params.userid
     if userid is None or userid == 0:
-        userid = 2
-        for users in content['users'][0]:
-            if 'userid' in content['users'][0][users]:
-                if int(content['users'][0][users]['userid']) > userid:
-                    userid = int(content['users'][0][users]['userid'])
-        userid = userid + 1
+        userid = max(used_userids | {2}) + 1
+        if userid > USERID_MAX:
+            # past the last one: a userid freed by /remove_user
+            free = [i for i in range(3, USERID_MAX + 1) if i not in used_userids]
+            if not free:
+                return {'result': 'error', 'reason': 'No userid left', 'route': 'add_user'}
+            userid = free[0]
+    elif not 1 <= userid <= USERID_MAX:
+        # The tunnels of a userid are a /30 of a /24 (glorytun, dsvpn...)
+        # and its port 650<userid>: past 63, the user was saved but got none.
+        return {'result': 'error', 'reason': 'Invalid userid, 1 to {}'.format(USERID_MAX), 'route': 'add_user'}
+    elif userid in used_userids:
+        # Its glorytun and dsvpn keys were regenerated: the other user's
+        # tunnels broke.
+        return {'result': 'error', 'reason': 'Userid already used', 'route': 'add_user'}
     if params.ips is None:
         publicips = []
     else:
         publicips = params.ips
+    if params.user_key is not None:
+        error = _user_password_error(params.user_key)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'add_user'}
     user_key = params.user_key if params.user_key is not None else secrets.token_hex(32).upper()
     user_json = {params.username: {"username": params.username, "permissions": params.permission, "user_password": user_key, "disabled": "false", "userid": str(userid), "public_ips": publicips}}
 #    shadowsocks_port = params.shadowsocks_port
@@ -7418,13 +7466,18 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
         if os.path.isfile('/etc/xray/xray-server.json'):
             xray_add_user(params.username,uuid,upsk)
     else:
+        ss_ports = []
         for publicip in publicips:
             if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-                shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key, userid, publicip)
-                shadowsocks_port = shadowsocks_port + 1
+                # The port asked for the first IP, the next free ones after:
+                # the port stored was the one after it, which /remove_user
+                # then took from the next user.
+                ss_ports.append(int(add_ss_user(str(shadowsocks_port) if not ss_ports else '', shadowsocks_key, userid, publicip)))
             if os.path.isfile('/etc/xray/xray-server.json'):
                 xray_add_user(params.username,uuid,upsk)
             add_gre_tunnels(params.username, publicip)
+        if ss_ports:
+            shadowsocks_port = ss_ports[0]
     if shadowsocks_port is not None:
         user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
     if params.vpn is not None:
@@ -7476,23 +7529,91 @@ def add_user_note(*, params: ExistingUser, current_user: User = Depends(get_curr
 class RemoveUser(BaseModel):
     username: str = Query(..., pattern=USERNAME_PATTERN)
 
+def _remove_user_ss_ports(udata, userid):
+    """Remove every shadowsocks-libev port of a user: its own, those of its
+    public IPs and GRE tunnels (each with its key), and any other port
+    manager.json records for its userid."""
+    ports = {str(udata.get('shadowsocks_port'))} if udata.get('shadowsocks_port') is not None else set()
+    ports |= {str(tunnel['shadowsocks_port']) for tunnel in (udata.get('gre_tunnels') or {}).values()
+              if isinstance(tunnel, dict) and tunnel.get('shadowsocks_port') is not None}
+    try:
+        with open('/etc/shadowsocks-libev/manager.json') as f:
+            data = json.loads(re.sub(r",\s*}", "}", f.read()))
+        ports |= {port for port, conf in (data.get('port_conf') or {}).items()
+                  if isinstance(conf, dict) and str(conf.get('userid')) == str(userid)}
+    except (OSError, ValueError, AttributeError):
+        pass  # the recorded ports only
+    for port in sorted(ports):
+        if port.isdigit():
+            remove_ss_user(port)
+
+def _remove_user_openvpn_lan(username, udata, users):
+    """Drop the client2client push routes of a removed user's LANs (those no
+    other user has) from tun0.conf, and its ccd."""
+    ccd = safe_path_join('/etc/openvpn/ccd', username)
+    if os.path.isfile(ccd):
+        os.remove(ccd)
+    if not os.path.isfile('/etc/openvpn/tun0.conf'):
+        return
+    kept = {_lan_route(net) for other, ucfg in users.items() if other != username
+            for net in (_lan_network(lan) for lan in ucfg.get('lanips') or []) if net}
+    gone = {_lan_route(net) for net in (_lan_network(lan) for lan in udata.get('lanips') or []) if net} - kept
+    if not gone:
+        return
+    with open('/etc/openvpn/tun0.conf') as f:
+        lines = f.readlines()
+    routes = {'push "route ' + network + ' ' + netmask + '"' for network, netmask in gone}
+    new_lines = [line for line in lines if line.strip() not in routes]
+    if new_lines != lines:
+        _atomic_write_text('/etc/openvpn/tun0.conf', ''.join(new_lines))
+        subprocess.run(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
+
+def _remove_user_resources(username, udata, users):
+    """What /remove_user left behind, kept by a removed user or inherited by
+    the next one given its name or userid: proxy ports and accounts, GRE
+    tunnels, firewall rules, OpenVPN routes and ccd, 6in4 and VXLAN units,
+    backups. *users*: every user, this one still included."""
+    userid = int(udata['userid'])
+    if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+        _remove_user_ss_ports(udata, userid)
+    for gre_intf in (udata.get('gre_tunnels') or {}):
+        if os.path.isfile('/etc/xray/xray-server.json'):
+            xray_del_user(str(udata.get('username', username)) + gre_intf)
+        intf_file = safe_path_join('/etc/openmptcprouter-vps-admin/intf', gre_intf)
+        if os.path.isfile(intf_file):
+            os.remove(intf_file)
+    _remove_user_openvpn_lan(username, udata, users)
+    for unit, conf in ((f"omr6in4@user{userid}", f'/etc/openmptcprouter-vps-admin/omr-6in4/user{userid}'),
+                       (f"omr-vxlan@user{userid}", f'/etc/openmptcprouter-vps-admin/omr-vxlan/user{userid}')):
+        if os.path.isfile(conf):
+            subprocess.run(["systemctl", "-q", "stop", unit], check=False)
+            subprocess.run(["systemctl", "-q", "disable", unit], check=False)
+            os.remove(conf)
+    backup_dir = '/var/opt/openmptcprouter'
+    if os.path.isdir(backup_dir):
+        for name in os.listdir(backup_dir):
+            if _is_own_backup(name, username):
+                os.remove(safe_path_join(backup_dir, name))
+
 @app.post('/remove_user', summary="Remove an user")
 @_serialise_config_write
 def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user), request: Request):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
+    content = read_omr_config()
+    if not content:
+        return {'result': 'error', 'reason': 'Config file not readable', 'route': 'remove_user'}
     if not params.username in content['users'][0]:
         return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'remove_user'}
     LOG.debug("Remove user " + log_safe(params.username))
-    userid = int(content['users'][0][params.username]['userid'])
+    try:
+        userid = int(content['users'][0][params.username]['userid'])
+    except (KeyError, TypeError, ValueError):
+        # the admin user: no tunnels, no ports, and the API's own login
+        return {'result': 'not allowed', 'reason': 'User without userid', 'route': 'remove_user'}
     if userid == 0:
         return {'result': 'not allowed', 'reason': 'Userid 0 is protected', 'route': 'remove_user'}
-    if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-        shadowsocks_port = content['users'][0][params.username].get('shadowsocks_port')
-        if shadowsocks_port is not None:
-            remove_ss_user(str(shadowsocks_port))
+    _remove_user_resources(params.username, content['users'][0][params.username], content['users'][0])
     if os.path.isfile('/etc/shadowsocks-go/server.json'):
         remove_ss_go_user(params.username)
     if os.path.isfile('/etc/v2ray/v2ray-server.json'):
@@ -7544,6 +7665,9 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
         # its peers would otherwise stay in wg0.conf until another user's
         # next /wireguard call, still holding their addresses
         _write_wireguard_conf(read_omr_config())
+    # Its DNATs, open ports and GRE SNAT stayed live until another change.
+    _nft_sync_ports()
+    _nft_sync_gre_snat()
     LOG.info("User admin (IP: " + request.client.host + ") removed user " + log_safe(params.username))
     return {'result': 'done', 'reason': 'user removed', 'route': 'remove_user'}
 
@@ -7564,6 +7688,9 @@ def modify_user(*, params: ModifyUser, current_user: User = Depends(get_current_
         return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'modify_user'}
     changes = {}
     if params.user_password is not None:
+        error = _user_password_error(params.user_password)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'modify_user'}
         changes['user_password'] = params.user_password
     if params.disabled is not None:
         changes['disabled'] = "true" if params.disabled else "false"

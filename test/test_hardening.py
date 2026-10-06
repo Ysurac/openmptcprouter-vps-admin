@@ -296,6 +296,101 @@ class TestPkiRetire:
 # Users
 # ---------------------------------------------------------------------------
 
+class TestAddUserChecks:
+    @pytest.mark.parametrize("payload,reason", [
+        ({"username": "readonly"}, "User already exists"),
+        ({"username": "admin"}, "User already exists"),
+        ({"username": "DEFAULT"}, "Invalid username"),
+        ({"username": "u" * 65}, "Invalid username"),
+        ({"username": "new", "userid": 2}, "Userid already used"),
+        ({"username": "new", "userid": 64}, "Invalid userid, 1 to 63"),
+        ({"username": "new", "userid": -1}, "Invalid userid, 1 to 63"),
+        ({"username": "new", "user_key": ""}, "Password too short, 8 characters at least"),
+        ({"username": "new", "user_key": "MySecretKey"}, "Template password"),
+    ])
+    def test_refused_before_anything_is_created(self, admin_client, payload, reason):
+        with patch("omr_admin._mutate_omr_config") as persist:
+            r = admin_client.post("/add_user", json=payload)
+        assert r.json()["reason"] == reason
+        assert not persist.called
+
+    def test_modify_user_refuses_an_empty_password(self, admin_client):
+        r = admin_client.post("/modify_user", json={"username": "readonly", "user_password": ""})
+        assert r.json()["result"] == "error"
+
+    def test_empty_stored_password_never_logs_in(self):
+        users = {"bob": {"username": "bob", "user_password": "", "permissions": "rw", "userid": 3}}
+        assert not omr_admin.authenticate_user(users, "bob", "")
+
+    def test_shadowsocks_port_stored_is_the_one_created(self, admin_client):
+        created = []
+
+        def _add(port, key, userid=0, ip=''):
+            created.append(port)
+            return 65110 + len(created) - 1
+
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/shadowsocks-libev/manager.json"),
+            patch("omr_admin.add_ss_user", side_effect=_add),
+            patch("omr_admin.add_gre_tunnels"),
+            patch("omr_admin.proxy_isolate_reverse_tunnels"),
+            patch("omr_admin._mutate_omr_config") as persist,
+        ):
+            r = admin_client.post("/add_user", json={"username": "new", "ips": ["203.0.113.9", "203.0.113.10"]})
+        assert r.json()["result"] == "done"
+        latest = {"users": [{}]}
+        persist.call_args[0][0](latest)
+        assert latest["users"][0]["new"]["shadowsocks_port"] == 65110
+        assert created == ["None", ""]   # the first asked for, the next one free
+
+
+class TestRemoveUserTeardown:
+    def test_every_shadowsocks_port_of_the_user_removed(self):
+        manager = {"port_conf": {"65102": {"key": "a", "userid": 2}, "65103": {"key": "a", "userid": "2"},
+                                 "65101": {"key": "b", "userid": 0}}}
+        udata = {"userid": 2, "shadowsocks_port": 65102,
+                 "gre_tunnels": {"gre-user2-ip1": {"shadowsocks_port": "65150"}}}
+        with (
+            patch("builtins.open", side_effect=_open_with({"/etc/shadowsocks-libev/manager.json": json.dumps(manager)})),
+            patch("omr_admin.remove_ss_user") as remove,
+        ):
+            omr_admin._remove_user_ss_ports(udata, 2)
+        assert sorted(call.args[0] for call in remove.call_args_list) == ["65102", "65103", "65150"]
+
+    def test_lan_routes_of_the_user_only(self):
+        tun0 = ('port 65301\npush "route 192.168.5.0 255.255.255.0"\n'
+                'push "route 192.168.6.0 255.255.255.0"\n')
+        users = {"readonly": {"lanips": ["192.168.5.1/24"]}, "openmptcprouter": {"lanips": ["192.168.6.1/24"]}}
+        written = {}
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/openvpn/tun0.conf"),
+            patch("builtins.open", side_effect=_open_with({"/etc/openvpn/tun0.conf": tun0})),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, new_mode=0o644: written.update({p: t})),
+        ):
+            omr_admin._remove_user_openvpn_lan("readonly", users["readonly"], users)
+        assert "192.168.5.0" not in written["/etc/openvpn/tun0.conf"]
+        assert "192.168.6.0" in written["/etc/openvpn/tun0.conf"]
+
+    def test_firewall_resynced(self, admin_client):
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin._mutate_omr_config"),
+            patch("omr_admin._nft_sync_ports") as sync_ports,
+            patch("omr_admin._nft_sync_gre_snat") as sync_gre,
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+        assert r.json()["result"] == "done"
+        assert sync_ports.called and sync_gre.called
+
+    def test_admin_user_cannot_be_removed(self, admin_client):
+        r = admin_client.post("/remove_user", json={"username": "admin"})
+        assert r.json()["result"] == "not allowed"
+
+
+# ---------------------------------------------------------------------------
+# Shared daemons
+# ---------------------------------------------------------------------------
+
 class TestSharedDaemons:
     def test_shadowsocks_key_with_a_quote_refused(self, other_client):
         with patch("os.path.isfile", return_value=True):
