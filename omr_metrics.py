@@ -24,6 +24,9 @@
 # -----------------
 # GET  /metrics                  — latest snapshot for the current user's WAN interfaces
 # POST /metrics                  — store one interface payload (called by omr-tracker)
+#                                  interface names match ^[A-Za-z0-9_.@:-]{1,32}$, at most
+#                                  32 interfaces per user; a timestamp more than 300 s
+#                                  off the server clock is replaced by the receive time
 # GET  /metrics/all              — all users' snapshots (admin only)
 # GET  /metrics/prometheus       — all users' metrics in Prometheus text format (admin only)
 # GET  /metrics/history          — time-series history (InfluxDB only)
@@ -120,14 +123,17 @@ import math
 import os
 import logging
 import random
+import tempfile
 import threading
 import time
 import urllib.request
 import urllib.error
-from typing import Optional, Dict
+from typing import Annotated, Optional, Dict
 
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import JSONResponse
 
 LOG = logging.getLogger('uvicorn.error')
@@ -265,80 +271,98 @@ def _stats_inc(count_key: str, ms_key: str, elapsed_ms: float):
 # Pydantic models — mirror the JSON produced by 040-metrics on the router
 # ---------------------------------------------------------------------------
 
-class SignalMetrics(BaseModel):
+# Interface and device names become dict keys, InfluxDB tags and Prometheus
+# labels: keep them to what OpenWrt uses (wan1, 4g_modem, eth0.2, wwan0,
+# pppoe-wan, ...) so a router cannot store arbitrary or huge identifiers.
+_NAME_PATTERN = r'^[A-Za-z0-9_.@:-]{1,32}$'
+_Name = Annotated[str, Field(pattern=_NAME_PATTERN)]
+# Same alphabet for the device/status tags, which routers may send empty.
+_Tag = Annotated[str, Field(pattern=r'^[A-Za-z0-9_.@:-]{0,32}$')]
+_Text = Annotated[str, Field(max_length=256)]
+# Every integer is stored in InfluxDB and converted to float: refuse values
+# no int64 counter can hold (10**400 would overflow float() later on).
+_Int64 = Annotated[int, Field(ge=-(2 ** 63), le=2 ** 63 - 1)]
+
+
+class _Payload(BaseModel):
+    # NaN/Infinity are not JSON numbers and would poison scores and averages.
+    model_config = ConfigDict(allow_inf_nan=False)
+
+
+class SignalMetrics(_Payload):
     quality: Optional[float] = None
-    operator: Optional[str] = None
-    state: Optional[str] = None
-    type: Optional[str] = None      # 'wifi' | 'modemmanager' | 'qmi'
+    operator: Optional[_Text] = None
+    state: Optional[_Text] = None
+    type: Optional[_Text] = None      # 'wifi' | 'modemmanager' | 'qmi'
     rssi: Optional[float] = None
     rsrp: Optional[float] = None
     rsrq: Optional[float] = None
     sinr: Optional[float] = None
 
 
-class WifiMetrics(BaseModel):
-    ssid: Optional[str] = None
-    bssid: Optional[str] = None
-    mode: Optional[str] = None
-    channel: Optional[int] = None
-    signal: Optional[int] = None    # dBm
-    noise: Optional[int] = None     # dBm
-    bitrate: Optional[str] = None
-    quality: Optional[int] = None
-    quality_max: Optional[int] = None
+class WifiMetrics(_Payload):
+    ssid: Optional[_Text] = None
+    bssid: Optional[_Text] = None
+    mode: Optional[_Text] = None
+    channel: Optional[_Int64] = None
+    signal: Optional[_Int64] = None    # dBm
+    noise: Optional[_Int64] = None     # dBm
+    bitrate: Optional[_Text] = None
+    quality: Optional[_Int64] = None
+    quality_max: Optional[_Int64] = None
 
 
-class TCMetrics(BaseModel):
-    qdisc: Optional[str] = None
-    sent_bytes: Optional[int] = None
-    sent_pkts: Optional[int] = None
-    dropped: Optional[int] = None
-    overlimits: Optional[int] = None
-    requeues: Optional[int] = None
-    backlog_bytes: Optional[int] = None
-    backlog_pkts: Optional[int] = None
-    ecn_mark: Optional[int] = None
-    drop_overlimit: Optional[int] = None
-    flows: Optional[int] = None
-    throttled: Optional[int] = None
-    flows_plimit: Optional[int] = None
-    new_flow_count: Optional[int] = None
+class TCMetrics(_Payload):
+    qdisc: Optional[_Text] = None
+    sent_bytes: Optional[_Int64] = None
+    sent_pkts: Optional[_Int64] = None
+    dropped: Optional[_Int64] = None
+    overlimits: Optional[_Int64] = None
+    requeues: Optional[_Int64] = None
+    backlog_bytes: Optional[_Int64] = None
+    backlog_pkts: Optional[_Int64] = None
+    ecn_mark: Optional[_Int64] = None
+    drop_overlimit: Optional[_Int64] = None
+    flows: Optional[_Int64] = None
+    throttled: Optional[_Int64] = None
+    flows_plimit: Optional[_Int64] = None
+    new_flow_count: Optional[_Int64] = None
 
 
-class BBRMetrics(BaseModel):
-    bw: Optional[int] = None             # bytes/s
-    pacing_rate: Optional[int] = None    # bytes/s
-    delivery_rate: Optional[int] = None  # bytes/s
-    cwnd: Optional[int] = None           # packets
-    min_rtt: Optional[float] = None      # ms
-    retrans: Optional[int] = None
+class BBRMetrics(_Payload):
+    bw: Optional[_Int64] = None             # bytes/s
+    pacing_rate: Optional[_Int64] = None    # bytes/s
+    delivery_rate: Optional[_Int64] = None  # bytes/s
+    cwnd: Optional[_Int64] = None           # packets
+    min_rtt: Optional[float] = None         # ms
+    retrans: Optional[_Int64] = None
 
 
-class CongestionMetrics(BaseModel):
-    score: Optional[int] = None          # 0-100
-    level: Optional[str] = None          # none | low | moderate | high | severe
+class CongestionMetrics(_Payload):
+    score: Optional[_Int64] = None          # 0-100
+    level: Optional[_Text] = None           # none | low | moderate | high | severe
 
 
-class BandwidthMetrics(BaseModel):
-    rx_bytes: Optional[int] = None
-    tx_bytes: Optional[int] = None
-    rx_bps: Optional[int] = None         # bytes/s
-    tx_bps: Optional[int] = None         # bytes/s
+class BandwidthMetrics(_Payload):
+    rx_bytes: Optional[_Int64] = None
+    tx_bytes: Optional[_Int64] = None
+    rx_bps: Optional[_Int64] = None         # bytes/s
+    tx_bps: Optional[_Int64] = None         # bytes/s
 
 
-class InterfaceMetrics(BaseModel):
+class InterfaceMetrics(_Payload):
     """Mirrors the JSON written by 040-metrics for one WAN interface."""
-    interface: str
-    device: Optional[str] = None
-    status: Optional[str] = None
-    status_msg: Optional[str] = None
-    device_ip: Optional[str] = None
-    device_ip6: Optional[str] = None
-    gateway: Optional[str] = None
-    gateway6: Optional[str] = None
-    weight: Optional[int] = 100           # nexthop weight (1-255, default 100)
-    cost: Optional[int] = None           # interface routing cost (lower = preferred)
-    asn: Optional[str] = None            # ASN of the WAN (e.g. "AS1234")
+    interface: _Name
+    device: Optional[_Tag] = None
+    status: Optional[_Tag] = None
+    status_msg: Optional[Annotated[str, Field(max_length=1024)]] = None
+    device_ip: Optional[_Text] = None
+    device_ip6: Optional[_Text] = None
+    gateway: Optional[_Text] = None
+    gateway6: Optional[_Text] = None
+    weight: Optional[_Int64] = 100        # nexthop weight (1-255, default 100)
+    cost: Optional[_Int64] = None         # interface routing cost (lower = preferred)
+    asn: Optional[_Text] = None           # ASN of the WAN (e.g. "AS1234")
     latency: Optional[float] = None      # ms
     rtt_min: Optional[float] = None      # ms
     rtt_max: Optional[float] = None      # ms
@@ -350,10 +374,10 @@ class InterfaceMetrics(BaseModel):
     bbr: Optional[BBRMetrics] = None
     congestion: Optional[CongestionMetrics] = None
     bandwidth: Optional[BandwidthMetrics] = None
-    timestamp: Optional[int] = None      # Unix epoch
+    timestamp: Optional[_Int64] = None    # Unix epoch
 
 
-class DecisionFeedback(BaseModel):
+class DecisionFeedback(_Payload):
     """Feedback used to fine-tune the interface scorer."""
     best_interface: Optional[str] = None   # shorthand: 1.0 for this iface, 0.0 rest
     weights: Optional[Dict[str, float]] = None  # free-form {iface: weight}
@@ -369,20 +393,53 @@ class AutoLearningToggle(BaseModel):
 # Storage backends
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _file_lock(path: str):
+    """Exclusive flock on *path* (created 0600), shared by every worker process."""
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        LOG.debug("omr_metrics: cannot lock %s (%s), carrying on unlocked", path, exc)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing the descriptor releases the flock
+
+
 class JSONBackend:
     """Stores the latest interface metrics per user in a single JSON file."""
 
+    # The thread lock covers the threads of one worker, the flock on
+    # METRICS_FILE.lock the other uvicorn workers doing the same
+    # read-modify-write.
     _lock = threading.Lock()
 
-    def read_all(self) -> dict:
+    def _load(self) -> dict:
+        """Return the stored data, {} only when the file does not exist yet.
+
+        Raises ValueError when the content is corrupt and OSError when it
+        cannot be read, so a writer can tell them apart from "no data".
+        """
         if not os.path.isfile(METRICS_FILE):
             return {}
+        with open(METRICS_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("top-level JSON value is not an object")
+        return data
+
+    def read_all(self) -> dict:
         try:
-            with open(METRICS_FILE) as f:
-                return json.load(f)
+            return self._load()
         except Exception as exc:
             LOG.debug("omr_metrics JSON: read error: %s", exc)
             return {}
+
+    def interfaces(self, username: str) -> list:
+        return list(self.read_user(username).keys())
 
     def read_user(self, username: str) -> dict:
         return self.read_all().get(username, {})
@@ -412,18 +469,48 @@ class JSONBackend:
         }
 
     def write_interface(self, username: str, payload: dict):
-        with self._lock:
-            data = self.read_all()
-            data.setdefault(username, {})[payload["interface"]] = payload
-            tmp = METRICS_FILE + '.tmp'
+        with self._lock, _file_lock(METRICS_FILE + '.lock'):
             try:
-                with open(tmp, 'w') as f:
+                data = self._load()
+            except ValueError as exc:
+                # Rewriting would keep only this user's data: set the corrupt
+                # file aside for recovery and start a new one.
+                aside = '{}.corrupt.{}'.format(METRICS_FILE, int(time.time()))
+                try:
+                    os.replace(METRICS_FILE, aside)
+                except OSError as move_exc:
+                    LOG.error("omr_metrics JSON: %s is corrupt (%s) and cannot be moved "
+                              "aside (%s), write refused", METRICS_FILE, exc, move_exc)
+                    return False
+                LOG.error("omr_metrics JSON: %s was corrupt (%s), kept as %s",
+                          METRICS_FILE, exc, aside)
+                data = {}
+            except OSError as exc:
+                LOG.error("omr_metrics JSON: cannot read %s (%s), write refused",
+                          METRICS_FILE, exc)
+                return False
+            data.setdefault(username, {})[payload["interface"]] = payload
+            tmp = None
+            try:
+                # Unique 0600 temp file: the data holds every router's WAN
+                # addresses, and a fixed name would be shared by the workers.
+                fd, tmp = tempfile.mkstemp(prefix=os.path.basename(METRICS_FILE) + '.',
+                                           suffix='.tmp',
+                                           dir=os.path.dirname(METRICS_FILE) or '.')
+                with os.fdopen(fd, 'w') as f:
                     json.dump(data, f, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(tmp, METRICS_FILE)
+                tmp = None
                 return True
             except Exception as exc:
                 LOG.error("omr_metrics JSON: write error: %s", exc)
                 return False
+            finally:
+                if tmp is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
 
 
 class InfluxBackend:
@@ -569,6 +656,20 @@ class InfluxBackend:
 
     def read_user(self, username: str) -> dict:
         return self._query(username).get(username, {})
+
+    def interfaces(self, username: str) -> list:
+        """Interfaces seen for *username* in the latest-snapshot window."""
+        sql = (
+            f"SELECT DISTINCT interface FROM {self._MEASUREMENT} "
+            f"WHERE username = $username "
+            f"AND time >= now() - interval '{self._LATEST_WINDOW}'"
+        )
+        try:
+            table = self._client.query(sql, query_parameters={"username": username})
+            return list(table.to_pydict().get("interface", []))
+        except Exception as exc:
+            LOG.error("omr_metrics InfluxDB interfaces: %s", exc)
+            return []
 
     def read_history(self, username: str, interface: Optional[str],
                      since_seconds: int, limit: int):
@@ -856,6 +957,41 @@ def _write_interface(username: str, payload: dict):
     return _get_backend().write_interface(username, payload)
 
 
+# Router timestamps further than this from the server clock are replaced
+# with the receive time (see set_metrics).
+_MAX_CLOCK_SKEW_S: int = 300
+
+# A router has a handful of WANs: cap the distinct interfaces stored per user
+# so one account cannot grow the store (and every per-interface loop) at will.
+MAX_INTERFACES_PER_USER: int = 32
+# Known interfaces per user, refreshed from the backend after this many
+# seconds so each POST does not cost an extra InfluxDB query.
+_IFACE_CACHE_TTL: float = 60.0
+_iface_cache: dict = {}   # {username: (monotonic ts, set of interfaces)}
+_iface_cache_lock = threading.Lock()
+
+
+def _accept_interface(username: str, interface: str) -> bool:
+    """True when *interface* is already known for *username* or still fits the cap.
+
+    Several workers each keep their own cache, so the cap can be overshot by
+    a few interfaces at most; it stays bounded, which is what matters.
+    """
+    now = time.monotonic()
+    with _iface_cache_lock:
+        entry = _iface_cache.get(username)
+    if entry is None or now - entry[0] > _IFACE_CACHE_TTL:
+        entry = (now, set(_get_backend().interfaces(username)))
+    known = entry[1]
+    if interface not in known:
+        if len(known) >= MAX_INTERFACES_PER_USER:
+            return False
+        known.add(interface)
+    with _iface_cache_lock:
+        _iface_cache[username] = entry
+    return True
+
+
 # Accepted shorthands for the ?since= query parameter → seconds.
 _SINCE_PRESETS: dict = {
     "15m": 900,    "30m": 1800,
@@ -1121,11 +1257,45 @@ def _torch_predict_at(timestamps: list, values: list, target_ts: float,
     return result
 
 
+# Each torch forecast trains a small MLP per metric, interface and horizon
+# (/metrics/decision?dscp=true runs ~60 per interface), so a client could keep
+# every worker's CPU busy. Bound it: only the first interfaces of a request
+# get torch forecasts, and only a few requests per process at a time; past
+# these bounds the cheap linear estimator is used instead.
+_FORECAST_MAX_TORCH_INTERFACES: int = 8
+_forecast_slots = threading.BoundedSemaphore(2)
+_forecast_ctx = threading.local()
+
+
+@contextlib.contextmanager
+def _torch_forecasts(enabled: bool = True):
+    """Allow or forbid torch forecasts in this thread for the block."""
+    prev = getattr(_forecast_ctx, "torch", True)
+    _forecast_ctx.torch = prev and enabled
+    try:
+        yield
+    finally:
+        _forecast_ctx.torch = prev
+
+
+@contextlib.contextmanager
+def _forecast_request():
+    """Take a forecast slot for one request without waiting: a request that
+    finds none falls back to linear forecasts rather than queueing torch work."""
+    acquired = _forecast_slots.acquire(blocking=False)
+    try:
+        with _torch_forecasts(acquired):
+            yield
+    finally:
+        if acquired:
+            _forecast_slots.release()
+
+
 def _predict_at(timestamps: list, values: list, target_ts: float,
                 halflife_s: float = PREDICT_HALFLIFE_S) -> Optional[float]:
     """Forecast dispatcher: uses torch when available and history is sufficient,
     otherwise falls back to exponentially weighted linear regression."""
-    if _TORCH_AVAILABLE:
+    if _TORCH_AVAILABLE and getattr(_forecast_ctx, "torch", True):
         result = _torch_predict_at(timestamps, values, target_ts, halflife_s)
         if result is not None:
             return result
@@ -1458,10 +1628,9 @@ def _log_bw(bps) -> float:
 
 def _staleness_feat(payload: dict, max_age_s: float = 300.0) -> float:
     """Return 1.0 when the snapshot is fresh, decaying to 0.0 at max_age_s."""
-    ts = payload.get("timestamp")
-    if ts is None:
-        return 0.5   # unknown age — neutral
-    age_s = max(0.0, time.time() - float(ts))
+    age_s = _snapshot_age_s(payload)
+    if age_s is None:
+        return 0.5   # unknown (or unusable) age — neutral
     return max(0.0, 1.0 - age_s / max_age_s)
 
 
@@ -1561,7 +1730,7 @@ def _snapshot_age_s(payload: dict) -> Optional[float]:
         return None
     try:
         return max(0.0, time.time() - float(ts))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -1604,7 +1773,7 @@ def _nested_value(payload: dict, path: tuple):
 def _as_float(value) -> Optional[float]:
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -1771,14 +1940,16 @@ def _dscp_class_weights(user_data: dict, history_data: dict, model_probs: dict) 
     # once; the torch path trains one small MLP per predictable metric.
     horizons = {class_info[4] for class_info in _DSCP_CLASSES}
     forecast_cache: dict = {}
-    for iface in interfaces:
-        p = user_data[iface]
-        hist = history_data.get(iface) or []
-        if not _is_interface_down(p) and len(hist) >= 2:
-            forecast_cache[iface] = {
-                horizon_s: _predict_payload(hist, horizon_seconds=horizon_s)
-                for horizon_s in horizons
-            }
+    with _forecast_request():
+        for iface in interfaces:
+            p = user_data[iface]
+            hist = history_data.get(iface) or []
+            if not _is_interface_down(p) and len(hist) >= 2:
+                with _torch_forecasts(len(forecast_cache) < _FORECAST_MAX_TORCH_INTERFACES):
+                    forecast_cache[iface] = {
+                        horizon_s: _predict_payload(hist, horizon_seconds=horizon_s)
+                        for horizon_s in horizons
+                    }
     for key, dscp_values, label, profile, horizon_s in _DSCP_CLASSES:
         raw: list = []
         for iface in interfaces:
@@ -1851,6 +2022,10 @@ if _TORCH_AVAILABLE:
             return self.net(x).squeeze(-1)
 
 _decision_model = None
+# mtime_ns of the model file this worker last loaded or saved: each uvicorn
+# worker holds its own copy of the model, so a newer file (training or
+# /metrics/decision/reset done by another worker) is reloaded on next use.
+_decision_model_mtime: Optional[int] = None
 _model_lock = threading.RLock()
 _optimizer = None   # persistent Adam; reset when model is reset
 
@@ -1881,43 +2056,90 @@ def _make_model():
     return model
 
 
+def _model_file_mtime() -> Optional[int]:
+    try:
+        return os.stat(DECISION_MODEL_FILE).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _load_model_file():
+    """Return the model saved in DECISION_MODEL_FILE, or None when unusable."""
+    try:
+        state = torch.load(DECISION_MODEL_FILE, map_location="cpu", weights_only=True)
+        saved_in = state.get("net.0.weight", torch.empty(0, 0)).shape[1]
+        if saved_in != N_FEATURES:
+            LOG.warning(
+                "omr_decision: saved model has %d input features but N_FEATURES=%d"
+                " – reinitializing (feature set changed)",
+                saved_in, N_FEATURES,
+            )
+            raise ValueError("feature dimension mismatch")
+        m = InterfaceScorer()
+        m.load_state_dict(state)
+        m.eval()
+        LOG.info("omr_decision: loaded model from %s", DECISION_MODEL_FILE)
+        return m
+    except Exception as exc:
+        LOG.warning("omr_decision: cannot load model (%s) – reinitializing", exc)
+        return None
+
+
 def _get_model():
-    global _decision_model
+    global _decision_model, _decision_model_mtime, _optimizer
     with _model_lock:
         if _decision_model is not None:
+            mtime = _model_file_mtime()
+            if mtime is None or mtime == _decision_model_mtime:
+                return _decision_model
+            # Saved by another worker since we loaded it. On a bad file keep
+            # the current model rather than retrying at every request.
+            _decision_model_mtime = mtime
+            m = _load_model_file()
+            if m is not None:
+                _decision_model = m
+                _optimizer = None   # Adam state belongs to the old parameters
+                _stats_update(model_loaded_at=time.time())
             return _decision_model
         if os.path.isfile(DECISION_MODEL_FILE):
-            try:
-                state = torch.load(DECISION_MODEL_FILE, map_location="cpu", weights_only=True)
-                saved_in = state.get("net.0.weight", torch.empty(0, 0)).shape[1]
-                if saved_in != N_FEATURES:
-                    LOG.warning(
-                        "omr_decision: saved model has %d input features but N_FEATURES=%d"
-                        " – reinitializing (feature set changed)",
-                        saved_in, N_FEATURES,
-                    )
-                    raise ValueError("feature dimension mismatch")
-                m = InterfaceScorer()
-                m.load_state_dict(state)
-                m.eval()
+            mtime = _model_file_mtime()
+            m = _load_model_file()
+            if m is not None:
                 _decision_model = m
+                _decision_model_mtime = mtime
                 _stats_update(model_loaded_at=time.time())
-                LOG.info("omr_decision: loaded model from %s", DECISION_MODEL_FILE)
                 return _decision_model
-            except Exception as exc:
-                LOG.warning("omr_decision: cannot load model (%s) – reinitializing", exc)
         _decision_model = _make_model()
+        _decision_model_mtime = _model_file_mtime()
         _stats_update(model_loaded_at=time.time())
         return _decision_model
 
 
 def _save_model(model):
-    tmp = DECISION_MODEL_FILE + '.tmp'
+    global _decision_model_mtime
+    tmp = None
     try:
-        torch.save(model.state_dict(), tmp)
+        # Unique temp name: several workers may save at the same time.
+        # mkstemp creates it 0600, like the metrics it was trained on.
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(DECISION_MODEL_FILE) + '.',
+                                   suffix='.tmp',
+                                   dir=os.path.dirname(DECISION_MODEL_FILE) or '.')
+        with os.fdopen(fd, 'wb') as f:
+            torch.save(model.state_dict(), f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, DECISION_MODEL_FILE)
+        tmp = None
+        with _model_lock:
+            if model is _decision_model:
+                # Our own save must not look like another worker's update.
+                _decision_model_mtime = _model_file_mtime()
     except Exception as exc:
         LOG.debug("omr_decision: save error: %s", exc)
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def _safe_float(v: float, default: float = 0.0) -> float:
@@ -1929,8 +2151,13 @@ def _safe_float(v: float, default: float = 0.0) -> float:
 
 def _cost_factor(payload: dict) -> float:
     """Return 1/cost so that lower cost → higher score. Neutral (1.0) when absent."""
-    c = payload.get("cost")
-    return 1.0 / float(c) if c and c > 0 else 1.0
+    # Stored rows may predate input validation: never let a huge or
+    # non-numeric cost raise out of an endpoint.
+    c = _as_float(payload.get("cost"))
+    if c is None or not math.isfinite(c) or c <= 0:
+        return 1.0
+    factor = 1.0 / c
+    return factor if math.isfinite(factor) else 1.0
 
 
 def _apply_cost(raw: list, interfaces: list, user_data: dict) -> list:
@@ -2114,7 +2341,9 @@ def _train_step(user_data: dict, target_weights: dict, lr: float,
         model.train()
         _optimizer.zero_grad()
         log_pred = torch.log_softmax(model(feat_tensor), dim=0)
-        loss = torch.nn.functional.kl_div(log_pred, target, reduction="batchmean")
+        # The input is one distribution over the interfaces, not a batch:
+        # "batchmean" would divide the KL by the number of interfaces.
+        loss = torch.nn.functional.kl_div(log_pred, target, reduction="sum")
         loss.backward()
         _optimizer.step()
         model.eval()
@@ -2147,7 +2376,9 @@ _AUTO_DEFAULTS: dict = {
 }
 
 # Watchdog: after this many consecutive non-finite or divergent losses the
-# model is reset to its heuristic initialisation.
+# model is reset to its heuristic initialisation. The loss is the KL divergence
+# (nats) of one routing distribution: 5.0 means the model gives the interface
+# the reward prefers around e^-5 of the traffic.
 _AUTO_MAX_LOSS: float = 5.0
 _AUTO_BAD_STREAK_LIMIT: int = 3
 _auto_bad_streak: int = 0
@@ -2302,12 +2533,41 @@ def _auto_watchdog(loss: float):
     _auto_bad_streak = 0
 
 
-def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
-    """One background training round over every user with stored metrics.
+# Users whose metrics may train the shared model when omr-admin-config.json
+# lists none (standalone wrapper); the standalone adds its own user here.
+TRUSTED_TRAINING_USERS: set = {"admin", "openmptcprouter"}
 
-    For each user: fetch per-interface history over the reward window, compute
-    observed rewards, and run one fine-tuning step against the sharpened
-    reward distribution.  Returns a summary dict (also folded into stats).
+
+def _trusted_training_users() -> set:
+    """Usernames whose self-reported metrics may train the shared model.
+
+    The model scores every user's interfaces, so samples come only from
+    accounts the VPS owner controls: the admins (permissions "admin") and
+    the main router (userid 0, "openmptcprouter" by default). Metrics are
+    stored under the posting user's name and only an admin may post for
+    another name, so other tenants cannot write under these names.
+    """
+    try:
+        with open(OMR_CONFIG_FILE) as f:
+            users = (json.load(f).get("users") or [{}])[0]
+    except Exception as exc:
+        LOG.debug("omr_auto: config read: %s", exc)
+        users = {}
+    trusted = {
+        name for name, info in users.items()
+        if isinstance(info, dict)
+        and (info.get("permissions") == "admin" or str(info.get("userid")) == "0")
+    } if isinstance(users, dict) else set()
+    return trusted or set(TRUSTED_TRAINING_USERS)
+
+
+def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
+    """One background training round over the trusted users with stored metrics.
+
+    For each trusted user (see _trusted_training_users): fetch per-interface
+    history over the reward window, compute observed rewards, and run one
+    fine-tuning step against the sharpened reward distribution.  Returns a
+    summary dict (also folded into stats).
     Silently does nothing without PyTorch or with the JSON backend.
     """
     cfg = cfg or _auto_cfg()
@@ -2315,8 +2575,11 @@ def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
     if not _TORCH_AVAILABLE or isinstance(_get_backend(), JSONBackend):
         return summary
 
+    trusted = _trusted_training_users()
     all_data = _read_all()
     for username, user_data in all_data.items():
+        if username not in trusted:
+            continue   # other tenants' data never trains the shared model
         if not isinstance(user_data, dict) or len(user_data) < 2:
             summary["skipped"] += 1
             continue
@@ -2362,6 +2625,46 @@ def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
 
 
 _auto_task = None   # asyncio.Task of the background loop, None when not running
+# Descriptor holding the auto-learning leader flock, None when not the leader.
+_auto_leader_fd: Optional[int] = None
+
+
+def _auto_leader() -> bool:
+    """True when this process runs the auto-learning rounds.
+
+    Every uvicorn worker starts the loop, but only the one holding a
+    non-blocking flock trains: the others would race on the same model file.
+    The lock is kept until stop_auto_learning() or process exit, and the
+    other workers retry at every round, so a dead leader gets replaced.
+    """
+    global _auto_leader_fd
+    if _auto_leader_fd is not None:
+        return True
+    path = os.path.join(os.path.dirname(DECISION_MODEL_FILE), '.omr-auto-learning.lock')
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        LOG.debug("omr_auto: cannot open %s (%s), running unlocked", path, exc)
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    except OSError as exc:
+        os.close(fd)
+        LOG.debug("omr_auto: cannot lock %s (%s), running unlocked", path, exc)
+        return True
+    _auto_leader_fd = fd
+    return True
+
+
+def _auto_release_leader():
+    global _auto_leader_fd
+    if _auto_leader_fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(_auto_leader_fd)
+        _auto_leader_fd = None
 
 
 async def _auto_learn_loop():
@@ -2379,6 +2682,9 @@ async def _auto_learn_loop():
         cfg = _auto_cfg()
         await asyncio.sleep(cfg["interval"])
         if not cfg["enabled"]:
+            continue
+        if not _auto_leader():
+            LOG.debug("omr_auto: another worker runs auto-learning, skipping round")
             continue
         available_mb = _available_memory_mb()
         if available_mb is not None and available_mb < cfg["min_available_mb"]:
@@ -2425,6 +2731,7 @@ def stop_auto_learning():
     if _auto_task is not None:
         _auto_task.cancel()
         _auto_task = None
+    _auto_release_leader()
 
 
 def _auto_set_enabled(enabled: bool) -> bool:
@@ -2484,6 +2791,7 @@ def _auto_status() -> dict:
     return {
         **_auto_cfg(),
         "task_running": _auto_task is not None and not _auto_task.done(),
+        "leader": _auto_leader_fd is not None,
         "torch_available": _TORCH_AVAILABLE,
         "history_backend": not isinstance(_get_backend(), JSONBackend),
     }
@@ -2753,6 +3061,11 @@ def _validate_feedback_weights(user_data: dict, weights: Dict[str, float]) -> di
 # Prometheus text-format serialiser
 # ---------------------------------------------------------------------------
 
+def _prom_label(value) -> str:
+    """Escape a label value as the Prometheus text format requires."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def _to_prometheus_text(all_data: dict) -> str:
     """Serialise {username: {interface: payload}} to Prometheus text format 0.0.4.
 
@@ -2797,12 +3110,12 @@ def _to_prometheus_text(all_data: dict) -> str:
 
     for username, ifaces in all_data.items():
         for iface, p in ifaces.items():
-            lbl = f'username="{username}",interface="{iface}"'
+            lbl = f'username="{_prom_label(username)}",interface="{_prom_label(iface)}"'
             status = p.get("status")
             online_s.append((lbl, 0 if (status and status != "online") else 1))
-            ts = p.get("timestamp")
-            if ts is not None:
-                age_s.append((lbl, round(now - float(ts), 1)))
+            ts = _as_float(p.get("timestamp"))
+            if ts is not None and math.isfinite(ts):
+                age_s.append((lbl, round(now - ts, 1)))
             for key, store in (
                 ("latency",  lat_s),
                 ("loss",     loss_s),
@@ -2828,7 +3141,7 @@ def _to_prometheus_text(all_data: dict) -> str:
             if bbr.get("bw") is not None:
                 bbr_s.append((lbl, bbr["bw"]))
             for anomaly in _interface_anomalies(p):
-                anomaly_s.append((f'{lbl},anomaly="{anomaly}"', 1))
+                anomaly_s.append((f'{lbl},anomaly="{_prom_label(anomaly)}"', 1))
 
     lines: list = []
     for name, help_text, samples in _metrics:
@@ -2845,9 +3158,37 @@ def _to_prometheus_text(all_data: dict) -> str:
 # Router factory — avoids circular imports with omradmin.py
 # ---------------------------------------------------------------------------
 
+class _MetricsRoute(APIRoute):
+    """Answer 422 without echoing the rejected input.
+
+    FastAPI's default handler puts each invalid value in the response, and a
+    rejected NaN/Infinity cannot be JSON encoded: the client got a 500.
+    """
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def route_handler(request):
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                detail = [
+                    {key: err[key] for key in ("type", "loc", "msg") if key in err}
+                    for err in exc.errors()
+                ]
+                return JSONResponse(status_code=422, content={"detail": detail})
+
+        return route_handler
+
+
 def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
-    """Return an APIRouter with /metrics and /metrics/decision endpoints."""
-    router = APIRouter()
+    """Return an APIRouter with /metrics and /metrics/decision endpoints.
+
+    Every endpoint depends on get_current_active_user so a disabled account
+    is refused on reads as well as writes; get_current_user is kept in the
+    signature for callers.
+    """
+    router = APIRouter(route_class=_MetricsRoute)
 
     # ---- metrics storage endpoints ----------------------------------------
 
@@ -2855,7 +3196,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
     async def get_metrics(
         username: Optional[str] = Query(None),
         interface: Optional[str] = Query(None),
-        current_user: User = Depends(get_current_user),
+        current_user: User = Depends(get_current_active_user),
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
         user_data = await asyncio.to_thread(_read_user, target)
@@ -2872,25 +3213,33 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
         payload = metrics.model_dump()
-        if payload.get('timestamp') is None:
-            payload['timestamp'] = int(time.time())
+        now = int(time.time())
+        # Latest-snapshot and staleness logic trust this timestamp: a router
+        # with a clock far off would pin its sample as "latest" for good.
+        # Keep accepting it, stamped with the receive time instead.
+        if payload.get('timestamp') is None or abs(payload['timestamp'] - now) > _MAX_CLOCK_SKEW_S:
+            payload['timestamp'] = now
+        accepted = await asyncio.to_thread(_accept_interface, target, payload['interface'])
+        if not accepted:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Too many interfaces for this user (max {MAX_INTERFACES_PER_USER})",
+            )
         written = await asyncio.to_thread(_write_interface, target, payload)
         if written is False:
-            from fastapi import HTTPException
             raise HTTPException(status_code=503, detail="Metrics storage unavailable")
         return {'result': 'ok'}
 
     @router.get('/metrics/all', summary="Get stored metrics for all users (admin only)")
-    async def get_all_metrics(current_user: User = Depends(get_current_user)):
+    async def get_all_metrics(current_user: User = Depends(get_current_active_user)):
         if current_user.permissions != "admin":
-            from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Admin only")
         return await asyncio.to_thread(_read_all)
 
     @router.get('/metrics/user', summary="Get current user profile and metrics DB stats")
     async def get_user_info(
         username: Optional[str] = Query(None),
-        current_user: User = Depends(get_current_user),
+        current_user: User = Depends(get_current_active_user),
     ):
         """Return metrics DB statistics for the user: entry count, first/last seen
         timestamps and known WAN interfaces.
@@ -2912,7 +3261,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         since: str = Query("1h", description="How far back to look: 15m 30m 1h 6h 12h 24h 2d 7d 30d or seconds"),
         limit: int = Query(1000, ge=1, le=10000, description="Maximum number of data points"),
         username: Optional[str] = Query(None),
-        current_user: User = Depends(get_current_user),
+        current_user: User = Depends(get_current_active_user),
     ):
         if isinstance(_get_backend(), JSONBackend):
             return _501_history
@@ -2935,7 +3284,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         horizon: int = Query(300, ge=1, le=86400, description="Prediction horizon in seconds (default 300 = 5 min)"),
         preemptive: bool = Query(True, description="Fetch history to penalise rising congestion before it peaks"),
         dscp: bool = Query(False, description="Include per-DSCP-traffic-class interface weighting (dscp_classes, dscp_by_interface)"),
-        current_user: User = Depends(get_current_user),
+        current_user: User = Depends(get_current_active_user),
     ):
         target = username if current_user.permissions == "admin" and username else current_user.username
         user_data = await asyncio.to_thread(_read_user, target)
@@ -2949,13 +3298,15 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             def _fetch_predicted():
                 predicted = {}
                 hist_by_iface = {}
-                for iface in user_data:
-                    hist = _read_history(target, iface, max(horizon * 10, 3600), 50)
-                    if len(hist) >= 2:
-                        predicted[iface] = _predict_payload(hist, horizon_seconds=horizon)
-                        hist_by_iface[iface] = hist   # reuse for trend and congestion features
-                    else:
-                        predicted[iface] = user_data[iface]
+                with _forecast_request():
+                    for iface in user_data:
+                        hist = _read_history(target, iface, max(horizon * 10, 3600), 50)
+                        if len(hist) >= 2:
+                            with _torch_forecasts(len(hist_by_iface) < _FORECAST_MAX_TORCH_INTERFACES):
+                                predicted[iface] = _predict_payload(hist, horizon_seconds=horizon)
+                            hist_by_iface[iface] = hist   # reuse for trend and congestion features
+                        else:
+                            predicted[iface] = user_data[iface]
                 return predicted, hist_by_iface
             user_data, history_data = await asyncio.to_thread(_fetch_predicted)
         elif preemptive and has_history_backend:
@@ -3008,7 +3359,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         limit: int = Query(100, ge=10, le=1000,
                            description="Maximum history points per interface"),
         username: Optional[str] = Query(None),
-        current_user: User = Depends(get_current_user),
+        current_user: User = Depends(get_current_active_user),
     ):
         """Return a combined quality forecast for every WAN interface.
 
@@ -3036,31 +3387,36 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
         def _build_forecasts():
             result: dict = {}
-            for iface in user_data:
-                _, hist = _qfetch(iface)
-                result[iface] = {
-                    "congestion": _forecast_metric(
-                        hist, ("congestion", "score"), _CONGESTION_LEVELS,
-                        hi_clamp=100.0, stable_slope_per_min=0.5, horizon_s=horizon,
-                        halflife_s=120.0,
-                    ),
-                    "loss": _forecast_metric(
-                        hist, ("loss",), _LOSS_THRESHOLDS,
-                        hi_clamp=100.0, stable_slope_per_min=0.1, horizon_s=horizon,
-                        halflife_s=180.0,
-                    ),
-                    "jitter": _forecast_metric(
-                        hist, ("jitter",), _JITTER_THRESHOLDS,
-                        hi_clamp=None, stable_slope_per_min=0.5, horizon_s=horizon,
-                        halflife_s=180.0,
-                    ),
-                    "rtt": _forecast_metric(
-                        hist, ("rtt_min",), _RTT_THRESHOLDS,
-                        hi_clamp=None, stable_slope_per_min=2.0, horizon_s=horizon,
-                        halflife_s=180.0,
-                    ),
-                }
+            with _forecast_request():
+                for index, iface in enumerate(user_data):
+                    _, hist = _qfetch(iface)
+                    with _torch_forecasts(index < _FORECAST_MAX_TORCH_INTERFACES):
+                        result[iface] = _iface_forecast(hist)
             return result
+
+        def _iface_forecast(hist):
+            return {
+                "congestion": _forecast_metric(
+                    hist, ("congestion", "score"), _CONGESTION_LEVELS,
+                    hi_clamp=100.0, stable_slope_per_min=0.5, horizon_s=horizon,
+                    halflife_s=120.0,
+                ),
+                "loss": _forecast_metric(
+                    hist, ("loss",), _LOSS_THRESHOLDS,
+                    hi_clamp=100.0, stable_slope_per_min=0.1, horizon_s=horizon,
+                    halflife_s=180.0,
+                ),
+                "jitter": _forecast_metric(
+                    hist, ("jitter",), _JITTER_THRESHOLDS,
+                    hi_clamp=None, stable_slope_per_min=0.5, horizon_s=horizon,
+                    halflife_s=180.0,
+                ),
+                "rtt": _forecast_metric(
+                    hist, ("rtt_min",), _RTT_THRESHOLDS,
+                    hi_clamp=None, stable_slope_per_min=2.0, horizon_s=horizon,
+                    halflife_s=180.0,
+                ),
+            }
 
         return await asyncio.to_thread(_build_forecasts)
 
@@ -3073,7 +3429,6 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
     ):
         if not _TORCH_AVAILABLE:
             return _501
-        from fastapi import HTTPException
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         target = username if username else current_user.username
@@ -3125,10 +3480,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
     @router.post('/metrics/decision/reset',
                  summary="Reset the scorer to heuristic initialization (admin only)")
-    async def reset_decision(current_user: User = Depends(get_current_user)):
+    async def reset_decision(current_user: User = Depends(get_current_active_user)):
         if not _TORCH_AVAILABLE:
             return _501
-        from fastapi import HTTPException
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         global _decision_model, _optimizer
@@ -3143,8 +3497,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
     @router.get('/metrics/decision/auto',
                 summary="Online auto-learning status (admin only)")
-    async def get_auto_learning(current_user: User = Depends(get_current_user)):
-        from fastapi import HTTPException
+    async def get_auto_learning(current_user: User = Depends(get_current_active_user)):
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         return {"auto_learning": _auto_status()}
@@ -3162,7 +3515,6 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         when possible; disabling leaves the task idling so a later enable is
         instant — the loop trains nothing while disabled.
         """
-        from fastapi import HTTPException
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         persisted = _auto_set_enabled(toggle.enabled)
@@ -3178,8 +3530,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
     @router.get('/metrics/prometheus',
                 summary="All WAN metrics in Prometheus text format (admin only)")
-    async def get_prometheus_metrics(current_user: User = Depends(get_current_user)):
-        from fastapi import HTTPException
+    async def get_prometheus_metrics(current_user: User = Depends(get_current_active_user)):
         from starlette.responses import PlainTextResponse
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
@@ -3193,8 +3544,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
     @router.get('/metrics/engine',
                 summary="Decision engine and storage backend diagnostics (admin only)")
-    async def get_engine_diagnostics(current_user: User = Depends(get_current_user)):
-        from fastapi import HTTPException
+    async def get_engine_diagnostics(current_user: User = Depends(get_current_active_user)):
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         return _engine_diagnostics()

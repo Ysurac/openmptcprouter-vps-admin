@@ -8,6 +8,8 @@
 # Auth
 # ----
 # HTTP Basic (default): credentials must match OMR_USER / OMR_PASS env vars.
+#                       The server refuses to start when OMR_PASS is unset,
+#                       empty or the old "changeme" default.
 # No-auth (dev):        set OMR_NOAUTH=1 to skip auth entirely.
 #
 # Usage
@@ -33,7 +35,13 @@ LOG = logging.getLogger("uvicorn.error")
 
 _NOAUTH = os.getenv("OMR_NOAUTH", "").strip() in ("1", "true", "yes")
 _USER   = os.getenv("OMR_USER", "admin")
-_PASS   = os.getenv("OMR_PASS", "changeme")
+_PASS   = os.getenv("OMR_PASS", "")
+
+# The API is admin-only and the port may be published: never run it with a
+# missing or well-known password.
+if not _NOAUTH and _PASS.strip() in ("", "changeme"):
+    raise SystemExit("omr_metrics_standalone: set OMR_PASS to a strong password "
+                     "(unset, empty and 'changeme' are refused), or OMR_NOAUTH=1 for local dev")
 
 _THE_USER = None   # built after env vars are read (see below)
 
@@ -85,6 +93,8 @@ app = FastAPI(
 )
 
 _THE_USER = User(username=_USER, permissions="admin")
+# The single standalone user is the owner: its metrics may train the model.
+omr_metrics.TRUSTED_TRAINING_USERS.add(_USER)
 
 app.include_router(
     omr_metrics.create_router(get_current_user, get_current_active_user, User)

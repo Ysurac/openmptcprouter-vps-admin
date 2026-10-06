@@ -23,6 +23,11 @@ omr-vps-admin (0.18+20261006) unstable; urgency=medium
   * Record the one-time XRay reverse uuid rotation (xray_reverse_per_user) only once xray-server.json is written: recorded before, a failed write left the shared uuid every router had seen in place for good
   * v2ray_del_user no longer rewrites v2ray-server.json and restarts V2Ray for every user when the user had nothing there (a file with another layout always looked changed)
   * /config: match the OpenVPN port and cipher directives exactly in tun0.conf (a substring test also read comments or other directives)
+  * omr_metrics: the JSON backend writes under a file lock shared by the uvicorn workers, through a unique 0600 temp file (two workers lost each other's metrics, and a half-written file made the next write wipe every user's), and keeps a corrupt file aside instead of overwriting it; the model file is saved the same way and reloaded by every worker when it changes, and only one worker runs the auto-learning
+  * omr_metrics: bound what a router posts: interface names [A-Za-z0-9_.@:-] of 32 characters at most, 32 interfaces per user, no NaN or infinite values, 64-bit integers, and a timestamp more than 5 minutes off the server's replaced by the receive time. A NaN, a huge number or a forged name broke the admin's /metrics/all, /metrics/prometheus and /metrics/decision for everyone; the Prometheus labels are now escaped (an interface name could add lines for another user)
+  * omr_metrics: train the shared decision model only on the admin's and the main router's metrics (any user's self-reported ones steered every user's weights), bound the torch forecasts (8 interfaces per request, 2 requests at once per worker, the linear estimate otherwise), refuse disabled users on the GET routes too, and fix the training loss, which was divided by the number of interfaces
+  * omr_metrics_standalone and docker-compose: refuse to start without a real OMR_PASS (it defaulted to "changeme") and publish the port on 127.0.0.1 unless OMR_BIND says otherwise
+  * Add tests for the above (test/test_hardening.py, test/test_metrics.py) and adapt the firewall, MQVPN, dsvpn, user and XRay reverse tests to the new behaviour
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 06 Oct 2026 00:00:00 +0200
 

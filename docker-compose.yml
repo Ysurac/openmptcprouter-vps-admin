@@ -41,7 +41,9 @@ x-app-base: &app-base
       "
       exec uvicorn omr_metrics_standalone:app --host 0.0.0.0 --port 8080
   ports:
-    - "${OMR_PORT:-8080}:8080"
+    # Published on localhost only by default; set OMR_BIND=0.0.0.0 in .env to
+    # expose it (the app refuses to start without a real OMR_PASS).
+    - "${OMR_BIND:-127.0.0.1}:${OMR_PORT:-8080}:8080"
   env_file: .env
   volumes:
     - omr-data:/etc/openmptcprouter-vps-admin

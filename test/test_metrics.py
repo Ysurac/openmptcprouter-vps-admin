@@ -125,15 +125,19 @@ def reset_backend():
     orig_ema    = dict(omr_metrics._weight_ema)
     omr_metrics._backend        = None
     omr_metrics._decision_model = None
+    omr_metrics._decision_model_mtime = None
     omr_metrics._weight_ema     = {}
     omr_metrics._auto_cfg_cache = {"ts": 0.0, "cfg": None}
     omr_metrics._auto_bad_streak = 0
+    omr_metrics._iface_cache.clear()
     yield
     omr_metrics._backend        = orig_backend
     omr_metrics._decision_model = orig_model
+    omr_metrics._decision_model_mtime = None
     omr_metrics._weight_ema     = orig_ema
     omr_metrics._auto_cfg_cache = {"ts": 0.0, "cfg": None}
     omr_metrics._auto_bad_streak = 0
+    omr_metrics._iface_cache.clear()
 
 
 @pytest.fixture
@@ -258,10 +262,11 @@ class TestPostMetrics:
         def fake_write(username, payload):
             captured["payload"] = payload
 
+        router_ts = int(time.time()) - 120   # within the accepted clock skew
         with patch.object(omr_metrics, "_write_interface", side_effect=fake_write):
-            self._post(user_client, _WAN)
+            self._post(user_client, {**_WAN, "timestamp": router_ts})
 
-        assert captured["payload"]["timestamp"] == 1_700_000_000
+        assert captured["payload"]["timestamp"] == router_ts
 
     def test_multiple_interfaces_stored_separately(self, user_client):
         calls = []
@@ -2289,39 +2294,57 @@ class TestGetModel:
 # ===========================================================================
 
 class TestSaveModel:
-    def test_writes_to_tmp_then_replaces(self, torch_env):
+    def test_writes_to_unique_tmp_then_replaces(self, torch_env, tmp_path):
         replaced = []
         model = _FakeModel()
+        model_file = str(tmp_path / "model.pt")
+
+        def spy_replace(src, dst):
+            replaced.append((src, dst))
+            _REAL_REPLACE(src, dst)
 
         with (
-            patch.object(omr_metrics, "DECISION_MODEL_FILE", "/fake/model.pt"),
-            patch("os.replace", side_effect=lambda s, d: replaced.append((s, d))),
+            patch.object(omr_metrics, "DECISION_MODEL_FILE", model_file),
+            patch("os.replace", side_effect=spy_replace),
         ):
             omr_metrics._save_model(model)
 
         assert len(replaced) == 1
         src, dst = replaced[0]
-        assert src == "/fake/model.pt.tmp"
-        assert dst == "/fake/model.pt"
+        # Unique per call (not a fixed .pt.tmp shared by the workers), same dir
+        assert src != model_file + ".tmp"
+        assert os.path.dirname(src) == str(tmp_path)
+        assert src.endswith(".tmp")
+        assert dst == model_file
+        assert os.stat(model_file).st_mode & 0o777 == 0o600
+        assert os.listdir(tmp_path) == ["model.pt"]
 
-    def test_passes_state_dict_to_torch_save(self, torch_env):
+    def test_passes_state_dict_to_torch_save(self, torch_env, tmp_path):
         saved = []
         model = _FakeModel()
 
         patched_torch = _FakeTorch()
-        patched_torch.save = lambda obj, path: saved.append((obj, path))
+        patched_torch.save = lambda obj, f: saved.append((obj, f.name))
 
         with (
             patch.dict(omr_metrics.__dict__, {"torch": patched_torch}),
-            patch.object(omr_metrics, "DECISION_MODEL_FILE", "/fake/model.pt"),
-            patch("os.replace"),
+            patch.object(omr_metrics, "DECISION_MODEL_FILE", str(tmp_path / "model.pt")),
         ):
             omr_metrics._save_model(model)
 
         assert len(saved) == 1
-        obj, path = saved[0]
+        obj, _ = saved[0]
         assert obj == model.state_dict()
-        assert path == "/fake/model.pt.tmp"
+
+    def test_save_error_removes_tmp_file(self, torch_env, tmp_path):
+        broken_torch = _FakeTorch()
+        broken_torch.save = lambda obj, f: (_ for _ in ()).throw(OSError("disk full"))
+        with (
+            patch.dict(omr_metrics.__dict__, {"torch": broken_torch}),
+            patch.object(omr_metrics, "DECISION_MODEL_FILE", str(tmp_path / "model.pt")),
+        ):
+            omr_metrics._save_model(_FakeModel())  # must not raise
+        assert os.listdir(tmp_path) == []
 
     def test_save_error_does_not_raise(self, torch_env):
         model = _FakeModel()
@@ -3695,7 +3718,7 @@ class TestAutoLearnRound:
         }
         with (
             patch.object(omr_metrics, "_read_all",
-                         return_value={"user1": {"wan": _WAN, "wan2": _WAN2}}),
+                         return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
             patch.object(omr_metrics, "_read_history",
                          side_effect=lambda u, i, s, l: hists[i]),
             patch.object(omr_metrics, "_train_step", return_value=0.05) as ts,
@@ -3715,7 +3738,7 @@ class TestAutoLearnRound:
         self._influx_env()
         with (
             patch.object(omr_metrics, "_read_all",
-                         return_value={"user1": {"wan": _WAN}}),
+                         return_value={"openmptcprouter": {"wan": _WAN}}),
             patch.object(omr_metrics, "_train_step") as ts,
         ):
             summary = omr_metrics._auto_learn_round(self._CFG)
@@ -3730,7 +3753,7 @@ class TestAutoLearnRound:
         }
         with (
             patch.object(omr_metrics, "_read_all",
-                         return_value={"user1": {"wan": _WAN, "wan2": _WAN2}}),
+                         return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
             patch.object(omr_metrics, "_read_history",
                          side_effect=lambda u, i, s, l: hists[i]),
             patch.object(omr_metrics, "_train_step") as ts,
@@ -3747,7 +3770,7 @@ class TestAutoLearnRound:
         }
         with (
             patch.object(omr_metrics, "_read_all",
-                         return_value={"user1": {"wan": _WAN, "wan2": _WAN2}}),
+                         return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
             patch.object(omr_metrics, "_read_history",
                          side_effect=lambda u, i, s, l: hists[i]),
             patch.object(omr_metrics, "_train_step", side_effect=RuntimeError("boom")),
@@ -3944,3 +3967,449 @@ class TestAutoLearningEndpoint:
         assert cfg["auto_learning"]["enabled"] is False
         assert "users" in cfg          # pre-existing config keys kept
         assert "port" in cfg
+
+
+# ===========================================================================
+# Hardening: storage, input bounds, exposition, CPU bounds, training trust
+# ===========================================================================
+
+def _json_backend_files(tmp_path):
+    return (
+        patch("builtins.open", new=_REAL_OPEN),
+        patch("os.replace", new=_REAL_REPLACE),
+        patch.object(omr_metrics, "METRICS_FILE", str(tmp_path / "omr-metrics.json")),
+    )
+
+
+def _write_many(metrics_file, username, count):
+    """Child process body for the cross-process JSON write test."""
+    with patch.object(omr_metrics, "METRICS_FILE", metrics_file):
+        backend = omr_metrics.JSONBackend()
+        for i in range(count):
+            backend.write_interface(username, {**_WAN, "interface": f"wan{i}"})
+
+
+class TestJSONBackendHardening:
+    def test_files_are_created_0600_without_leftovers(self, tmp_path):
+        a, b, c = _json_backend_files(tmp_path)
+        with a, b, c:
+            assert omr_metrics.JSONBackend().write_interface("alice", _WAN) is True
+        metrics_file = tmp_path / "omr-metrics.json"
+        assert os.stat(metrics_file).st_mode & 0o777 == 0o600
+        assert os.stat(str(metrics_file) + ".lock").st_mode & 0o777 == 0o600
+        assert sorted(os.listdir(tmp_path)) == ["omr-metrics.json", "omr-metrics.json.lock"]
+
+    def test_writes_from_two_processes_are_not_lost(self, tmp_path):
+        import multiprocessing
+        metrics_file = str(tmp_path / "omr-metrics.json")
+        ctx = multiprocessing.get_context("fork")
+        with (
+            patch("builtins.open", new=_REAL_OPEN),
+            patch("os.replace", new=_REAL_REPLACE),
+        ):
+            procs = [ctx.Process(target=_write_many, args=(metrics_file, user, 25))
+                     for user in ("alice", "bob")]
+            for proc in procs:
+                proc.start()
+            for proc in procs:
+                proc.join(60)
+            assert all(proc.exitcode == 0 for proc in procs)
+            with patch.object(omr_metrics, "METRICS_FILE", metrics_file):
+                data = omr_metrics.JSONBackend().read_all()
+        assert len(data["alice"]) == 25
+        assert len(data["bob"]) == 25
+
+    def test_corrupt_file_is_kept_aside_not_overwritten(self, tmp_path):
+        metrics_file = tmp_path / "omr-metrics.json"
+        metrics_file.write_text('{"bob": {"wan": {"interface": "wan"')   # half-written
+        a, b, c = _json_backend_files(tmp_path)
+        with a, b, c:
+            assert omr_metrics.JSONBackend().write_interface("alice", _WAN) is True
+        aside = [name for name in os.listdir(tmp_path) if ".corrupt." in name]
+        assert len(aside) == 1
+        assert (tmp_path / aside[0]).read_text() == '{"bob": {"wan": {"interface": "wan"'
+        assert list(json.loads(metrics_file.read_text())) == ["alice"]
+
+    def test_unreadable_file_refuses_the_write(self, tmp_path):
+        metrics_file = tmp_path / "omr-metrics.json"
+        metrics_file.write_text('{"bob": {}}')
+        backend = omr_metrics.JSONBackend()
+        a, b, c = _json_backend_files(tmp_path)
+        with a, b, c, patch.object(backend, "_load", side_effect=PermissionError("denied")):
+            assert backend.write_interface("alice", _WAN) is False
+        assert metrics_file.read_text() == '{"bob": {}}'
+
+    def test_non_object_json_reads_as_empty(self, tmp_path):
+        (tmp_path / "omr-metrics.json").write_text("[1, 2]")
+        a, b, c = _json_backend_files(tmp_path)
+        with a, b, c:
+            assert omr_metrics.JSONBackend().read_all() == {}
+
+
+class TestInterfaceMetricsValidation:
+    def _post(self, client, payload):
+        with patch.object(omr_metrics, "_write_interface", return_value=True) as wi:
+            r = client.post("/metrics", json=payload)
+        return r, wi
+
+    @pytest.mark.parametrize("name", ["wan", "wan1", "lan", "eth0.2", "wwan0",
+                                      "4g_modem", "pppoe-wan", "wan@eth0", "a" * 32])
+    def test_openwrt_interface_names_accepted(self, user_client, name):
+        r, _ = self._post(user_client, {**_WAN, "interface": name})
+        assert r.status_code == 200
+
+    @pytest.mark.parametrize("name", ["", "a" * 33, "wan 1", 'wan"x', "wan\n", "wan{}", "wän"])
+    def test_bad_interface_names_rejected(self, user_client, name):
+        r, wi = self._post(user_client, {**_WAN, "interface": name})
+        assert r.status_code == 422
+        wi.assert_not_called()
+
+    def test_bad_device_tag_rejected(self, user_client):
+        r, _ = self._post(user_client, {**_WAN, "device": 'eth0",x="1'})
+        assert r.status_code == 422
+
+    def test_empty_status_still_accepted(self, user_client):
+        r, _ = self._post(user_client, {**_WAN, "status": ""})
+        assert r.status_code == 200
+
+    def test_oversized_text_rejected(self, user_client):
+        r, _ = self._post(user_client, {**_WAN, "asn": "A" * 10_000})
+        assert r.status_code == 422
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_floats_rejected(self, user_client, value):
+        r, wi = self._post(user_client, {**_WAN, "latency": value})
+        assert r.status_code == 422
+        wi.assert_not_called()
+
+    def test_nested_non_finite_float_rejected(self, user_client):
+        r, _ = self._post(user_client, {**_WAN, "bbr": {"min_rtt": float("nan")}})
+        assert r.status_code == 422
+
+    @pytest.mark.parametrize("field", ["cost", "weight", "timestamp"])
+    def test_huge_integers_rejected(self, user_client, field):
+        r, wi = self._post(user_client, {**_WAN, field: 10 ** 400})
+        assert r.status_code == 422
+        wi.assert_not_called()
+
+    def test_huge_nested_counter_rejected(self, user_client):
+        r, _ = self._post(user_client, {**_WAN, "bandwidth": {"rx_bytes": 2 ** 64}})
+        assert r.status_code == 422
+
+    @pytest.mark.parametrize("offset", [-100_000, 100_000, -301, 301])
+    def test_skewed_router_clock_gets_receive_time(self, user_client, offset):
+        before = int(time.time())
+        r, wi = self._post(user_client, {**_WAN, "timestamp": before + offset})
+        assert r.status_code == 200
+        stored = wi.call_args.args[1]["timestamp"]
+        assert before <= stored <= int(time.time())
+
+    def test_new_interface_beyond_cap_refused_existing_still_updated(self, user_client):
+        known = [f"wan{i}" for i in range(omr_metrics.MAX_INTERFACES_PER_USER)]
+        backend = MagicMock()
+        backend.interfaces.return_value = known
+        omr_metrics._backend = backend
+        r_new, wi_new = self._post(user_client, {**_WAN, "interface": "extra"})
+        r_old, wi_old = self._post(user_client, {**_WAN, "interface": "wan3"})
+        assert r_new.status_code == 422
+        wi_new.assert_not_called()
+        assert r_old.status_code == 200
+        wi_old.assert_called_once()
+
+    def test_cap_counts_interfaces_accepted_since_cache_refresh(self, user_client):
+        backend = MagicMock()
+        backend.interfaces.return_value = []
+        omr_metrics._backend = backend
+        with patch.object(omr_metrics, "MAX_INTERFACES_PER_USER", 2):
+            codes = [self._post(user_client, {**_WAN, "interface": name})[0].status_code
+                     for name in ("wan", "wan2", "wan", "wan3")]
+        assert codes == [200, 200, 200, 422]
+        backend.interfaces.assert_called_once_with("openmptcprouter")
+
+
+class TestStoredValueOverflow:
+    def test_cost_factor_survives_bad_stored_cost(self):
+        assert omr_metrics._cost_factor({"cost": 10 ** 400}) == 1.0
+        assert omr_metrics._cost_factor({"cost": "cheap"}) == 1.0
+        assert omr_metrics._cost_factor({"cost": 5e-324}) == 1.0
+        assert omr_metrics._cost_factor({"cost": 4}) == 0.25
+
+    def test_prometheus_survives_huge_timestamp(self):
+        text = omr_metrics._to_prometheus_text({"u": {"wan": {**_WAN, "timestamp": 10 ** 400}}})
+        assert "omr_latency_ms" in text
+        assert "omr_data_age_seconds" not in text
+
+    def test_decision_endpoint_survives_bad_stored_row(self, user_client):
+        row = {**_WAN, "cost": 10 ** 400, "timestamp": 10 ** 400}
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", False),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": row, "wan2": _WAN2}),
+        ):
+            r = user_client.get("/metrics/decision")
+        assert r.status_code == 200
+        assert set(r.json()["weights"]) == {"wan", "wan2"}
+
+
+class TestPrometheusEscaping:
+    def test_label_values_are_escaped(self):
+        text = omr_metrics._to_prometheus_text({'a"b\\c\nd': {"wan": _WAN}})
+        assert 'username="a\\"b\\\\c\\nd"' in text
+        # one sample per line: the newline did not split the line
+        for line in text.splitlines():
+            assert line.startswith(("#", "omr_"))
+
+    def test_anomaly_label_escaped(self):
+        with patch.object(omr_metrics, "_interface_anomalies", return_value=['x"y']):
+            text = omr_metrics._to_prometheus_text({"u": {"wan": _WAN}})
+        assert 'anomaly="x\\"y"' in text
+
+
+class TestForecastBounds:
+    def _hist(self, n=3):
+        now = int(time.time())
+        return [{**_WAN, "timestamp": now - 30 * (n - i), "latency": 20.0 + i} for i in range(n)]
+
+    def _torch_calls(self, n_ifaces):
+        user_data = {f"wan{i}": {**_WAN, "interface": f"wan{i}"} for i in range(n_ifaces)}
+        history = {iface: self._hist() for iface in user_data}
+        calls = []
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_predict_at",
+                         side_effect=lambda *a, **k: calls.append(1)),
+        ):
+            omr_metrics._dscp_class_weights(user_data, history, {})
+        return len(calls)
+
+    def _per_iface(self):
+        horizons = {c[4] for c in omr_metrics._DSCP_CLASSES}
+        return len(horizons) * len(omr_metrics._PREDICTABLE)
+
+    def test_small_request_unchanged(self):
+        assert self._torch_calls(2) == 2 * self._per_iface()
+
+    def test_torch_forecasts_capped_per_request(self):
+        cap = omr_metrics._FORECAST_MAX_TORCH_INTERFACES
+        assert self._torch_calls(cap + 4) == cap * self._per_iface()
+
+    def test_no_free_slot_falls_back_to_linear(self):
+        slots = omr_metrics._forecast_slots
+        taken = 0
+        while slots.acquire(blocking=False):
+            taken += 1
+        try:
+            assert self._torch_calls(2) == 0
+        finally:
+            for _ in range(taken):
+                slots.release()
+        assert self._torch_calls(1) == self._per_iface()   # slots released
+
+    def test_quality_forecast_endpoint_ok_while_busy(self, user_client):
+        slots = omr_metrics._forecast_slots
+        taken = 0
+        while slots.acquire(blocking=False):
+            taken += 1
+        try:
+            with (
+                patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+                patch.object(omr_metrics, "_read_history", return_value=self._hist(6)),
+                patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+                patch.object(omr_metrics, "_torch_predict_at") as tp,
+            ):
+                r = user_client.get("/metrics/quality/forecast")
+        finally:
+            for _ in range(taken):
+                slots.release()
+        assert r.status_code == 200
+        assert "wan" in r.json()
+        tp.assert_not_called()
+
+
+class TestTrustedTraining:
+    _CFG = {**omr_metrics._AUTO_DEFAULTS, "enabled": True}
+
+    def test_trusted_users_from_config(self):
+        # MOCK_CONFIG: admin (permissions admin), openmptcprouter (userid 0), readonly
+        assert omr_metrics._trusted_training_users() == {"admin", "openmptcprouter"}
+
+    def test_trusted_users_criteria(self):
+        import io
+        cfg = {"users": [{
+            "boss": {"permissions": "admin"},
+            "main": {"userid": "0"},
+            "tenant": {"userid": 3, "permissions": "rw"},
+        }]}
+        with patch("builtins.open", return_value=io.StringIO(json.dumps(cfg))):
+            assert omr_metrics._trusted_training_users() == {"boss", "main"}
+
+    def test_fallback_when_config_has_no_users(self):
+        with patch("builtins.open", side_effect=OSError("missing")):
+            assert omr_metrics._trusted_training_users() == {"admin", "openmptcprouter"}
+
+    def test_tenant_metrics_never_train_the_model(self, torch_env):
+        omr_metrics._backend = MagicMock()   # history-capable backend
+        hists = {"wan": _auto_hist(_WAN, n=10, loss=0.0),
+                 "wan2": _auto_hist(_WAN2, n=10, loss=15.0)}
+        read_users = []
+
+        def fake_history(user, iface, since, limit):
+            read_users.append(user)
+            return hists[iface]
+
+        with (
+            patch.object(omr_metrics, "_read_all", return_value={
+                "tenant": {"wan": _WAN, "wan2": _WAN2},
+                "openmptcprouter": {"wan": _WAN, "wan2": _WAN2},
+            }),
+            patch.object(omr_metrics, "_read_history", side_effect=fake_history),
+            patch.object(omr_metrics, "_train_step", return_value=0.05) as ts,
+            patch.object(omr_metrics, "_get_model", return_value=_FakeModel()),
+            patch.object(omr_metrics, "_save_model"),
+        ):
+            summary = omr_metrics._auto_learn_round(self._CFG)
+        assert summary["trained"] == 1
+        ts.assert_called_once()
+        assert set(read_users) == {"openmptcprouter"}
+
+
+class TestDisabledUserRefused:
+    @pytest.fixture
+    def disabled_client(self):
+        from conftest import _ASGITestClient
+        disabled = omr_admin.User(username="openmptcprouter", userid=0,
+                                  permissions="admin", disabled=True)
+        app.dependency_overrides[omr_admin.get_current_user] = lambda: disabled
+        yield _ASGITestClient(app, raise_server_exceptions=False)
+        app.dependency_overrides.pop(omr_admin.get_current_user, None)
+
+    @pytest.mark.parametrize("path", [
+        "/metrics", "/metrics/all", "/metrics/user", "/metrics/history",
+        "/metrics/decision", "/metrics/quality/forecast", "/metrics/decision/auto",
+        "/metrics/prometheus", "/metrics/engine",
+    ])
+    def test_get_endpoints_refuse_disabled_user(self, disabled_client, path):
+        with patch.object(omr_metrics, "_read_user") as ru, \
+             patch.object(omr_metrics, "_read_all") as ra:
+            r = disabled_client.get(path)
+        assert r.status_code == 400
+        ru.assert_not_called()
+        ra.assert_not_called()
+
+    def test_reset_refuses_disabled_user(self, disabled_client):
+        assert disabled_client.post("/metrics/decision/reset").status_code == 400
+
+
+class TestModelSharedAcrossWorkers:
+    def test_reloads_when_another_worker_saved(self, torch_env):
+        old, new = _FakeModel(), _FakeModel()
+        omr_metrics._decision_model = old
+        omr_metrics._decision_model_mtime = 1
+        omr_metrics._optimizer = object()
+        with (
+            patch.object(omr_metrics, "_model_file_mtime", return_value=2),
+            patch.object(omr_metrics, "_load_model_file", return_value=new) as lm,
+        ):
+            assert omr_metrics._get_model() is new
+            assert omr_metrics._get_model() is new
+        lm.assert_called_once()
+        assert omr_metrics._optimizer is None
+
+    def test_unchanged_file_is_not_reloaded(self, torch_env):
+        cached = _FakeModel()
+        omr_metrics._decision_model = cached
+        omr_metrics._decision_model_mtime = 5
+        with (
+            patch.object(omr_metrics, "_model_file_mtime", return_value=5),
+            patch.object(omr_metrics, "_load_model_file") as lm,
+        ):
+            assert omr_metrics._get_model() is cached
+        lm.assert_not_called()
+
+    def test_bad_new_file_keeps_current_model(self, torch_env):
+        cached = _FakeModel()
+        omr_metrics._decision_model = cached
+        omr_metrics._decision_model_mtime = 1
+        with (
+            patch.object(omr_metrics, "_model_file_mtime", return_value=2),
+            patch.object(omr_metrics, "_load_model_file", return_value=None) as lm,
+        ):
+            assert omr_metrics._get_model() is cached
+            assert omr_metrics._get_model() is cached
+        lm.assert_called_once()   # not retried at every request
+
+    def test_own_save_is_not_reloaded(self, torch_env, tmp_path):
+        model = _FakeModel()
+        with patch.object(omr_metrics, "DECISION_MODEL_FILE", str(tmp_path / "model.pt")):
+            omr_metrics._decision_model = model
+            omr_metrics._save_model(model)
+            assert omr_metrics._decision_model_mtime == omr_metrics._model_file_mtime()
+            with patch.object(omr_metrics, "_load_model_file") as lm:
+                assert omr_metrics._get_model() is model
+            lm.assert_not_called()
+
+
+class TestAutoLearningLeader:
+    def test_only_one_worker_leads(self, tmp_path):
+        with patch.object(omr_metrics, "DECISION_MODEL_FILE", str(tmp_path / "m.pt")):
+            try:
+                assert omr_metrics._auto_leader() is True
+                assert omr_metrics._auto_leader() is True   # kept
+                leader_fd = omr_metrics._auto_leader_fd
+                lock_file = tmp_path / ".omr-auto-learning.lock"
+                assert os.stat(lock_file).st_mode & 0o777 == 0o600
+                # What another worker sees: its own descriptor, same file
+                omr_metrics._auto_leader_fd = None
+                assert omr_metrics._auto_leader() is False
+                os.close(leader_fd)   # the leader dies
+                assert omr_metrics._auto_leader() is True
+            finally:
+                omr_metrics._auto_release_leader()
+        assert omr_metrics._auto_leader_fd is None
+
+    def test_stop_releases_leadership(self, tmp_path):
+        with patch.object(omr_metrics, "DECISION_MODEL_FILE", str(tmp_path / "m.pt")):
+            assert omr_metrics._auto_leader() is True
+            omr_metrics.stop_auto_learning()
+            assert omr_metrics._auto_leader_fd is None
+
+
+class TestTrainLoss:
+    def test_kl_is_summed_over_interfaces(self, torch_env):
+        seen = []
+
+        def spy(log_input, target, reduction="batchmean"):
+            seen.append(reduction)
+            return _fake_kl_div(log_input, target)
+
+        omr_metrics._decision_model = _FakeModel()
+        with patch.object(_FakeFunctional, "kl_div", staticmethod(spy)):
+            omr_metrics._train_step({"wan": _WAN, "wan2": _WAN2},
+                                    {"wan": 1.0, "wan2": 0.0}, 0.01)
+        assert seen == ["sum"]
+
+
+class TestStandalonePassword:
+    def _import(self, monkeypatch, **env):
+        import importlib
+        import sys
+        for key in ("OMR_PASS", "OMR_NOAUTH", "OMR_USER"):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.delitem(sys.modules, "omr_metrics_standalone", raising=False)
+        try:
+            return importlib.import_module("omr_metrics_standalone")
+        finally:
+            sys.modules.pop("omr_metrics_standalone", None)
+
+    @pytest.mark.parametrize("env", [{}, {"OMR_PASS": ""}, {"OMR_PASS": "changeme"}])
+    def test_refuses_to_start_without_real_password(self, monkeypatch, env):
+        with pytest.raises(SystemExit):
+            self._import(monkeypatch, **env)
+
+    def test_starts_with_a_password(self, monkeypatch):
+        module = self._import(monkeypatch, OMR_PASS="a-real-secret", OMR_USER="admin")
+        assert module.app is not None
+
+    def test_noauth_dev_mode_still_starts(self, monkeypatch):
+        assert self._import(monkeypatch, OMR_NOAUTH="1").app is not None
