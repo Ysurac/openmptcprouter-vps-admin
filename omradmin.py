@@ -448,6 +448,41 @@ def _pki_index_line_is(line, username):
     subject = line.rstrip('\r\n').split('\t')[-1]
     return re.search(r'/CN=' + re.escape(username) + r'(?:/|$)', subject) is not None
 
+PKI_DIR = '/etc/openvpn/ca/pki'
+
+def _pki_retire_user_certs(username):
+    """Mark the still valid certificates of *username* revoked in easyrsa's
+    index.txt, so build-client-full can issue a new one (openssl refuses a
+    second valid certificate for a subject), then regenerate the CRL.
+    The lines used to be deleted instead: a revoked certificate then left
+    the next CRL and worked again, and a valid one could never be revoked.
+    True if a certificate was revoked."""
+    index_file = os.path.join(PKI_DIR, 'index.txt')
+    if not os.path.isfile(index_file):
+        return False
+    with open(index_file, 'r') as f:
+        lines = f.readlines()
+    revoked_at = time.strftime('%y%m%d%H%M%SZ', time.gmtime())
+    changed = False
+    for i, line in enumerate(lines):
+        fields = line.rstrip('\r\n').split('\t')
+        if len(fields) >= 6 and fields[0] == 'V' and _pki_index_line_is(line, username):
+            fields[0] = 'R'
+            fields[2] = revoked_at
+            lines[i] = '\t'.join(fields) + '\n'
+            changed = True
+    if changed:
+        LOG.debug("Revoking the previous certificate of %s", log_safe(username))
+        _atomic_write_text(index_file, ''.join(lines))
+        _openvpn_gen_crl()
+    return changed
+
+def _openvpn_gen_crl():
+    env = os.environ.copy()
+    env['EASYRSA_CRL_DAYS'] = '3650'
+    subprocess.run(["./easyrsa", "gen-crl"], cwd="/etc/openvpn/ca", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    subprocess.run(["chmod", "644", os.path.join(PKI_DIR, 'crl.pem')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
 def get_bytes_openvpn(user):
     try:
         ovpn_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3693,15 +3728,7 @@ async def config(userid: Optional[int] = Query(None), username: Optional[str] = 
     if not os.path.isfile('/etc/openvpn/ca/pki/private/' + username + '.key') or not os.path.isfile('/etc/openvpn/ca/pki/issued/' + username + '.crt'):
         if os.path.isfile('/etc/openvpn/tun0.conf'):
             LOG.debug("OpenVPN cert missing for %s, creating it", username)
-            index_file = '/etc/openvpn/ca/pki/index.txt'
-            if os.path.isfile(index_file):
-                with open(index_file, 'r') as f:
-                    lines = f.readlines()
-                filtered = [l for l in lines if not _pki_index_line_is(l, username)]
-                if len(filtered) != len(lines):
-                    LOG.debug("Removing stale PKI index entry for %s", username)
-                    with open(index_file, 'w') as f:
-                        f.writelines(filtered)
+            _pki_retire_user_certs(username)
             for stale in [
                 f"/etc/openvpn/ca/pki/reqs/{username}.req",
                 f"/etc/openvpn/ca/pki/private/{username}.key",
@@ -7137,16 +7164,8 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     # a certificate failure cannot leave orphaned proxy or tunnel accounts.
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         LOG.debug("Create user " + log_safe(params.username) + " in OpenVPN")
-        # Clean up any leftover revoked PKI entry for this CN so easyrsa can reissue
-        index_file = '/etc/openvpn/ca/pki/index.txt'
-        if os.path.isfile(index_file):
-            with open(index_file, 'r') as f:
-                lines = f.readlines()
-            filtered = [l for l in lines if not _pki_index_line_is(l, params.username)]
-            if len(filtered) != len(lines):
-                LOG.debug("Removing stale PKI index entry for %s", log_safe(params.username))
-                with open(index_file, 'w') as f:
-                    f.writelines(filtered)
+        # A certificate left valid for this CN would make easyrsa refuse to reissue
+        _pki_retire_user_certs(params.username)
         for stale in [
             safe_path_join('/etc/openvpn/ca/pki/reqs', params.username + '.req'),
             safe_path_join('/etc/openvpn/ca/pki/private', params.username + '.key'),
@@ -7265,10 +7284,10 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     _mutate_omr_config(persist_removal)
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         subprocess.run(["./easyrsa", "--batch", "revoke", params.username], cwd="/etc/openvpn/ca", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        env = os.environ.copy()
-        env['EASYRSA_CRL_DAYS'] = '3650'
-        subprocess.run(["./easyrsa", "gen-crl"], cwd="/etc/openvpn/ca", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        subprocess.run(["chmod", "644", "/etc/openvpn/ca/pki/crl.pem"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        # Whatever easyrsa could not revoke (no issued file left) is revoked
+        # in the index, which also regenerates the CRL.
+        if not _pki_retire_user_certs(params.username):
+            _openvpn_gen_crl()
         req_file = safe_path_join('/etc/openvpn/ca/pki/reqs', params.username + '.req')
         if os.path.isfile(req_file):
             os.remove(req_file)

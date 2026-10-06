@@ -260,3 +260,38 @@ class TestWireGuardNewline:
 # ---------------------------------------------------------------------------
 # OpenVPN certificates
 # ---------------------------------------------------------------------------
+
+class TestPkiRetire:
+    _INDEX = ("R\t360101000000Z\t250101000000Z\t01\tunknown\t/CN=bob\n"
+              "V\t360101000000Z\t\t02\tunknown\t/CN=bob\n"
+              "V\t360101000000Z\t\t03\tunknown\t/CN=bobby\n")
+
+    def test_valid_certificate_revoked_and_revoked_one_kept(self):
+        written = {}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/openvpn/ca/pki/index.txt": self._INDEX})),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, new_mode=0o644: written.update({p: t})),
+            patch("omr_admin._openvpn_gen_crl") as gen_crl,
+        ):
+            assert omr_admin._pki_retire_user_certs("bob")
+        lines = written["/etc/openvpn/ca/pki/index.txt"].splitlines()
+        assert lines[0] == self._INDEX.splitlines()[0]          # still revoked, still in the CRL
+        assert lines[1].startswith("R\t360101000000Z\t") and lines[1].split("\t")[2]
+        assert lines[2].startswith("V\t")                        # bobby untouched
+        gen_crl.assert_called_once()
+
+    def test_nothing_valid_nothing_written(self):
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/openvpn/ca/pki/index.txt": self._INDEX})),
+            patch("omr_admin._atomic_write_text") as write,
+            patch("omr_admin._openvpn_gen_crl") as gen_crl,
+        ):
+            assert not omr_admin._pki_retire_user_certs("alice")
+        assert not write.called and not gen_crl.called
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
