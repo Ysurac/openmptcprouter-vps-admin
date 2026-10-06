@@ -10,7 +10,12 @@ After=network.target network-online.target nftables.service
 Type=simple
 Restart=always
 ExecStart=/usr/bin/omradmin.py
+# CAP_SYS_MODULE: /sipalg modprobes nf_conntrack_sip.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_IPC_LOCK CAP_SETGID CAP_SETUID CAP_SYS_CHROOT CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETFCAP CAP_SYS_MODULE
+# Nothing it runs (systemctl, sysctl, ip, nft, easyrsa, wg, xray...) needs a
+# setuid binary nor a home directory.
+NoNewPrivileges=yes
+ProtectHome=yes
 
 [Install]
 WantedBy=multi-user.target
