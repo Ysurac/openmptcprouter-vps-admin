@@ -419,6 +419,8 @@ def patch_env(request):
         patch("subprocess.Popen", side_effect=_subprocess_popen_factory),
         patch("omr_admin.requests.get", side_effect=_requests_get_factory),
         patch("fastapi.routing.run_in_threadpool", side_effect=_run_in_threadpool_direct),
+        # the sockets of the machine running the tests (_server_ports)
+        patch("omr_admin.psutil.net_connections", return_value=[]),
     ):
         yield
 

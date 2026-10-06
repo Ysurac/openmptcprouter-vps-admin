@@ -683,8 +683,8 @@ class TestShorewallOpen:
         # router side ever looks at, so the port was silently never opened.
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.shorewall_add_port") as add4,
-            patch("omr_admin.shorewall6_add_port") as add6,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
+            patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
         ):
             r = user_client.post("/shorewallopen", json={**self._PAYLOAD, "ipproto": "any"})
         assert r.status_code == 200
@@ -697,8 +697,8 @@ class TestShorewallOpen:
         # the chain is flushed in one transaction, drop every other port.
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.shorewall_add_port") as add4,
-            patch("omr_admin.shorewall6_add_port") as add6,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
+            patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
         ):
             r = user_client.post(
                 "/shorewallopen",
@@ -713,8 +713,8 @@ class TestShorewallOpen:
         # 65500...): redirecting them to the router locks the VPS out.
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.shorewall_add_port") as add4,
-            patch("omr_admin.shorewall6_add_port") as add6,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
+            patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
         ):
             r = user_client.post(
                 "/shorewallopen",
@@ -727,7 +727,7 @@ class TestShorewallOpen:
     def test_accept_of_a_server_port_allowed(self, user_client):
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.shorewall_add_port") as add4,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
         ):
             r = user_client.post("/firewallopen", json={**self._PAYLOAD, "port": "65222"})
         assert r.json()["result"] == "done"
@@ -744,7 +744,7 @@ class TestShorewallOpen:
         ):
             with (
                 patch("os.path.isfile", return_value=True),
-                patch("omr_admin.shorewall_add_port") as add4,
+                patch("omr_admin.shorewall_add_port", return_value=None) as add4,
             ):
                 r = user_client.post("/firewallopen", json={**self._PAYLOAD, field: value})
             assert r.json() == {"result": "error", "reason": reason, "route": "firewallopen"}, field
@@ -2640,8 +2640,8 @@ class TestMqvpn:
         """No firewall changes when the port stays the same."""
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.shorewall_add_port") as add4,
-            patch("omr_admin.shorewall6_add_port") as add6,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
+            patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
             patch("omr_admin.shorewall_del_port") as del4,
             patch("omr_admin.shorewall6_del_port") as del6,
         ):

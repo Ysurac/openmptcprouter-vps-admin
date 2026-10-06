@@ -41,6 +41,8 @@ def _open_config(data):
     def _open(path, mode="r", *args, **kwargs):
         if str(path) == "/etc/openmptcprouter-vps-admin/omr-admin-config.json":
             return io.StringIO(json.dumps(data))
+        if str(path) == omr_admin.OMR_CONFIG_LOCK_FILE:
+            return io.StringIO()
         raise FileNotFoundError(path)
     return _open
 
@@ -840,10 +842,10 @@ class TestRenderHardening:
         })
         real = omr_admin._render_fw_entry
 
-        def flaky(username, udata, entry):
+        def flaky(username, udata, entry, exclude=()):
             if username == "alice":
                 raise ValueError("boom")
-            return real(username, udata, entry)
+            return real(username, udata, entry, exclude)
 
         with patch("omr_admin._render_fw_entry", side_effect=flaky):
             accept, _dnat = omr_admin._render_fw_ports(config)

@@ -2133,6 +2133,8 @@ def _ip_field_error(fields, route):
 # 64999 for the same reason. Opening (ACCEPT) them stays allowed: that is
 # how the services themselves are opened.
 FW_DNAT_MAX_PORT = 64999
+FW_MAX_USER_ENTRIES = 1024
+FW_NAME_MAX_LEN = 128
 _FW_PORT_RE = re.compile(r'(\d{1,5})(?:[-:](\d{1,5}))?')
 _FW_PROTOS = ('tcp', 'udp', 'sctp')
 
@@ -2177,14 +2179,37 @@ def _user_tunnel_ip6(userid, host):
 NFT_VPNCL_IFACES = ('client-wg*',)
 _NFT_FROM_NET = 'iifname != ' + _nft_iface_set(NFT_VPN_IFACES + NFT_VPNCL_IFACES)
 
+def _dedicated_ips(config_data):
+    """{username: [network]} of the public IPs each user has to itself
+    (/add_user ips)."""
+    dedicated = {}
+    for username, udata in ((config_data.get('users') or [{}])[0]).items():
+        nets = [_ip_network(ip) if isinstance(ip, str) else None for ip in udata.get('public_ips') or []]
+        dedicated[username] = [net for net in nets if net is not None]
+    return dedicated
+
+def _nft_daddr_exclusion(nets, family):
+    """` ip daddr != { ... }` leaving out *nets* of *family*, '' if none."""
+    nets = [str(net) for net in nets if net.version == family]
+    if not nets:
+        return ''
+    return f' {"ip" if family == 4 else "ip6"} daddr != {{ {", ".join(nets)} }}'
+
 def _render_fw_ports(config_data):
     """Pure: (accept_rules, dnat_rules) from every user's fw_ports entries."""
     accept_rules, dnat_rules = [], []
     users = config_data.get('users', [{}])[0]
-    for username, udata in users.items():
+    dedicated = _dedicated_ips(config_data)
+    # The first DNAT rule matching a connection wins: the main router's
+    # come first, as nobody else can take a port from it.
+    ordered = sorted(users.items(), key=lambda item: not _is_primary_userid(item[1].get('userid')))
+    for username, udata in ordered:
+        # A redirect without an address is on every public IP of the VPS,
+        # but those another user has to itself: it took that user's traffic.
+        others = [net for other, nets in dedicated.items() if other != username for net in nets]
         for entry in udata.get('fw_ports', []):
             try:
-                rule = _render_fw_entry(username, udata, entry)
+                rule = _render_fw_entry(username, udata, entry, others)
             except Exception:
                 # The chains are flushed in one transaction for every user,
                 # and this also runs at startup: an entry this can't render
@@ -2195,9 +2220,9 @@ def _render_fw_ports(config_data):
                 (accept_rules if rule[0] == 'accept' else dnat_rules).append(rule[1])
     return accept_rules, dnat_rules
 
-def _render_fw_entry(username, udata, entry):
+def _render_fw_entry(username, udata, entry, exclude=()):
     """('accept' or 'dnat', rule) for one fw_ports entry, None if it renders
-    nothing."""
+    nothing. A DNAT without source_dip leaves out the addresses *exclude*."""
     name = entry.get('name', '')
     port = entry.get('port', '')
     proto = entry.get('proto', 'tcp')
@@ -2252,6 +2277,8 @@ def _render_fw_entry(username, udata, entry):
             LOG.warning("skipping firewall entry %s %s/%s of user %s: invalid redirect target",
                         log_safe(name), log_safe(proto), log_safe(port), log_safe(username))
             return None
+        if not source_dip:
+            match += _nft_daddr_exclusion(exclude, family)
         return 'dnat', f'{_NFT_FROM_NET} {match} {proto} dport {port} dnat {"ip" if family == 4 else "ip6"} to {target} comment "{tag}"'
     return None
 
@@ -2260,15 +2287,18 @@ def _render_bulk_redirect(config_data):
     userid 0 (the primary/default user) same as before."""
     lines = []
     default_user = config_data.get('users', [{}])[0].get('openmptcprouter', {})
+    # Not on the public IPs the other users have to themselves.
+    others = [net for username, nets in _dedicated_ips(config_data).items()
+              if username != 'openmptcprouter' for net in nets]
     if config_data.get('bulk_redirect_v4'):
         target = default_user.get('vpnremoteip', '')
         if target:
             for proto in ('tcp', 'udp'):
-                lines.append(f'{_NFT_FROM_NET} meta nfproto ipv4 {proto} dport 1-64999 dnat ip to {target} comment "OMR bulk redirect {proto}"')
+                lines.append(f'{_NFT_FROM_NET} meta nfproto ipv4{_nft_daddr_exclusion(others, 4)} {proto} dport 1-64999 dnat ip to {target} comment "OMR bulk redirect {proto}"')
     target6 = _user_tunnel_ip6(default_user.get('userid'), 2)
     if config_data.get('bulk_redirect_v6') and target6:
         for proto in ('tcp', 'udp'):
-            lines.append(f'{_NFT_FROM_NET} meta nfproto ipv6 {proto} dport 1-64999 dnat ip6 to {target6} comment "OMR bulk redirect {proto}6"')
+            lines.append(f'{_NFT_FROM_NET} meta nfproto ipv6{_nft_daddr_exclusion(others, 6)} {proto} dport 1-64999 dnat ip6 to {target6} comment "OMR bulk redirect {proto}6"')
     return lines
 
 def _nft_sync_ports():
@@ -2292,43 +2322,51 @@ def _fw_port_add(username, port, proto, name, fwtype, family, source_dip, dest_i
         # nothing but bloated fw_ports forever.
         LOG.debug("ignoring firewall entry with unsupported fwtype %s (%s %s/%s)",
                   log_safe(fwtype), log_safe(name), log_safe(proto), log_safe(port))
-        return
+        return None
     error = _fw_entry_error(port, proto, fwtype, source_dip, dest_ip)
     if error:
         LOG.warning("refusing firewall entry %s %s/%s of user %s: %s",
                     log_safe(name), log_safe(proto), log_safe(port), log_safe(username), error)
-        return
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        data = json.load(f)
-    if username not in data['users'][0]:
-        return
-    ports = data['users'][0][username].get('fw_ports', [])
+        return error
     key = (name, str(port), proto, fwtype, family, source_dip, dest_ip)
     entry = {'name': name, 'port': port, 'proto': proto, 'fwtype': fwtype, 'family': family,
              'source_dip': source_dip, 'dest_ip': dest_ip, 'vpn': vpn, 'comment': comment}
-    # Routers re-POST every port they know on each reconciliation pass; an
-    # identical entry already present means nothing to write or resync.
-    supported = [p for p in ports if p.get('fwtype') in ('ACCEPT', 'DNAT')]
-    if entry in ports and supported == ports:
-        return
-    # also prune entries with unsupported fwtypes accumulated before the
-    # check above existed -- they render nothing and only bloat the config
-    ports = [p for p in supported if _fw_port_key(p) != key]
-    ports.append(entry)
-    modif_config_user(username, {'fw_ports': ports})
-    _nft_sync_ports()
+    # Read and written under the lock: two requests of a router, on two
+    # workers, each wrote back its own copy of the list, losing the other's
+    # entry.
+    with _omr_config_lock():
+        data = read_omr_config()
+        if username not in data.get('users', [{}])[0]:
+            return None
+        ports = data['users'][0][username].get('fw_ports', [])
+        # Routers re-POST every port they know on each reconciliation pass; an
+        # identical entry already present means nothing to write or resync.
+        supported = [p for p in ports if p.get('fwtype') in ('ACCEPT', 'DNAT')]
+        if entry in ports and supported == ports:
+            return None
+        # also prune entries with unsupported fwtypes accumulated before the
+        # check above existed -- they render nothing and only bloat the config
+        ports = [p for p in supported if _fw_port_key(p) != key]
+        if len(ports) >= FW_MAX_USER_ENTRIES:
+            # Each entry is in the config every request parses, and in the
+            # chains every change of any user flushes and rebuilds.
+            return 'No more than {} firewall entries per user'.format(FW_MAX_USER_ENTRIES)
+        ports.append(entry)
+        modif_config_user(username, {'fw_ports': ports})
+        _nft_sync_ports()
+    return None
 
 def _fw_port_del(username, port, proto, name, fwtype, family, source_dip='', dest_ip=''):
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        data = json.load(f)
-    if username not in data['users'][0]:
-        return
-    ports = data['users'][0][username].get('fw_ports', [])
-    key = (name, str(port), proto, fwtype, family, source_dip, dest_ip)
-    new_ports = [p for p in ports if _fw_port_key(p) != key and p.get('fwtype') in ('ACCEPT', 'DNAT')]
-    if new_ports != ports:
-        modif_config_user(username, {'fw_ports': new_ports})
-        _nft_sync_ports()
+    with _omr_config_lock():
+        data = read_omr_config()
+        if username not in data.get('users', [{}])[0]:
+            return
+        ports = data['users'][0][username].get('fw_ports', [])
+        key = (name, str(port), proto, fwtype, family, source_dip, dest_ip)
+        new_ports = [p for p in ports if _fw_port_key(p) != key and p.get('fwtype') in ('ACCEPT', 'DNAT')]
+        if new_ports != ports:
+            modif_config_user(username, {'fw_ports': new_ports})
+            _nft_sync_ports()
 
 # --- GRE-tunnel-per-public-IP SNAT (gre_snat chain) ---------------------
 
@@ -2562,13 +2600,13 @@ def _nft_resync_all():
     _sync_openvpn_client2client(bool(config_data.get('client2client', False)) if config_data else False)
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
-    _fw_port_add(user.username, str(port), proto, name, fwtype, 4, source_dip, dest_ip, vpn, gencomment)
+    return _fw_port_add(user.username, str(port), proto, name, fwtype, 4, source_dip, dest_ip, vpn, gencomment)
 
 def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
     _fw_port_del(username, str(port), proto, name, fwtype, 4, source_dip, dest_ip)
 
 def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
-    _fw_port_add(user.username, str(port), proto, name, fwtype, 6, source_dip, dest_ip, vpn, gencomment)
+    return _fw_port_add(user.username, str(port), proto, name, fwtype, 6, source_dip, dest_ip, vpn, gencomment)
 
 def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
     _fw_port_del(username, str(port), proto, name, fwtype, 6, source_dip, dest_ip)
@@ -4532,14 +4570,90 @@ def _public_ip_owner(omr_config_data, address):
                 return username
     return None
 
+def _server_ports(proto):
+    """[(first, last)] of the ports the VPS itself uses with *proto*, on more
+    than the loopback: what listens now, and what the proxies and MQVPN are
+    configured to listen on even while stopped."""
+    spans = []
+    if proto in ('tcp', 'udp'):
+        try:
+            for conn in psutil.net_connections(kind=proto):
+                if not conn.laddr or (proto == 'tcp' and conn.status != psutil.CONN_LISTEN) or \
+                   (proto == 'udp' and conn.raddr):
+                    continue
+                try:
+                    if ipaddress.ip_address(conn.laddr.ip.split('%')[0]).is_loopback:
+                        continue
+                except ValueError:
+                    pass  # not an address we know: count it
+                spans.append((conn.laddr.port, conn.laddr.port))
+        except (psutil.Error, OSError):
+            pass  # can't list the sockets: the configured ports below still count
+    for config in PROXY_REDIRECT_CONFIGS.values():
+        try:
+            with open(config) as f:
+                inbounds = json.load(f).get('inbounds', [])
+        except (OSError, ValueError, AttributeError):
+            continue
+        for inbound in inbounds:
+            listen = str(inbound.get('listen') or '0.0.0.0')
+            if listen.startswith('127.') or listen == '::1' or proto not in _proxy_inbound_networks(inbound):
+                continue
+            spans.extend(_proxy_inbound_ports(inbound))
+    if proto == 'udp' and os.path.isfile('/etc/mqvpn/server.json'):
+        try:
+            with open('/etc/mqvpn/server.json') as f:
+                listen = str(json.load(f).get('listen', '0.0.0.0:443'))
+            spans.append((int(listen.rsplit(':', 1)[-1]),) * 2)
+        except (OSError, ValueError, AttributeError):
+            pass  # no MQVPN port known
+    return spans
+
+def _fw_dnat_error(omr_config_data, username, port, proto, families, source_dip):
+    """Why a router other than the main one can't redirect port/proto (on
+    source_dip, or every public IP of the VPS without), None if it can.
+    The first DNAT rule matching a connection wins, before the VPS sees it:
+    a redirect of a port another user redirects took that user's traffic,
+    one of a port the server uses (MQVPN's udp/443, VLESS Reality's tcp/443,
+    a proxy redirect...) took it from every user."""
+    first, last = _proxy_port_range(port)
+    def dedicated(address):
+        return bool(address) and _public_ip_owner(omr_config_data, address) is not None
+    for other, udata in ((omr_config_data.get('users') or [{}])[0]).items():
+        if other == username:
+            continue
+        for entry in udata.get('fw_ports') or []:
+            if entry.get('fwtype') != 'DNAT' or entry.get('proto') != proto or entry.get('family') not in families:
+                continue
+            span = _proxy_port_range(entry.get('port', ''))
+            if not span or span[1] < first or last < span[0]:
+                continue
+            other_dip = entry.get('source_dip', '')
+            if source_dip and other_dip:
+                a, b = _ip_network(source_dip), _ip_network(other_dip)
+                if a is None or b is None or a.version != b.version or not a.overlaps(b):
+                    continue
+            elif dedicated(source_dip) or dedicated(other_dip):
+                # A redirect without address leaves out the dedicated IPs.
+                continue
+            return 'Port already redirected by another user'
+    # The user's own dedicated IP is only its own routers' business.
+    if not dedicated(source_dip):
+        if any(a <= last and first <= b for a, b in _server_ports(proto)):
+            return 'Port used by the server'
+    return None
+
 def _firewall_open(params, current_user, route):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': route}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        try:
-            omr_config_data = json.load(f)
-        except ValueError as e:
-            omr_config_data = {}
+    # The checks against the other users' entries and the write together.
+    with _omr_config_lock():
+        return _firewall_open_locked(params, current_user, route)
+
+def _firewall_open_locked(params, current_user, route):
+    omr_config_data = read_omr_config()
+    if current_user.username not in omr_config_data.get('users', [{}])[0]:
+        return {'result': 'error', 'reason': 'Config file not readable', 'route': route}
     name = params.name
     port = params.port
     proto = params.proto
@@ -4552,6 +4666,10 @@ def _firewall_open(params, current_user, route):
     vpn = "default"
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': route}
+    # Kept in the config and listed back by /firewalllist one per line.
+    if len(name) > FW_NAME_MAX_LEN or len(params.comment) > FW_NAME_MAX_LEN or \
+       any(not c.isprintable() for c in name + params.comment):
+        return {'result': 'error', 'reason': 'Invalid name or comment', 'route': route}
     if fwtype in ('ACCEPT', 'DNAT'):
         # Unsupported fwtypes are ignored further down, as they always were.
         error = _fw_entry_error(port, proto, fwtype, source_dip, source_ip)
@@ -4570,19 +4688,28 @@ def _firewall_open(params, current_user, route):
         # taking every other port with it.
         wanted = [_addr_family(addr) for addr in (source_dip, source_ip)]
         families = tuple(f for f in families if all(w in (None, f) for w in wanted))
+    if fwtype == 'DNAT' and families and not _is_server_admin(current_user):
+        error = _fw_dnat_error(omr_config_data, current_user.username, str(port), proto, families, source_dip)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': route}
     if 4 in families:
-        if 'gre_tunnels' in omr_config_data['users'][0][current_user.username]:
-            for tunnel in omr_config_data['users'][0][current_user.username]['gre_tunnels']:
-                if omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['public_ip'] == source_dip:
-                    vpn = omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['remote_ip']
-        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
+        source_net = _ip_network(source_dip) if source_dip else None
+        for tunnel in (omr_config_data['users'][0][current_user.username].get('gre_tunnels') or {}).values():
+            tunnel_ip = _ip_network(tunnel.get('public_ip') or '')
+            if source_net is not None and tunnel_ip is not None and tunnel_ip == source_net and tunnel.get('remote_ip'):
+                vpn = tunnel['remote_ip']
+        error = shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': route}
     if 6 in families:
         # GRE tunnels are IPv4-only, so the lookup above never applies to
         # the v6 rule: pass 'default' explicitly (not `vpn`, which the v4
         # branch may just have set) so `comment` lands in
         # shorewall6_add_port's actual gencomment slot instead of silently
         # taking vpn's position.
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, 'default', comment)
+        error = shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, 'default', comment)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': route}
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/firewallopen', summary="Redirect a port from Server to Router")
