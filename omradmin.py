@@ -2637,9 +2637,10 @@ def _nft_resync_dscp_classify():
 # Modern kernels require an explicit `ct helper` object + a rule assigning
 # it, rather than the old global auto-attach flag Shorewall's
 # DONT_LOAD/AUTOHELPERS toggled (netfilter's automatic-helper-assignment
-# was disabled by default years ago regardless of iptables/nftables) --
-# this is the part of the migration flagged in the plan as needing live
-# validation against this VPS's actual kernel rather than assumed correct.
+# was disabled by default years ago regardless of iptables/nftables).
+# The base ruleset jumps ct_helpers from chains at priority filter: `ct
+# helper set` needs the connection conntrack (-200) creates, so at priority
+# raw it did nothing (openmptcprouter#4365).
 def _nft_load_sip_module():
     # The installer blacklists nf_conntrack_sip (SIP ALG off by default), and
     # a blacklist entry also stops the kernel's alias autoload when the ct
@@ -2654,6 +2655,13 @@ def _nft_load_sip_module():
         LOG.warning("SIP ALG not applied, can't load nf_conntrack_sip: %s",
                     result.stderr.decode(errors='replace').strip())
         return False
+    # nf_nat_sip, the NAT half: the ct helper object only autoloads the
+    # conntrack half, and without it nothing rewrites the SDP addresses of a
+    # DNATed call. The helper still tracks the call without it, so go on.
+    result = subprocess.run(['modprobe', 'nf_nat_sip'], capture_output=True, check=False)
+    if result.returncode != 0:
+        LOG.warning("SIP ALG without NAT, can't load nf_nat_sip: %s",
+                    result.stderr.decode(errors='replace').strip())
     return True
 
 def _nft_ensure_ct_helpers():

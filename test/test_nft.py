@@ -614,10 +614,12 @@ class TestSyncSipAlg:
         # a modprobe blacklist only blocks alias autoloading, so the module
         # must be loaded explicitly before the helper objects are created
         assert calls[0].args[0] == ["modprobe", "nf_conntrack_sip"]
-        helper_script = calls[1].kwargs["input"].decode()
+        # and its NAT half, which nothing autoloads
+        assert calls[1].args[0] == ["modprobe", "nf_nat_sip"]
+        helper_script = calls[2].kwargs["input"].decode()
         assert 'add ct helper inet omr sip_udp { type "sip" protocol udp; }' in helper_script
         assert 'add ct helper inet omr sip_tcp { type "sip" protocol tcp; }' in helper_script
-        chain_script = calls[2].kwargs["input"].decode()
+        chain_script = calls[3].kwargs["input"].decode()
         assert chain_script.splitlines()[0] == "flush chain inet omr ct_helpers"
         assert 'ct helper set "sip_udp"' in chain_script
         assert 'ct helper set "sip_tcp"' in chain_script
@@ -632,6 +634,20 @@ class TestSyncSipAlg:
             return result
         with patch("subprocess.run", side_effect=_run):
             assert omr_admin._nft_sync_sipalg(True) is False
+
+    def test_enable_goes_on_without_nf_nat_sip(self):
+        # nf_nat_sip missing: the helper still tracks calls, it just can't
+        # rewrite them, so warn and assign it anyway
+        def _run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 1 if cmd == ["modprobe", "nf_nat_sip"] else 0
+            result.stderr = b"modprobe: FATAL: Module nf_nat_sip not found"
+            return result
+        with patch("subprocess.run", side_effect=_run) as run, \
+             patch.object(omr_admin.LOG, "warning") as warning:
+            assert omr_admin._nft_sync_sipalg(True) is True
+        assert run.call_count == 4
+        assert "nf_nat_sip" in warning.call_args.args[-1]
 
     def test_enable_stops_when_modprobe_fails(self):
         # omr-admin.service without CAP_SYS_MODULE: modprobe gets EPERM. Report
