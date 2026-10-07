@@ -4226,22 +4226,24 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
     if 'internet' in omr_config_data and not omr_config_data['internet']:
         internet = False
 
+    # Every user's own pair and ULA, as /vpnips wrote them. Users other than
+    # userid 0 used to get userid 0's pair (fd00::a00:1|2) and no ULA: their
+    # router took the other tunnel's addresses, and its set_vpn_ip, seeing
+    # its ULA missing, POSTed /vpnips on every run. Until the router's first
+    # /vpnips there is no file, and all three stay empty: the router keeps
+    # what it has.
     localip6 = ''
     remoteip6 = ''
     ula = ''
-    if userid == 0:
-        if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
-            with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), "r") as omr6in4_file:
-                for line in omr6in4_file:
-                    if 'LOCALIP6=' in line:
-                        localip6 = line.replace(line[:9], '').rstrip()
-                    if 'REMOTEIP6=' in line:
-                        remoteip6 = line.replace(line[:10], '').rstrip()
-                    if 'ULA=' in line:
-                        ula = line.replace(line[:4], '').rstrip()
-    else:
-        localip6 = 'fd00::a00:1'
-        remoteip6 = 'fd00::a00:2'
+    if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
+        with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), "r") as omr6in4_file:
+            for line in omr6in4_file:
+                if 'LOCALIP6=' in line:
+                    localip6 = line.replace(line[:9], '').rstrip()
+                if 'REMOTEIP6=' in line:
+                    remoteip6 = line.replace(line[:10], '').rstrip()
+                if 'ULA=' in line:
+                    ula = line.replace(line[:4], '').rstrip()
 
     vpn = 'openvpn'
     if 'vpn' in omr_config_data['users'][0][username]:

@@ -328,6 +328,56 @@ class TestConfig:
         assert r.status_code == 200
 
 
+class TestConfigIp6in4:
+    """/config reports each user's own 6in4 pair and ULA, as /vpnips wrote
+    them in omr-6in4/user<id>. Users other than userid 0 used to get userid
+    0's pair and no ULA."""
+
+    _FILES = {
+        "/etc/openmptcprouter-vps-admin/omr-6in4/user0":
+            "LOCALIP=10.255.255.1\nREMOTEIP=10.255.255.2\n"
+            "LOCALIP6=fd00::a00:1/126\nREMOTEIP6=fd00::a00:2/126\nULA=fd12:3456:789a::/48\n",
+        "/etc/openmptcprouter-vps-admin/omr-6in4/user2":
+            "LOCALIP=10.255.255.1\nREMOTEIP=10.255.255.6\n"
+            "LOCALIP6=fd00::a02:1/126\nREMOTEIP6=fd00::a02:2/126\nULA=fd34:5678:9abc::/48\n",
+    }
+
+    def _get(self, client, files):
+        real_isfile = os.path.isfile
+
+        def isfile(p):
+            if str(p).startswith("/etc/openmptcprouter-vps-admin/omr-6in4/"):
+                return str(p) in files
+            return real_isfile(p)
+
+        def fake_open(p, mode="r", *a, **kw):
+            if str(p) in files:
+                return io.StringIO(files[str(p)])
+            return _mock_open(p, mode, *a, **kw)
+
+        with (
+            patch("os.path.isfile", side_effect=isfile),
+            patch("builtins.open", side_effect=fake_open),
+        ):
+            r = client.get("/config")
+        assert r.status_code == 200
+        return r.json()["ip6in4"]
+
+    def test_userid_0_reads_its_file(self, user_client):
+        assert self._get(user_client, self._FILES) == {
+            "localip": "fd00::a00:1/126", "remoteip": "fd00::a00:2/126",
+            "ula": "fd12:3456:789a::/48"}
+
+    def test_other_user_reads_its_own_file(self, ro_client):
+        assert self._get(ro_client, self._FILES) == {
+            "localip": "fd00::a02:1/126", "remoteip": "fd00::a02:2/126",
+            "ula": "fd34:5678:9abc::/48"}
+
+    def test_other_user_without_file_gets_nothing(self, ro_client):
+        files = {k: v for k, v in self._FILES.items() if not k.endswith("user2")}
+        assert self._get(ro_client, files) == {"localip": "", "remoteip": "", "ula": ""}
+
+
 class TestConfigWritePermissions:
     """The config holds every user's password and the VPN keys, so a write of
     it must leave it root-only (0600), even if some other writer had widened
