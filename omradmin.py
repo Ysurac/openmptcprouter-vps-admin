@@ -486,7 +486,9 @@ def _openvpn_gen_crl():
     subprocess.run(["./easyrsa", "gen-crl"], cwd="/etc/openvpn/ca", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     subprocess.run(["chmod", "644", os.path.join(PKI_DIR, 'crl.pem')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
-def get_bytes_openvpn(user):
+def _openvpn_status():
+    """The lines of OpenVPN's management `status` (format 1), None if it
+    can't be read."""
     try:
         ovpn_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         ovpn_socket.settimeout(2)
@@ -496,7 +498,7 @@ def get_bytes_openvpn(user):
         if not line.startswith('>INFO:OpenVPN'.encode()):
             ovpn_socket.close()
             LOG.debug("OpenVPN error")
-            return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+            return None
         ovpn_socket.send('status\r\n'.encode())
         ovpn_stats = []
         while True:
@@ -511,9 +513,33 @@ def get_bytes_openvpn(user):
         ovpn_socket.close()
     except socket.timeout as err:
         LOG.debug("OpenVPN stats timeout (" + str(err) + ")")
-        return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
+        return None
     except socket.error as err:
         LOG.debug("OpenVPN stats error (" + str(err) + ")")
+        return None
+    return ovpn_stats
+
+def _openvpn_leases():
+    """{tunnel address: common name} of the connected OpenVPN clients, from
+    the ROUTING TABLE rows (Virtual Address,Common Name,...); the subnets of
+    their iroutes are left out. Empty if OpenVPN can't be asked."""
+    leases = {}
+    in_table = False
+    for data in (_openvpn_status() or []):
+        fields = data.strip().split(',')
+        if fields[0] in ('ROUTING TABLE', 'GLOBAL STATS', 'END'):
+            in_table = fields[0] == 'ROUTING TABLE'
+            continue
+        if in_table and len(fields) >= 2 and fields[1]:
+            try:
+                leases[str(ipaddress.IPv4Address(fields[0]))] = fields[1]
+            except ValueError:
+                continue
+    return leases
+
+def get_bytes_openvpn(user):
+    ovpn_stats = _openvpn_status()
+    if ovpn_stats is None:
         return { 'downlinkBytes': 0, 'uplinkBytes': 0 }
     for data in ovpn_stats:
         # A CLIENT LIST row: Common Name,Real Address,Bytes Received,Bytes
@@ -7167,9 +7193,13 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
             #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'lan'}
 
+# The private IPv4 addresses /vpnips takes for either end of the tunnel.
+_VPNIPS_IP4_PATTERN = r'^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$'
+_VPNIPS_IP4_RE = re.compile(_VPNIPS_IP4_PATTERN)
+
 class VPNips(BaseModel):
-    remoteip: str = Query(..., pattern=r'^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
-    localip: str = Query(..., pattern=r'^(10(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){3}|((172\.(1[6-9]|2[0-9]|3[01]))|192\.168)(\.(25[0-5]|2[0-4][0-9]|1[0-9]{1,2}|[0-9]{1,2})){2})$')
+    remoteip: str = Query(..., pattern=_VPNIPS_IP4_PATTERN)
+    localip: str = Query(..., pattern=_VPNIPS_IP4_PATTERN)
     remoteip6: Optional[str] = None
     localip6: Optional[str] = None
     ula: Optional[str] = None
@@ -7178,19 +7208,115 @@ class VPNips(BaseModel):
 # fd00::b0<id>:x, ...) is in fd00::/64.
 _VPS_TUNNEL_NET6 = ipaddress.ip_network('fd00::/64')
 _ULA_NET = ipaddress.ip_network('fc00::/7')
+# A router's end of its static tunnels is in the /30 of its userid in each of
+# these (add_glorytun_tcp, add_glorytun_udp, add_dsvpn).
+_USER_TUNNEL_POOLS4 = tuple(ipaddress.ip_network(net) for net in
+                            ('10.255.255.0/24', '10.255.254.0/24', '10.255.251.0/24'))
+# mlvpn0 is the main router's alone (/config gives its password to no other).
+_MLVPN_NET4 = ipaddress.ip_network('10.255.253.0/24')
+OMR_6IN4_DIR = '/etc/openmptcprouter-vps-admin/omr-6in4'
 
-def _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, ula):
+def _valid_ula(value):
+    """The network of a ULA prefix a router may route over its 6in4 tunnel,
+    None if it can't be one: a /48 to /64 of fc00::/7 out of the VPS's own
+    fd00::/64. omr-6in4-run routes it via the router as root (`ip route
+    replace ${ULA} via ...`, so ::/0 took the VPS's IPv6 default route)."""
+    net = _ip_network(value or '')
+    if net is None or net.version != 6 or not net.subnet_of(_ULA_NET) \
+       or not 48 <= net.prefixlen <= 64 or net.overlaps(_VPS_TUNNEL_NET6):
+        return None
+    return net
+
+def _userid_names(users, userid):
+    """The users acting as *userid*: those that have it, and for 0, the main
+    router's, the administrators without one too (a router logged in as
+    admin is the main one)."""
+    names = set()
+    for name, ucfg in users.items():
+        uid = ucfg.get('userid')
+        if uid is None:
+            if userid == 0 and ucfg.get('permissions') == 'admin':
+                names.add(name)
+            continue
+        try:
+            if int(uid) == userid:
+                names.add(name)
+        except (TypeError, ValueError):
+            continue
+    return names
+
+def _used_userids(users):
+    used = set()
+    for ucfg in users.values():
+        try:
+            used.add(int(ucfg.get('userid')))
+        except (TypeError, ValueError):
+            continue
+    return used
+
+def _mqvpn_fixed_ips():
+    """{fixed address: user name} of MQVPN's server.json."""
+    try:
+        with open('/etc/mqvpn/server.json') as f:
+            entries = json.load(f).get('users', [])
+    except (OSError, ValueError, AttributeError):
+        return {}
+    fixed = {}
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get('fixed_ip'), str):
+            net = _ip_network(entry['fixed_ip'])
+            if net is not None and net.version == 4:
+                fixed[str(net.network_address)] = entry.get('name')
+    return fixed
+
+def _remoteip_owner_error(users, userid, remoteip, leases=None):
+    """Why *remoteip* isn't the router address of *userid* to claim, None if
+    it may be. Every DNAT of the user goes to it, so another router's address
+    sent that user's ports to that router, its own services and LAN, and made
+    that router's own /vpnips fail. *leases*: the live OpenVPN ones
+    ({address: common name}), None to leave them out."""
+    addr = ipaddress.ip_address(remoteip)
+    own = _userid_names(users, userid)
+    taken = 'remoteip already used by another user'
+    for pool in _USER_TUNNEL_POOLS4:
+        if addr in pool:
+            slot = (int(addr) - int(pool.network_address)) // 4
+            if slot == userid:
+                break
+            if slot in _used_userids(users):
+                return taken
+            # The other routers have the static /30 of their userid only;
+            # the main one may get its address by DHCP over glorytun.
+            if userid != 0:
+                return 'Invalid remoteip'
+    if addr in _MLVPN_NET4 and userid != 0:
+        return 'Invalid remoteip'
+    for name, ucfg in users.items():
+        if name in own:
+            continue
+        for peer in ucfg.get('wireguard_peers') or []:
+            if any(net.version == 4 and addr in net for net in (_wireguard_peer_nets(peer.get('ip')) or [])):
+                return taken
+    holder = _mqvpn_fixed_ips().get(str(addr))
+    if holder is not None and holder not in own:
+        return taken
+    holder = (leases or {}).get(str(addr))
+    if holder is not None and holder not in own:
+        return taken
+    return None
+
+def _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, ula, leases=None):
     """API error if the addresses of a /vpnips request aren't this router's
-    to claim, else None. omr-6in4-run routes ULA via the router as root
-    (`ip route replace ${ULA} via ...`, so ::/0 took the VPS's IPv6 default
-    route), and remoteip is the address every DNAT of this user goes to."""
-    if ula and ula != 'auto':
-        net = _ip_network(ula)
-        if not net.subnet_of(_ULA_NET) or not 48 <= net.prefixlen <= 64 or net.overlaps(_VPS_TUNNEL_NET6):
-            return {'result': 'error', 'reason': 'Invalid ula', 'route': 'vpnips'}
+    to claim, else None. omr-6in4-run routes ULA via the router as root,
+    and remoteip is the address every DNAT of this user goes to. An address
+    another user stored is the caller's all the same when OpenVPN has leased
+    it to the caller (*leases*): the other one's is stale."""
+    if ula and ula != 'auto' and _valid_ula(ula) is None:
+        return {'result': 'error', 'reason': 'Invalid ula', 'route': 'vpnips'}
     userid = current_user.userid
     if userid is None:
         userid = 0   # an admin: a router logged in as admin is the main one
+    userid = int(userid)
     for name, value, host in (('localip6', localip6, 1), ('remoteip6', remoteip6, 2)):
         # Only ever the router's own pair, which is also what it defaults to.
         own = _user_tunnel_ip6(userid, host)
@@ -7198,28 +7324,104 @@ def _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, re
             return {'result': 'error', 'reason': f'Invalid {name}', 'route': 'vpnips'}
     if remoteip == localip:
         return {'result': 'error', 'reason': 'Invalid remoteip', 'route': 'vpnips'}
-    for other, ucfg in omr_config_data['users'][0].items():
-        if other == current_user.username:
+    users = omr_config_data['users'][0]
+    error = _remoteip_owner_error(users, userid, remoteip, leases)
+    if error:
+        return {'result': 'error', 'reason': error, 'route': 'vpnips'}
+    own = _userid_names(users, userid) | {current_user.username}
+    leased = (leases or {}).get(remoteip) in own
+    for other, ucfg in users.items():
+        if other in own:
             continue
         # The VPS end of a tunnel can be shared (every OpenVPN client has
         # 10.255.252.1 as its localip), a router's address can't.
-        if remoteip in (ucfg.get('vpnremoteip'), ucfg.get('vpnlocalip')):
+        if remoteip == ucfg.get('vpnlocalip') or (remoteip == ucfg.get('vpnremoteip') and not leased):
             return {'result': 'error', 'reason': 'remoteip already used by another user', 'route': 'vpnips'}
         if localip == ucfg.get('vpnremoteip'):
             return {'result': 'error', 'reason': 'localip already used by another user', 'route': 'vpnips'}
-        other_ula = _ip_network(ucfg.get('ula') or '')
-        if ula and ula != 'auto' and other_ula is not None and other_ula.version == 6 and _ip_network(ula).overlaps(other_ula):
+        # Only a valid one: a ::/0 stored by an older release blocked every
+        # other user's ULA.
+        other_ula = _valid_ula(ucfg.get('ula'))
+        if ula and ula != 'auto' and other_ula is not None and _valid_ula(ula).overlaps(other_ula):
             return {'result': 'error', 'reason': 'ula already used by another user', 'route': 'vpnips'}
     return None
 
+def _6in4_conf_text(userid, localip, remoteip, ula):
+    """omr-6in4/user<id>, which omr-6in4-run reads as root: the tunnel's
+    IPv4 ends, the userid's own IPv6 pair and the ULA routed via the router,
+    if any. None when the userid has no IPv6 pair."""
+    localip6 = _user_tunnel_ip6(userid, 1)
+    remoteip6 = _user_tunnel_ip6(userid, 2)
+    if localip6 is None or remoteip6 is None:
+        return None
+    lines = ['LOCALIP=' + localip, 'REMOTEIP=' + remoteip,
+             'LOCALIP6=' + localip6 + '/126', 'REMOTEIP6=' + remoteip6 + '/126']
+    if ula == 'auto':
+        lines.append('ULA=auto')
+    elif _valid_ula(ula) is not None:
+        # As the router sent it (/config reports it back, and the router
+        # compares it with its own), unless it has host bits, which `ip
+        # route` refuses.
+        try:
+            ipaddress.ip_network(ula)
+        except ValueError:
+            ula = str(_valid_ula(ula))
+        lines.append('ULA=' + ula)
+    return ''.join(line + '\n' for line in lines)
+
+def _apply_6in4_conf(userid, text):
+    """Write omr-6in4/user<id> and restart its unit when *text* changes it;
+    with None, stop the unit and remove the file."""
+    conf = os.path.join(OMR_6IN4_DIR, 'user' + str(int(userid)))
+    if text is None:
+        _remove_tunnel_unit(f"omr6in4@user{int(userid)}", conf)
+        return
+    if os.path.isfile(conf):
+        with open(conf) as f:
+            if f.read() == text:
+                return
+    _atomic_write_text(conf, text)
+    # Enabled as well: the installer only enables userid 0's, and the
+    # others' tunnels didn't come back at boot.
+    subprocess.run(["systemctl", "-q", "enable", f"omr6in4@user{int(userid)}"], check=False)
+    subprocess.run(["systemctl", "-q", "restart", f"omr6in4@user{int(userid)}"], check=False)
+
+def _remove_tunnel_unit(unit, conf):
+    if os.path.isfile(conf):
+        subprocess.run(["systemctl", "-q", "stop", unit], check=False)
+        subprocess.run(["systemctl", "-q", "disable", unit], check=False)
+        os.remove(conf)
+
+def _drop_stale_remoteip(users, names):
+    """Forget the router address *names* stored, now another router's: their
+    DNATs, 6in4 and VXLAN tunnels went to it. Their routers post their
+    current one at the next sync."""
+    for name in names:
+        try:
+            userid = int(users[name].get('userid') or 0)
+        except (TypeError, ValueError):
+            userid = 0
+        LOG.warning("Dropping the stale tunnel address of user %s, leased to another router", log_safe(name))
+        _apply_6in4_conf(userid, None)
+        _remove_tunnel_unit(f"omr-vxlan@user{userid}", f'/etc/openmptcprouter-vps-admin/omr-vxlan/user{userid}')
+
+    def mutate(content):
+        for name in names:
+            content['users'][0].get(name, {}).pop('vpnremoteip', None)
+    _mutate_omr_config(mutate)
+
 # Set user vpn IPs
 @app.post('/vpnips', summary="Set current user VPN IPs")
+@_serialise_config_write
 def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user)):
     # Read-only users too (the default of /add_user): the router's tunnel
     # addresses are what its 6in4 tunnel and DNATs use, and
     # _vpnips_error() keeps them to the router's own.
     #if current_user.permissions == "ro":
     #    return {'result': 'permission', 'reason': 'Read only user', 'route': 'vpnips'}
+    # Serialised: the checks against the other users' addresses and the
+    # writes that follow them are one step, or two routers could both claim
+    # the same address.
     if current_user.userid is None and current_user.permissions != "admin":
         # Its 6in4 tunnel and DNAT address would be userid 0's.
         return _no_userid_error('vpnips')
@@ -7239,12 +7441,21 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         return error
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
-    error = _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, ula)
+    # OpenVPN hands its addresses out by DHCP: who has one right now.
+    leases = _openvpn_leases() if os.path.isfile('/etc/openvpn/tun0.conf') else {}
+    error = _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, ula, leases)
     if error:
         return error
+    users = omr_config_data['users'][0]
     if 'vpnremoteip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnremoteip'] == remoteip and 'vpnlocalip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnlocalip'] == localip and ula and ('ula' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['ula'] == ula):
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
-    remoteip_changed = 'vpnremoteip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnremoteip'] != remoteip
+    userid = int(current_user.userid if current_user.userid is not None else 0)
+    own = _userid_names(users, userid) | {current_user.username}
+    stale = [other for other, ucfg in users.items() if other not in own and ucfg.get('vpnremoteip') == remoteip]
+    if stale:
+        # _vpnips_error() let it through: OpenVPN leased it to this router.
+        _drop_stale_remoteip(users, stale)
+    remoteip_changed = bool(stale) or 'vpnremoteip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnremoteip'] != remoteip
     if remoteip_changed:
         LOG.debug("modif_config_user for vpnips")
         modif_config_user(current_user.username, {'vpnremoteip': remoteip})
@@ -7254,30 +7465,10 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     if ula and ('ula' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['ula'] != ula):
         LOG.debug("modif_config_user for ula")
         modif_config_user(current_user.username, {'ula': ula})
-    userid = int(current_user.userid if current_user.userid is not None else 0)
 
     if not '6in4' in omr_config_data or omr_config_data['6in4']:
-        if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
-            initial_md5 = hashlib.md5(file_as_bytes('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid))).hexdigest()
-        else:
-            initial_md5 = ''
-        with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'w+') as n:
-            n.write('LOCALIP=' + localip + "\n")
-            n.write('REMOTEIP=' + remoteip + "\n")
-            if localip6:
-                n.write('LOCALIP6=' + localip6 + "\n")
-            else:
-                n.write('LOCALIP6=fd00::a0' + hex(userid)[2:] + ':1/126' + "\n")
-            if remoteip6:
-                n.write('REMOTEIP6=' + remoteip6 + "\n")
-            else:
-                n.write('REMOTEIP6=fd00::a0' + hex(userid)[2:] + ':2/126' + "\n")
-            if ula:
-                n.write('ULA=' + ula + "\n")
-        final_md5 = hashlib.md5(file_as_bytes('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid))).hexdigest()
-        if initial_md5 != final_md5:
-            subprocess.run(["systemctl", "-q", "restart", f"omr6in4@user{userid}"], check=False)
-            #set_lastchange()
+        _apply_6in4_conf(userid, _6in4_conf_text(userid, localip, remoteip, ula))
+        #set_lastchange()
 
     if 'vxlan' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vxlan']:
         write_vxlan_conf(current_user.username, userid)
@@ -7293,6 +7484,109 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         _nft_sync_ports()
 
     return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
+
+def _read_6in4_conf(userid):
+    """The KEY=value lines of omr-6in4/user<id>, {} without one."""
+    values = {}
+    try:
+        with open(os.path.join(OMR_6IN4_DIR, 'user' + str(int(userid)))) as f:
+            for line in f:
+                key, sep, value = line.rstrip('\n').partition('=')
+                if sep:
+                    values[key] = value
+    except OSError:
+        pass
+    return values
+
+def _check_6in4_confs():
+    """Rewrite each omr-6in4/user<id> from what /vpnips accepts now. Older
+    releases wrote what a router sent unchecked, and omr-6in4-run applies,
+    as root at every boot, anything that looks like an address: ULA=::/0
+    took the VPS's IPv6 default route until that router posted again.
+
+    The stored addresses a router can't claim any more are dropped from the
+    config too, so that the router, missing them in /config, posts its own
+    again: a router address another router's (two users with the same one
+    lose it both, as there is no telling whose it is), and a ULA that isn't
+    one or overlaps another user's (both too). A file is rewritten from what
+    its userid stored, and removed with its unit when that is nothing, as
+    for a userid nobody has."""
+    if not os.path.isdir(OMR_6IN4_DIR):
+        return
+    with _omr_config_lock():
+        def clean(content):
+            users = content['users'][0]
+            group_of = {name: 0 for name in _userid_names(users, 0)}
+            for name, ucfg in users.items():
+                try:
+                    group_of[name] = int(ucfg.get('userid'))
+                except (TypeError, ValueError):
+                    continue
+            groups = {}
+            for name, userid in group_of.items():
+                groups.setdefault(userid, set()).add(name)
+            drop = {}
+            for name, ucfg in users.items():
+                if name not in group_of:
+                    continue
+                for key in ('vpnlocalip', 'vpnremoteip'):
+                    value = ucfg.get(key)
+                    if value is not None and not (isinstance(value, str) and _VPNIPS_IP4_RE.fullmatch(value)):
+                        drop.setdefault(name, set()).add(key)
+                remoteip = ucfg.get('vpnremoteip')
+                if 'vpnremoteip' not in drop.get(name, ()) and remoteip and \
+                   _remoteip_owner_error(users, group_of[name], remoteip):
+                    drop.setdefault(name, set()).add('vpnremoteip')
+                ula = ucfg.get('ula')
+                if ula and ula != 'auto':
+                    net = _valid_ula(ula)
+                    if net is None or any(
+                            group_of.get(other, -1) != group_of[name] and _valid_ula(o.get('ula')) is not None
+                            and _valid_ula(o.get('ula')).overlaps(net)
+                            for other, o in users.items()):
+                        drop.setdefault(name, set()).add('ula')
+            # Then, among the router addresses left, one that two userids
+            # have, or the VPS end of another tunnel.
+            claimed = {name: users[name]['vpnremoteip'] for name in group_of
+                       if users[name].get('vpnremoteip') and 'vpnremoteip' not in drop.get(name, ())}
+            for name, remoteip in claimed.items():
+                if any(group_of.get(other, -1) != group_of[name] and
+                       remoteip in (claimed.get(other), o.get('vpnlocalip'))
+                       for other, o in users.items()):
+                    drop.setdefault(name, set()).add('vpnremoteip')
+            for name, keys in drop.items():
+                LOG.warning("Dropping the %s of user %s, not its own to claim", ', '.join(sorted(keys)), log_safe(name))
+                for key in keys:
+                    users[name].pop(key, None)
+            return copy.deepcopy(users), groups
+
+        users, groups = _mutate_omr_config(clean)
+        for entry in os.listdir(OMR_6IN4_DIR):
+            match = re.fullmatch(r'user(\d+)', entry)
+            if not match:
+                continue
+            userid = int(match.group(1))
+            current = _read_6in4_conf(userid)
+            text = None
+            # The user of this userid whose addresses the file has: the
+            # main router's may be stored under the admin's name.
+            for name in sorted(groups.get(userid, ())):
+                ucfg = users[name]
+                if ucfg.get('vpnremoteip') and ucfg.get('vpnlocalip') and \
+                   (ucfg['vpnremoteip'], ucfg['vpnlocalip']) == (current.get('REMOTEIP'), current.get('LOCALIP')):
+                    # The ULA the file has, if it is still the stored one:
+                    # /vpnips writes the one the router sends, none when
+                    # it sends none, but stores only a new one.
+                    ula = current.get('ULA')
+                    if not (ula == 'auto' == ucfg.get('ula') or
+                            (_valid_ula(ula) is not None and _valid_ula(ula) == _valid_ula(ucfg.get('ula')))):
+                        ula = None
+                    text = _6in4_conf_text(userid, ucfg['vpnlocalip'], ucfg['vpnremoteip'],
+                                           ucfg.get('ula') if ula else None)
+                    break
+            if text is None:
+                LOG.warning("Removing omr-6in4/user%d: no user has its addresses", userid)
+            _apply_6in4_conf(userid, text)
 
 # Update VPS
 @app.get('/update', summary="Update VPS script")
@@ -7648,12 +7942,8 @@ def _remove_user_resources(username, udata, users):
         if os.path.isfile(intf_file):
             os.remove(intf_file)
     _remove_user_openvpn_lan(username, udata, users)
-    for unit, conf in ((f"omr6in4@user{userid}", f'/etc/openmptcprouter-vps-admin/omr-6in4/user{userid}'),
-                       (f"omr-vxlan@user{userid}", f'/etc/openmptcprouter-vps-admin/omr-vxlan/user{userid}')):
-        if os.path.isfile(conf):
-            subprocess.run(["systemctl", "-q", "stop", unit], check=False)
-            subprocess.run(["systemctl", "-q", "disable", unit], check=False)
-            os.remove(conf)
+    _apply_6in4_conf(userid, None)
+    _remove_tunnel_unit(f"omr-vxlan@user{userid}", f'/etc/openmptcprouter-vps-admin/omr-vxlan/user{userid}')
     backup_dir = '/var/opt/openmptcprouter'
     if os.path.isdir(backup_dir):
         for name in os.listdir(backup_dir):
@@ -7922,6 +8212,11 @@ class MPTCPServer(uvicorn.Server):
 # does). Runs once per module import, i.e. once per uvicorn worker. A
 # failure here must not stop omr-admin from starting: the API is how the
 # state that broke it gets fixed.
+# Before it: dropping a router address another router has changes the DNATs.
+try:
+    _check_6in4_confs()
+except Exception:
+    LOG.exception("6in4 tunnel check at startup failed")
 try:
     _nft_resync_all()
 except Exception:

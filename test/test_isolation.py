@@ -529,12 +529,208 @@ class TestVpnIpsOwnership:
         assert body["reason"] == "remoteip already used by another user" and not modif.called
         body, _ = self._post(other_client, config, remoteip="10.255.255.1", localip="10.255.255.5")
         assert body["reason"] == "remoteip already used by another user"
-        body, _ = self._post(other_client, config, remoteip="10.255.255.6", localip="10.255.255.5",
+        # 10.255.255.10: userid 2's glorytun address
+        body, _ = self._post(other_client, config, remoteip="10.255.255.10", localip="10.255.255.9",
                              ula="fd12:3456:789a::/56")
         assert body["reason"] == "ula already used by another user"
         # the VPS end of a tunnel is shared (every OpenVPN client's localip)
-        body, _ = self._post(other_client, config, remoteip="10.255.255.6", localip="10.255.255.1")
+        body, _ = self._post(other_client, config, remoteip="10.255.255.10", localip="10.255.255.1")
         assert body["result"] == "done"
+
+    def test_invalid_stored_ula_of_another_user_blocks_nobody(self, other_client):
+        # an older release stored ::/0, which overlaps every ULA
+        config = _config()
+        config["users"][0]["openmptcprouter"]["ula"] = "::/0"
+        body, _ = self._post(other_client, config, remoteip="10.255.255.10", localip="10.255.255.9",
+                             ula="fd12:3456:789a::/48")
+        assert body["result"] == "done"
+
+    def test_stale_address_leased_to_the_caller(self, other_client):
+        # OpenVPN gave 10.255.252.6 to 'readonly' since 'openmptcprouter'
+        # stored it: the stored one is stale, not a reason to refuse
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnremoteip="10.255.252.6", vpnlocalip="10.255.252.1")
+        with patch("omr_admin._openvpn_leases", return_value={"10.255.252.6": "readonly"}), \
+             patch("omr_admin._drop_stale_remoteip") as drop:
+            body, _ = self._post(other_client, config, remoteip="10.255.252.6", localip="10.255.252.1")
+        assert body["result"] == "done"
+        assert drop.call_args.args[1] == ["openmptcprouter"]
+        # not leased to it: refused as before
+        with patch("omr_admin._openvpn_leases", return_value={"10.255.252.6": "openmptcprouter"}), \
+             patch("omr_admin._drop_stale_remoteip") as drop:
+            body, modif = self._post(other_client, config, remoteip="10.255.252.6", localip="10.255.252.1")
+        assert body["reason"] == "remoteip already used by another user"
+        assert not drop.called and not modif.called
+
+
+class TestRemoteipOwner:
+    """The router address of a /vpnips is where every DNAT of the user goes:
+    another router's, and this user's ports reached that router."""
+
+    _USERS = {
+        "admin": {"permissions": "admin"},
+        "openmptcprouter": {"userid": 0},
+        "readonly": {"userid": 2, "wireguard_peers": [{"key": "k", "ip": "10.255.247.3"}]},
+        "third": {"userid": "3"},
+    }
+
+    def _error(self, userid, remoteip, leases=None, fixed=None):
+        with patch("omr_admin._mqvpn_fixed_ips", return_value=fixed or {}):
+            return omr_admin._remoteip_owner_error(self._USERS, userid, remoteip, leases)
+
+    @pytest.mark.parametrize("remoteip", ["10.255.255.10", "10.255.254.10", "10.255.251.10"])
+    def test_own_static_slot(self, remoteip):
+        assert self._error(2, remoteip) is None
+
+    @pytest.mark.parametrize("remoteip,reason", [
+        ("10.255.255.2", "remoteip already used by another user"),   # userid 0's
+        ("10.255.254.14", "remoteip already used by another user"),  # userid 3's
+        ("10.255.251.6", "Invalid remoteip"),                        # userid 1, nobody's yet
+        ("10.255.253.2", "Invalid remoteip"),                        # MLVPN, the main router's
+    ])
+    def test_not_its_slot(self, remoteip, reason):
+        assert self._error(2, remoteip) == reason
+
+    def test_main_router_may_use_a_free_slot(self):
+        # glorytun by DHCP: its address isn't always in its /30
+        assert self._error(0, "10.255.255.6") is None
+        assert self._error(0, "10.255.253.2") is None
+        assert self._error(0, "10.255.255.10") == "remoteip already used by another user"
+
+    def test_wireguard_peer_of_another_user(self):
+        assert self._error(0, "10.255.247.3") == "remoteip already used by another user"
+        assert self._error(2, "10.255.247.3") is None
+
+    def test_mqvpn_fixed_address_of_another_user(self):
+        assert self._error(2, "10.255.220.9", fixed={"10.255.220.9": "openmptcprouter"}) \
+            == "remoteip already used by another user"
+        assert self._error(2, "10.255.220.9", fixed={"10.255.220.9": "readonly"}) is None
+
+    def test_openvpn_lease(self):
+        assert self._error(2, "10.255.252.6", leases={"10.255.252.6": "third"}) \
+            == "remoteip already used by another user"
+        assert self._error(2, "10.255.252.6", leases={"10.255.252.6": "readonly"}) is None
+        # the main router logged in as admin: its certificate is still its own
+        assert self._error(0, "10.255.252.6", leases={"10.255.252.6": "openmptcprouter"}) is None
+
+    def test_openvpn_leases_parsed(self):
+        status = ["OpenVPN CLIENT LIST\n", "Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since\n",
+                  "readonly,1.2.3.4:1194,10,20,Wed\n", "ROUTING TABLE\n",
+                  "Virtual Address,Common Name,Real Address,Last Ref\n",
+                  "10.255.252.6,readonly,1.2.3.4:1194,Wed\n", "192.168.2.0/24,readonly,1.2.3.4:1194,Wed\n",
+                  "GLOBAL STATS\n", "Max bcast/mcast queue length,0\n", "END\n"]
+        with patch("omr_admin._openvpn_status", return_value=status):
+            assert omr_admin._openvpn_leases() == {"10.255.252.6": "readonly"}
+        with patch("omr_admin._openvpn_status", return_value=None):
+            assert omr_admin._openvpn_leases() == {}
+
+
+class TestSixInFourConf:
+    """omr-6in4/user<id>, which omr-6in4-run reads as root."""
+
+    def test_own_pair_whatever_was_sent(self):
+        text = omr_admin._6in4_conf_text(2, "10.255.255.9", "10.255.255.10", "fd12:3456:789a::/48")
+        assert text == ("LOCALIP=10.255.255.9\nREMOTEIP=10.255.255.10\nLOCALIP6=fd00::a02:1/126\n"
+                        "REMOTEIP6=fd00::a02:2/126\nULA=fd12:3456:789a::/48\n")
+
+    @pytest.mark.parametrize("ula,line", [
+        ("auto", "ULA=auto"),
+        ("fd12:3456:789a::1/48", "ULA=fd12:3456:789a::/48"),   # host bits, which ip route refuses
+        ("fd0a:0b0c:0d0e::/48", "ULA=fd0a:0b0c:0d0e::/48"),    # as sent: the router compares it
+        ("::/0", None), ("fd00::/48", None), ("", None), (None, None),
+    ])
+    def test_ula(self, ula, line):
+        text = omr_admin._6in4_conf_text(0, "10.255.255.1", "10.255.255.2", ula)
+        assert [l for l in text.splitlines() if l.startswith("ULA=")] == ([line] if line else [])
+
+
+class TestCheck6in4Confs:
+    """At startup, the files an older release wrote from unchecked values."""
+
+    def _run(self, config, files):
+        applied = {}
+        state = {"config": config}
+
+        def _mutate(mutator):
+            return mutator(state["config"])
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.listdir", return_value=list(files)),
+            patch("omr_admin._mutate_omr_config", side_effect=_mutate),
+            patch("omr_admin._read_6in4_conf", side_effect=lambda uid: dict(files.get(f"user{uid}", {}))),
+            patch("omr_admin._apply_6in4_conf", side_effect=lambda uid, text: applied.__setitem__(uid, text)),
+            patch("omr_admin._mqvpn_fixed_ips", return_value={}),
+        ):
+            omr_admin._check_6in4_confs()
+        return applied, state["config"]["users"][0]
+
+    def test_unchecked_ula_and_pair_rewritten(self):
+        config = _config()
+        config["users"][0]["readonly"].update(vpnlocalip="10.255.255.9", vpnremoteip="10.255.255.10", ula="::/0")
+        files = {"user2": {"LOCALIP": "10.255.255.9", "REMOTEIP": "10.255.255.10",
+                           "LOCALIP6": "::/0", "REMOTEIP6": "fd00::a02:2/126", "ULA": "::/0"}}
+        applied, users = self._run(config, files)
+        assert applied[2] == ("LOCALIP=10.255.255.9\nREMOTEIP=10.255.255.10\nLOCALIP6=fd00::a02:1/126\n"
+                              "REMOTEIP6=fd00::a02:2/126\n")
+        assert "ula" not in users["readonly"]   # the router posts its own again
+
+    def test_overlapping_ulas_both_dropped(self):
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnlocalip="10.255.255.1", vpnremoteip="10.255.255.2",
+                                                    ula="fd12:3456:789a::/48")
+        config["users"][0]["readonly"].update(vpnlocalip="10.255.255.9", vpnremoteip="10.255.255.10",
+                                             ula="fd12:3456:789a::/56")
+        files = {"user0": {"LOCALIP": "10.255.255.1", "REMOTEIP": "10.255.255.2", "ULA": "fd12:3456:789a::/48"},
+                 "user2": {"LOCALIP": "10.255.255.9", "REMOTEIP": "10.255.255.10", "ULA": "fd12:3456:789a::/56"}}
+        applied, users = self._run(config, files)
+        assert "ULA=" not in applied[0] and "ULA=" not in applied[2]
+        assert "ula" not in users["openmptcprouter"] and "ula" not in users["readonly"]
+
+    def test_valid_ula_kept(self):
+        config = _config()
+        config["users"][0]["readonly"].update(vpnlocalip="10.255.255.9", vpnremoteip="10.255.255.10",
+                                             ula="fd12:3456:789a::/48")
+        files = {"user2": {"LOCALIP": "10.255.255.9", "REMOTEIP": "10.255.255.10", "ULA": "fd12:3456:789a::/48"}}
+        applied, users = self._run(config, files)
+        assert applied[2].endswith("ULA=fd12:3456:789a::/48\n")
+        assert users["readonly"]["ula"] == "fd12:3456:789a::/48"
+
+    def test_address_of_another_router_dropped(self):
+        # userid 2 had claimed the main router's glorytun address
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnlocalip="10.255.255.1", vpnremoteip="10.255.255.2")
+        config["users"][0]["readonly"].update(vpnlocalip="10.255.255.1", vpnremoteip="10.255.255.2")
+        files = {"user0": {"LOCALIP": "10.255.255.1", "REMOTEIP": "10.255.255.2"},
+                 "user2": {"LOCALIP": "10.255.255.1", "REMOTEIP": "10.255.255.2"}}
+        applied, users = self._run(config, files)
+        assert applied[0].startswith("LOCALIP=10.255.255.1\nREMOTEIP=10.255.255.2\n") and applied[2] is None
+        assert users["openmptcprouter"]["vpnremoteip"] == "10.255.255.2"
+        assert "vpnremoteip" not in users["readonly"]
+
+    def test_same_dynamic_address_dropped_for_both(self):
+        # an OpenVPN address: no telling whose it is from the config alone
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnlocalip="10.255.252.1", vpnremoteip="10.255.252.6")
+        config["users"][0]["readonly"].update(vpnlocalip="10.255.252.1", vpnremoteip="10.255.252.6")
+        files = {"user0": {"LOCALIP": "10.255.252.1", "REMOTEIP": "10.255.252.6"},
+                 "user2": {"LOCALIP": "10.255.252.1", "REMOTEIP": "10.255.252.6"}}
+        applied, users = self._run(config, files)
+        assert applied == {0: None, 2: None}
+        assert "vpnremoteip" not in users["openmptcprouter"] and "vpnremoteip" not in users["readonly"]
+
+    def test_file_of_nobody_removed(self):
+        applied, _ = self._run(_config(), {"user7": {"LOCALIP": "10.255.255.29", "REMOTEIP": "10.255.255.30"},
+                                           "README": {}})
+        assert applied == {7: None}
+
+    def test_main_router_stored_under_admin(self):
+        config = _config()
+        config["users"][0]["admin"].update(vpnlocalip="10.255.255.1", vpnremoteip="10.255.255.2")
+        files = {"user0": {"LOCALIP": "10.255.255.1", "REMOTEIP": "10.255.255.2"}}
+        applied, users = self._run(config, files)
+        assert applied[0].startswith("LOCALIP=10.255.255.1\nREMOTEIP=10.255.255.2\n")
+        assert users["admin"]["vpnremoteip"] == "10.255.255.2"
 
 
 def _open_with_config(config):
