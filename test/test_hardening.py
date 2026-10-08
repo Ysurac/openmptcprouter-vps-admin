@@ -343,6 +343,47 @@ class TestAddUserChecks:
         assert latest["users"][0]["new"]["shadowsocks_port"] == 65110
         assert created == ["None", ""]   # the first asked for, the next one free
 
+    def test_gre_tunnels_of_the_public_ips_once_the_user_is_saved(self, admin_client):
+        order = MagicMock()
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin.add_gre_tunnels", side_effect=lambda *a: order.gre(*a)),
+            patch("omr_admin.proxy_isolate_reverse_tunnels"),
+            patch("omr_admin.read_omr_config", return_value=dict(json.loads(json.dumps(MOCK_CONFIG)), gre_tunnels=True)),
+            patch("omr_admin._mutate_omr_config", side_effect=lambda *a: order.persist()),
+        ):
+            r = admin_client.post("/add_user", json={"username": "new", "ips": ["203.0.113.9", "203.0.113.10"]})
+        assert r.json()["result"] == "done"
+        # looked up in the config without the user, before: none ever made
+        assert [c[0] for c in order.mock_calls] == ["persist", "gre"]
+        assert order.gre.call_args.args == ("new",)
+
+    def test_gre_tunnels_on_when_the_config_does_not_say(self, admin_client):
+        config = json.loads(json.dumps(MOCK_CONFIG))
+        del config["gre_tunnels"]
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin.add_gre_tunnels") as gre,
+            patch("omr_admin.proxy_isolate_reverse_tunnels"),
+            patch("omr_admin.read_omr_config", return_value=config),
+            patch("omr_admin._mutate_omr_config"),
+        ):
+            r = admin_client.post("/add_user", json={"username": "new", "ips": ["203.0.113.9"]})
+        assert r.json()["result"] == "done"
+        gre.assert_called_once_with("new")
+
+    def test_no_gre_tunnel_when_the_vps_has_them_off(self, admin_client):
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin.add_gre_tunnels") as gre,
+            patch("omr_admin.proxy_isolate_reverse_tunnels"),
+            patch("omr_admin.read_omr_config", return_value=dict(json.loads(json.dumps(MOCK_CONFIG)), gre_tunnels=False)),
+            patch("omr_admin._mutate_omr_config"),
+        ):
+            r = admin_client.post("/add_user", json={"username": "new", "ips": ["203.0.113.9"]})
+        assert r.json()["result"] == "done"
+        gre.assert_not_called()
+
 
 class TestRemoveUserTeardown:
     def test_every_shadowsocks_port_of_the_user_removed(self):

@@ -1303,24 +1303,30 @@ class TestTunnelFilesWrittenAtomically:
             "iroute 192.168.1.0 255.255.255.0\niroute 10.1.0.0 255.255.0.0\n", 0o644)
 
 
-class TestGreIntfComplete:
-    """A GRE tunnel file is only written when missing: one cut off by an
-    earlier release must count as missing, or it would never be rewritten."""
+class TestGreIntfRewrite:
+    """A GRE tunnel file cut off by an earlier release is written again in
+    full: the file is compared with what it has to hold, not only checked
+    for being there."""
 
     @pytest.mark.real_env
-    @pytest.mark.parametrize("content,complete", [
-        ("INTF=eth0\nLOCALIP=10.255.249.1\nUSERNAME=openmptcprouter\nUSERID=0\n", True),
-        ("INTF=eth0\nLOCALIP=10.255.249.1\n", False),
-        ("", False),
+    @pytest.mark.parametrize("content", [
+        "INTF=eth0\nLOCALIP=10.255.240.5\n",
+        "",
     ])
-    def test_complete(self, tmp_path, content, complete):
-        p = tmp_path / "gre-user0-ip1"
-        p.write_text(content)
-        assert omr_admin._gre_intf_complete(str(p)) is complete
+    def test_truncated_file_rewritten(self, tmp_path, content):
+        (tmp_path / "gre-user0-ip1").write_text(content)
+        with patch("omr_admin.GRE_INTF_DIR", str(tmp_path)), patch("subprocess.run"):
+            omr_admin._gre_write_intf("gre-user0-ip1", "eth0", "203.0.113.5", "255.255.255.0",
+                                      omr_admin.IPNetwork("10.255.240.4/30"), "openmptcprouter", 0)
+        assert (tmp_path / "gre-user0-ip1").read_text().endswith("USERNAME=openmptcprouter\nUSERID=0\n")
 
     @pytest.mark.real_env
-    def test_missing(self, tmp_path):
-        assert omr_admin._gre_intf_complete(str(tmp_path / "gre-user0-ip1")) is False
+    def test_missing_file_written(self, tmp_path):
+        with patch("omr_admin.GRE_INTF_DIR", str(tmp_path / "intf")), patch("subprocess.run") as run:
+            omr_admin._gre_write_intf("gre-user0-ip1", "eth0", "203.0.113.5", "255.255.255.0",
+                                      omr_admin.IPNetwork("10.255.240.4/30"), "openmptcprouter", 0)
+        assert (tmp_path / "intf" / "gre-user0-ip1").read_text().startswith("INTF=eth0\nINTFADDR=203.0.113.5\n")
+        run.assert_not_called()
 
 
 class TestTightenTunnelKeys:

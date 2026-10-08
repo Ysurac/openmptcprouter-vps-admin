@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from conftest import omr_admin  # noqa: F401  (fixtures)
+from conftest import _REAL_OPEN, omr_admin  # noqa: F401  (fixtures)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -281,3 +281,79 @@ class TestXrayEndpointReverse:
         conf = modif.call_args[0][1]["xray"]
         assert conf["reverse_key"] == reverse_id
         assert conf["transport"] == "tcp"
+
+
+# ===========================================================================
+# xray_add_user / xray_del_user: users pushed to the running xray
+# ===========================================================================
+
+
+def _xray_server():
+    return {"inbounds": [
+        {"tag": "omrin-tunnel", "protocol": "vless", "port": 65248,
+         "settings": {"clients": [{"id": "u-main", "email": "openmptcprouter"},
+                                  {"id": "u-rev", "email": "omr-reverse", "reverse": {"tag": "OMRLan"}}],
+                      "decryption": "none"}},
+        {"tag": "omrin-vmess-tunnel", "protocol": "vmess", "settings": {"clients": []}},
+        {"tag": "omrin-trojan-tunnel", "protocol": "trojan", "settings": {"clients": []}},
+        {"tag": "omrin-socks-tunnel", "protocol": "socks", "settings": {"accounts": []}},
+        {"tag": "omrin-shadowsocks-tunnel", "protocol": "shadowsocks",
+         "settings": {"password": "spsk", "method": "2022-blake3-aes-256-gcm", "clients": []}},
+        {"tag": "api", "protocol": "dokodemo-door", "settings": {}},
+    ], "routing": {"rules": []}, "outbounds": []}
+
+
+class TestXrayLiveUsers:
+    @staticmethod
+    def _run(func, data, *args):
+        written, calls = {}, []
+
+        def run(cmd, **kwargs):
+            entry = list(cmd)
+            if entry[-1].endswith(".json"):
+                with _REAL_OPEN(entry[-1]) as f:
+                    entry[-1] = json.load(f)
+            calls.append(entry)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("shutil.which", return_value="/usr/bin/xray"), \
+             patch("os.path.isfile", return_value=True), \
+             patch("builtins.open", side_effect=lambda p, *a, **k: io.StringIO(json.dumps(data))
+                   if str(p) == "/etc/xray/xray-server.json" else _REAL_OPEN(p, *a, **k)), \
+             patch("omr_admin._atomic_write_json", side_effect=lambda p, d: written.update(data=d)), \
+             patch("omr_admin._schedule_proxy_restart"), \
+             patch("subprocess.run", side_effect=run):
+            func(*args)
+        return written.get("data"), calls
+
+    def test_new_user_added_alone_to_each_running_inbound(self):
+        data, calls = self._run(omr_admin.xray_add_user, _xray_server(), "alice", "u-alice", "k-alice")
+        subs = [c[2] for c in calls]
+        # "adi" of an inbound xray has: "existing tag found", every time
+        assert subs.count("adi") == 1            # the SOCKS inbound only, no user manager
+        assert subs.count("adu") == 4
+        for c in calls:
+            assert c[3] == "--server=127.0.0.1:10086"   # ahead of the arguments
+        adu = [c[-1]["inbounds"][0] for c in calls if c[2] == "adu"]
+        assert {i["tag"]: i["settings"]["clients"] for i in adu}["omrin-tunnel"] == \
+            [{"id": "u-alice", "level": 0, "alterId": 0, "email": "alice"}]
+        ss = next(i for i in adu if i["tag"] == "omrin-shadowsocks-tunnel")
+        assert ss["settings"]["clients"] == [{"password": "k-alice", "email": "alice"}]
+        assert ss["settings"]["method"] == "2022-blake3-aes-256-gcm"
+        assert ["rmu", "-tag=omrin-tunnel", "alice"] == calls[subs.index("rmu")][2:3] + calls[subs.index("rmu")][4:]
+        # written for a restart
+        tunnel = data["inbounds"][0]["settings"]["clients"]
+        assert tunnel[-1]["email"] == "alice"
+
+    def test_user_added_again_replaced_not_listed_twice(self):
+        data, _ = self._run(omr_admin.xray_add_user, _xray_server(), "openmptcprouter", "u-new", "k")
+        clients = data["inbounds"][0]["settings"]["clients"]
+        assert [c["id"] for c in clients if c.get("email") == "openmptcprouter"] == ["u-new"]
+        # the reverse tunnel client stays
+        assert any(c.get("reverse") for c in clients)
+
+    def test_removed_user_only_from_its_inbounds_and_alone(self):
+        data, calls = self._run(omr_admin.xray_del_user, _xray_server(), "openmptcprouter")
+        assert [c[2] for c in calls] == ["rmu"]
+        assert calls[0][4:] == ["-tag=omrin-tunnel", "openmptcprouter"]
+        assert [c["email"] for c in data["inbounds"][0]["settings"]["clients"]] == ["omr-reverse"]

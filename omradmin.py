@@ -30,6 +30,7 @@ import hmac
 import urllib.parse
 #import pathlib
 import shutil
+import tempfile
 import time
 import copy
 import io
@@ -1161,6 +1162,51 @@ def v2ray_add_user(user, v2rayuuid='', restart=1):
             subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
     return v2rayuuid
 
+XRAY_API_SERVER = '--server=127.0.0.1:10086'
+
+def _xray_api(cmd, *args, config=None):
+    """Run "xray api <args>" against the running xray; *config*: a dict
+    passed as the JSON file of the command (adi, adu). The file is a private
+    temporary one: /etc/xray/newconfig.json, world readable, kept every
+    user's key of the inbound once the command was done."""
+    path = None
+    try:
+        if config is not None:
+            # 0600: the users' keys
+            with tempfile.NamedTemporaryFile('w', prefix='omr-xray-api-', suffix='.json', delete=False) as f:
+                path = f.name
+                json.dump(config, f)
+        # The server flag first: the flags end at the first argument
+        result = subprocess.run(["/usr/bin/xray", "api", cmd, XRAY_API_SERVER, *args] + ([path] if path else []),
+                                capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            LOG.debug("xray api %s failed: %s", cmd, (result.stderr or result.stdout or '').strip())
+    except OSError as exception:
+        LOG.debug("xray api %s not run (%s)", cmd, exception)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+def _xray_live_user(inbound, user, client=None):
+    """Push a change of one user of *inbound* (from xray-server.json, already
+    changed) to the running xray: rmu, then adu with that user alone
+    (*client*, None to remove it). The users were pushed with "adi" of the
+    whole inbound, which xray refuses for an inbound it already has
+    ("existing tag found"): a new user only worked after a restart. SOCKS is
+    not a user manager in xray: that inbound is replaced as it is now."""
+    tag = inbound.get('tag', '')
+    if inbound.get('protocol') == 'socks':
+        _xray_api('rmi', tag)
+        _xray_api('adi', config={'inbounds': [inbound]})
+        return
+    _xray_api('rmu', '-tag=' + tag, user)
+    if client is not None:
+        settings = dict(inbound.get('settings') or {}, clients=[client])
+        _xray_api('adu', config={'inbounds': [dict(inbound, settings=settings)]})
+
 def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
     if xrayuuid == '':
         xrayuuid = str(uuid.uuid1())
@@ -1170,56 +1216,32 @@ def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
         return xrayuuid
     if not os.path.isfile('/etc/xray/xray-server.json'):
         return xrayuuid
+    clients = {
+        'omrin-tunnel': {'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user},
+        'omrin-vmess-tunnel': {'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user},
+        'omrin-trojan-tunnel': {'password': xrayuuid, 'email': user},
+        'omrin-shadowsocks-tunnel': {'password': ukeyss2022, 'email': user},
+    }
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
-        for inbounds in data['inbounds']:
-            custominbounds = {"inbounds": []}
-            if inbounds['tag'] == 'omrin-tunnel':
-                inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
-                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-tunnel")
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
-                LOG.debug(tt)
-            if inbounds['tag'] == 'omrin-vmess-tunnel':
-                inbounds['settings']['clients'].append({'id': xrayuuid, 'level': 0, 'alterId': 0, 'email': user})
-                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-vmess-tunnel")
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
-                LOG.debug(tt)
-            if inbounds['tag'] == 'omrin-trojan-tunnel':
-                inbounds['settings']['clients'].append({'password': xrayuuid, 'email': user})
-                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-trojan-tunnel")
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
-                LOG.debug(tt)
-            if inbounds['tag'] == 'omrin-socks-tunnel':
-                inbounds['settings']['accounts'].append({'pass': xrayuuid, 'user': user})
-                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-socks-tunnel")
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
-                LOG.debug(tt)
-            if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
-                inbounds['settings']['clients'].append({'password': ukeyss2022, 'email': user})
-                #os.system("xray api rmi --server=127.0.0.1:65080 omrin-shadowsocks-tunnel")
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                tt = subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], check=False).returncode
-                LOG.debug(tt)
+    pushed = []
+    for inbound in data['inbounds']:
+        tag = inbound.get('tag')
+        settings = inbound.setdefault('settings', {})
+        # Replaced, not added once more: /add_user with several public IPs
+        # listed the user once per IP. A reverse tunnel client is left alone.
+        if tag == 'omrin-socks-tunnel':
+            settings['accounts'] = [a for a in settings.get('accounts', []) if a.get('user') != user] \
+                + [{'pass': xrayuuid, 'user': user}]
+            pushed.append((inbound, None))
+        elif tag in clients:
+            settings['clients'] = [c for c in settings.get('clients', [])
+                                   if c.get('email') != user or c.get('reverse')] + [clients[tag]]
+            pushed.append((inbound, clients[tag]))
+    # Before the live push: a restart meanwhile reads the users from the file
     _atomic_write_json('/etc/xray/xray-server.json', data)
+    for inbound, client in pushed:
+        _xray_live_user(inbound, user, client)
     if ip != '':
         try:
             xray_tag = 'output-' + str(ip)
@@ -1271,65 +1293,81 @@ def xray_del_user(user, restart=1):
         return
     with open('/etc/xray/xray-server.json') as f:
         data = json.load(f)
-        # Before the omrin-tunnel clients are pushed back live below; the
-        # redirects removed need the restart.
-        redirects_dropped = _proxy_drop_user('xray', data, user)
-        for inbounds in data['inbounds']:
-            custominbounds = {"inbounds": []}
-            if inbounds['tag'] == 'omrin-tunnel':
-                for xrayuser in list(inbounds['settings']['clients']):
-                    if xrayuser['email'] == user:
-                        inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            if inbounds['tag'] == 'omrin-vmess-tunnel':
-                for xrayuser in list(inbounds['settings']['clients']):
-                    if xrayuser['email'] == user:
-                        inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-vmess-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            if inbounds['tag'] == 'omrin-trojan-tunnel':
-                for xrayuser in list(inbounds['settings']['clients']):
-                    if xrayuser['email'] == user:
-                        inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-trojan-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            if inbounds['tag'] == 'omrin-socks-tunnel':
-                for xrayuser in list(inbounds['settings']['accounts']):
-                    if xrayuser['user'] == user:
-                        inbounds['settings']['accounts'].remove(xrayuser)
-                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-socks-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
-                for xrayuser in list(inbounds['settings']['clients']):
-                    if xrayuser['email'] == user:
-                        inbounds['settings']['clients'].remove(xrayuser)
-                subprocess.run(["/usr/bin/xray", "api", "rmi", "--server=127.0.0.1:10086", "omrin-shadowsocks-tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                custominbounds['inbounds'].append(inbounds)
-                with open('/etc/xray/newconfig.json', 'w') as f:
-                    json.dump(custominbounds, f, indent=4)
-                #os.system("xray api adi --server=127.0.0.1:65080 " + json.dumps(custominbounds))
-                subprocess.run(["/usr/bin/xray", "api", "adi", "--server=127.0.0.1:10086", "/etc/xray/newconfig.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    # Before the users are pushed live below; the redirects removed need
+    # the restart.
+    redirects_dropped = _proxy_drop_user('xray', data, user)
+    pushed = []
+    for inbound in data['inbounds']:
+        tag = inbound.get('tag')
+        settings = inbound.get('settings') or {}
+        if tag == 'omrin-socks-tunnel':
+            accounts = settings.get('accounts', [])
+            kept = [a for a in accounts if a.get('user') != user]
+            if len(kept) != len(accounts):
+                settings['accounts'] = kept
+                pushed.append(inbound)
+        elif tag in ('omrin-tunnel', 'omrin-vmess-tunnel', 'omrin-trojan-tunnel', 'omrin-shadowsocks-tunnel'):
+            clients = settings.get('clients', [])
+            kept = [c for c in clients if c.get('email') != user or c.get('reverse')]
+            if len(kept) != len(clients):
+                settings['clients'] = kept
+                pushed.append(inbound)
+    reality_dropped = _xray_drop_reality_client(data, user)
     _atomic_write_json('/etc/xray/xray-server.json', data)
-    # No xray restart: users are pushed live through the xray API above
-    if redirects_dropped:
+    # Only the inbounds that had the user, and that user only: every one
+    # was removed and added back whole, cutting the connections of all its
+    # users, for a user it may not even have had
+    for inbound in pushed:
+        _xray_live_user(inbound, user)
+    # The Reality inbound is not pushed live, so a client removed from it
+    # needs a restart.
+    if redirects_dropped or reality_dropped:
         _schedule_proxy_restart('xray')
+
+def _xray_drop_reality_client(data, user):
+    """Remove *user*'s client from the VLESS Reality inbound of *data*.
+    True if it changed."""
+    changed = False
+    for ib in data.get('inbounds', []):
+        if ib.get('tag') == 'omrin-vless-reality':
+            clients = ib.get('settings', {}).get('clients', [])
+            kept = [c for c in clients if c.get('email') != user]
+            if len(kept) != len(clients):
+                ib['settings']['clients'] = kept
+                changed = True
+    return changed
+
+def _proxy_gre_user_sync(data, user, puuid, tag, inbounds=None):
+    """Make the user of a GRE tunnel (public IP) usable whatever protocol the
+    router picked, in *data* (xray-server.json or v2ray-server.json): a
+    client on a VLESS Reality inbound, which xray_add_user leaves out, and
+    one routing rule sending it to the tunnel's outbound from every tunnel
+    inbound (*inbounds*, xray's by default). Rules that predate it only
+    matched omrin-tunnel. True if it changed.
+
+    The rule goes after the "blocked" ones: inserted first, it let the user
+    of a public IP reach the VPS's own 127.0.0.0/8 and localhost services
+    (the proxy's API among them) through the proxy."""
+    changed = False
+    for ib in data.get('inbounds', []) if puuid else []:
+        if ib.get('tag') == 'omrin-vless-reality':
+            clients = ib.setdefault('settings', {}).setdefault('clients', [])
+            if not any(c.get('email') == user and c.get('id') == puuid for c in clients):
+                clients[:] = [c for c in clients if c.get('email') != user]
+                clients.append({'id': puuid, 'flow': 'xtls-rprx-vision', 'email': user})
+                changed = True
+    rules = data.setdefault('routing', {}).setdefault('rules', [])
+    wanted = {'type': 'field', 'inboundTag': list(inbounds or XRAY_TUNNEL_INBOUNDS), 'user': [ user ], 'outboundTag': tag}
+    # This user's rule only: the users of a same public IP share its outbound
+    def mine(rule):
+        return rule.get('outboundTag') == tag and rule.get('user') in (user, [ user ])
+    at = [i for i, r in enumerate(rules) if mine(r)]
+    blocked = [i for i, r in enumerate(rules) if r.get('outboundTag') == 'blocked']
+    if not (len(at) == 1 and rules[at[0]] == wanted and at[0] > max(blocked, default=-1)):
+        rules[:] = [r for r in rules if not mine(r)]
+        rules.append(wanted)
+        changed = True
+    return changed
 
 def v2ray_add_outbound(tag,ip, restart=1):
     if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
@@ -1392,12 +1430,17 @@ def v2ray_add_routing(tag, user, restart=1):
         if user == "":
                 data['routing']['rules'].append({'type': 'field', 'inboundTag': ( 'omrin-tunnel' ), 'outboundTag': tag})
         else:
-                data['routing']['rules'].append({'type': 'field', 'inboundTag': ( 'omrin-tunnel' ), 'user': ( user ), 'outboundTag': tag})
+                _proxy_gre_user_sync(data, user, '', tag, V2RAY_TUNNEL_INBOUNDS)
 
     _atomic_write_json('/etc/v2ray/v2ray-server.json', data)
     final_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
     if initial_md5 != final_md5 and restart == 1:
         subprocess.run(["systemctl", "-q", "restart", "v2ray"], check=False)
+
+# Every inbound a router reaches xray through, one per protocol it can pick
+# (xray.omrout.protocol on the router)
+XRAY_TUNNEL_INBOUNDS = ('omrin-tunnel', 'omrin-vmess-tunnel', 'omrin-trojan-tunnel',
+                        'omrin-socks-tunnel', 'omrin-shadowsocks-tunnel', 'omrin-vless-reality')
 
 def xray_add_routing(tag, user, restart=1):
     if not os.path.isfile('/etc/xray/xray-server.json'):
@@ -1408,7 +1451,11 @@ def xray_add_routing(tag, user, restart=1):
         if user == "":
                 data['routing']['rules'].insert(0,{'type': 'field', 'inboundTag': ( 'omrin-tunnel' ), 'outboundTag': tag})
         else:
-                data['routing']['rules'].insert(0,{'type': 'field', 'inboundTag': ( 'omrin-tunnel' ), 'user': ( user ), 'outboundTag': tag})
+                # A user's rule on omrin-tunnel alone only held for VLESS: a
+                # router on VMess, Trojan, SOCKS, Shadowsocks (shadowsocks-rust
+                # included) or VLESS Reality left through the main address.
+                # After the "blocked" rules, not ahead of them.
+                _proxy_gre_user_sync(data, user, '', tag)
     _atomic_write_json('/etc/xray/xray-server.json', data)
     final_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
     if initial_md5 != final_md5 and restart == 1:
@@ -1443,141 +1490,273 @@ def xray_del_routing(tag, restart=1):
         subprocess.run(["systemctl", "-q", "restart", "xray"], check=False)
 
 
-def _gre_intf_complete(path):
-    """True if a GRE tunnel file exists and was written to the end (USERID=
-    is its last line). It is only written when missing, so a file cut off by
-    an earlier release would otherwise never be rewritten."""
+# The /30 of each GRE tunnel (a public IP of the VPS for a router), server
+# side .1, router side .2. They were taken from 10.255.249.0/24 in order,
+# which is also where the default VXLAN L3 /30 of each userid is
+# (VXLAN_V4_POOL_LEGACY): the first tunnels had the VXLAN addresses of
+# userids 0, 1... A tunnel still in there is moved once.
+GRE_V4_POOL = IPNetwork('10.255.240.0/22')
+GRE_INTF_DIR = '/etc/openmptcprouter-vps-admin/intf'
+GRE_DEFAULT_USER = 'openmptcprouter'
+
+def _vps_public_ipv4s():
+    """(interface, address, netmask) of each public IPv4 address of the VPS.
+    With the stdlib: netaddr 1.x has no IPAddress.is_private(), every address
+    raised and a VPS on Debian 13 had no tunnel at all."""
+    res = []
+    for intf in netifaces.interfaces():
+        try:
+            for ip_info in netifaces.ifaddresses(intf).get(netifaces.AF_INET, []):
+                addr = ip_info.get('addr', '')
+                if ipaddress.ip_address(addr).is_global:
+                    res.append((intf.split(':')[0], addr, ip_info.get('netmask', '')))
+        except (ValueError, OSError):
+            continue  # an interface gone while listed, an address that is not one
+    return res
+
+def _gre_network(tunnel):
+    """The /30 of a stored tunnel, None if it has none. Entries older than
+    the network field have local_ip, the .1 of it."""
+    try:
+        if tunnel.get('network'):
+            return IPNetwork(tunnel['network']).cidr
+        if tunnel.get('local_ip'):
+            return IPNetwork(tunnel['local_ip'] + '/30').cidr
+    except (AddrFormatError, ValueError, TypeError):
+        pass
+    return None
+
+def _gre_write_intf(gre_intf, iface, addr, netmask, network, user, userid):
+    """Write the file omr-service creates the tunnel from, when it changed.
+    omr-service only recreates a tunnel whose remote address changed: one
+    with new addresses is removed here and comes back with them."""
+    os.makedirs(GRE_INTF_DIR, exist_ok=True)
+    path = safe_path_join(GRE_INTF_DIR, gre_intf)
+    text = ('INTF=' + iface + "\n"
+            + 'INTFADDR=' + addr + "\n"
+            + 'INTFNETMASK=' + str(netmask) + "\n"
+            + 'NETWORK=' + str(network) + "\n"
+            + 'LOCALIP=' + str(network[1]) + "\n"
+            + 'REMOTEIP=' + str(network[2]) + "\n"
+            + 'NETMASK=255.255.255.252' + "\n"
+            + 'BROADCASTIP=' + str(network.broadcast) + "\n"
+            # the key of the user in the config: omr-service looks its
+            # vpnremoteip up with it
+            + 'USERNAME=' + str(user) + "\n"
+            + 'USERID=' + str(userid) + "\n")
     try:
         with open(path) as f:
-            return any(line.startswith('USERID=') for line in f)
+            old = f.read()
     except OSError:
+        old = None
+    if old == text:
+        return
+    _atomic_write_text(path, text)
+    if old is not None and ('NETWORK=' + str(network) + "\n" not in old or 'INTFADDR=' + addr + "\n" not in old):
+        subprocess.run(["ip", "link", "del", gre_intf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+def _gre_ss_port(addr, userid, udata):
+    """The shadowsocks-libev port of *userid* bound to public IP *addr*:
+    the one manager.json has, or a new one with the user's key. (port, added)
+    or (None, False). Any port bound to the address was taken before, the
+    one of another user on it as well."""
+    try:
+        with open('/etc/shadowsocks-libev/manager.json') as f:
+            data = json.loads(re.sub(r",\s*}", "}", f.read()))
+    except (OSError, ValueError):
+        return None, False
+    port_conf = data.get('port_conf') or {}
+    for port, conf in port_conf.items():
+        if isinstance(conf, dict) and conf.get('local_address') == addr \
+                and str(conf.get('userid', userid)) == str(userid):
+            return str(port), False
+    main_port = str(udata.get('shadowsocks_port'))
+    key = (data.get('port_key') or {}).get(main_port) or (port_conf.get(main_port) or {}).get('key')
+    if not key:
+        return None, False
+    return str(add_ss_user('', key, userid, addr)), True
+
+def _proxy_gre_outbound_sync(data, tag, addr):
+    """One freedom outbound *tag* leaving from public IP *addr* in *data*
+    (xray-server.json), shared by every user of the address. True if it
+    changed."""
+    outbounds = data.setdefault('outbounds', [])
+    wanted = {'protocol': 'freedom', 'settings': { 'userLevel': 0 }, 'tag': tag, 'sendThrough': addr}
+    if [o for o in outbounds if o.get('tag') == tag] == [wanted]:
         return False
+    outbounds[:] = [o for o in outbounds if o.get('tag') != tag]
+    outbounds.append(wanted)
+    return True
 
-def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
+def _gre_drop_stale_intf(userid, tunnels):
+    """Remove the tunnel files of *userid* no tunnel of it names, and their
+    tunnels. The renaming runs left some: two files for one public IP gave
+    omr-service two tunnels with the same ends, which the kernel refuses."""
+    try:
+        names = os.listdir(GRE_INTF_DIR)
+    except OSError:
+        return
+    pattern = re.compile(r'gre-user{}-ip[0-9]+'.format(int(userid)))
+    for name in names:
+        if pattern.fullmatch(name) and name not in tunnels:
+            LOG.info("Remove the GRE tunnel %s, of no public IP of its user", name)
+            os.remove(safe_path_join(GRE_INTF_DIR, name))
+            subprocess.run(["ip", "link", "del", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+_GRE_PROXY_USER_RE = re.compile(r'.+gre-user[0-9]+-ip[0-9]+')
+
+# The proxies a router can reach a public IP through, as the user of that IP
+V2RAY_TUNNEL_INBOUNDS = ('omrin-tunnel', 'omrin-vmess-tunnel', 'omrin-trojan-tunnel', 'omrin-socks-tunnel')
+GRE_PROXIES = {
+    'xray': {'file': '/etc/xray/xray-server.json', 'inbounds': None},
+    'v2ray': {'file': '/etc/v2ray/v2ray-server.json', 'inbounds': V2RAY_TUNNEL_INBOUNDS},
+}
+
+def _proxy_gre_sync_all(service, users, md5=None):
+    """The *service* (xray, v2ray) side of the GRE tunnels of *users*: the
+    outbound of each public IP, the routing of each tunnel user to it, and
+    nothing for a tunnel no user has anymore (a removed user's rule stayed,
+    and its outbound with it). Restarts the service when its config changed
+    since *md5* (now when not given)."""
+    xray_file = GRE_PROXIES[service]['file']
+    if not os.path.isfile(xray_file):
+        return
+    xray_md5 = md5 if md5 else hashlib.md5(file_as_bytes(xray_file)).hexdigest()
+    try:
+        with open(xray_file) as f:
+            data = json.load(f)
+        changed = False
+        emails = set()
+        for user, udata in users.items():
+            if not isinstance(udata, dict):
+                continue
+            for gre_intf, tunnel in (udata.get('gre_tunnels') or {}).items():
+                gre_xray = (tunnel.get(service) or {}) if isinstance(tunnel, dict) else {}
+                if not gre_xray.get('uuid') or not tunnel.get('public_ip'):
+                    continue
+                email = str(udata.get('username', user)) + gre_intf
+                emails.add(email)
+                tag = 'output-' + tunnel['public_ip']
+                changed = _proxy_gre_outbound_sync(data, tag, tunnel['public_ip']) or changed
+                changed = _proxy_gre_user_sync(data, email, gre_xray['uuid'], tag,
+                                               GRE_PROXIES[service]['inbounds']) or changed
+        rules = data.get('routing', {}).get('rules', [])
+        def stale(rule):
+            names = rule.get('user')
+            names = [names] if isinstance(names, str) else (names or [])
+            return str(rule.get('outboundTag', '')).startswith('output-') and names \
+                and all(_GRE_PROXY_USER_RE.fullmatch(str(n)) and n not in emails for n in names)
+        kept = [r for r in rules if not stale(r)]
+        if len(kept) != len(rules):
+            data['routing']['rules'] = kept
+            changed = True
+        used = {r.get('outboundTag') for r in data.get('routing', {}).get('rules', [])}
+        outbounds = data.get('outbounds', [])
+        kept = [o for o in outbounds if not (str(o.get('tag', '')).startswith('output-') and o.get('tag') not in used)]
+        if len(kept) != len(outbounds):
+            data['outbounds'] = kept
+            changed = True
+        if changed:
+            _atomic_write_json(xray_file, data)
+    except (OSError, ValueError) as exception:
+        LOG.debug("%s of the GRE tunnels not synced (%s)", service, exception)
+    # The routing and outbounds need a restart, as v2ray's users (xray's
+    # are pushed live)
+    if hashlib.md5(file_as_bytes(xray_file)).hexdigest() != xray_md5:
+        subprocess.run(["systemctl", "-q", "restart", service], check=False)
+
+def add_gre_tunnels(only_user=None):
+    """A GRE tunnel, carried in the user's VPN, for each public IP of the VPS
+    a user gets: every one for the default user, those of its public_ips for
+    another. A tunnel keeps its name and /30 from one run to the next, found
+    by its public IP: they were given in the order of the addresses and of
+    the users, so a new user or address renamed and renumbered the others.
+    *only_user*: that user only (/add_user)."""
     LOG.debug("Add gre-tunnels now...")
-    nbip = 0
-    allips = []
-    for intf in netifaces.interfaces():
-        addrs = netifaces.ifaddresses(intf)
-        try:
-            ipv4_addr_list = addrs[netifaces.AF_INET]
-            for ip_info in ipv4_addr_list:
-                addr = ip_info['addr']
-                #LOG.debug("Check if " + str(addr) + " is not IPv4 or reserved")
-                if not IPAddress(addr).is_link_local() and not IPAddress(addr).is_reserved() and not IPAddress(addr).is_private():
-                    allips.append(addr)
-                    nbip = nbip + 1
-        except Exception as exception:
-            #LOG.debug("There is an exception in add_gre_tunnels")
-            pass
-
-    if nbip > 1:
-        nbgre = 0
-        nbip = 0
-        for intf in netifaces.interfaces():
-            addrs = netifaces.ifaddresses(intf)
+    public = _vps_public_ipv4s()
+    allips = [addr for _, addr, _ in public]
+    if len(public) > 1:
+        xray_file = '/etc/xray/xray-server.json'
+        v2ray_file = '/etc/v2ray/v2ray-server.json'
+        md5s = {service: hashlib.md5(file_as_bytes(conf['file'])).hexdigest()
+                for service, conf in GRE_PROXIES.items() if os.path.isfile(conf['file'])}
+        ss_added = False
+        content = read_omr_config()
+        users = (content.get('users') or [{}])[0]
+        used = {str(net) for udata in users.values() if isinstance(udata, dict)
+                for net in (_gre_network(t) for t in (udata.get('gre_tunnels') or {}).values() if isinstance(t, dict))
+                if net is not None and net in GRE_V4_POOL}
+        free = (net for net in GRE_V4_POOL.subnet(30) if str(net) not in used)
+        for user, udata in users.items():
+            if only_user is not None and user != only_user:
+                continue
+            if user == 'admin' or not isinstance(udata, dict):
+                continue
             try:
-                ipv4_addr_list = addrs[netifaces.AF_INET]
-                for ip_info in ipv4_addr_list:
-                    addr = ip_info['addr']
-                    if not IPAddress(addr).is_private() and not IPAddress(addr).is_reserved() and not IPAddress(addr).is_link_local():
-                        netmask = ip_info['netmask']
-                        ip = IPNetwork('10.255.249.0/24')
-                        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-                            content = json.load(f)
-                        for user in content['users'][0]:
-                            if user != "admin" and ((user == addtouser and str(ip) == addwithip) or user == 'openmptcprouter'):
-                                subnets = ip.subnet(30)
-                                network = list(subnets)[nbgre]
-                                nbgre = nbgre + 1
-                                userid = 0
-                                username = user
-                                iface = intf.split(':')[0]
-                                if 'userid' in content['users'][0][user]:
-                                    userid = content['users'][0][user]['userid']
-                                if 'username' in content['users'][0][user]:
-                                    username = content['users'][0][user]['username']
-                                gre_intf = 'gre-user' + str(userid) + '-ip' + str(nbip)
-                                if not _gre_intf_complete('/etc/openmptcprouter-vps-admin/intf/' + gre_intf):
-                                    _atomic_write_text('/etc/openmptcprouter-vps-admin/intf/' + gre_intf,
-                                                       'INTF=' + str(intf.split(':')[0]) + "\n"
-                                                       + 'INTFADDR=' + str(addr) + "\n"
-                                                       + 'INTFNETMASK=' + str(netmask) + "\n"
-                                                       + 'NETWORK=' + str(network) + "\n"
-                                                       + 'LOCALIP=' + str(list(network)[1]) + "\n"
-                                                       + 'REMOTEIP=' + str(list(network)[2]) + "\n"
-                                                       + 'NETMASK=255.255.255.252' + "\n"
-                                                       + 'BROADCASTIP=' + str(network.broadcast) + "\n"
-                                                       + 'USERNAME=' + str(username) + "\n"
-                                                       + 'USERID=' + str(userid) + "\n")
-                                # SNAT for this tunnel is rendered from gre_tunnels (iface/network
-                                # added below) into the gre_snat nft chain by _nft_sync_gre_snat(),
-                                # called once at the end of this function -- see the nftables
-                                # engine block above shorewall_add_port. No firewall zone
-                                # declaration is needed for a secondary public-IP interface the way
-                                # the old /etc/shorewall/interfaces write handled it: the static nft
-                                # ruleset's forward/output ACCEPT rules only match the single
-                                # NET_IFACE define, so a secondary WAN interface here is picked up
-                                # for SNAT/egress but not (yet) for forwarding through it -- a known
-                                # gap in multi-public-IP setups, unchanged in scope from before this
-                                # migration since the live test VPS doesn't have a second public IP
-                                # to validate against either.
-                                user_gre_tunnels = {}
-                                if 'gre_tunnels' in content['users'][0][user]:
-                                    user_gre_tunnels = content['users'][0][user]['gre_tunnels']
-                                user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr), 'iface': str(iface), 'network': str(network)}
-                                if os.path.isfile('/etc/shadowsocks-libev/manager.json') and not 'shadowsocks_port' in user_gre_tunnels[gre_intf]:
-                                    with open('/etc/shadowsocks-libev/manager.json') as g:
-                                        contentss = g.read()
-                                    contentss = re.sub(r",\s*}", "}", contentss) # pylint: disable=W1401
-                                    datass = json.loads(contentss)
-                                    makechange = True
-                                    if 'port_conf' in datass:
-                                        for sscport in datass['port_conf']:
-                                            if 'local_address' in datass['port_conf'][sscport] and datass['port_conf'][sscport]['local_address'] == str(addr):
-                                                makechange = False
-                                    if makechange:
-                                        ss_port = content['users'][0][user]['shadowsocks_port']
-                                        if 'port_key' in datass:
-                                            ss_key = datass['port_key'][str(ss_port)]
-                                        if 'port_conf' in datass:
-                                            ss_key = datass['port_conf'][str(ss_port)]['key']
-                                        if gre_intf not in user_gre_tunnels:
-                                            user_gre_tunnels[gre_intf] = {}
-                                        shadowsocks_port = str(add_ss_user('', ss_key, userid, str(addr))) # pylint: disable=E0606
-                                        user_gre_tunnels[gre_intf].update({'shadowsocks_port': shadowsocks_port})
-                                        #user_gre_tunnels[gre_intf] = {'local_ip': str(list(network)[1]), 'remote_ip': str(list(network)[2]), 'public_ip': str(addr)}
-                                        #modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
-                                if os.path.isfile('/etc/xray/xray-server.json') and not 'xray' in user_gre_tunnels[gre_intf]:
-                                    try:
-                                        xray_user = str(username) + gre_intf
-                                        xrayuuid = str(uuid.uuid1())
-                                        ukeyss2022 = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
-                                        LOG.debug("Delete XRay user...")
-                                        xray_del_user(xray_user)
-                                        LOG.debug("Create XRay user...")
-                                        xray_add_user(xray_user,xrayuuid,ukeyss2022)
-                                        xray_tag = 'output-' + str(addr)
-                                        LOG.debug("Delete XRay routing...")
-                                        xray_del_routing(xray_tag)
-                                        LOG.debug("Add XRay routing...")
-                                        xray_add_routing(xray_tag,xray_user,0)
-                                        LOG.debug("Delete XRay outbound...")
-                                        xray_del_outbound(xray_tag)
-                                        LOG.debug("Add XRay outbound...")
-                                        xray_add_outbound(xray_tag,str(addr),0)
-                                        if gre_intf not in user_gre_tunnels:
-                                            user_gre_tunnels[gre_intf] = {}
-                                        LOG.debug("Prepare json XRay outbound...")
-                                        user_gre_tunnels[gre_intf].update({'xray': {'uuid': xrayuuid,'ss2022': ukeyss2022}})
-                                    except Exception as exception:
-                                        LOG.debug("XRay outbound for %s not added (%s)", addr, exception)
-                                modif_config_user(user, {'gre_tunnels': user_gre_tunnels})
-                        nbip = nbip + 1
-            except Exception as exception:
-                LOG.debug("GRE tunnels setup error (%s)", exception)
+                userid = int(udata['userid'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if user == GRE_DEFAULT_USER:
+                wanted = allips
+            else:
+                wanted = [addr for addr in allips if addr in (udata.get('public_ips') or [])]
+            if not wanted:
+                continue
+            stored = udata.get('gre_tunnels') or {}
+            tunnels = {name: dict(t) for name, t in stored.items() if isinstance(t, dict)}
+            for iface, addr, netmask in public:
+                if addr not in wanted:
+                    continue
+                try:
+                    gre_intf = next((name for name, t in tunnels.items() if t.get('public_ip') == addr), None)
+                    if gre_intf is None:
+                        n = 0
+                        while 'gre-user{}-ip{}'.format(userid, n) in tunnels or \
+                                os.path.exists(os.path.join(GRE_INTF_DIR, 'gre-user{}-ip{}'.format(userid, n))):
+                            n += 1
+                        gre_intf = 'gre-user{}-ip{}'.format(userid, n)
+                    tunnel = tunnels.get(gre_intf, {})
+                    network = _gre_network(tunnel)
+                    if network is None or network not in GRE_V4_POOL:
+                        network = next(free, None)
+                        if network is None:
+                            LOG.warning("No /30 left for the GRE tunnel of %s to %s", log_safe(user), addr)
+                            continue
+                    tunnel.update(local_ip=str(network[1]), remote_ip=str(network[2]),
+                                  public_ip=addr, iface=iface, network=str(network))
+                    _gre_write_intf(gre_intf, iface, addr, netmask, network, user, userid)
+                    if os.path.isfile('/etc/shadowsocks-libev/manager.json') and not tunnel.get('shadowsocks_port'):
+                        port, added = _gre_ss_port(addr, userid, udata)
+                        if port:
+                            tunnel['shadowsocks_port'] = port
+                            ss_added = ss_added or added
+                    xray_user = str(udata.get('username', user)) + gre_intf
+                    if os.path.isfile(xray_file) and not (tunnel.get('xray') or {}).get('uuid'):
+                        xrayuuid = str(uuid.uuid1())
+                        ukeyss2022 = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
+                        xray_del_user(xray_user)
+                        xray_add_user(xray_user, xrayuuid, ukeyss2022)
+                        tunnel['xray'] = {'uuid': xrayuuid, 'ss2022': ukeyss2022}
+                    if tunnel.get('xray') and not tunnel['xray'].get('email'):
+                        # The router's SOCKS outbound logs in with it
+                        tunnel['xray']['email'] = xray_user
+                    if os.path.isfile(v2ray_file) and not (tunnel.get('v2ray') or {}).get('uuid'):
+                        # Same user name: one v2ray-server.json, one xray-server.json
+                        v2rayuuid = str(uuid.uuid1())
+                        v2ray_del_user(xray_user, restart=0)
+                        v2ray_add_user(xray_user, v2rayuuid, restart=0)
+                        tunnel['v2ray'] = {'uuid': v2rayuuid, 'email': xray_user}
+                    tunnels[gre_intf] = tunnel
+                except Exception as exception:
+                    LOG.debug("GRE tunnel of %s to %s not set up (%s)", log_safe(user), addr, exception)
+            if tunnels != stored:
+                modif_config_user(user, {'gre_tunnels': tunnels})
+            _gre_drop_stale_intf(userid, tunnels)
+        latest = (read_omr_config().get('users') or [{}])[0]
+        for service, md5 in md5s.items():
+            _proxy_gre_sync_all(service, latest, md5)
         _nft_sync_gre_snat()
-        if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
+        if ss_added:
             subprocess.run(["systemctl", "-q", "restart", "shadowsocks-libev-manager@manager"], check=False)
     set_global_param('allips', allips)
 
@@ -2524,11 +2703,38 @@ def _render_gre_snat(config_data):
             lines.append(f'oifname "{gre_intf}" snat ip to {local_ip} comment "{tag}"')
     return lines
 
+_GRE_IFACE_RE = re.compile(r'[A-Za-z0-9_.-]{1,15}')
+
+def _render_gre_forward(config_data):
+    """Forward chain rules of the GRE tunnels. The base forward chain only
+    lets the tunnels out through NET_IFACE (and DNAT replies back in from
+    it): a public address on another interface got its SNAT from gre_snat
+    but every packet was rejected before reaching it."""
+    lines = []
+    users = config_data.get('users', [{}])[0]
+    for username, udata in users.items():
+        for gre_intf, tunnel in udata.get('gre_tunnels', {}).items():
+            public_ip, iface = tunnel.get('public_ip'), tunnel.get('iface')
+            if not (public_ip and iface and _GRE_IFACE_RE.fullmatch(iface) and _GRE_IFACE_RE.fullmatch(gre_intf)):
+                continue
+            tag = _nft_comment(f'OMR GRE ip {public_ip} user {username}')
+            lines.append(f'iifname "{gre_intf}" oifname "{iface}" accept comment "{tag}"')
+            lines.append(f'meta nfproto ipv4 iifname "{iface}" oifname "{gre_intf}" ct status dnat accept comment "{tag}"')
+    return lines
+
 def _nft_sync_gre_snat():
     config_data = read_omr_config()
     if not config_data:
         return False
-    return _nft_flush_chain('gre_snat', _render_gre_snat(config_data))
+    snat_ok = _nft_flush_chain('gre_snat', _render_gre_snat(config_data))
+    # gre_forward is newer than the ruleset of an installed VPS: "add chain"
+    # creates it there (and does nothing when it exists), nftables/omr.nft
+    # jumps to it once the VPS is updated.
+    script = f'add chain {NFT_FAMILY} {NFT_TABLE} gre_forward\n'
+    script += f'flush chain {NFT_FAMILY} {NFT_TABLE} gre_forward\n'
+    for line in _render_gre_forward(config_data):
+        script += f'add rule {NFT_FAMILY} {NFT_TABLE} gre_forward {line}\n'
+    return _nft_run(script) and snat_ok
 
 # --- client-to-client policy (client2client chain) -----------------------
 
@@ -2816,9 +3022,6 @@ omr_config_data = load_startup_config()
 if 'debug' in omr_config_data and omr_config_data['debug']:
     LOG.setLevel(logging.DEBUG)
 warn_template_passwords(omr_config_data)
-if 'gre_tunnels' in omr_config_data and omr_config_data['gre_tunnels']:
-    LOG.debug("Add GRE tunnels")
-    add_gre_tunnels()
 
 fake_users_db = omr_config_data['users'][0]
 
@@ -7834,7 +8037,6 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
                 ss_ports.append(int(add_ss_user(str(shadowsocks_port) if not ss_ports else '', shadowsocks_key, userid, publicip)))
             if os.path.isfile('/etc/xray/xray-server.json'):
                 xray_add_user(params.username,uuid,upsk)
-            add_gre_tunnels(params.username, publicip)
         if ss_ports:
             shadowsocks_port = ss_ports[0]
     if shadowsocks_port is not None:
@@ -7848,6 +8050,9 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
 
     _mutate_omr_config(persist_user)
     proxy_isolate_reverse_tunnels()
+    # Once the user is saved: it was looked up in the config without it
+    if publicips and read_omr_config().get('gre_tunnels', True):
+        add_gre_tunnels(params.username)
     if os.path.isfile('/etc/glorytun-tcp/tun0'):
         LOG.debug("Create user " + log_safe(params.username) + " in Glorytun-TCP")
         add_glorytun_tcp(userid)
@@ -7935,12 +8140,20 @@ def _remove_user_resources(username, udata, users):
     userid = int(udata['userid'])
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         _remove_user_ss_ports(udata, userid)
+    md5s = {service: hashlib.md5(file_as_bytes(conf['file'])).hexdigest()
+            for service, conf in GRE_PROXIES.items() if os.path.isfile(conf['file'])}
     for gre_intf in (udata.get('gre_tunnels') or {}):
         if os.path.isfile('/etc/xray/xray-server.json'):
             xray_del_user(str(udata.get('username', username)) + gre_intf)
+        if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+            v2ray_del_user(str(udata.get('username', username)) + gre_intf, restart=0)
         intf_file = safe_path_join('/etc/openmptcprouter-vps-admin/intf', gre_intf)
         if os.path.isfile(intf_file):
             os.remove(intf_file)
+    if udata.get('gre_tunnels'):
+        # Its routing to the public IPs, and an outbound no one else uses
+        for service, md5 in md5s.items():
+            _proxy_gre_sync_all(service, {k: v for k, v in users.items() if k != username}, md5)
     _remove_user_openvpn_lan(username, udata, users)
     _apply_6in4_conf(userid, None)
     _remove_tunnel_unit(f"omr-vxlan@user{userid}", f'/etc/openmptcprouter-vps-admin/omr-vxlan/user{userid}')
@@ -8207,7 +8420,7 @@ class MPTCPServer(uvicorn.Server):
 
 # Rebuild the dynamic nft chains (user_accept/user_dnat/gre_snat/
 # client2client/dscp_mark/ct_helpers) from persisted state at every process
-# startup -- mirrors add_gre_tunnels() above (nft itself has no persistence
+# startup -- as add_gre_tunnels() below (nft itself has no persistence
 # of rule content across a ruleset reload/reboot, only omr-admin-config.json
 # does). Runs once per module import, i.e. once per uvicorn worker. A
 # failure here must not stop omr-admin from starting: the API is how the
@@ -8217,6 +8430,23 @@ try:
     _check_6in4_confs()
 except Exception:
     LOG.exception("6in4 tunnel check at startup failed")
+# The xray users were pushed through this file, world readable, with every
+# key of the inbound in it; nothing writes it anymore (_xray_api)
+try:
+    os.remove('/etc/xray/newconfig.json')
+except OSError:
+    pass
+# Here, once every function is defined: from where the config is read, the
+# xray user of a new tunnel failed (xray_del_user -> _proxy_drop_user, not
+# defined yet). On unless set to false (the installer's GRETUNNELS=no), as
+# omr-service reads it: once only "true" counted, and the default config,
+# without the key, no longer got its tunnels updated.
+if omr_config_data.get('gre_tunnels', True):
+    try:
+        LOG.debug("Add GRE tunnels")
+        add_gre_tunnels()
+    except Exception:
+        LOG.exception("GRE tunnels setup at startup failed")
 try:
     _nft_resync_all()
 except Exception:

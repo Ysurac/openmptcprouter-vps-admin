@@ -25,6 +25,8 @@ import io
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from conftest import _mock_open, omr_admin  # noqa: F401  (fixture import side effect)
 
 
@@ -497,6 +499,98 @@ class TestRenderGreSnat:
         assert omr_admin._render_gre_snat(config) == []
 
 
+class TestRenderGreForward:
+    def test_tunnel_reaches_its_interface_and_dnat_comes_back(self):
+        config = _config({"alice": {"gre_tunnels": {"gre-user3-ip0": {
+            "public_ip": "203.0.113.5", "network": "10.255.249.0/30",
+            "iface": "eth1", "local_ip": "10.255.249.1",
+        }}}})
+        lines = omr_admin._render_gre_forward(config)
+        assert len(lines) == 2
+        assert lines[0].startswith('iifname "gre-user3-ip0" oifname "eth1" accept')
+        assert lines[1].startswith('meta nfproto ipv4 iifname "eth1" oifname "gre-user3-ip0" ct status dnat accept')
+
+    def test_entry_without_iface_is_skipped(self):
+        config = _config({"alice": {"gre_tunnels": {"gre-user3-ip0": {
+            "public_ip": "203.0.113.5", "local_ip": "10.255.249.1",
+        }}}})
+        assert omr_admin._render_gre_forward(config) == []
+
+    def test_iface_name_that_is_not_one_is_skipped(self):
+        config = _config({"alice": {"gre_tunnels": {"gre-user3-ip0": {
+            "public_ip": "203.0.113.5", "iface": 'eth1" accept; drop "',
+        }}}})
+        assert omr_admin._render_gre_forward(config) == []
+
+    def test_sync_creates_and_fills_gre_forward(self):
+        config = _config({"alice": {"gre_tunnels": {"gre-user3-ip0": {
+            "public_ip": "203.0.113.5", "network": "10.255.249.0/30",
+            "iface": "eth1", "local_ip": "10.255.249.1",
+        }}}})
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin._nft_flush_chain", return_value=True) as flush, \
+             patch("omr_admin._nft_run", return_value=True) as run:
+            assert omr_admin._nft_sync_gre_snat() is True
+        flush.assert_called_once()
+        assert flush.call_args.args[0] == "gre_snat"
+        script = run.call_args.args[0]
+        # created first: a VPS whose omr.nft predates the chain has none
+        assert script.index("add chain inet omr gre_forward") < script.index("flush chain inet omr gre_forward")
+        assert 'add rule inet omr gre_forward iifname "gre-user3-ip0" oifname "eth1" accept' in script
+
+
+# ===========================================================================
+# _proxy_gre_user_sync
+# ===========================================================================
+
+
+class TestXrayGreUserSync:
+    @staticmethod
+    def _data():
+        return {
+            "inbounds": [
+                {"tag": "omrin-tunnel", "settings": {"clients": []}},
+                {"tag": "omrin-vless-reality", "settings": {"clients": [{"id": "main", "flow": "xtls-rprx-vision"}]}},
+            ],
+            "routing": {"rules": [
+                # what xray_add_routing wrote before: VLESS only
+                {"type": "field", "inboundTag": "omrin-tunnel", "user": "omrgre-user0-ip1", "outboundTag": "output-203.0.113.5"},
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+            ]},
+        }
+
+    def test_rule_covers_every_tunnel_inbound_and_reality_gets_the_user(self):
+        data = self._data()
+        assert omr_admin._proxy_gre_user_sync(data, "omrgre-user0-ip1", "uuid-1", "output-203.0.113.5") is True
+        rules = [r for r in data["routing"]["rules"] if r["outboundTag"] == "output-203.0.113.5"]
+        assert rules == [{"type": "field", "inboundTag": list(omr_admin.XRAY_TUNNEL_INBOUNDS),
+                          "user": ["omrgre-user0-ip1"], "outboundTag": "output-203.0.113.5"}]
+        assert "omrin-shadowsocks-tunnel" in rules[0]["inboundTag"]
+        reality = data["inbounds"][1]["settings"]["clients"]
+        assert {"id": "uuid-1", "flow": "xtls-rprx-vision", "email": "omrgre-user0-ip1"} in reality
+        assert {"id": "main", "flow": "xtls-rprx-vision"} in reality
+        assert {"type": "field", "inboundTag": ["api"], "outboundTag": "api"} in data["routing"]["rules"]
+
+    def test_second_run_changes_nothing(self):
+        data = self._data()
+        omr_admin._proxy_gre_user_sync(data, "omrgre-user0-ip1", "uuid-1", "output-203.0.113.5")
+        assert omr_admin._proxy_gre_user_sync(data, "omrgre-user0-ip1", "uuid-1", "output-203.0.113.5") is False
+
+    def test_new_uuid_replaces_the_reality_client(self):
+        data = self._data()
+        omr_admin._proxy_gre_user_sync(data, "omrgre-user0-ip1", "uuid-1", "output-203.0.113.5")
+        assert omr_admin._proxy_gre_user_sync(data, "omrgre-user0-ip1", "uuid-2", "output-203.0.113.5") is True
+        ids = [c["id"] for c in data["inbounds"][1]["settings"]["clients"] if c.get("email") == "omrgre-user0-ip1"]
+        assert ids == ["uuid-2"]
+
+    def test_reality_client_dropped_with_the_user(self):
+        data = self._data()
+        omr_admin._proxy_gre_user_sync(data, "omrgre-user0-ip1", "uuid-1", "output-203.0.113.5")
+        assert omr_admin._xray_drop_reality_client(data, "omrgre-user0-ip1") is True
+        assert data["inbounds"][1]["settings"]["clients"] == [{"id": "main", "flow": "xtls-rprx-vision"}]
+        assert omr_admin._xray_drop_reality_client(data, "omrgre-user0-ip1") is False
+
+
 # ===========================================================================
 # _render_client2client / _render_ct_helpers
 # ===========================================================================
@@ -886,3 +980,288 @@ class TestRenderHardening:
             assert omr_admin._fw_entry_error("80", "tcp", "ACCEPT", addr) == "Invalid address", addr
         for addr in ("1.2.3.0/24", "1.2.3.4", "2001:db8::/32", "0.0.0.0/0", "::ffff:1.2.3.4"):
             assert omr_admin._fw_entry_error("80", "tcp", "ACCEPT", addr) is None, addr
+
+
+
+class TestXrayGreSyncAll:
+    @staticmethod
+    def _run(data, users):
+        written = {}
+        with patch("os.path.isfile", return_value=True), \
+             patch("omr_admin.file_as_bytes", return_value=b"x"), \
+             patch("builtins.open", side_effect=lambda *a, **k: io.StringIO(json.dumps(data))), \
+             patch("omr_admin._atomic_write_json", side_effect=lambda p, d: written.update(data=d)):
+            omr_admin._proxy_gre_sync_all("xray", users, "md5")
+        return written.get("data")
+
+    def test_rule_and_outbound_of_a_removed_user_dropped(self):
+        data = {"outbounds": [{"tag": "direct"}, {"protocol": "freedom", "settings": {"userLevel": 0},
+                                                  "tag": "output-203.0.113.9", "sendThrough": "203.0.113.9"}],
+                "routing": {"rules": [
+                    {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                    {"type": "field", "inboundTag": list(omr_admin.XRAY_TUNNEL_INBOUNDS),
+                     "user": ["gretestgre-user3-ip0"], "outboundTag": "output-203.0.113.9"},
+                    # not one of the GRE tunnels': left alone
+                    {"type": "field", "user": ["alice"], "outboundTag": "output-198.51.100.7"},
+                ]}}
+        new = self._run(data, {"openmptcprouter": {"userid": 0}})
+        assert [r["outboundTag"] for r in new["routing"]["rules"]] == ["api", "output-198.51.100.7"]
+        assert [o["tag"] for o in new["outbounds"]] == ["direct"]
+
+    def test_tunnel_of_a_user_kept(self):
+        users = {"openmptcprouter": {"userid": 0, "gre_tunnels": {"gre-user0-ip1": {
+            "public_ip": "203.0.113.9", "xray": {"uuid": "u1"}}}}}
+        data = {"outbounds": [], "routing": {"rules": []}}
+        new = self._run(data, users)
+        assert [o["tag"] for o in new["outbounds"]] == ["output-203.0.113.9"]
+        assert new["routing"]["rules"][0]["user"] == ["openmptcproutergre-user0-ip1"]
+        assert self._run(new, users) is None   # nothing more to change
+
+
+class TestProxyGreRulePlacement:
+    @staticmethod
+    def _data():
+        return {"inbounds": [], "routing": {"rules": [
+            {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+            {"type": "field", "inboundTag": ["omrin-tunnel"], "ip": ["127.0.0.0/8"], "outboundTag": "blocked"},
+            {"type": "field", "inboundTag": ["omrin-tunnel"], "domain": ["domain:localhost"], "outboundTag": "blocked"},
+        ]}}
+
+    def test_after_the_blocked_rules(self):
+        # first, it reached the VPS's own localhost services through the proxy
+        data = self._data()
+        omr_admin._proxy_gre_user_sync(data, "openmptcproutergre-user0-ip1", "u1", "output-203.0.113.5")
+        assert data["routing"]["rules"][-1]["user"] == ["openmptcproutergre-user0-ip1"]
+
+    def test_rule_of_an_earlier_release_moved_after_them(self):
+        data = self._data()
+        data["routing"]["rules"].insert(0, {"type": "field", "inboundTag": list(omr_admin.XRAY_TUNNEL_INBOUNDS),
+                                            "user": ["openmptcproutergre-user0-ip1"], "outboundTag": "output-203.0.113.5"})
+        assert omr_admin._proxy_gre_user_sync(data, "openmptcproutergre-user0-ip1", "u1", "output-203.0.113.5") is True
+        assert [r["outboundTag"] for r in data["routing"]["rules"]] == ["api", "blocked", "blocked", "output-203.0.113.5"]
+
+    def test_stable_with_several_users(self):
+        data = self._data()
+        for _ in range(2):
+            omr_admin._proxy_gre_user_sync(data, "a-gre-user0-ip0", "u1", "output-203.0.113.5")
+            omr_admin._proxy_gre_user_sync(data, "b-gre-user3-ip0", "u3", "output-203.0.113.5")
+        assert omr_admin._proxy_gre_user_sync(data, "a-gre-user0-ip0", "u1", "output-203.0.113.5") is False
+        assert omr_admin._proxy_gre_user_sync(data, "b-gre-user3-ip0", "u3", "output-203.0.113.5") is False
+
+    def test_v2ray_tunnel_inbounds(self):
+        data = self._data()
+        omr_admin._proxy_gre_user_sync(data, "openmptcproutergre-user0-ip1", "u1", "output-203.0.113.5",
+                                       omr_admin.V2RAY_TUNNEL_INBOUNDS)
+        assert data["routing"]["rules"][-1]["inboundTag"] == list(omr_admin.V2RAY_TUNNEL_INBOUNDS)
+
+    def test_no_reality_client_without_a_uuid(self):
+        data = {"inbounds": [{"tag": "omrin-vless-reality", "settings": {"clients": []}}], "routing": {"rules": []}}
+        omr_admin._proxy_gre_user_sync(data, "alice", "", "output-203.0.113.5")
+        assert data["inbounds"][0]["settings"]["clients"] == []
+
+
+class TestXrayGreSharedIp:
+    _data = staticmethod(TestXrayGreUserSync._data)
+
+    def test_users_of_a_same_public_ip_keep_their_own_rule(self):
+        data = self._data()
+        data["routing"]["rules"] = [r for r in data["routing"]["rules"] if r["outboundTag"] == "api"]
+        omr_admin._proxy_gre_user_sync(data, "openmptcproutergre-user0-ip1", "uuid-1", "output-203.0.113.5")
+        omr_admin._proxy_gre_user_sync(data, "alicegre-user3-ip0", "uuid-3", "output-203.0.113.5")
+        users = [r["user"] for r in data["routing"]["rules"] if r["outboundTag"] == "output-203.0.113.5"]
+        assert sorted(users) == [["alicegre-user3-ip0"], ["openmptcproutergre-user0-ip1"]]
+        # nothing left to change for either: no restart ping-pong
+        assert omr_admin._proxy_gre_user_sync(data, "openmptcproutergre-user0-ip1", "uuid-1", "output-203.0.113.5") is False
+        assert omr_admin._proxy_gre_user_sync(data, "alicegre-user3-ip0", "uuid-3", "output-203.0.113.5") is False
+
+    def test_shared_outbound_of_a_public_ip(self):
+        data = {"outbounds": [{"protocol": "freedom", "tag": "direct"}]}
+        assert omr_admin._proxy_gre_outbound_sync(data, "output-203.0.113.5", "203.0.113.5") is True
+        assert omr_admin._proxy_gre_outbound_sync(data, "output-203.0.113.5", "203.0.113.5") is False
+        assert [o["tag"] for o in data["outbounds"]] == ["direct", "output-203.0.113.5"]
+
+
+# ===========================================================================
+# add_gre_tunnels
+# ===========================================================================
+
+
+_PUBLIC = [("eth0", "198.51.100.1", "255.255.255.0"), ("eth0", "203.0.113.5", "255.255.255.255"),
+           ("eth1", "203.0.113.9", "255.255.255.0")]
+
+
+class TestAddGreTunnels:
+    @staticmethod
+    def _run(config, public=_PUBLIC, only_user=None, isfile=lambda p: False):
+        writes = []
+
+        def modif(user, changes):
+            config["users"][0][user].update(changes)
+
+        with patch("omr_admin._vps_public_ipv4s", return_value=public), \
+             patch("omr_admin.read_omr_config", side_effect=lambda: config), \
+             patch("omr_admin.modif_config_user", side_effect=modif) as modified, \
+             patch("omr_admin._gre_write_intf", side_effect=lambda *a: writes.append(a)), \
+             patch("os.path.isfile", side_effect=isfile), \
+             patch("os.path.exists", return_value=False), \
+             patch("omr_admin._nft_sync_gre_snat"), \
+             patch("omr_admin._gre_drop_stale_intf"), \
+             patch("omr_admin.set_global_param"):
+            omr_admin.add_gre_tunnels(only_user)
+        return modified, writes
+
+    @staticmethod
+    def _config():
+        return {"gre_tunnels": True, "users": [{
+            "admin": {"username": "admin", "permissions": "admin"},
+            "openmptcprouter": {"userid": 0, "username": "openmptcprouter"},
+            "alice": {"userid": 3, "username": "alice", "public_ips": ["203.0.113.9"]},
+            "bob": {"userid": 4, "username": "bob"},
+        }]}
+
+    def test_default_user_every_ip_others_their_public_ips(self):
+        config = self._config()
+        self._run(config)
+        users = config["users"][0]
+        assert {t["public_ip"] for t in users["openmptcprouter"]["gre_tunnels"].values()} == \
+            {"198.51.100.1", "203.0.113.5", "203.0.113.9"}
+        # "(user == addtouser and str(ip) == addwithip)" compared the /24 of
+        # the tunnels with a public IP: no other user ever had one
+        assert {name: t["public_ip"] for name, t in users["alice"]["gre_tunnels"].items()} == \
+            {"gre-user3-ip0": "203.0.113.9"}
+        assert "gre_tunnels" not in users["bob"]
+        assert "gre_tunnels" not in users["admin"]
+
+    def test_tunnels_out_of_the_vxlan_slices_and_distinct(self):
+        config = self._config()
+        self._run(config)
+        nets = [t["network"] for u in config["users"][0].values() for t in (u.get("gre_tunnels") or {}).values()]
+        assert len(nets) == len(set(nets)) == 4
+        for net in nets:
+            assert omr_admin.IPNetwork(net) in omr_admin.GRE_V4_POOL
+            assert omr_admin.IPNetwork(net) not in omr_admin.VXLAN_V4_POOL_LEGACY
+
+    def test_second_run_changes_nothing(self):
+        config = self._config()
+        self._run(config)
+        before = json.loads(json.dumps(config))
+        modified, _ = self._run(config)
+        modified.assert_not_called()
+        assert config == before
+
+    def test_new_address_keeps_the_others_names_and_networks(self):
+        config = self._config()
+        self._run(config, public=_PUBLIC[1:])
+        before = dict(config["users"][0]["openmptcprouter"]["gre_tunnels"])
+        # an address listed ahead of the others: it renamed and renumbered them
+        self._run(config)
+        after = config["users"][0]["openmptcprouter"]["gre_tunnels"]
+        for name, tunnel in before.items():
+            assert after[name]["public_ip"] == tunnel["public_ip"]
+            assert after[name]["network"] == tunnel["network"]
+        new = [name for name in after if name not in before]
+        assert len(new) == 1 and after[new[0]]["public_ip"] == "198.51.100.1"
+        # the router maps the tunnels in order: a new one comes last
+        assert list(after)[-1] == new[0]
+
+    def test_tunnel_in_the_vxlan_slices_is_moved_keeping_the_rest(self):
+        config = self._config()
+        config["users"][0]["openmptcprouter"]["gre_tunnels"] = {"gre-user0-ip1": {
+            "local_ip": "10.255.249.1", "remote_ip": "10.255.249.2", "public_ip": "203.0.113.5",
+            "shadowsocks_port": "65150", "xray": {"uuid": "u", "ss2022": "k"}}}
+        _, writes = self._run(config, public=_PUBLIC[1:])
+        tunnel = config["users"][0]["openmptcprouter"]["gre_tunnels"]["gre-user0-ip1"]
+        assert omr_admin.IPNetwork(tunnel["network"]) in omr_admin.GRE_V4_POOL
+        assert tunnel["remote_ip"] == str(omr_admin.IPNetwork(tunnel["network"])[2])
+        assert tunnel["shadowsocks_port"] == "65150"
+        assert tunnel["xray"]["uuid"] == "u"
+        assert any(w[0] == "gre-user0-ip1" for w in writes)
+
+    def test_only_user(self):
+        config = self._config()
+        self._run(config, only_user="alice")
+        assert "gre_tunnels" in config["users"][0]["alice"]
+        assert "gre_tunnels" not in config["users"][0]["openmptcprouter"]
+
+    def test_startup_call_after_what_it_uses(self):
+        # At import time: above a function it reaches, it failed with a NameError
+        import inspect
+        src = inspect.getsource(omr_admin)
+        call = src.index("\n        add_gre_tunnels()\n")
+        for name in ("def _proxy_drop_user(", "def xray_del_user(", "def xray_add_user(",
+                     "def _nft_sync_gre_snat(", "def _proxy_gre_user_sync("):
+            assert src.index(name) < call, name
+
+    def test_v2ray_user_of_each_tunnel(self):
+        config = self._config()
+        v2ray = "/etc/v2ray/v2ray-server.json"
+        with patch("omr_admin.v2ray_add_user") as add, patch("omr_admin.v2ray_del_user"), \
+             patch("omr_admin.file_as_bytes", return_value=b"x"), \
+             patch("omr_admin._proxy_gre_sync_all") as sync:
+            self._run(config, only_user="alice", isfile=lambda p: p == v2ray)
+        tunnel = config["users"][0]["alice"]["gre_tunnels"]["gre-user3-ip0"]
+        assert tunnel["v2ray"]["email"] == "alicegre-user3-ip0"
+        assert add.call_args.args[:2] == ("alicegre-user3-ip0", tunnel["v2ray"]["uuid"])
+        assert add.call_args.kwargs == {"restart": 0}   # one restart, in the sync
+        assert [c.args[0] for c in sync.call_args_list] == ["v2ray"]
+
+    def test_a_single_public_ip_has_no_tunnel(self):
+        config = self._config()
+        modified, _ = self._run(config, public=_PUBLIC[:1])
+        modified.assert_not_called()
+
+
+def _open_manager(data):
+    def _open(path, mode="r", *args, **kwargs):
+        if str(path) == "/etc/shadowsocks-libev/manager.json":
+            return io.StringIO(json.dumps(data))
+        raise FileNotFoundError(path)
+    return _open
+
+
+class TestGreSsPort:
+    def test_own_port_on_the_address_reused(self):
+        manager = {"port_conf": {"65101": {"key": "k0", "userid": 0}, "65150": {"key": "k0", "userid": 0, "local_address": "203.0.113.5"}}}
+        with patch("builtins.open", side_effect=_open_manager(manager)), patch("omr_admin.add_ss_user") as add:
+            assert omr_admin._gre_ss_port("203.0.113.5", 0, {"shadowsocks_port": 65101}) == ("65150", False)
+        add.assert_not_called()
+
+    def test_port_of_another_user_on_the_address_not_taken(self):
+        manager = {"port_conf": {"65102": {"key": "k2", "userid": 2}, "65160": {"key": "k0", "userid": 0, "local_address": "203.0.113.5"}}}
+        with patch("builtins.open", side_effect=_open_manager(manager)), patch("omr_admin.add_ss_user", return_value=65161) as add:
+            assert omr_admin._gre_ss_port("203.0.113.5", 2, {"shadowsocks_port": 65102}) == ("65161", True)
+        add.assert_called_once_with('', "k2", 2, "203.0.113.5")
+
+    def test_user_without_a_port_gets_none(self):
+        manager = {"port_conf": {"65101": {"key": "k0", "userid": 0}}}
+        with patch("builtins.open", side_effect=_open_manager(manager)), patch("omr_admin.add_ss_user") as add:
+            assert omr_admin._gre_ss_port("203.0.113.5", 4, {}) == (None, False)
+        add.assert_not_called()
+
+
+@pytest.mark.real_env
+class TestGreWriteIntf:
+    def test_written_once_and_a_renumbered_tunnel_recreated(self, tmp_path):
+        net = omr_admin.IPNetwork("10.255.240.4/30")
+        with patch("omr_admin.GRE_INTF_DIR", str(tmp_path)), patch("subprocess.run") as run:
+            omr_admin._gre_write_intf("gre-user0-ip1", "eth0", "203.0.113.5", "255.255.255.0", net, "openmptcprouter", 0)
+            text = (tmp_path / "gre-user0-ip1").read_text()
+            assert "NETWORK=10.255.240.4/30\nLOCALIP=10.255.240.5\nREMOTEIP=10.255.240.6\n" in text
+            assert "USERNAME=openmptcprouter\nUSERID=0\n" in text
+            run.assert_not_called()
+            omr_admin._gre_write_intf("gre-user0-ip1", "eth0", "203.0.113.5", "255.255.255.0", net, "openmptcprouter", 0)
+            run.assert_not_called()
+            # omr-service only recreates a tunnel whose remote changed
+            omr_admin._gre_write_intf("gre-user0-ip1", "eth0", "203.0.113.5", "255.255.255.0",
+                                      omr_admin.IPNetwork("10.255.240.8/30"), "openmptcprouter", 0)
+            run.assert_called_once()
+            assert run.call_args.args[0] == ["ip", "link", "del", "gre-user0-ip1"]
+
+    def test_files_of_no_tunnel_of_the_user_removed(self, tmp_path):
+        for name in ("gre-user0-ip0", "gre-user0-ip1", "gre-user0-ip3", "gre-user3-ip0", "notes"):
+            (tmp_path / name).write_text("x")
+        with patch("omr_admin.GRE_INTF_DIR", str(tmp_path)), patch("subprocess.run") as run:
+            omr_admin._gre_drop_stale_intf(0, {"gre-user0-ip0": {}, "gre-user0-ip1": {}})
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["gre-user0-ip0", "gre-user0-ip1", "gre-user3-ip0", "notes"]
+        run.assert_called_once()
+        assert run.call_args.args[0] == ["ip", "link", "del", "gre-user0-ip3"]
