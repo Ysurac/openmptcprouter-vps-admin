@@ -1,3 +1,10 @@
+omr-vps-admin (0.18+20261009) unstable; urgency=medium
+
+  * /mptcp_dscp: pin a DSCP class to every MPTCP endpoint id of a WAN. A pin took one remote_id, the WAN's IPv4 endpoint id, but a dual-stack WAN also has an id for each IPv6 address (id+128, id+192), so bpf_dscp never preferred its IPv6 subflows for the class. A pin now carries remote_ids, every id of the WAN, passed to "mptcp-scheduler-dscp.sh set <dscp> id <N>..." for the id set of mptcp-bpf-dscp's dscp_remote_ids map. A router that only sends remote_id still works, and when an older mptcp-dscp-manager refuses several ids, the first one, the IPv4 id, is set alone
+  * Add tests for the above (test/test_dscp_sync.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 09 Oct 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20261008) unstable; urgency=medium
 
   * GRE tunnels (the public IPs of a VPS with several): a tunnel keeps its name and /30 from one run to the next, found by its public IP. They were given in the order of the addresses and of the users, so a new user or address renamed and renumbered the others. The /30s now come from 10.255.240.0/22: 10.255.249.0/24 is also where the default VXLAN L3 /30 of each userid is, and the first tunnels had the VXLAN addresses of userids 0, 1... A tunnel still in there is moved once
