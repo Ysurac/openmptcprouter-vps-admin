@@ -5835,12 +5835,13 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
-# Set bpf_dscp DSCP-to-WAN pins (server/VPS side: dscp_remote_id map).
+# Set bpf_dscp DSCP-to-WAN pins (server/VPS side: dscp_remote_ids map).
 #
 # The router pins a DSCP class to a WAN by local endpoint IP
 # (dscp_iface); on the VPS every subflow shares the same local IP, so
-# the equivalent pin instead keys on the MPTCP remote endpoint id the
-# router assigned to that WAN (dscp_remote_id) -- see
+# the equivalent pin instead keys on the MPTCP remote endpoint ids the
+# router assigned to that WAN (dscp_remote_ids), one per address of the
+# WAN: its metric for IPv4, +128/+192 for its IPv6 ones -- see
 # mptcp-bpf-dscp/debian/README.Debian. This route is what closes the
 # "no automated sync... copy the number over manually" gap that doc
 # used to describe: the router's openmptcprouter-vps init script calls
@@ -5854,7 +5855,9 @@ DSCP_CLASSES = (
 
 class DscpPin(BaseModel):
     dscp: str
-    remote_id: int
+    # A router older than the id lists sends remote_id only (its IPv4 id)
+    remote_id: Optional[int] = None
+    remote_ids: List[int] = []
 
 class MPTCPDscpParams(BaseModel):
     pins: List[DscpPin] = []
@@ -5870,16 +5873,22 @@ def mptcp_dscp(*, params: MPTCPDscpParams, current_user: User = Depends(get_curr
         return {'result': 'warning', 'reason': 'mptcp-dscp-manager not installed', 'route': 'mptcp_dscp'}
     desired = {}
     for pin in params.pins:
-        if pin.dscp not in DSCP_CLASSES or not (0 <= pin.remote_id <= 255):
-            return {'result': 'error', 'reason': f'Invalid pin {pin.dscp!r}/{pin.remote_id!r}', 'route': 'mptcp_dscp'}
-        desired[pin.dscp] = pin.remote_id
+        ids = pin.remote_ids or ([pin.remote_id] if pin.remote_id is not None else [])
+        if pin.dscp not in DSCP_CLASSES or not ids or not all(0 <= i <= 255 for i in ids):
+            return {'result': 'error', 'reason': f'Invalid pin {pin.dscp!r}/{ids!r}', 'route': 'mptcp_dscp'}
+        desired[pin.dscp] = [str(i) for i in dict.fromkeys(ids)]
     # Converge every known class to the desired state in one pass, rather
     # than tracking previous state server-side: cheap (bpftool map
     # update/delete are near-instant) and self-healing if a previous push
     # was ever interrupted partway through.
     for dscp in DSCP_CLASSES:
         if dscp in desired:
-            subprocess.run([script, 'set', dscp, 'id', str(desired[dscp])], check=False)
+            ids = desired[dscp]
+            result = subprocess.run([script, 'set', dscp, 'id'] + ids, check=False)
+            # An mptcp-dscp-manager older than the id sets takes one id:
+            # keep the first, the WAN's IPv4 one
+            if len(ids) > 1 and result.returncode != 0:
+                subprocess.run([script, 'set', dscp, 'id', ids[0]], check=False)
         else:
             subprocess.run([script, 'del', dscp], check=False)
     return {'result': 'done', 'reason': 'changes applied'}

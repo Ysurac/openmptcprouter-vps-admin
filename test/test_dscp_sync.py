@@ -3,9 +3,10 @@ Unit tests for the VPS-side DSCP/weight sync endpoints (server side of the
 router's per-WAN DSCP pinning, per-WAN weighting, and destination -> DSCP
 classification):
 
-  - POST /mptcp_dscp:    converges the bpf_dscp dscp_remote_id map to the
-    router's dscp_iface -> WAN pins, keyed by MPTCP remote endpoint id
-    instead of local IP (every subflow shares one local IP on the VPS).
+  - POST /mptcp_dscp:    converges the bpf_dscp dscp_remote_ids map to the
+    router's dscp_iface -> WAN pins, keyed by MPTCP remote endpoint ids
+    instead of local IP (every subflow shares one local IP on the VPS),
+    one per address of the WAN.
   - POST /mptcp_weight:  converges the bpf_weight(_rr) weight_remote_id map
     the same way, tracking previously-pushed remote ids in a small state
     file so stale ones get cleaned up (remote ids have no fixed
@@ -131,6 +132,73 @@ class TestMptcpDscpEndpoint:
         assert len(calls) == len(omr_admin.DSCP_CLASSES)
         deleted = {c[2] for c in calls if c[1] == "del"}
         assert deleted == set(omr_admin.DSCP_CLASSES) - {"cs4"}
+
+    def test_remote_ids_list_sets_every_id(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=_exists_only(_DSCP_SCRIPT)),
+            patch("subprocess.run") as run,
+        ):
+            run.return_value.returncode = 0
+            r = user_client.post(
+                "/mptcp_dscp",
+                json={"pins": [{"dscp": "ef", "remote_id": 4, "remote_ids": [4, 132, 196]}]},
+            )
+        assert r.json()["result"] == "done"
+        calls = [c.args[0] for c in run.call_args_list]
+        assert [_DSCP_SCRIPT, "set", "ef", "id", "4", "132", "196"] in calls
+        assert len(calls) == len(omr_admin.DSCP_CLASSES)
+
+    def test_remote_ids_without_remote_id_and_duplicates(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=_exists_only(_DSCP_SCRIPT)),
+            patch("subprocess.run") as run,
+        ):
+            run.return_value.returncode = 0
+            r = user_client.post(
+                "/mptcp_dscp", json={"pins": [{"dscp": "cs0", "remote_ids": [3, 131, 3]}]}
+            )
+        assert r.json()["result"] == "done"
+        calls = [c.args[0] for c in run.call_args_list]
+        assert [_DSCP_SCRIPT, "set", "cs0", "id", "3", "131"] in calls
+
+    @pytest.mark.parametrize("remote_ids", [[4, 256], [-1, 4]])
+    def test_out_of_range_id_in_remote_ids_errors(self, user_client, remote_ids):
+        with (
+            patch("os.path.exists", side_effect=_exists_only(_DSCP_SCRIPT)),
+            patch("subprocess.run") as run,
+        ):
+            r = user_client.post(
+                "/mptcp_dscp",
+                json={"pins": [{"dscp": "cs4", "remote_id": 4, "remote_ids": remote_ids}]},
+            )
+        assert r.json()["result"] == "error"
+        run.assert_not_called()
+
+    def test_pin_without_any_id_errors(self, user_client):
+        with patch("os.path.exists", side_effect=_exists_only(_DSCP_SCRIPT)):
+            r = user_client.post("/mptcp_dscp", json={"pins": [{"dscp": "cs4"}]})
+        assert r.json()["result"] == "error"
+
+    def test_old_manager_script_falls_back_to_the_first_id(self, user_client):
+        # mptcp-scheduler-dscp.sh before the id sets refuses more than one id
+        def _run(cmd, check=False):
+            from unittest.mock import MagicMock
+            res = MagicMock()
+            res.returncode = 1 if cmd[1] == "set" and len(cmd) > 5 else 0
+            return res
+
+        with (
+            patch("os.path.exists", side_effect=_exists_only(_DSCP_SCRIPT)),
+            patch("subprocess.run", side_effect=_run) as run,
+        ):
+            r = user_client.post(
+                "/mptcp_dscp",
+                json={"pins": [{"dscp": "ef", "remote_id": 4, "remote_ids": [4, 132]}]},
+            )
+        assert r.json()["result"] == "done"
+        calls = [c.args[0] for c in run.call_args_list]
+        assert [_DSCP_SCRIPT, "set", "ef", "id", "4", "132"] in calls
+        assert [_DSCP_SCRIPT, "set", "ef", "id", "4"] in calls
 
     def test_empty_pins_deletes_every_class(self, user_client):
         with (
