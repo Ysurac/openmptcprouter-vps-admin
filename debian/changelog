@@ -1,6 +1,7 @@
 omr-vps-admin (0.18+20261009) unstable; urgency=medium
 
   * /mptcp_dscp: pin a DSCP class to every MPTCP endpoint id of a WAN. A pin took one remote_id, the WAN's IPv4 endpoint id, but a dual-stack WAN also has an id for each IPv6 address (id+128, id+192), so bpf_dscp never preferred its IPv6 subflows for the class. A pin now carries remote_ids, every id of the WAN, passed to "mptcp-scheduler-dscp.sh set <dscp> id <N>..." for the id set of mptcp-bpf-dscp's dscp_remote_ids map. A router that only sends remote_id still works, and when an older mptcp-dscp-manager refuses several ids, the first one, the IPv4 id, is set alone
+  * /mptcp_weight: accept a weight of 0, up to 4294967295. LuCI's Weight field allows 0, and one WAN at 0 had the whole list refused, cached as pushed by the router: no WAN got its weight on the VPS until the config changed. bpf_weight(_rr) reads 0 as the neutral 100, so it is set as is; above 4294967295, the __u32 of weight_remote_id, mptcp-scheduler-weight.sh would have written another value
   * Add tests for the above (test/test_dscp_sync.py)
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Fri, 09 Oct 2026 00:00:00 +0200
