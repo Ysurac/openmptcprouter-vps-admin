@@ -241,7 +241,7 @@ class TestMptcpWeightEndpoint:
         assert r.json()["result"] == "warning"
 
     @pytest.mark.parametrize(
-        "remote_id,weight", [(-1, 10), (256, 10), (1, 0), (1, -5)]
+        "remote_id,weight", [(-1, 10), (256, 10), (1, -5), (1, 2**32)]
     )
     def test_invalid_pin_errors(self, user_client, remote_id, weight):
         with patch("os.path.exists", side_effect=_exists_only(_WEIGHT_SCRIPT)):
@@ -273,6 +273,29 @@ class TestMptcpWeightEndpoint:
         assert [_WEIGHT_SCRIPT, "set", "id", "2", "20"] in calls
         assert not any(c[1] == "del" for c in calls)
         assert env.written[_WEIGHT_STATE_FILE] == "1 2"
+
+    def test_zero_weight_accepted(self, user_client):
+        # One WAN at weight 0 (neutral for bpf_weight) must not refuse the
+        # weights of the others
+        env = _FileEnv({})
+        with (
+            patch("os.path.exists", side_effect=_exists_only(_WEIGHT_SCRIPT)),
+            patch("builtins.open", side_effect=env),
+            patch("subprocess.run") as run,
+        ):
+            r = user_client.post(
+                "/mptcp_weight",
+                json={
+                    "weights": [
+                        {"remote_id": 1, "weight": 0},
+                        {"remote_id": 2, "weight": 200},
+                    ]
+                },
+            )
+        assert r.json()["result"] == "done"
+        calls = [c.args[0] for c in run.call_args_list]
+        assert [_WEIGHT_SCRIPT, "set", "id", "1", "0"] in calls
+        assert [_WEIGHT_SCRIPT, "set", "id", "2", "200"] in calls
 
     def test_stale_ids_removed_and_state_file_rewritten(self, user_client):
         env = _FileEnv({_WEIGHT_STATE_FILE: "1 2 3"})

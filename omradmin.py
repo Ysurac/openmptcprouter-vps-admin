@@ -5923,7 +5923,9 @@ def mptcp_weight(*, params: MPTCPWeightParams, current_user: User = Depends(get_
         return {'result': 'warning', 'reason': 'mptcp-weight-manager not installed', 'route': 'mptcp_weight'}
     desired = {}
     for pin in params.weights:
-        if not (0 <= pin.remote_id <= 255) or pin.weight <= 0:
+        # A weight is a __u32 in weight_remote_id, and 0 is the neutral 100
+        # there as on the router, where LuCI's uinteger field allows it
+        if not (0 <= pin.remote_id <= 255) or not (0 <= pin.weight <= 0xffffffff):
             return {'result': 'error', 'reason': f'Invalid weight pin {pin.remote_id!r}/{pin.weight!r}', 'route': 'mptcp_weight'}
         desired[pin.remote_id] = pin.weight
     for remote_id, weight in desired.items():
