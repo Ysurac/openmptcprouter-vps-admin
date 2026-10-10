@@ -1943,6 +1943,14 @@ def _add_mqvpn_locked(username, fixed_ip):
     except Exception as e:
         LOG.debug("MQVPN add user json error (" + str(e) + ")")
 
+def _mqvpn_drop_user_auth_key(mqvpn_config, keys=None):
+    """Remove the server-wide auth_key of *mqvpn_config* when it is one of
+    the users' keys (or of *keys*): /mqvpn wrote the router's own key there."""
+    if keys is None:
+        keys = [u.get('key') for u in mqvpn_config.get('users', []) if isinstance(u, dict)]
+    if mqvpn_config.get('auth_key') and mqvpn_config['auth_key'] in keys:
+        del mqvpn_config['auth_key']
+
 def remove_mqvpn(username):
     api_result = mqvpn_api({'cmd': 'remove_user', 'name': username})
     if not api_result.get('ok'):
@@ -1952,7 +1960,10 @@ def remove_mqvpn(username):
         with _omr_config_lock():
             with open('/etc/mqvpn/server.json') as f:
                 mqvpn_config = json.load(f)
+            removed = [u.get('key') for u in mqvpn_config.get('users', []) if u.get('name') == username]
             mqvpn_config['users'] = [u for u in mqvpn_config.get('users', []) if u.get('name') != username]
+            # its key as the server-wide one would still let it in
+            _mqvpn_drop_user_auth_key(mqvpn_config, removed)
             # its per-path policy too: a re-added name got it back
             if 'path_policy' in mqvpn_config:
                 mqvpn_config['path_policy'] = [e for e in mqvpn_config['path_policy'] if e.get('user') != username]
@@ -2455,7 +2466,10 @@ def _ip_field_error(fields, route):
 FW_DNAT_MAX_PORT = 64999
 FW_MAX_USER_ENTRIES = 1024
 FW_NAME_MAX_LEN = 128
-_FW_PORT_RE = re.compile(r'(\d{1,5})(?:[-:](\d{1,5}))?')
+# No leading zero: nft reads 0673 as octal (443) where int() reads 673, so
+# a port checked against the server's and the other users' ports here was
+# another one in the rule.
+_FW_PORT_RE = re.compile(r'([1-9]\d{0,4})(?:[-:]([1-9]\d{0,4}))?')
 _FW_PROTOS = ('tcp', 'udp', 'sctp')
 
 def _fw_entry_error(port, proto, fwtype, source_dip='', dest_ip=''):
@@ -2542,7 +2556,7 @@ def _render_fw_ports(config_data):
 
 def _render_fw_entry(username, udata, entry, exclude=()):
     """('accept' or 'dnat', rule) for one fw_ports entry, None if it renders
-    nothing. A DNAT without source_dip leaves out the addresses *exclude*."""
+    nothing. A DNAT leaves out the addresses *exclude*."""
     name = entry.get('name', '')
     port = entry.get('port', '')
     proto = entry.get('proto', 'tcp')
@@ -2559,8 +2573,10 @@ def _render_fw_entry(username, udata, entry, exclude=()):
         LOG.warning("skipping firewall entry %s %s/%s of user %s: %s",
                     log_safe(name), log_safe(proto), log_safe(port), log_safe(username), error)
         return None
-    # Shorewall's a:b range is nft's a-b (the router already sends a-b).
-    port = str(port).replace(':', '-')
+    # Shorewall's a:b range is nft's a-b (the router already sends a-b),
+    # written from the ports checked above, never the text as sent.
+    first, last = _proxy_port_range(port)
+    port = str(first) if first == last else f'{first}-{last}'
     if any(af not in (None, family) for af in (_addr_family(source_dip), _addr_family(dest_ip))):
         # An address restriction from the other family renders nft
         # syntax that does not parse (`meta nfproto ipv6 ip6 daddr
@@ -2597,8 +2613,9 @@ def _render_fw_entry(username, udata, entry, exclude=()):
             LOG.warning("skipping firewall entry %s %s/%s of user %s: invalid redirect target",
                         log_safe(name), log_safe(proto), log_safe(port), log_safe(username))
             return None
-        if not source_dip:
-            match += _nft_daddr_exclusion(exclude, family)
+        # With an address too: a network as source_dip (0.0.0.0/0) also
+        # covers the other users' dedicated IPs.
+        match += _nft_daddr_exclusion(exclude, family)
         return 'dnat', f'{_NFT_FROM_NET} {match} {proto} dport {port} dnat {"ip" if family == 4 else "ip6"} to {target} comment "{tag}"'
     return None
 
@@ -3470,6 +3487,23 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, title="OpenMPTCPr
 # _BodySizeLimit refuses a bigger one as it comes in.
 BACKUP_MAX_SIZE = 16 * 1024 * 1024
 
+def _bearer_token_signed(scope):
+    """True if the request carries an Authorization: Bearer token signed with
+    our key and not expired. Only that: get_current_user still checks its
+    user and password, this needs no config read."""
+    for name, value in scope.get('headers', []):
+        if name != b'authorization':
+            continue
+        scheme, _, token = value.decode('latin-1').partition(' ')
+        if scheme.lower() != 'bearer':
+            return False
+        try:
+            jwt.decode(token.strip(), SECRET_KEY, algorithms=[ALGORITHM])
+        except PyJWTError:
+            return False
+        return True
+    return False
+
 class _BodySizeLimit:
     """Refuse, with a 413, a request body bigger than the limit of its path:
     FastAPI reads a JSON body whole, and then decodes it, before the endpoint
@@ -3483,6 +3517,12 @@ class _BodySizeLimit:
 
     async def __call__(self, scope, receive, send):
         limit = self.limits.get(scope.get('path'), self.default) if scope['type'] == 'http' else None
+        if limit is not None and self.default is not None and limit > self.default and \
+           not _bearer_token_signed(scope):
+            # The bigger limits only with a token of ours: anyone could
+            # otherwise have each connection hold a 21 MB body, and its
+            # parsed copies, in memory until the authentication refused it.
+            limit = self.default
         if limit is None:
             await self.app(scope, receive, send)
             return
@@ -3578,7 +3618,10 @@ def create_access_token(*, data: dict, expires_delta: timedelta = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+# Not async: the config lock below would block the event loop, so every
+# request of the worker, while a route holding it ran easyrsa, systemctl or
+# the MQVPN control API. A plain def runs in the threadpool.
+def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=HTTP_403_FORBIDDEN,
         detail="Could not validate credentials",
@@ -3625,6 +3668,11 @@ try:
     LOG.info("omr_metrics module loaded")
 except ImportError:
     pass  # metrics module is optional
+except Exception:  # pylint: disable=broad-except
+    # Optional, so a broken one (a truncated download, a dependency raising
+    # something else than ImportError) must not stop the API at import, in
+    # a crash loop systemd gives up on.
+    LOG.exception("omr_metrics module not loaded")
 
 # Show something at homepage
 @app.get("/")
@@ -3634,7 +3682,7 @@ async def homepage():
 # Provide a method to create access tokens. The create_jwt()
 # function is used to actually generate the token
 @app.post('/token', response_model=Token)
-async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     fake_users_db = (read_omr_config().get('users') or [{}])[0]
 
     user = authenticate_user(fake_users_db, form_data.username, form_data.password)
@@ -3663,7 +3711,7 @@ async def route_logout_and_remove_cookie():
 
 # Login for doc
 @app.get("/login_basic")
-async def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
+def login_basic(request: Request, auth: BasicAuth = Depends(basic_auth)):
     if not auth:
         response = Response(headers={"WWW-Authenticate": "Basic"}, status_code=401)
         return response
@@ -3905,6 +3953,56 @@ def status(userid: Optional[int] = Query(None), username: Optional[str] = Query(
         return {'error': 'No iface defined', 'route': 'status'}
 
 # Get VPS config
+# The VPS's public IPv4 and name, asked once to these services and kept in the
+# config: over HTTPS, as the name goes into shadowsocks' plugin_opts, which
+# ss-manager writes unescaped into each ss-server's JSON config.
+PUBLIC_IPV4_URLS = ('https://ip.openmptcprouter.com', 'https://ifconfig.me')
+PUBLIC_HOSTNAME_URLS = ('https://hostname.openmptcprouter.com',)
+_HOSTNAME_RE = re.compile(r'(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+                          r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?')
+
+def _is_ipv4_address(value):
+    return isinstance(value, str) and '/' not in value and _addr_family(value) == 4
+
+def _is_hostname(value):
+    return isinstance(value, str) and bool(_HOSTNAME_RE.fullmatch(value))
+
+def _public_lookup(urls, valid):
+    """The first answer of *urls* that *valid* accepts, '' if none: an
+    error page (5xx, a captive portal's HTML) was kept as the address."""
+    for url in urls:
+        try:
+            response = requests.get(url, timeout=2)
+        except requests.RequestException:
+            continue  # try the next service
+        if not response.ok:
+            continue
+        value = response.text.strip()
+        if len(value) <= 253 and valid(value):
+            return value
+    return ''
+
+def _vps_public_param(omr_config_data, key, valid, urls, offline):
+    """omr_config_data[key] if it is set and *valid* (or set empty), else
+    looked up on *urls* and kept, or offline() when the VPS has no internet.
+    A value an older release kept unchecked is looked up again."""
+    value = omr_config_data.get(key)
+    if key in omr_config_data and (value == '' or valid(value)):
+        return value
+    if 'internet' in omr_config_data and not omr_config_data['internet']:
+        return offline()
+    value = _public_lookup(urls, valid)
+    if value:
+        set_global_param(key, value)
+    return value
+
+def _vps_ipv4(omr_config_data):
+    return _vps_public_param(omr_config_data, 'ipv4', _is_ipv4_address, PUBLIC_IPV4_URLS,
+                             lambda: _iface_global_addr(IFACE, 4))
+
+def _vps_hostname(omr_config_data):
+    return _vps_public_param(omr_config_data, 'hostname', _is_hostname, PUBLIC_HOSTNAME_URLS, lambda: '')
+
 @app.get('/config', summary="Get full server configuration for current user")
 def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get config...')
@@ -4410,23 +4508,7 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
     if ipv6_addr != '':
         set_global_param('ipv6_addr', ipv6_addr)
     LOG.debug('get server IPv4')
-    ipv4_addr = ''
-    if 'ipv4' in omr_config_data:
-        ipv4_addr = omr_config_data['ipv4']
-    elif 'internet' in omr_config_data and not omr_config_data['internet']:
-        ipv4_addr = _iface_global_addr(IFACE, 4)
-    else:
-        try:
-            ipv4_addr = requests.get('http://ip.openmptcprouter.com', timeout=2).text.strip()
-        except Exception:
-            pass  # lookup failed, try the next service
-        if not ipv4_addr:
-            try:
-                ipv4_addr = requests.get('http://ifconfig.me', timeout=2).text.strip()
-            except Exception:
-                pass  # lookup failed, ipv4_addr stays empty
-        if ipv4_addr:
-            set_global_param('ipv4', ipv4_addr)
+    ipv4_addr = _vps_ipv4(omr_config_data)
 
     with open('/proc/cpuinfo', 'r') as _f:
         vps_aes = 'aes' in _f.read()
@@ -4437,17 +4519,7 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
     vps_loadavg = ' '.join(read_proc('/proc/loadavg').split()[:3])
     vps_uptime = read_proc('/proc/uptime').split()[0]
     LOG.debug('get hostname')
-    if 'hostname' in omr_config_data:
-        vps_domain = omr_config_data['hostname']
-    elif 'internet' in omr_config_data and not omr_config_data['internet']:
-        vps_domain = ''
-    else:
-        try:
-            vps_domain = requests.get('http://hostname.openmptcprouter.com', timeout=2).text.strip()
-        except Exception:
-            vps_domain = ''
-        if vps_domain:
-            set_global_param('hostname', vps_domain)
+    vps_domain = _vps_hostname(omr_config_data)
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
     user_permissions = user_config.get('permissions', current_user.permissions)
 
@@ -4612,6 +4684,8 @@ def _ss_manager_readd(port, conf):
 # OMR's ss-manager writes the key back into each ss-server's JSON config
 # without escaping it: a '"' would add keys (plugin, acl...) of its own.
 _SS_KEY_RE = re.compile(r'[^"\\\x00-\x1f\x7f]{1,256}')
+# The method too, and the cipher names are all like this.
+_SS_METHOD_RE = re.compile(r'[A-Za-z0-9-]{1,64}')
 
 @app.post('/shadowsocks', summary="Modify Shadowsocks-libev configuration")
 def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends(get_current_user)):
@@ -4622,6 +4696,8 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         return {'result': 'warning', 'reason': 'Shadowsocks-lib not installed', 'route': 'shadowsocks'}
     if params.key is not None and not _SS_KEY_RE.fullmatch(params.key):
         return {'result': 'error', 'reason': 'Invalid key', 'route': 'shadowsocks'}
+    if params.method is not None and not _SS_METHOD_RE.fullmatch(params.method):
+        return {'result': 'error', 'reason': 'Invalid method', 'route': 'shadowsocks'}
     # manager.json is every user's, and /add_user, /remove_user write it
     # too: two writers each lost the other's key or port.
     with _omr_config_lock():
@@ -4703,15 +4779,7 @@ def _shadowsocks_locked(params, current_user):
     modif_config_user(current_user.username, {'shadowsocks_port': port})
 
     #ipv4_addr = os.popen('wget -4 -qO- -T 2 http://ip.openmptcprouter.com').read().rstrip()
-    if 'hostname' in omr_config_data:
-        vps_domain = omr_config_data['hostname']
-    else:
-        try:
-            vps_domain = requests.get('http://hostname.openmptcprouter.com', timeout=2).text.strip()
-        except Exception:
-            vps_domain = ''
-        if vps_domain:
-            set_global_param('hostname', vps_domain)
+    vps_domain = _vps_hostname(omr_config_data)
 
     if 'port_key' in data:
         if ipv6_network == '':
@@ -5026,13 +5094,26 @@ def _public_ip_owner(omr_config_data, address):
     """The user a public IP of the VPS is dedicated to (/add_user ips), None
     if none. Not the GRE tunnels: the main router has one on every public
     IP, those of the other users included."""
+    owners = _public_ip_owners(omr_config_data, address)
+    return owners[0] if owners else None
+
+def _public_ip_owners(omr_config_data, address, contained=False):
+    """Every user with a public IP of the VPS dedicated to it that *address*
+    (an IP or a network) overlaps, or with *contained* lies within. A
+    network can cover the IPs of several users: 0.0.0.0/0 is everyone's."""
     net = _ip_network(address)
+    owners = []
+    if net is None:
+        return owners
     for username, udata in ((omr_config_data.get('users') or [{}])[0]).items():
         for ip in udata.get('public_ips') or []:
             other = _ip_network(ip) if isinstance(ip, str) else None
-            if net is not None and other is not None and net.version == other.version and net.overlaps(other):
-                return username
-    return None
+            if other is None or net.version != other.version:
+                continue
+            if net.subnet_of(other) if contained else net.overlaps(other):
+                owners.append(username)
+                break
+    return owners
 
 def _server_ports(proto):
     """[(first, last)] of the ports the VPS itself uses with *proto*, on more
@@ -5082,7 +5163,9 @@ def _fw_dnat_error(omr_config_data, username, port, proto, families, source_dip)
     a proxy redirect...) took it from every user."""
     first, last = _proxy_port_range(port)
     def dedicated(address):
-        return bool(address) and _public_ip_owner(omr_config_data, address) is not None
+        # Within a dedicated IP, not just overlapping one: a network
+        # around it (0.0.0.0/0) is on the shared IPs as well.
+        return bool(address) and bool(_public_ip_owners(omr_config_data, address, contained=True))
     for other, udata in ((omr_config_data.get('users') or [{}])[0]).items():
         if other == username:
             continue
@@ -5139,7 +5222,7 @@ def _firewall_open_locked(params, current_user, route):
         error = _fw_entry_error(port, proto, fwtype, source_dip, source_ip)
         if error:
             return {'result': 'error', 'reason': error, 'route': route}
-    if source_dip and _public_ip_owner(omr_config_data, source_dip) not in (None, current_user.username):
+    if source_dip and set(_public_ip_owners(omr_config_data, source_dip)) - {current_user.username}:
         # The public IP another user has to itself (/add_user ips):
         # redirecting its ports would take that user's traffic.
         return {'result': 'error', 'reason': 'Address used by another user', 'route': route}
@@ -6684,7 +6767,9 @@ class MQVPNReorderRule(BaseModel):
     profile: str
 
 class MQVPN(BaseModel):
-    key: str
+    # Ignored: the router sends the key /config gave it, its own user's,
+    # which was written as the server-wide auth_key (see below).
+    key: Optional[str] = None
     scheduler: str = 'wlb'
     port: int = Query(443, gt=0, lt=65535)
     fec_enable: bool = False
@@ -6713,7 +6798,11 @@ def _mqvpn_set_config_locked(params, current_user):
     mqvpn_listen = mqvpn_cfg.get('listen', '0.0.0.0:443')
     host_part = mqvpn_listen.rsplit(':', 1)[0]
     old_port = mqvpn_listen.rsplit(':', 1)[-1]
-    mqvpn_cfg['auth_key'] = params.key
+    # Not the server-wide auth_key: mqvpn checks it before the users' keys,
+    # so the router's sessions were the "(global)" user's (its per-user
+    # DSCP and weight pushes found no session) and its key kept working
+    # once the user was removed. A key a release wrote there is dropped.
+    _mqvpn_drop_user_auth_key(mqvpn_cfg)
     mqvpn_cfg['scheduler'] = params.scheduler
     mqvpn_cfg['listen'] = host_part + ':' + str(params.port)
     mqvpn_cfg['fec_enable'] = params.fec_enable
@@ -6894,6 +6983,28 @@ def _mqvpn_path_policy_clear(policy, username, iface, field):
                 policy.pop(i)
             return
 
+# The live pushes of a /mqvpn_dscp or /mqvpn_weight call, all together: each
+# control API call may wait its 5 s timeouts on a wedged mqvpn.
+MQVPN_PUSH_DEADLINE = 15.0
+
+def _mqvpn_push(pushes):
+    """Send the control API commands of *pushes* ([(iface, command)]) to the
+    running mqvpn, once server.json is written and the config lock released:
+    held across them, it stopped every config change and login for as long
+    as a wedged mqvpn took to time out on each. The warnings, one per iface
+    not set; what wasn't pushed applies at mqvpn's next start."""
+    warnings = []
+    deadline = time.monotonic() + MQVPN_PUSH_DEADLINE
+    for iface, command in pushes:
+        if time.monotonic() > deadline:
+            warnings.append(f'{iface}: MQVPN control API too slow, applied at its next start')
+            continue
+        resp = mqvpn_api(command)
+        if not isinstance(resp, dict) or not resp.get('ok'):
+            error = resp.get('error', 'unknown error') if isinstance(resp, dict) else 'unknown error'
+            warnings.append(f'{iface}: {error}')
+    return warnings
+
 class MQVPNDscpPin(BaseModel):
     iface: str
     dscp: List[str] = []
@@ -6926,19 +7037,16 @@ def mqvpn_dscp(*, params: MQVPNDscpParams, current_user: User = Depends(get_curr
         policy = mqvpn_cfg.setdefault('path_policy', [])
         initial_policy = json.dumps(policy, sort_keys=True)
         previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'dscp_mask')
-        warnings = []
+        pushes = []
         for iface in previous_ifaces - set(desired.keys()):
-            resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': 0})
-            if not resp.get('ok'):
-                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            pushes.append((iface, {'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': 0}))
             _mqvpn_path_policy_clear(policy, username, iface, 'dscp_mask')
         for iface, mask in desired.items():
-            resp = mqvpn_api({'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': mask})
-            if not resp.get('ok'):
-                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            pushes.append((iface, {'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': mask}))
             _mqvpn_path_policy_set(policy, username, iface, 'dscp_mask', mask)
         if json.dumps(policy, sort_keys=True) != initial_policy:
             _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg)
+    warnings = _mqvpn_push(pushes)
     if warnings:
         return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_dscp'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_dscp'}
@@ -6972,21 +7080,18 @@ def mqvpn_weight(*, params: MQVPNWeightParams, current_user: User = Depends(get_
         policy = mqvpn_cfg.setdefault('path_policy', [])
         initial_policy = json.dumps(policy, sort_keys=True)
         previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'weight')
-        warnings = []
+        pushes = []
         for iface in previous_ifaces - set(desired.keys()):
             # 0 resets to the scheduler's default weight (1) -- see mqvpn's
             # src/path_entry_internal.h path_entry_t.weight doc comment.
-            resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': 0})
-            if not resp.get('ok'):
-                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            pushes.append((iface, {'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': 0}))
             _mqvpn_path_policy_clear(policy, username, iface, 'weight')
         for iface, weight in desired.items():
-            resp = mqvpn_api({'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': weight})
-            if not resp.get('ok'):
-                warnings.append(f'{iface}: {resp.get("error", "unknown error")}')
+            pushes.append((iface, {'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': weight}))
             _mqvpn_path_policy_set(policy, username, iface, 'weight', weight)
         if json.dumps(policy, sort_keys=True) != initial_policy:
             _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg)
+    warnings = _mqvpn_push(pushes)
     if warnings:
         return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_weight'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_weight'}
@@ -7168,35 +7273,81 @@ def _write_wireguard_conf(config_data, current_user=None):
     caller's -- are dropped: each router re-posts its own at every sync."""
     if not os.path.isfile('/etc/wireguard/wg0.conf'):
         return False
-    wg_config = configparser.ConfigParser(strict=False)
     with open(r'/etc/wireguard/wg0.conf') as conf_file:
-        wg_config.read_file(conf_file)
-    wg_port = wg_config.get('Interface', 'ListenPort')
-    wg_key = wg_config.get('Interface', 'PrivateKey')
+        conf_lines = conf_file.read().splitlines()
+    # [Interface] is kept line for line: wg-quick brings wg0 up from this
+    # file, and only kept ListenPort and PrivateKey, its Address and
+    # SaveConfig were gone and wg0 came back without its address.
+    interface, wg_interface = [], []
+    wg_port = None
+    section = None
+    for line in conf_lines:
+        header = _WG_SECTION_RE.fullmatch(line)
+        if header:
+            section = header.group(1).lower()
+        if section not in (None, 'interface'):
+            continue
+        interface.append(line)
+        key, sep, value = line.partition('=')
+        key = key.strip().lower()
+        if sep and key in _WG_TOOL_INTERFACE_KEYS:
+            wg_interface.append(line.strip())
+            if key == 'listenport':
+                wg_port = value.strip()
+    while interface and not interface[-1].strip():
+        interface.pop()
+    if not any(line.partition('=')[0].strip().lower() == 'address' for line in interface):
+        # Lost to a release that only kept those two: the installer's.
+        interface.append('Address = {}/{}'.format(WIREGUARD_SERVER_IP, WIREGUARD_NET.prefixlen))
 
     initial_md5 = hashlib.md5(file_as_bytes('/etc/wireguard/wg0.conf')).hexdigest()
     n = io.StringIO()
-    n.write('[Interface]\n')
-    n.write('ListenPort = ' + wg_port + '\n')
-    n.write('PrivateKey = ' + wg_key + '\n')
+    peers = io.StringIO()
     for username, user_config in config_data.get('users', [{}])[0].items():
         for peer in user_config.get('wireguard_peers', []):
             if _wireguard_peer_error(peer.get('key'), peer.get('ip')) or not _wireguard_peer_in_vpn(peer.get('ip')):
                 LOG.warning("Ignoring invalid WireGuard peer of user %s", log_safe(username))
                 continue
-            n.write('\n')
-            n.write('[Peer]\n')
-            n.write('PublicKey  = ' + peer['key'] + '\n')
+            peers.write('\n')
+            peers.write('[Peer]\n')
+            peers.write('PublicKey  = ' + peer['key'] + '\n')
             # The validated parts, not the raw value (see _wireguard_peer_nets).
-            n.write('AllowedIPs = ' + ', '.join(part.strip(' ') for part in peer['ip'].split(',')) + '\n')
+            peers.write('AllowedIPs = ' + ', '.join(part.strip(' ') for part in peer['ip'].split(',')) + '\n')
+    n.write('\n'.join(interface) + '\n' + peers.getvalue())
     # wg0.conf holds the server's private key: 0600 if it is ever created.
     _atomic_write_text('/etc/wireguard/wg0.conf', n.getvalue(), new_mode=0o600)
     final_md5 = hashlib.md5(file_as_bytes('/etc/wireguard/wg0.conf')).hexdigest()
     if initial_md5 != final_md5:
-        subprocess.run(["wg", "setconf", "wg0", "/etc/wireguard/wg0.conf"], check=False)
-        if current_user is not None:
+        _wg_syncconf('\n'.join(['[Interface]'] + wg_interface) + '\n' + peers.getvalue())
+        if current_user is not None and wg_port:
             shorewall_add_port(current_user, str(wg_port), 'udp', 'wireguard')
     return True
+
+# What `wg` reads of [Interface]; Address, SaveConfig, DNS, MTU, PostUp...
+# are wg-quick's, and `wg setconf/syncconf` refuses a file with them.
+_WG_SECTION_RE = re.compile(r'\s*\[\s*([A-Za-z]+)\s*\]\s*')
+_WG_TOOL_INTERFACE_KEYS = ('privatekey', 'listenport', 'fwmark')
+
+def _wg_syncconf(text):
+    """Apply *text*, a config `wg` reads, to the running wg0: syncconf keeps
+    the sessions of the peers it doesn't change, where setconf reset them."""
+    path = None
+    try:
+        # 0600: it holds the server's private key
+        with tempfile.NamedTemporaryFile('w', prefix='omr-wg0-', suffix='.conf', delete=False) as f:
+            path = f.name
+            f.write(text)
+        result = subprocess.run(["wg", "syncconf", "wg0", path], capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            LOG.warning("wg syncconf wg0 failed: %s", log_safe((result.stderr or result.stdout or '').strip()))
+    except OSError as exception:
+        LOG.warning("wg syncconf wg0 not run (%s)", exception)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 @app.post('/wireguard', summary="Modify Wireguard configuration")
 def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_user)):
@@ -8306,12 +8457,10 @@ def serialenforce(*, params: SerialEnforce, current_user: User = Depends(get_cur
     return {'result': 'done'}
 
 @app.get('/list_users', summary="List all users")
-async def list_users(current_user: User = Depends(get_current_user)):
+def list_users(current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'list_users'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
-    return content['users'][0]
+    return (read_omr_config().get('users') or [{}])[0]
 
 @app.get('/get-number-of-users', summary="Get the total number of users")
 def get_number_of_users(current_user: User = Depends(get_current_user)):

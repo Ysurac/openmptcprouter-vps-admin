@@ -144,6 +144,11 @@ try:
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
+except Exception as _torch_exc:  # pylint: disable=broad-except
+    # A broken install raises OSError (a missing .so), RuntimeError...: the
+    # import of this module, and with it omr-admin's, failed on it.
+    LOG.warning("omr_metrics: PyTorch unusable (%s), decision engine disabled", _torch_exc)
+    _TORCH_AVAILABLE = False
 
 METRICS_FILE = '/etc/openmptcprouter-vps-admin/omr-metrics.json'
 OMR_CONFIG_FILE = '/etc/openmptcprouter-vps-admin/omr-admin-config.json'

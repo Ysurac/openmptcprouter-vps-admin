@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from conftest import (MOCK_CONFIG, _ASGITestClient, _mock_open,  # noqa: F401
-                      app, omr_admin)
+from conftest import (_REAL_OPEN, MOCK_CONFIG, _ASGITestClient,  # noqa: F401
+                      _mock_open, app, omr_admin)
 
 PRIMARY = omr_admin.User(username="openmptcprouter", userid=0, permissions="rw", shadowsocks_port=65101)
 OTHER = omr_admin.User(username="readonly", userid=2, permissions="rw", shadowsocks_port=65102)
@@ -624,3 +624,293 @@ class TestV2rayDelUser:
         ):
             omr_admin.v2ray_del_user("bob")
         assert write.called and run.called
+
+
+# ---------------------------------------------------------------------------
+# Ports with a leading zero: nft reads them as octal
+# ---------------------------------------------------------------------------
+
+class TestLeadingZeroPort:
+    def test_refused(self):
+        # 0673 is 443 for nft, 673 for int(): checked as one, redirected as the other
+        for port in ("0673", "065", "80-0443", "010:20", "0"):
+            assert omr_admin._fw_entry_error(port, "udp", "DNAT") == "Invalid port", port
+            assert omr_admin._proxy_redirect_error(port, "udp", "", "") == "Invalid port", port
+        assert omr_admin._fw_entry_error("443", "udp", "DNAT") is None
+        assert omr_admin._fw_entry_error("100-200", "udp", "DNAT") is None
+
+    def test_firewallopen_refuses_it(self, other_client):
+        with patch("omr_admin.shorewall_add_port", return_value=None) as add:
+            r = other_client.post("/firewallopen", json={"name": "x", "port": "0673", "proto": "udp", "fwtype": "DNAT"})
+        assert r.json()["reason"] == "Invalid port"
+        assert not add.called
+
+    def test_rendered_from_the_checked_ports(self):
+        config = _config()
+        users = config["users"][0]
+        users["openmptcprouter"]["vpnremoteip"] = "10.255.255.2"
+        users["openmptcprouter"]["fw_ports"] = [_dnat("0673"), _dnat("80:90")]
+        _accept, dnat = omr_admin._render_fw_ports(config)
+        # the stored one an older release accepted is skipped
+        assert len(dnat) == 1 and " dport 80-90 " in dnat[0]
+
+
+# ---------------------------------------------------------------------------
+# A network as the address of a redirect
+# ---------------------------------------------------------------------------
+
+class TestDnatNetworkAddress:
+    def test_owners_of_a_network(self):
+        config = _config()
+        config["users"][0]["readonly"]["public_ips"] = ["203.0.113.9"]
+        config["users"][0]["openmptcprouter"]["public_ips"] = ["203.0.113.5"]
+        assert set(omr_admin._public_ip_owners(config, "0.0.0.0/0")) == {"readonly", "openmptcprouter"}
+        assert omr_admin._public_ip_owners(config, "0.0.0.0/0", contained=True) == []
+        assert omr_admin._public_ip_owners(config, "203.0.113.9", contained=True) == ["readonly"]
+        assert omr_admin._public_ip_owners(config, "not an address") == []
+
+    def test_network_over_another_users_ip_refused(self, other_client):
+        # the first owner found was the caller itself: the other one was missed
+        config = _config()
+        config["users"][0] = {"readonly": config["users"][0]["readonly"], **config["users"][0]}
+        config["users"][0]["readonly"]["public_ips"] = ["203.0.113.9"]
+        config["users"][0]["openmptcprouter"]["public_ips"] = ["203.0.113.5"]
+        with (
+            patch("builtins.open", side_effect=_open_with({CONFIG_PATH: json.dumps(config)})),
+            patch("omr_admin.shorewall_add_port", return_value=None) as add,
+        ):
+            r = other_client.post("/firewallopen", json={"name": "x", "port": "8080", "proto": "tcp",
+                                                        "fwtype": "DNAT", "source_dip": "0.0.0.0/0"})
+        assert r.json()["reason"] == "Address used by another user"
+        assert not add.called
+
+    def test_network_around_its_own_ip_is_not_its_own_ip(self, other_client):
+        # 0.0.0.0/0 is also the shared IPs: the server's ports are checked
+        config = _config()
+        config["users"][0]["readonly"]["public_ips"] = ["203.0.113.9"]
+        with (
+            patch("builtins.open", side_effect=_open_with({CONFIG_PATH: json.dumps(config)})),
+            patch("omr_admin._server_ports", return_value=[(443, 443)]),
+            patch("omr_admin.shorewall_add_port", return_value=None) as add,
+        ):
+            r = other_client.post("/firewallopen", json={"name": "x", "port": "443", "proto": "udp",
+                                                        "fwtype": "DNAT", "source_dip": "0.0.0.0/0"})
+        assert r.json()["reason"] == "Port used by the server"
+        assert not add.called
+
+    def test_rule_with_an_address_leaves_out_the_other_users_ips(self):
+        config = _config()
+        users = config["users"][0]
+        users["openmptcprouter"]["public_ips"] = ["203.0.113.5"]
+        users["readonly"]["vpnremoteip"] = "10.255.255.6"
+        users["readonly"]["fw_ports"] = [_dnat("8080", "203.0.113.0/24")]
+        _accept, dnat = omr_admin._render_fw_ports(config)
+        rule = next(rule for rule in dnat if "to 10.255.255.6" in rule)
+        assert "ip daddr 203.0.113.0/24" in rule and "ip daddr != { 203.0.113.5/32 }" in rule
+
+
+# ---------------------------------------------------------------------------
+# WireGuard: wg0.conf's [Interface]
+# ---------------------------------------------------------------------------
+
+class TestWireGuardInterface:
+    _SERVER = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
+    _PEER = "uKU1qOpAj/4jKsjk3ZqdpQ6GNZpI7mGTWArxpvzSg1I="
+
+    def _write(self, wg_conf):
+        config = _config()
+        config["users"][0]["openmptcprouter"]["wireguard_peers"] = [{"ip": "10.255.247.2", "key": self._PEER}]
+        out = io.StringIO()
+        out.close = lambda: None
+
+        def _open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/wireguard/wg0.conf":
+                return out if "w" in mode else io.StringIO(wg_conf)
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open),
+            patch("omr_admin.file_as_bytes", side_effect=[b"old", b"new"]),
+            patch("omr_admin._wg_syncconf") as sync,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add,
+        ):
+            assert omr_admin._write_wireguard_conf(config, PRIMARY)
+        return out.getvalue(), sync.call_args.args[0], add
+
+    def test_interface_kept(self):
+        # what wg-quick brings wg0 up with: its address was lost
+        wg_conf = ("[Interface]\nPrivateKey = " + self._SERVER + "\nListenPort = 65311\n"
+                   "Address = 10.255.247.1/24\nSaveConfig = true\nPostUp = true\n\n"
+                   "[Peer]\nPublicKey = " + self._SERVER + "\nAllowedIPs = 10.255.247.9\n")
+        out, live, add = self._write(wg_conf)
+        assert out.startswith("[Interface]\nPrivateKey = " + self._SERVER + "\nListenPort = 65311\n"
+                              "Address = 10.255.247.1/24\nSaveConfig = true\nPostUp = true\n\n[Peer]\n")
+        assert out.count("Address") == 1 and "10.255.247.9" not in out and "10.255.247.2" in out
+        # `wg` refuses wg-quick's keys
+        assert live == ("[Interface]\nPrivateKey = " + self._SERVER + "\nListenPort = 65311\n\n"
+                        "[Peer]\nPublicKey  = " + self._PEER + "\nAllowedIPs = 10.255.247.2\n")
+        assert add.call_args.args[1:3] == ("65311", "udp")
+
+    def test_lost_address_put_back(self):
+        out, _live, _add = self._write("[Interface]\nListenPort = 65311\nPrivateKey = " + self._SERVER + "\n")
+        assert "\nAddress = 10.255.247.1/24\n" in out
+
+    def test_syncconf_gets_a_private_file_removed_after(self):
+        seen = {}
+
+        def _run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["mode"] = os.stat(cmd[3]).st_mode & 0o777
+            with _REAL_OPEN(cmd[3]) as f:
+                seen["text"] = f.read()
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("subprocess.run", side_effect=_run), patch("os.remove", side_effect=os.unlink):
+            omr_admin._wg_syncconf("[Interface]\nListenPort = 1\n")
+        assert seen["cmd"][:3] == ["wg", "syncconf", "wg0"]
+        assert seen["mode"] == 0o600 and seen["text"] == "[Interface]\nListenPort = 1\n"
+        assert not os.path.exists(seen["cmd"][3])
+
+
+# ---------------------------------------------------------------------------
+# Authentication off the event loop, MQVPN pushes out of the lock
+# ---------------------------------------------------------------------------
+
+class TestAuthOffTheEventLoop:
+    def test_auth_paths_are_not_coroutines(self):
+        # they take the config lock: on the event loop, every request of
+        # the worker waited for the route holding it
+        for func in (omr_admin.get_current_user, omr_admin.login_for_access_token,
+                     omr_admin.login_basic, omr_admin.list_users):
+            assert not asyncio.iscoroutinefunction(func), func.__name__
+
+    def _mqvpn(self, client, route, payload):
+        depths = []
+
+        def _api(command):
+            depths.append(getattr(omr_admin._omr_config_lock_state, "depth", 0))
+            return {"ok": True}
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.mqvpn_api", side_effect=_api),
+            patch("omr_admin._atomic_write_json") as write,
+        ):
+            r = client.post(route, json=payload)
+        return r.json(), depths, write
+
+    def test_mqvpn_pushes_once_the_lock_is_released(self, primary_client):
+        body, depths, write = self._mqvpn(primary_client, "/mqvpn_dscp", {"pins": [{"iface": "wan1", "dscp": ["ef"]}]})
+        assert body["result"] == "done" and write.called
+        assert depths == [0]
+        body, depths, write = self._mqvpn(primary_client, "/mqvpn_weight", {"weights": [{"iface": "wan1", "weight": 3}]})
+        assert body["result"] == "done" and write.called
+        assert depths == [0]
+
+    def test_mqvpn_pushes_stop_at_the_deadline(self, primary_client):
+        with patch("omr_admin.MQVPN_PUSH_DEADLINE", -1):
+            body, depths, write = self._mqvpn(primary_client, "/mqvpn_weight",
+                                              {"weights": [{"iface": "wan1", "weight": 3}]})
+        # persisted all the same, for mqvpn's next start
+        assert body["result"] == "warning" and "too slow" in body["reason"]
+        assert depths == [] and write.called
+
+
+# ---------------------------------------------------------------------------
+# Big request bodies only with a token
+# ---------------------------------------------------------------------------
+
+class TestBodyLimitNeedsToken:
+    def _run(self, path, size, headers=()):
+        limit = next(m for m in app.user_middleware if m.cls is omr_admin._BodySizeLimit)
+        middleware = omr_admin._BodySizeLimit(lambda *a: asyncio.sleep(0), **limit.kwargs)
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {"type": "http", "path": path,
+                 "headers": [(b"content-length", str(size).encode()), *headers]}
+        asyncio.run(middleware(scope, receive, send))
+        return sent[0]["status"] if sent else None
+
+    def test_backup_without_token_gets_the_default_limit(self):
+        assert self._run("/backuppost", omr_admin.REQUEST_MAX_SIZE + 1) == 413
+        assert self._run("/dscp_classify", omr_admin.REQUEST_MAX_SIZE + 1) == 413
+
+    def test_backup_with_a_token_of_ours(self):
+        import jwt
+        from conftest import USER_TOKEN
+        good = [(b"authorization", b"Bearer " + USER_TOKEN.encode())]
+        assert self._run("/backuppost", 2 * 1024 * 1024, good) is None
+        forged = jwt.encode({"sub": "admin"}, "not-our-key", algorithm="HS256")
+        assert self._run("/backuppost", 2 * 1024 * 1024, [(b"authorization", b"Bearer " + forged.encode())]) == 413
+        assert self._run("/backuppost", 2 * 1024 * 1024, [(b"authorization", b"Basic eDp5")]) == 413
+
+
+# ---------------------------------------------------------------------------
+# What ss-manager writes unescaped into ss-server's JSON config
+# ---------------------------------------------------------------------------
+
+class TestShadowsocksUnescaped:
+    def test_method_with_a_quote_refused(self, primary_client):
+        payload = {"port": 65101, "method": 'aes-256-gcm","plugin":"/bin/sh', "fast_open": False,
+                   "reuse_port": False, "no_delay": False, "key": "testkey"}
+        with patch("os.path.isfile", return_value=True), patch("omr_admin._shadowsocks_locked") as locked:
+            r = primary_client.post("/shadowsocks", json=payload)
+        assert r.json() == {"result": "error", "reason": "Invalid method", "route": "shadowsocks"}
+        assert not locked.called
+
+    def test_lookups_over_https(self):
+        assert all(url.startswith("https://") for url in omr_admin.PUBLIC_IPV4_URLS + omr_admin.PUBLIC_HOSTNAME_URLS)
+
+    def test_lookup_answer_checked(self):
+        def _get(url, timeout):
+            if url == "https://a":
+                return MagicMock(ok=False, text="1.2.3.4")
+            if url == "https://b":
+                return MagicMock(ok=True, text='x","plugin":"/bin/sh')
+            return MagicMock(ok=True, text=" vps.example.com\n")
+
+        with patch("omr_admin.requests.get", side_effect=_get):
+            assert omr_admin._public_lookup(("https://a", "https://b", "https://c"), omr_admin._is_hostname) == "vps.example.com"
+            assert omr_admin._public_lookup(("https://a", "https://b"), omr_admin._is_hostname) == ""
+        assert omr_admin._is_ipv4_address("192.0.2.1")
+        assert not omr_admin._is_ipv4_address("<html>") and not omr_admin._is_ipv4_address("192.0.2.0/24")
+
+    def test_stored_value_checked(self):
+        with (
+            patch("omr_admin._public_lookup", return_value="vps.example.com") as lookup,
+            patch("omr_admin.set_global_param") as set_param,
+        ):
+            assert omr_admin._vps_hostname({"hostname": "ok.example.com"}) == "ok.example.com"
+            assert omr_admin._vps_hostname({"hostname": ""}) == ""
+            assert not lookup.called
+            # kept unchecked by an older release
+            assert omr_admin._vps_hostname({"hostname": 'x","plugin":"/bin/sh'}) == "vps.example.com"
+            set_param.assert_called_once_with("hostname", "vps.example.com")
+            assert omr_admin._vps_hostname({"internet": False}) == ""
+            assert lookup.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# A broken PyTorch must not stop omr-admin
+# ---------------------------------------------------------------------------
+
+@pytest.mark.real_env
+def test_omr_metrics_imports_with_a_broken_torch(tmp_path):
+    import subprocess
+    import sys
+    (tmp_path / "torch").mkdir()
+    (tmp_path / "torch" / "__init__.py").write_text("raise OSError('libtorch_cpu.so: cannot open shared object file')\n")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = "import omr_metrics; print(omr_metrics._TORCH_AVAILABLE)"
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                            env={**os.environ, "PYTHONPATH": f"{tmp_path}{os.pathsep}{repo}",
+                                 "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"

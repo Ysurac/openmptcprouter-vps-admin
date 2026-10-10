@@ -2708,31 +2708,72 @@ class TestMqvpn:
         del4.assert_not_called()
         del6.assert_not_called()
 
-    def test_config_fields_are_updated(self, user_client):
-        """auth_key and scheduler must be written into the JSON config."""
+    def _post_capture(self, user_client, payload, server_json=None):
         capture = io.StringIO()
         capture.close = lambda: None  # prevent the with-block from closing it
 
         def _capture_open(path, mode="r", *args, **kwargs):
-            if str(path) == "/etc/mqvpn/server.json" and "w" in str(mode):
-                return capture
+            if str(path) == "/etc/mqvpn/server.json":
+                if "w" in str(mode):
+                    return capture
+                if server_json is not None:
+                    return io.BytesIO(server_json.encode()) if "b" in str(mode) else io.StringIO(server_json)
             return _mock_open(path, mode, *args, **kwargs)
 
         with (
             patch("os.path.isfile", return_value=True),
             patch("builtins.open", side_effect=_capture_open),
         ):
-            r = user_client.post("/mqvpn", json=self._PAYLOAD)
-        assert r.json()["result"] == "done"
+            r = user_client.post("/mqvpn", json=payload)
         capture.seek(0)
-        written = json.loads(capture.read())
-        assert written["auth_key"] == self._PAYLOAD["key"]
+        return r, json.loads(capture.read())
+
+    def test_config_fields_are_updated(self, user_client):
+        """scheduler and the others must be written into the JSON config."""
+        r, written = self._post_capture(user_client, self._PAYLOAD)
+        assert r.json()["result"] == "done"
+        # the router's key is its own user's: not the server-wide auth_key
+        assert written["auth_key"] == MQVPN_CONFIG["auth_key"]
         assert written["scheduler"] == self._PAYLOAD["scheduler"]
         assert written["fec_enable"] == self._PAYLOAD["fec_enable"]
         assert written["fec_scheme"] == self._PAYLOAD["fec_scheme"]
         assert written["reinjection_control"] == self._PAYLOAD["reinjection_control"]
         assert written["reinjection_mode"] == self._PAYLOAD["reinjection_mode"]
         assert written["cc"] == self._PAYLOAD["cc"]
+
+    def test_user_key_written_as_auth_key_is_dropped(self, user_client):
+        """A release wrote the router's own key as auth_key: mqvpn then took
+        its sessions for the "(global)" user's, and kept letting the key in
+        once the user was removed."""
+        config = dict(MQVPN_CONFIG, auth_key="user-mqvpn-key")
+        r, written = self._post_capture(user_client, self._PAYLOAD, json.dumps(config))
+        assert r.json()["result"] == "done"
+        assert "auth_key" not in written
+        assert written["users"] == MQVPN_CONFIG["users"]
+
+    def test_key_is_optional(self, user_client):
+        payload = {k: v for k, v in self._PAYLOAD.items() if k != "key"}
+        r, written = self._post_capture(user_client, payload)
+        assert r.json()["result"] == "done"
+        assert written["scheduler"] == self._PAYLOAD["scheduler"]
+
+    def test_remove_user_drops_its_key_as_auth_key(self):
+        capture = io.StringIO()
+        capture.close = lambda: None
+        config = json.dumps(dict(MQVPN_CONFIG, auth_key="user-mqvpn-key"))
+
+        def _open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json":
+                return capture if "w" in str(mode) else io.StringIO(config)
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("builtins.open", side_effect=_open),
+            patch("omr_admin.mqvpn_api", return_value={"ok": True}),
+        ):
+            omr_admin.remove_mqvpn("openmptcprouter")
+        written = json.loads(capture.getvalue())
+        assert written["users"] == [] and "auth_key" not in written
 
     def test_config_returns_user_key_not_auth_key(self, user_client):
         """/config must expose the current user's key, not the global auth_key."""
@@ -3256,7 +3297,9 @@ class TestWireGuard:
         ):
             assert omr_admin._write_wireguard_conf(config)
         out = tmp.getvalue()
-        assert out.startswith("[Interface]\nListenPort = 65311\nPrivateKey = " + self._KEY + "\n")
+        assert out.startswith("[Interface]\nListenPort = 65311\nPrivateKey = " + self._KEY + "\n"
+                              # lost to a release that only kept the two lines above
+                              "Address = 10.255.247.1/24\n")
         assert "AllowedIPs = 10.255.247.2\n" in out
         assert "AllowedIPs = 10.255.247.3/32\n" in out
         # the unowned peer of an earlier release and the invalid stored ones are gone
@@ -3264,7 +3307,8 @@ class TestWireGuard:
         assert out.count("[Peer]") == 2
         assert write.call_args.args[0] == "/etc/wireguard/wg0.conf"
         assert write.call_args.args[2] == 0o600   # it holds the server's private key
-        run.assert_called_once_with(["wg", "setconf", "wg0", "/etc/wireguard/wg0.conf"], check=False)
+        assert run.call_count == 1
+        assert run.call_args.args[0][:3] == ["wg", "syncconf", "wg0"]
 
     def test_requires_auth(self, unauth_client):
         r = unauth_client.post("/wireguard", json=self._PAYLOAD)
