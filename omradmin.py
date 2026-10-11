@@ -22,6 +22,7 @@ import platform
 import glob
 import socket
 import socket as _socket
+import ssl
 import functools
 from operator import itemgetter
 import re
@@ -8627,6 +8628,8 @@ def log_startup_environment():
     LOG.info("OMR-Admin starting on kernel %s %s (OpenMPTCProuter VPS %s)",
              uname.release, uname.machine, get_omr_version() or 'unknown')
 
+API_TLS_CIPHERS = 'ECDHE+AESGCM:ECDHE+CHACHA20'
+
 def main(omrport: int, omrhost: str, workers: int):
     LOG.debug("Main OMR-Admin launch")
     log_startup_environment()
@@ -8638,7 +8641,15 @@ def main(omrport: int, omrhost: str, workers: int):
     ssl_opts = dict(
         ssl_certfile='/etc/openmptcprouter-vps-admin/cert.pem',
         ssl_keyfile='/etc/openmptcprouter-vps-admin/key.pem',
-        ssl_version=5,
+        # TLS 1.2 and 1.3: 5 was PROTOCOL_TLSv1_2, TLS 1.2 alone. With
+        # uvicorn's default ciphers ("TLSv1") that was CBC with SHA1 only,
+        # ECDHE-RSA-AES256-SHA. TLS 1.3 has its own suites, these are 1.2's:
+        # AEAD only, which also keeps TLS 1.0/1.1 out where Python (< 3.10)
+        # doesn't. The router's curl (OpenSSL, mbedTLS, wolfSSL) has them.
+        # TLS 1.2 stays: before v0.60 the router's curl was built on mbedTLS
+        # 2, without TLS 1.3, and would no longer reach the API at all.
+        ssl_version=ssl.PROTOCOL_TLS_SERVER,
+        ssl_ciphers=API_TLS_CIPHERS,
         # No proxy sits in front of the API: uvicorn's default trusts the
         # X-Forwarded-For of a connection from 127.0.0.1, which a router can
         # open through the VPS's own proxies, and the client address it sets

@@ -914,3 +914,104 @@ def test_omr_metrics_imports_with_a_broken_torch(tmp_path):
                                  "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "False"
+
+
+# ---------------------------------------------------------------------------
+# The API's TLS
+# ---------------------------------------------------------------------------
+
+class TestApiTls:
+    def test_main_passes_tls_server_and_aead_ciphers(self):
+        import ssl
+        with (
+            patch("omr_admin.uvicorn.run") as run,
+            patch("omr_admin.log_startup_environment"),
+        ):
+            omr_admin.main(65500, "127.0.0.1", 2)
+        kwargs = run.call_args.kwargs
+        # 5, PROTOCOL_TLSv1_2, was TLS 1.2 alone
+        assert kwargs["ssl_version"] == ssl.PROTOCOL_TLS_SERVER
+        assert kwargs["ssl_ciphers"] == omr_admin.API_TLS_CIPHERS
+        assert kwargs["proxy_headers"] is False
+
+    def test_single_worker_gets_the_same(self):
+        import ssl
+        with (
+            patch("omr_admin.uvicorn.Config") as config,
+            patch("omr_admin.MPTCPServer") as server,
+            patch("omr_admin.log_startup_environment"),
+        ):
+            server.return_value.serve = MagicMock(return_value=None)
+            with patch("omr_admin.asyncio.new_event_loop") as loop, \
+                 patch("omr_admin.asyncio.get_running_loop", side_effect=RuntimeError), \
+                 patch("omr_admin.asyncio.set_event_loop"):
+                omr_admin.main(65500, "127.0.0.1", 1)
+        assert loop.return_value.run_until_complete.called
+        kwargs = config.call_args.kwargs
+        assert kwargs["ssl_version"] == ssl.PROTOCOL_TLS_SERVER
+        assert kwargs["ssl_ciphers"] == omr_admin.API_TLS_CIPHERS
+
+
+@pytest.mark.real_env
+def test_api_tls_handshakes(tmp_path):
+    """The context uvicorn builds from main()'s options: TLS 1.3, TLS 1.2
+    with an AEAD suite, nothing older and no CBC suite."""
+    import shutil
+    import socket
+    import ssl
+    import subprocess
+    import threading
+
+    from uvicorn.config import create_ssl_context
+
+    if shutil.which("openssl") is None:
+        pytest.skip("no openssl binary to make a certificate")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-x509",
+                    "-keyout", str(key), "-out", str(cert), "-subj", "/CN=omr-test"],
+                   check=True, capture_output=True)
+    server_ctx = create_ssl_context(certfile=str(cert), keyfile=str(key), password=None,
+                                    ssl_version=ssl.PROTOCOL_TLS_SERVER, cert_reqs=ssl.CERT_NONE,
+                                    ca_certs=None, ciphers=omr_admin.API_TLS_CIPHERS)
+
+    def handshake(minimum, maximum, ciphers=None):
+        client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_ctx.check_hostname = False
+        client_ctx.verify_mode = ssl.CERT_NONE
+        try:
+            client_ctx.minimum_version, client_ctx.maximum_version = minimum, maximum
+            if ciphers:
+                client_ctx.set_ciphers(ciphers)
+        except (ValueError, ssl.SSLError):
+            return None  # this OpenSSL can't even offer it
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+
+        def serve():
+            conn, _ = listener.accept()
+            try:
+                with server_ctx.wrap_socket(conn, server_side=True):
+                    pass
+            except (ssl.SSLError, OSError):
+                pass
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            with socket.create_connection(listener.getsockname(), timeout=5) as sock, \
+                 client_ctx.wrap_socket(sock) as tls:
+                return tls.version(), tls.cipher()[0]
+        except (ssl.SSLError, OSError):
+            return None
+        finally:
+            thread.join(5)
+            listener.close()
+
+    v = ssl.TLSVersion
+    assert handshake(v.TLSv1_3, v.TLSv1_3)[0] == "TLSv1.3"
+    version, cipher = handshake(v.TLSv1_2, v.TLSv1_2)
+    assert version == "TLSv1.2" and ("GCM" in cipher or "CHACHA20" in cipher), cipher
+    # the only suite it negotiated before
+    assert handshake(v.TLSv1_2, v.TLSv1_2, "ECDHE-RSA-AES256-SHA") is None
+    assert handshake(v.TLSv1, v.TLSv1_1, "ALL:@SECLEVEL=0") is None
