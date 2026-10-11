@@ -1,3 +1,10 @@
+omr-vps-admin (0.18+20261011) unstable; urgency=medium
+
+  * API TLS: TLS 1.3, and TLS 1.2 with AEAD suites only (ECDHE with AES-GCM or ChaCha20). ssl_version 5 was PROTOCOL_TLSv1_2, TLS 1.2 alone, and with uvicorn's default ciphers ("TLSv1") the only suite negotiated was ECDHE-RSA-AES256-SHA, CBC with SHA1. Without a CBC suite, TLS 1.0 and 1.1 have none to agree on, also where Python (< 3.10) doesn't refuse them. TLS 1.2 stays for the routers before v0.60, whose curl was built on mbedTLS 2, without TLS 1.3
+  * Add tests for the above (test/test_hardening.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sun, 11 Oct 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20261010) unstable; urgency=medium
 
   * Firewall: refuse a port with a leading zero, and write the rules from the ports checked. nft reads 0673 as octal, 443, where the checks read 673: a router other than the main one passed the "Port used by the server" and "Port already redirected by another user" checks and redirected udp/443 (MQVPN) or another user's port. An entry stored with one is skipped
