@@ -13,7 +13,25 @@ omr-vps-admin (0.18+20261012) unstable; urgency=medium
   * /login_basic: the cookie's token only works as that cookie and from the address that logged in. A browser sends the cookie to every HTTPS port of the VPS, a port redirected to another user's router included
   * omr_metrics: the latest snapshot query returns one row per interface, every row of the last day was read and parsed at each call. History is limited to 30 days. The weight smoothing is shared by the workers (/run/omr-admin-weight-ema.json), a router's polls alternated between two averages. A new decision model is saved once, under a lock, for every worker, instead of a random one per worker
   * install_omr-ai.sh: the decision model is made by omr_metrics itself: the copy of the network the installer kept had 19 features and other layers, refused at every start. A config with a trailing comma is read, an unreadable one left as it is (it was replaced by {}, every user lost), written 0600 from the start, and omr-admin restarted once the influxdb block is in it
-  * Add tests for the above (test/test_hardening.py, test/test_isolation.py, test/test_api.py, test/test_dscp_sync.py, test/test_metrics.py, test/test_install_omr_ai.py)
+  * /modify_user: a disabled user loses its access, not only its API login: its xray/v2ray clients, shadowsocks ports, shadowsocks-go, MQVPN and SoftEther users are taken out, its glorytun/DSVPN units stopped, OpenVPN refuses it ("disable" in its ccd) and its WireGuard peers leave wg0.conf. What was taken is kept under access_suspended and put back, with the same keys, when the user is enabled again (an MQVPN fixed IP at mqvpn's next start)
+  * GRE tunnels: the tunnels of an address a user no longer has are removed, with their proxy users and shadowsocks port; a tunnel's xray email is saved (a shallow copy made it equal to the stored one)
+  * /add_user: refuse ipp_tcp.txt, ipp_udp.txt (OpenVPN's files in ccd) and a name starting with '-' (an option of xray and easyrsa)
+  * shadowsocks-go: the older API path is tried when the current one answers 404, not only when it raises
+  * /backuppost: written atomically, under a dated name no other backup has (two in the same second overwrote each other); older backups made 0600 at startup
+  * Failures no longer reported as success: a firewall rule nft refuses is not kept and is reported, and so is an address of the other IP family; /mptcp keeps in sysctl.d only the values the kernel took and reports the others; /glorytun refuses a user without a tunnel; a failed systemctl restart is logged with its error
+  * /mptcp restarts every user's glorytun-tcp, not only tun0. glorytun-udp's PORT (the client's) is no longer taken for a port it listens on. Port 65535 is accepted
+  * Under the config lock: /mptcp_weight's state file (also written atomically), tun0.conf (/lan, /openvpn, client2client), the VXLAN checks and save, /wan's ACL, which /remove_user now also cleans
+  * Validation: the /dsvpn key, the VXLAN MTU (1280-9000), MQVPN's fixed_ip (in its subnet, not its own, not another user's); a VXLAN bridge name fits the 15 characters of an interface for every VNI
+  * Limits: MQVPN path_policy 16 interfaces per user and 128 in all (mqvpn drops the rest), 8 WireGuard peers per user, 8 speedtests per user and 16 per worker (429)
+  * /update runs in a transient unit that starts omr again however the update ends: one that failed left it stopped
+  * A JWT without exp is refused; each startup step is guarded, one failing no longer stops the worker
+  * omr_metrics: disabling auto-learning no longer runs one more round, a toggle reaches every worker at the next config change; /metrics/engine off the event loop; InfluxDB timeouts of 30 s (query) and 10 s (write), failures warned once a minute; metric values in their ranges (1e308 was a 500, a negative latency the best WAN); a trained model saved under its lock; the JSON backend drops entries over a day old; a config with a trailing comma is read
+  * omr-admin.service: PrivateTmp, ProtectClock, ProtectHostname, ProtectKernelLogs, ProtectControlGroups, LockPersonality, RestrictRealtime, RestrictSUIDSGID; the umask stays 0022, easyrsa rewrites the CRL OpenVPN reads as nobody
+  * postinst works without a running systemd (chroot, image build)
+  * install_omr-ai.sh: influxdb3-python 0.21.0 and torch 2.8.0 for the pip fallback, not whatever PyPI has
+  * CI: packages deployed from develop, master and main only; tests also run on Debian 13's own Python packages; a test checks every route but the public ones needs a login. Docker refuses the example InfluxDB token; .env ignored by git
+  * docs/api.md: the /firewall* routes, the /sipalg row, and the changes above
+  * Add tests for the above (test/test_hardening.py, test/test_isolation.py, test/test_api.py, test/test_dscp_sync.py, test/test_metrics.py, test/test_install_omr_ai.py, test/test_nft.py)
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 12 Oct 2026 00:00:00 +0200
 
