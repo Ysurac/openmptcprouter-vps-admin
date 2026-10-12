@@ -664,7 +664,7 @@ class TestSyncOpenvpnClientToClient:
         assert changed is True
         assert "client-to-client" in written
         assert writes == 1
-        run_mock.assert_called_once_with(["systemctl", "-q", "restart", "openvpn@tun0"], check=False)
+        run_mock.assert_called_once_with(["systemctl", "-q", "restart", "openvpn@tun0"], capture_output=True, text=True, check=False)
 
     def test_disable_removes_line_and_restarts(self):
         changed, written, _writes, run_mock = self._run("proto tcp6-server\nclient-to-client\n", False)
@@ -1148,6 +1148,47 @@ class TestAddGreTunnels:
         modified, _ = self._run(config)
         modified.assert_not_called()
         assert config == before
+
+    def test_xray_email_of_an_older_tunnel_saved(self):
+        # a shallow copy set it in the stored tunnel too: nothing changed
+        config = self._config()
+        self._run(config)
+        tunnel = next(iter(config["users"][0]["alice"]["gre_tunnels"].values()))
+        tunnel["xray"] = {"uuid": "u", "ss2022": "k"}
+        modified, _ = self._run(config, isfile=lambda p: p == "/etc/xray/xray-server.json")
+        assert any(c.args[0] == "alice" for c in modified.call_args_list)
+        assert tunnel["xray"].get("email") is None   # the stored dict untouched
+        saved = next(iter(config["users"][0]["alice"]["gre_tunnels"].values()))
+        assert saved["xray"]["email"] == "alicegre-user3-ip0"
+
+    def test_tunnel_of_an_address_no_longer_the_users_removed(self):
+        config = self._config()
+        self._run(config)
+        config["users"][0]["alice"]["public_ips"] = []
+        with patch("omr_admin._gre_drop_tunnel") as drop:
+            self._run(config)
+        assert config["users"][0]["alice"]["gre_tunnels"] == {}
+        assert [c.args[2] for c in drop.call_args_list] == ["gre-user3-ip0"]
+        # the default user keeps the tunnels of the addresses still there
+        with patch("omr_admin._gre_drop_tunnel") as drop:
+            self._run(config, public=_PUBLIC[:2])
+        assert {t["public_ip"] for t in config["users"][0]["openmptcprouter"]["gre_tunnels"].values()} == \
+            {"198.51.100.1", "203.0.113.5"}
+        assert len(drop.call_args_list) == 1
+
+    def test_dropped_tunnel_keeps_the_users_own_port(self):
+        udata = {"username": "alice", "shadowsocks_port": 65120}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.xray_del_user") as xdel,
+            patch("omr_admin.v2ray_del_user") as vdel,
+            patch("omr_admin.remove_ss_user") as ssdel,
+        ):
+            omr_admin._gre_drop_tunnel(udata, "alice", "gre-user3-ip0", {"shadowsocks_port": 65120})
+            omr_admin._gre_drop_tunnel(udata, "alice", "gre-user3-ip1", {"shadowsocks_port": "65121"})
+        assert [c.args[0] for c in xdel.call_args_list] == ["alicegre-user3-ip0", "alicegre-user3-ip1"]
+        assert vdel.call_count == 2
+        ssdel.assert_called_once_with("65121")
 
     def test_new_address_keeps_the_others_names_and_networks(self):
         config = self._config()

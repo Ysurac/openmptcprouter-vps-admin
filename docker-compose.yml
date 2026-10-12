@@ -186,6 +186,12 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        # The example's token (or a short one) would be the admin token of
+        # an InfluxDB anyone can guess.
+        case "$$INFLUXDB_TOKEN" in
+          change-this-influx-token|changeme) echo "Set a random INFLUXDB_TOKEN in .env (openssl rand -hex 32)" >&2; exit 1 ;;
+        esac
+        [ "$${#INFLUXDB_TOKEN}" -ge 16 ] || { echo "INFLUXDB_TOKEN is too short (16 characters at least)" >&2; exit 1; }
         printf '{"token": "%s", "name": "admin", "expiry_millis": 4102444800000}' \
           "$$INFLUXDB_TOKEN" > /var/lib/influxdb3/admin-token.json
         chown influxdb3: /var/lib/influxdb3/admin-token.json 2>/dev/null || true

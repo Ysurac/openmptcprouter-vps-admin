@@ -123,6 +123,7 @@ import math
 import os
 import logging
 import random
+import re
 import tempfile
 import threading
 import time
@@ -155,6 +156,12 @@ OMR_CONFIG_FILE = '/etc/openmptcprouter-vps-admin/omr-admin-config.json'
 OMR_CONFIG_LOCK_FILE = os.path.join(os.path.dirname(OMR_CONFIG_FILE), '.omr-admin-config.lock')
 DECISION_MODEL_FILE = '/etc/openmptcprouter-vps-admin/omr-decision-model.pt'
 _config_thread_lock = threading.RLock()
+
+
+def _parse_admin_config(f) -> dict:
+    """omr-admin-config.json as omr-admin reads it, a trailing comma
+    included: json.load refused it, and the metrics lost their settings."""
+    return json.loads(re.sub(r",\s*}", "}", f.read()))
 
 
 @contextlib.contextmanager
@@ -323,6 +330,11 @@ _Text = Annotated[str, Field(max_length=256)]
 # Every integer is stored in InfluxDB and converted to float: refuse values
 # no int64 counter can hold (10**400 would overflow float() later on).
 _Int64 = Annotated[int, Field(ge=-(2 ** 63), le=2 ** 63 - 1)]
+# Floats in the ranges they have: 1e308 overflowed the scoring (a 500), and
+# a negative latency or loss made the worst WAN the best.
+_Ms = Annotated[float, Field(ge=0, le=3_600_000)]
+_Percent = Annotated[float, Field(ge=0, le=100)]
+_Db = Annotated[float, Field(ge=-1000, le=1000)]      # dBm, dB
 
 
 class _Payload(BaseModel):
@@ -331,14 +343,14 @@ class _Payload(BaseModel):
 
 
 class SignalMetrics(_Payload):
-    quality: Optional[float] = None
+    quality: Optional[_Percent] = None
     operator: Optional[_Text] = None
     state: Optional[_Text] = None
     type: Optional[_Text] = None      # 'wifi' | 'modemmanager' | 'qmi'
-    rssi: Optional[float] = None
-    rsrp: Optional[float] = None
-    rsrq: Optional[float] = None
-    sinr: Optional[float] = None
+    rssi: Optional[_Db] = None
+    rsrp: Optional[_Db] = None
+    rsrq: Optional[_Db] = None
+    sinr: Optional[_Db] = None
 
 
 class WifiMetrics(_Payload):
@@ -375,7 +387,7 @@ class BBRMetrics(_Payload):
     pacing_rate: Optional[_Int64] = None    # bytes/s
     delivery_rate: Optional[_Int64] = None  # bytes/s
     cwnd: Optional[_Int64] = None           # packets
-    min_rtt: Optional[float] = None         # ms
+    min_rtt: Optional[_Ms] = None           # ms
     retrans: Optional[_Int64] = None
 
 
@@ -404,11 +416,11 @@ class InterfaceMetrics(_Payload):
     weight: Optional[_Int64] = 100        # nexthop weight (1-255, default 100)
     cost: Optional[_Int64] = None         # interface routing cost (lower = preferred)
     asn: Optional[_Text] = None           # ASN of the WAN (e.g. "AS1234")
-    latency: Optional[float] = None      # ms
-    rtt_min: Optional[float] = None      # ms
-    rtt_max: Optional[float] = None      # ms
-    loss: Optional[float] = None         # percent
-    jitter: Optional[float] = None       # ms
+    latency: Optional[_Ms] = None        # ms
+    rtt_min: Optional[_Ms] = None        # ms
+    rtt_max: Optional[_Ms] = None        # ms
+    loss: Optional[_Percent] = None      # percent
+    jitter: Optional[_Ms] = None         # ms
     signal: Optional[SignalMetrics] = None
     wifi: Optional[WifiMetrics] = None
     tc: Optional[TCMetrics] = None
@@ -421,8 +433,8 @@ class InterfaceMetrics(_Payload):
 class DecisionFeedback(_Payload):
     """Feedback used to fine-tune the interface scorer."""
     best_interface: Optional[str] = None   # shorthand: 1.0 for this iface, 0.0 rest
-    weights: Optional[Dict[str, float]] = None  # free-form {iface: weight}
-    learning_rate: float = 0.01
+    weights: Optional[Dict[str, Annotated[float, Field(le=1e6)]]] = None  # free-form {iface: weight}, >= 0 checked below
+    learning_rate: Annotated[float, Field(gt=0, le=1)] = 0.01
 
 
 class AutoLearningToggle(BaseModel):
@@ -480,7 +492,10 @@ class JSONBackend:
             return {}
 
     def interfaces(self, username: str) -> list:
-        return list(self.read_user(username).keys())
+        """Interfaces of *username* seen in the last day, as InfluxDB's."""
+        cutoff = time.time() - self._MAX_AGE_S
+        return [iface for iface, p in self.read_user(username).items()
+                if isinstance(p, dict) and isinstance(p.get("timestamp"), (int, float)) and p["timestamp"] >= cutoff]
 
     def read_user(self, username: str) -> dict:
         return self.read_all().get(username, {})
@@ -509,6 +524,28 @@ class JSONBackend:
             "interfaces": sorted(user_data.keys()),
         }
 
+    # The latest snapshot only, of the last day as InfluxDB's (its
+    # _LATEST_WINDOW): an interface a router no longer has, or a removed
+    # user, was kept for good, and 32 interfaces seen once filled a user's
+    # allowance (MAX_INTERFACES_PER_USER) for good.
+    _MAX_AGE_S = 86400
+
+    def _evict_stale(self, data: dict, keep=None) -> None:
+        cutoff = time.time() - self._MAX_AGE_S
+        for user in list(data):
+            ifaces = data[user]
+            if not isinstance(ifaces, dict):
+                del data[user]
+                continue
+            for iface in list(ifaces):
+                if (user, iface) == keep:
+                    continue
+                ts = ifaces[iface].get("timestamp") if isinstance(ifaces[iface], dict) else None
+                if not isinstance(ts, (int, float)) or ts < cutoff:
+                    del ifaces[iface]
+            if not ifaces:
+                del data[user]
+
     def write_interface(self, username: str, payload: dict):
         with self._lock, _file_lock(METRICS_FILE + '.lock'):
             try:
@@ -531,6 +568,7 @@ class JSONBackend:
                           METRICS_FILE, exc)
                 return False
             data.setdefault(username, {})[payload["interface"]] = payload
+            self._evict_stale(data, keep=(username, payload["interface"]))
             tmp = None
             try:
                 # Unique 0600 temp file: the data holds every router's WAN
@@ -554,6 +592,21 @@ class JSONBackend:
                         os.unlink(tmp)
 
 
+_influx_warned = {"ts": 0.0}
+
+
+def _influx_warn(msg: str, *args) -> None:
+    """A failed InfluxDB query or write: a warning, once a minute at most
+    (it fails at every poll while InfluxDB is down), debug otherwise. At
+    debug only, a down InfluxDB went unnoticed; at error, it flooded."""
+    now = time.time()
+    if now - _influx_warned["ts"] >= 60:
+        _influx_warned["ts"] = now
+        LOG.warning(msg, *args)
+    else:
+        LOG.debug(msg, *args)
+
+
 class InfluxBackend:
     """Stores metrics in InfluxDB 3.x.
 
@@ -571,13 +624,23 @@ class InfluxBackend:
                  retention_days: int = 60):
         from influxdb_client_3 import InfluxDBClient3  # noqa: PLC0415
         # org is not used in InfluxDB 3; bucket becomes the database name
-        self._client = InfluxDBClient3(host=url, token=token, database=bucket)
+        # Timeouts of our own: the client's defaults kept a worker thread
+        # (and the request behind it) waiting on a wedged InfluxDB for 5 min.
+        try:
+            self._client = InfluxDBClient3(host=url, token=token, database=bucket,
+                                           query_timeout=self._QUERY_TIMEOUT_MS,
+                                           write_timeout=self._WRITE_TIMEOUT_MS)
+        except TypeError:   # a client older than these options
+            self._client = InfluxDBClient3(host=url, token=token, database=bucket)
         self._bucket = bucket
         self._url = url
         self._token = token
         self._retention_days = max(1, int(retention_days))
         threading.Thread(target=self._apply_retention, daemon=True,
                          name="omr-influx-retention").start()
+
+    _QUERY_TIMEOUT_MS = 30_000
+    _WRITE_TIMEOUT_MS = 10_000
 
     # Retries absorb InfluxDB3 still starting up right after boot (no
     # systemd ordering guarantees it's ready before omr-admin), where the
@@ -669,7 +732,7 @@ class InfluxBackend:
         try:
             table = self._client.query(sql, query_parameters=params or None)
         except Exception as exc:
-            LOG.error("omr_metrics InfluxDB: query error: %s", exc)
+            _influx_warn("omr_metrics InfluxDB: query error: %s", exc)
             return {}
 
         result: dict = {}
@@ -710,7 +773,7 @@ class InfluxBackend:
             table = self._client.query(sql, query_parameters={"username": username})
             return list(table.to_pydict().get("interface", []))
         except Exception as exc:
-            LOG.error("omr_metrics InfluxDB interfaces: %s", exc)
+            _influx_warn("omr_metrics InfluxDB interfaces: %s", exc)
             return []
 
     def read_history(self, username: str, interface: Optional[str],
@@ -757,7 +820,7 @@ class InfluxBackend:
                 sql, query_parameters={"username": username, "interface": interface}
             )
         except Exception as exc:
-            LOG.debug("omr_metrics InfluxDB history: query error: %s", exc)
+            _influx_warn("omr_metrics InfluxDB history: query error: %s", exc)
             return []
         return self._parse_history_rows(table)
 
@@ -775,7 +838,7 @@ class InfluxBackend:
         try:
             table = self._client.query(sql, query_parameters={"username": username})
         except Exception as exc:
-            LOG.debug("omr_metrics InfluxDB history: query error: %s", exc)
+            _influx_warn("omr_metrics InfluxDB history: query error: %s", exc)
             return {}
 
         result: dict = {}
@@ -829,7 +892,7 @@ class InfluxBackend:
             first_seen = _ts(firsts[0]) if firsts else None
             last_seen  = _ts(lasts[0])  if lasts  else None
         except Exception as exc:
-            LOG.error("omr_metrics InfluxDB user_stats: %s", exc)
+            _influx_warn("omr_metrics InfluxDB user_stats: %s", exc)
             entry_count, first_seen, last_seen = 0, None, None
 
         try:
@@ -837,7 +900,7 @@ class InfluxBackend:
             id_ = itable.to_pydict()
             interfaces = sorted(id_.get("interface", []))
         except Exception as exc:
-            LOG.error("omr_metrics InfluxDB user_stats interfaces: %s", exc)
+            _influx_warn("omr_metrics InfluxDB user_stats interfaces: %s", exc)
             interfaces = []
 
         return {
@@ -927,7 +990,7 @@ class InfluxBackend:
             self._client.write(record=p)
             return True
         except Exception as exc:
-            LOG.debug("omr_metrics InfluxDB: write error: %s", exc)
+            _influx_warn("omr_metrics InfluxDB: write error: %s", exc)
             return False
 
 
@@ -944,7 +1007,7 @@ def _init_backend():
     global EMA_ALPHA
     try:
         with open(OMR_CONFIG_FILE) as f:
-            config = json.load(f)
+            config = _parse_admin_config(f)
         ema_alpha = config.get("ema_alpha")
         if ema_alpha is not None:
             try:
@@ -2461,17 +2524,28 @@ _auto_cfg_cache: dict = {"ts": 0.0, "cfg": None}
 _AUTO_HISTORY_LIMIT: int = 240
 
 
+def _config_mtime() -> Optional[int]:
+    try:
+        return os.stat(OMR_CONFIG_FILE).st_mtime_ns
+    except OSError:
+        return None
+
+
 def _auto_cfg(force: bool = False) -> dict:
-    """Return the sanitised auto_learning config block (cached for 60 s)."""
+    """Return the sanitised auto_learning config block (cached for 60 s, or
+    until the config file changes: a toggle received by another worker, the
+    leader one maybe, was seen a minute later)."""
     now = time.time()
     cached = _auto_cfg_cache["cfg"]
-    if not force and cached is not None and now - _auto_cfg_cache["ts"] < _AUTO_CFG_TTL:
+    mtime = _config_mtime()
+    if not force and cached is not None and now - _auto_cfg_cache["ts"] < _AUTO_CFG_TTL \
+            and mtime == _auto_cfg_cache.get("mtime"):
         return cached
 
     raw: dict = {}
     try:
         with open(OMR_CONFIG_FILE) as f:
-            raw = json.load(f).get("auto_learning") or {}
+            raw = _parse_admin_config(f).get("auto_learning") or {}
     except Exception as exc:
         LOG.debug("omr_auto: config read: %s", exc)
 
@@ -2502,6 +2576,7 @@ def _auto_cfg(force: bool = False) -> dict:
     }
     _auto_cfg_cache["ts"] = now
     _auto_cfg_cache["cfg"] = cfg
+    _auto_cfg_cache["mtime"] = mtime
     return cfg
 
 
@@ -2620,7 +2695,7 @@ def _trusted_training_users() -> set:
     """
     try:
         with open(OMR_CONFIG_FILE) as f:
-            users = (json.load(f).get("users") or [{}])[0]
+            users = (_parse_admin_config(f).get("users") or [{}])[0]
     except Exception as exc:
         LOG.debug("omr_auto: config read: %s", exc)
         users = {}
@@ -2750,8 +2825,10 @@ async def _auto_learn_loop():
     """
     LOG.info("omr_auto: background auto-learning loop started")
     while True:
+        await asyncio.sleep(_auto_cfg()["interval"])
+        # Read after the sleep: read before it, a round ran once more after
+        # auto-learning was disabled.
         cfg = _auto_cfg()
-        await asyncio.sleep(cfg["interval"])
         if not cfg["enabled"]:
             continue
         if not _auto_leader():
@@ -2818,7 +2895,7 @@ def _auto_set_enabled(enabled: bool) -> bool:
     try:
         with _config_write_lock():
             with open(OMR_CONFIG_FILE) as f:
-                cfg_file = json.load(f)
+                cfg_file = _parse_admin_config(f)
             block = cfg_file.get("auto_learning") or {}
             block["enabled"] = bool(enabled)
             cfg_file["auto_learning"] = block
@@ -2852,6 +2929,7 @@ def _auto_set_enabled(enabled: bool) -> bool:
     cfg["enabled"] = bool(enabled)   # runtime effect even if persistence failed
     _auto_cfg_cache["cfg"] = cfg
     _auto_cfg_cache["ts"] = time.time()
+    _auto_cfg_cache["mtime"] = _config_mtime()
     LOG.info("omr_auto: auto-learning %s via API (persisted=%s)",
              "enabled" if enabled else "disabled", persisted)
     return persisted
@@ -3068,7 +3146,7 @@ def _backend_meta() -> dict:
     influx_cfg: dict = {}
     try:
         with open(OMR_CONFIG_FILE) as f:
-            influx_cfg = json.load(f).get("influxdb") or {}
+            influx_cfg = _parse_admin_config(f).get("influxdb") or {}
     except Exception:
         pass  # no influxdb settings, use the defaults
     url   = influx_cfg.get("url", "")
@@ -3543,7 +3621,11 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                 feedback.learning_rate,
                 history_data=history_data,
             )
-            _save_model(_get_model())
+            # Under the lock, as the auto-learning round and the resets: a
+            # reset or a round meanwhile had its model written over, or
+            # saved this one half trained.
+            with _model_lock:
+                _save_model(_get_model())
             return loss_value
 
         loss = await asyncio.to_thread(_train_and_save)
@@ -3618,6 +3700,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
     async def get_engine_diagnostics(current_user: User = Depends(get_current_active_user)):
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        return _engine_diagnostics()
+        # disk usage, the model file, a backend query: not on the event loop
+        return await asyncio.to_thread(_engine_diagnostics)
 
     return router

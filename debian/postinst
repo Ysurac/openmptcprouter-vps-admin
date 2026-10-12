@@ -22,10 +22,16 @@ OMR_ADMIN_PASS=$(od -vN "32" -An -tx1 /dev/urandom | tr '[:lower:]' '[:upper:]' 
 #	openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -keyout /etc/openmptcprouter-vps-admin/key.pem -out /etc/openmptcprouter-vps-admin/cert.pem -subj "/C=US/ST=Oregon/L=Portland/O=OpenMPTCProuterVPS/OU=Org/CN=www.openmptcprouter.vps"
 #fi
 
-# pick up debian/omr-admin.service and the nftables.service.d drop-in
-systemctl daemon-reload
-systemctl enable omr-admin.service
-systemctl restart omr-admin.service
+# pick up debian/omr-admin.service and the nftables.service.d drop-in.
+# Without a running systemd (a chroot, an image build, a container)
+# systemctl failed and, with sh -e, the whole install with it.
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload
+	systemctl enable omr-admin.service
+	systemctl restart omr-admin.service
+else
+	systemctl enable omr-admin.service 2>/dev/null || true
+fi
 
 
 db_stop

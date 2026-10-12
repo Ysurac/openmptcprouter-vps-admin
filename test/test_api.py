@@ -1506,7 +1506,7 @@ class TestProxyRestartCoalescing:
         self._age(marker, 6)
         with patch("subprocess.run") as run:
             created[-1].fn(*created[-1].args)
-        run.assert_called_once_with(["systemctl", "-q", "restart", "v2ray"], check=False)
+        run.assert_called_once_with(["systemctl", "-q", "restart", "v2ray"], capture_output=True, text=True, check=False)
         assert not marker.exists()
 
     @pytest.mark.real_env
@@ -1540,7 +1540,7 @@ class TestProxyRestartCoalescing:
         monkeypatch.setattr(omr_admin, "PROXY_RESTART_DELAY", 0)
         with patch("subprocess.run") as run:
             omr_admin._schedule_proxy_restart("xray")
-        run.assert_called_once_with(["systemctl", "-q", "restart", "xray"], check=False)
+        run.assert_called_once_with(["systemctl", "-q", "restart", "xray"], capture_output=True, text=True, check=False)
 
 
 # ===========================================================================
@@ -1740,6 +1740,7 @@ class TestMPTCPListenerRestarts:
         with (
             patch("os.path.exists", return_value=False),
             patch("os.path.isfile", side_effect=lambda p: str(p) in present),
+            patch("glob.glob", side_effect=lambda pat: sorted(p for p in present if __import__("fnmatch").fnmatch(p, pat))),
             # The restart block is gated on the sysctl file actually changing;
             # `move` is mocked in this suite so the two hashes would match.
             patch("omr_admin.file_as_bytes", side_effect=[b"before", b"after"]),
@@ -1771,6 +1772,36 @@ class TestMPTCPListenerRestarts:
         for svc in ("shadowsocks-libev-manager@manager", "shadowsocks-go",
                     "v2ray", "xray", "glorytun-tcp@tun0", "openvpn@tun0"):
             assert any("restart " + svc in c for c in calls), (svc, calls)
+
+    def test_every_users_glorytun_tcp_restarted(self, user_client):
+        calls = self._post_and_collect(user_client, {"/etc/glorytun-tcp/tun0", "/etc/glorytun-tcp/tun0.key",
+                                                     "/etc/glorytun-tcp/tun3"})
+        restarted = [c for c in calls if "restart glorytun-tcp" in c]
+        assert restarted == ["systemctl -q restart glorytun-tcp@tun0", "systemctl -q restart glorytun-tcp@tun3"]
+
+    def test_value_the_kernel_refuses_not_saved(self, user_client):
+        written = {}
+
+        def _run(cmd, *a, **kw):
+            refused = cmd[:2] == ["sysctl", "-qw"] and cmd[2].startswith("net.ipv4.tcp_congestion_control=")
+            return MagicMock(returncode=1 if refused else 0, stderr="sysctl: setting key: No such file")
+
+        sysctl_d = "net.ipv4.tcp_congestion_control=cubic\nnet.core.rmem_max=1\n"
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("os.path.isfile", return_value=False),
+            patch("builtins.open", side_effect=lambda p, *a, **k: io.StringIO(sysctl_d)
+                  if str(p) == "/etc/sysctl.d/90-shadowsocks.conf" else _mock_open(p, *a, **k)),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, **k: written.update({p: t})),
+            patch("omr_admin.file_as_bytes", side_effect=[b"before", b"after"]),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp", json={**self._PAYLOAD, "congestion_control": "bbr9"})
+        assert r.json() == {"result": "error", "reason": "Refused by the kernel: net.ipv4.tcp_congestion_control",
+                            "route": "mptcp"}
+        text = written["/etc/sysctl.d/90-shadowsocks.conf"]
+        assert "tcp_congestion_control=cubic" in text and "bbr9" not in text
+        assert "net.mptcp.checksum_enabled=0" in text and "net.core.rmem_max=1" in text
 
     def test_no_restart_when_sysctl_file_unchanged(self, user_client):
         calls = []
@@ -3596,14 +3627,48 @@ class TestBackupPost:
         assert r.json()["result"] == "error"
         assert opened_for_write == []
 
-    def test_success(self, user_client):
-        r = user_client.post("/backuppost", json=self._PAYLOAD)
+    @staticmethod
+    def _post_in(tmp_path, client, payload):
+        with (
+            patch.object(omr_admin, "BACKUP_DIR", str(tmp_path)),
+            patch("builtins.open", side_effect=lambda p, *a, **k: io.open(p, *a, **k) if str(p).startswith(str(tmp_path))
+                  else _mock_open(p, *a, **k)),
+        ):
+            return client.post("/backuppost", json=payload)
+
+    def test_success(self, user_client, tmp_path):
+        r = self._post_in(tmp_path, user_client, self._PAYLOAD)
+        assert r.json()["result"] == "done"
+        assert (tmp_path / "openmptcprouter-backup.tar.gz").read_bytes() == b"fake-tar-gz-data"
+
+    def test_matching_sha256sum_is_accepted(self, user_client, tmp_path):
+        payload = dict(self._PAYLOAD, sha256sum=__import__("hashlib").sha256(b"fake-tar-gz-data").hexdigest().upper())
+        r = self._post_in(tmp_path, user_client, payload)
         assert r.json()["result"] == "done"
 
-    def test_matching_sha256sum_is_accepted(self, user_client):
-        payload = dict(self._PAYLOAD, sha256sum=__import__("hashlib").sha256(b"fake-tar-gz-data").hexdigest().upper())
-        r = user_client.post("/backuppost", json=payload)
-        assert r.json()["result"] == "done"
+    def test_two_in_the_same_second_both_kept_private_and_whole(self, user_client, tmp_path):
+        import base64
+        import stat
+        with patch("omr_admin.time.time", return_value=1_800_000_000):
+            for data in (b"first", b"second"):
+                r = self._post_in(tmp_path, user_client, {"data": base64.b64encode(data).decode()})
+                assert r.json()["result"] == "done"
+        dated = sorted(p.name for p in tmp_path.glob("openmptcprouter-*-backup.tar.gz"))
+        assert dated == ["openmptcprouter-1800000000-backup.tar.gz", "openmptcprouter-1800000001-backup.tar.gz"]
+        assert (tmp_path / dated[0]).read_bytes() == b"first"
+        assert (tmp_path / "openmptcprouter-backup.tar.gz").read_bytes() == b"second"
+        assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in tmp_path.iterdir())
+        assert not list(tmp_path.glob("*.tmp.*"))
+
+    @pytest.mark.real_env
+    def test_older_backups_tightened(self, tmp_path):
+        import stat
+        old = tmp_path / "openmptcprouter-backup.tar.gz"
+        old.write_bytes(b"x")
+        old.chmod(0o644)
+        with patch.object(omr_admin, "BACKUP_DIR", str(tmp_path)):
+            omr_admin._tighten_router_backups()
+        assert stat.S_IMODE(old.stat().st_mode) == 0o600
 
     def test_sha256sum_mismatch_is_rejected_before_files_are_opened(self, user_client):
         opened_for_write = []
@@ -5115,7 +5180,8 @@ class TestModifyUser:
             written.update(data)
             real_json_dump(data, f, **kw)
 
-        with patch("omr_admin.json.dump", side_effect=_capture_write):
+        with patch("omr_admin.json.dump", side_effect=_capture_write), \
+             patch("omr_admin._suspend_user_access", return_value={}):
             r = admin_client.post("/modify_user", json={"username": "readonly", "disabled": True})
 
         assert r.json()["result"] == "done"
@@ -5171,7 +5237,8 @@ class TestModifyUser:
             written.update(data)
             real_json_dump(data, f, **kw)
 
-        with patch("omr_admin.json.dump", side_effect=_capture_write):
+        with patch("omr_admin.json.dump", side_effect=_capture_write), \
+             patch("omr_admin._suspend_user_access", return_value={}):
             r = admin_client.post("/modify_user", json={
                 "username": "readonly",
                 "user_password": "newpass-1234",

@@ -305,6 +305,17 @@ class TestProxyRedirectIsolation:
 
     @pytest.mark.real_env
     @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_redirect_with_an_empty_destip_removed(self, configs, service):
+        paths, _ = configs
+        add = getattr(omr_admin, f"{service}_add_port")
+        delete = getattr(omr_admin, f"{service}_del_port")
+        assert add(OTHER, "8090", "tcp", "x", "", "80") is None
+        assert "_redir_tcp_8090" in open(paths[service]).read()
+        delete(OTHER, "8090", "tcp", "x", "", "80")
+        assert "_redir_tcp_8090" not in open(paths[service]).read()
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
     def test_same_user_new_destination_replaces_the_redirect(self, configs, service):
         paths, _ = configs
         add = getattr(omr_admin, f"{service}_add_port")

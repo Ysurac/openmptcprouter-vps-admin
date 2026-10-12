@@ -37,6 +37,11 @@ CREDS_FILE="/etc/influxdb3/omr-influxdb.env"
 # Set to "false" to skip PyTorch + decision-model init (~250 MB if pip fallback).
 INSTALL_AI="${INSTALL_AI:-true}"
 
+# The pip fallback installs these versions (the Debian packages are used when
+# there are some): unpinned, every install got whatever PyPI had that day.
+INFLUXDB3_PYTHON_VERSION="${INFLUXDB3_PYTHON_VERSION:-0.21.0}"
+TORCH_VERSION="${TORCH_VERSION:-2.8.0}"
+
 # Commit (or branch) omr_metrics.py is downloaded from. The VPS installer sets
 # it to its OMR_ADMIN_VERSION so omr_metrics.py matches the installed omradmin.py.
 OMR_ADMIN_VERSION="${OMR_ADMIN_VERSION:-develop}"
@@ -256,14 +261,14 @@ log "Database ready."
 # 5. Python influxdb3-python client  (Debian package preferred)
 # ---------------------------------------------------------------------------
 step "Installing influxdb3-python library..."
-apt_or_pip python3-influxdb3 influxdb3-python
+apt_or_pip python3-influxdb3 "influxdb3-python==${INFLUXDB3_PYTHON_VERSION}"
 
 # ---------------------------------------------------------------------------
 # 6. PyTorch  (Debian package preferred, enabled by default)
 # ---------------------------------------------------------------------------
 if [ "$INSTALL_AI" = "true" ]; then
     step "Installing PyTorch..."
-    apt_or_pip python3-torch torch --index-url https://download.pytorch.org/whl/cpu
+    apt_or_pip python3-torch "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
 else
     log "INSTALL_AI=false — skipping PyTorch and decision model."
 fi

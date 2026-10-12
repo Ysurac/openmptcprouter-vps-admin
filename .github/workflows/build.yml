@@ -26,7 +26,10 @@ jobs:
       with:
         name: Debian packages
         path: packages
+    # Deployed from the release branches only: every branch pushed
+    # replaced the packages users install.
     - name: Deploy - Create directory
+      if: github.event_name == 'push' && contains(fromJSON('["refs/heads/develop", "refs/heads/master", "refs/heads/main"]'), github.ref)
       uses: ysurac/ssh-action@5a841de87115730aff750ac127773e3b2b3f56dd # master
       with:
         command: |
@@ -37,6 +40,7 @@ jobs:
         key: ${{ secrets.PRIVATE_KEY }}
         args: -tt
     - name: Deploy - Upload via rsync
+      if: github.event_name == 'push' && contains(fromJSON('["refs/heads/develop", "refs/heads/master", "refs/heads/main"]'), github.ref)
       uses: ysurac/action-rsync@1032c2593f9067e6ce901a1d77c6342dc50bcd24 # master
       env:
         ARGS: -av

@@ -89,10 +89,10 @@ Configuration endpoints return a JSON object of the form:
 | GET | `/config` | Full configuration for the current user (keys, ports, VPN/proxy settings…) |
 | GET | `/clienthost` | Client IP as seen by the server (no auth) |
 | GET | `/mptcpsupport` | Check whether the current connection uses MPTCP (no auth) |
-| GET | `/update` | Trigger the VPS update script (`omr-update` service) |
+| GET | `/update` | Trigger the VPS update script (`omr-update` service), in a transient `omr-update-run` unit that stops `omr` and starts it again however the update ends |
 | GET | `/openapi.json` | OpenAPI schema (auth required) |
 | GET | `/docs` | Swagger UI (auth required, see `/login_basic`) |
-| GET | `/speedtest?size=N` | Download speed test: streams N MiB (1–100, default 10) of zeroes; `X-MPTCP` header reports MPTCP status |
+| GET | `/speedtest?size=N` | Download speed test: streams N MiB (1–100, default 10) of zeroes; `X-MPTCP` header reports MPTCP status. At most 8 running per user and 16 per worker (429 beyond) |
 | POST | `/speedtest` | Upload speed test: measures the received request body, returns bytes/duration/speed |
 
 ### Proxy configuration
@@ -145,33 +145,34 @@ table (`user_accept`, `user_dnat`, `gre_snat`, `client2client`, `dscp_mark`,
 MD5-diff-then-reload dance and no partial-apply window. The static base
 ruleset/chain declarations ship separately (`nftables` package plus the
 sibling `openmptcprouter-vps` repo's `nftables/omr.nft`); these endpoints
-only ever flush/repopulate chain *contents*. Endpoint paths keep their
-historical `/shorewall*` names for router/client compatibility even though
-Shorewall itself is no longer used.
+only ever flush/repopulate chain *contents*. The `/firewall*` endpoints have
+`/shorewall*` aliases, the historical names older routers still call, even
+though Shorewall itself is no longer used.
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
-| POST | `/shorewall` | `ShorewallAllparams` | Enable/disable the "redirect all ports (1–64999) to the router" DNAT rules (`redirect_ports`: `enable`/`disable`, `ipproto`: `ipv4`/`ipv6`/`any`), stored as `bulk_redirect_v4`/`bulk_redirect_v6` |
-| POST | `/shorewalllist` | `ShorewallListparams` | List the OMR-managed rules for the current user, read back from `fw_ports` and rendered in the Shorewall rules-file line layout (`DNAT\t\tnet\t\tvpn:...\tproto\tport\t# OMR user redirect name port proto`), which the router's `openmptcprouter-vps` init script greps and awk-splits to reconcile its port forwards |
-| POST | `/shorewallopen` | `Shorewallparams` | Open/redirect a port (name, port, proto, fwtype `ACCEPT`/`DNAT`, optional source_dip/source_ip/comment) |
-| POST | `/shorewallclose` | `Shorewallparams` | Remove a previously added rule |
-
-`ipproto` accepts `ipv4`, `ipv6` and `any` on all four endpoints. `any` means
-both families: LuCI's "Restrict to address family = IPv4 and IPv6" stores
-`family='any'` in uci and the router's `_vps_firewall_redirect_port` passes
-that value through untouched, so anything else here is a rule the router
-believes it pushed and the VPS never applied (the router doesn't look at the
-API result). On `/shorewallopen`, an address restriction still pins the rule
-to the family of that literal, since an IPv4 `source_dip` on a v6 rule would
-render nft syntax that doesn't parse and the chain is flushed in a single
-transaction.
+| POST | `/firewall` (alias `/shorewall`) | `ShorewallAllparams` | Enable/disable the "redirect all ports (1–64999) to the router" DNAT rules (`redirect_ports`: `enable`/`disable`, `ipproto`: `ipv4`/`ipv6`/`any`), stored as `bulk_redirect_v4`/`bulk_redirect_v6`. Server-wide: the administrator or the main router only |
+| POST | `/firewalllist` (alias `/shorewalllist`) | `ShorewallListparams` | List the OMR-managed rules for the current user, read back from `fw_ports` and rendered in the Shorewall rules-file line layout (`DNAT\t\tnet\t\tvpn:...\tproto\tport\t# OMR user redirect name port proto`), which the router's `openmptcprouter-vps` init script greps and awk-splits to reconcile its port forwards |
+| POST | `/firewallopen` (alias `/shorewallopen`) | `Firewallparams` | Open/redirect a port (name, port, proto, fwtype `ACCEPT`/`DNAT`, optional source_dip/source_ip/comment). A rule nft refuses is not kept and is reported (`Firewall rule refused`) |
+| POST | `/firewallclose` (alias `/shorewallclose`) | `Firewallparams` | Remove a previously added rule |
 | POST | `/sipalg` | `SipALGparams` | Enable/disable SIP ALG via an nft `ct helper` object for SIP plus a rule assigning it (`ct_helpers` chain), replacing Shorewall's AUTOHELPERS/DONT_LOAD toggle |
+
+`ipproto` accepts `ipv4`, `ipv6` and `any` on the four firewall endpoints.
+`any` means both families: LuCI's "Restrict to address family = IPv4 and
+IPv6" stores `family='any'` in uci and the router's
+`_vps_firewall_redirect_port` passes that value through untouched, so
+anything else here is a rule the router believes it pushed and the VPS never
+applied (the router doesn't look at the API result). With `any`, an address
+restriction pins the rule to the family of that literal; with `ipv4` or
+`ipv6`, an address of the other family is refused (`Address of the other IP
+family`): an IPv4 `source_dip` on a v6 rule would render nft syntax that
+doesn't parse, and the chain is flushed in a single transaction.
 
 ### Network settings
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
-| POST | `/mptcp` | `MPTCPparams` | Server MPTCP settings: checksum, path manager, scheduler, syn retries, congestion control, and protocol-version specific knobs |
+| POST | `/mptcp` | `MPTCPparams` | Server MPTCP settings: checksum, path manager, scheduler, syn retries, congestion control, and protocol-version specific knobs. A value the kernel refuses is not saved in sysctl.d and is reported (`Refused by the kernel: <key>`) |
 | POST | `/mptcp_dscp` | `MPTCPDscpParams` | Sync the router's per-WAN DSCP pins (`pins: [{dscp, remote_id}]`) into bpf_dscp's `dscp_remote_id` map via `mptcp-scheduler-dscp.sh`; keyed by MPTCP remote endpoint id since every subflow shares one local IP on the VPS. Warns if `mptcp-dscp-manager` isn't installed |
 | POST | `/mptcp_weight` | `MPTCPWeightParams` | Sync the router's per-WAN weights (`weights: [{remote_id, weight}]`) into bpf_weight(_rr)'s `weight_remote_id` map via `mptcp-scheduler-weight.sh`, cleaning up remote ids dropped since the previous sync. Warns if `mptcp-weight-manager` isn't installed |
 | POST | `/dscp_classify` | `DscpClassifyParams` | Mirror the router's destination→DSCP classification (`entries: [{dscp, cidr}]`) into native per-class/family nft sets plus the `dscp_mark` chain's `ip[6] dscp set` rules, so the VPS's own outbound traffic to a proxied destination carries the same DSCP as the router→VPS leg. Warns if `nft` isn't installed |
@@ -192,7 +193,7 @@ transaction.
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
 | POST | `/add_user` | `NewUser` | Create a user: username, permission, default VPN/proxy, optional userid, keys, Shadowsocks port, public exit IP |
-| POST | `/modify_user` | `ModifyUser` | Change password, enabled/disabled state, VPN or proxy of a user |
+| POST | `/modify_user` | `ModifyUser` | Change password, enabled/disabled state, VPN or proxy of a user. Disabling also cuts the user's access: its xray/v2ray clients, shadowsocks ports, shadowsocks-go and MQVPN users and SoftEther account are taken out, its glorytun/DSVPN units stopped, OpenVPN refuses it (`disable` in its ccd) and its WireGuard peers are left out of wg0.conf. What was taken is kept under `access_suspended` and put back when the user is enabled again (an MQVPN fixed IP applies at mqvpn's next start) |
 | POST | `/remove_user` | `RemoveUser` | Delete a user and all its per-user service configuration |
 | POST | `/add_user_note` | `ExistingUser` | Attach a free-form note to a user |
 | GET | `/list_users` | — | Dump the full user table |

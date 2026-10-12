@@ -664,11 +664,33 @@ class TestJSONBackend:
             patch("os.path.isfile", wraps=os.path.isfile),
             patch.object(omr_metrics, "METRICS_FILE", str(metrics_file)),
         ):
-            backend.write_interface("alice", _WAN)
-            backend.write_interface("alice", _WAN2)
+            now = int(time.time())
+            backend.write_interface("alice", {**_WAN, "timestamp": now})
+            backend.write_interface("alice", {**_WAN2, "timestamp": now})
             result = backend.read_user("alice")
         assert "wan" in result
         assert "wan2" in result
+
+    def test_entries_over_a_day_old_evicted(self, tmp_path):
+        metrics_file = tmp_path / "omr-metrics.json"
+        now = int(time.time())
+        metrics_file.write_text(json.dumps({
+            "alice": {"old": {**_WAN, "interface": "old", "timestamp": now - 2 * 86400},
+                      "wan": {**_WAN, "timestamp": now - 60}},
+            "gone": {"wan": {**_WAN, "timestamp": now - 3 * 86400}},     # a removed user
+        }))
+        backend = omr_metrics.JSONBackend()
+        with (
+            patch("builtins.open", new=_REAL_OPEN),
+            patch("os.replace", new=_REAL_REPLACE),
+            patch("os.path.isfile", wraps=os.path.isfile),
+            patch.object(omr_metrics, "METRICS_FILE", str(metrics_file)),
+        ):
+            assert sorted(backend.interfaces("alice")) == ["wan"]   # the allowance counts the live ones
+            backend.write_interface("alice", {**_WAN2, "timestamp": now})
+            data = backend.read_all()
+        assert sorted(data) == ["alice"]
+        assert sorted(data["alice"]) == ["wan", "wan2"]
 
     def test_write_interface_uses_backend_lock(self, tmp_path):
         metrics_file = tmp_path / "omr-metrics.json"
@@ -1824,6 +1846,18 @@ class TestTrainDecision:
         ):
             self._post(admin_client, {"best_interface": "wan"})
         mock_save.assert_called_once()
+
+    def test_model_saved_under_its_lock(self, admin_client):
+        held = []
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
+            patch.object(omr_metrics, "_train_step", return_value=0.0),
+            patch.object(omr_metrics, "_get_model", return_value=MagicMock()),
+            patch.object(omr_metrics, "_save_model", side_effect=lambda m: held.append(omr_metrics._model_lock._is_owned())),
+        ):
+            self._post(admin_client, {"best_interface": "wan"})
+        assert held == [True]
 
     def test_unauthenticated_returns_403(self, unauth_client):
         r = unauth_client.post("/metrics/decision/train", json={"best_interface": "wan"})
@@ -4020,7 +4054,8 @@ def _write_many(metrics_file, username, count):
     with patch.object(omr_metrics, "METRICS_FILE", metrics_file):
         backend = omr_metrics.JSONBackend()
         for i in range(count):
-            backend.write_interface(username, {**_WAN, "interface": f"wan{i}"})
+            # fresh: an entry over a day old is evicted
+            backend.write_interface(username, {**_WAN, "interface": f"wan{i}", "timestamp": int(time.time())})
 
 
 class TestJSONBackendHardening:
@@ -4489,3 +4524,27 @@ class TestStandalonePassword:
 
     def test_noauth_dev_mode_still_starts(self, monkeypatch):
         assert self._import(monkeypatch, OMR_NOAUTH="1").app is not None
+
+
+class TestMetricRanges:
+    @pytest.mark.parametrize("field,value", [("latency", 1e308), ("latency", -5.0), ("loss", 101.0),
+                                             ("loss", -1.0), ("jitter", -0.1), ("rtt_min", 1e9)])
+    def test_out_of_range_refused(self, user_client, field, value):
+        r = user_client.post("/metrics", json={"interface": "wan1", "status": "online", field: value})
+        assert r.status_code == 422
+
+    def test_signal_in_dbm_accepted(self, user_client):
+        with patch.object(omr_metrics, "_write_interface", return_value=True), \
+             patch.object(omr_metrics, "_accept_interface", return_value=True):
+            r = user_client.post("/metrics", json={"interface": "wan1", "status": "online", "latency": 30.5, "loss": 0,
+                                                   "signal": {"quality": 80, "rsrp": -95, "sinr": 12.5}})
+        assert r.status_code == 200, r.text
+
+
+class TestAdminConfigTrailingComma:
+    def test_auto_learning_settings_read(self, tmp_path):
+        conf = tmp_path / "omr-admin-config.json"
+        conf.write_text('{"auto_learning": {"enabled": true, "interval": 600,}, "users": [{}],}')
+        with patch.object(omr_metrics, "OMR_CONFIG_FILE", str(conf)), patch("builtins.open", new=_REAL_OPEN):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["enabled"] is True and cfg["interval"] == 600

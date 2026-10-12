@@ -572,3 +572,14 @@ class TestDecisionModel:
         assert "omr_metrics.ensure_decision_model()" in SCRIPT_TEXT
         # once omr_metrics.py is there
         assert SCRIPT_TEXT.index("omr_metrics.ensure_decision_model()") > SCRIPT_TEXT.index('-o "$dest"')
+
+
+class TestPipPinned:
+    def test_pip_fallback_installs_pinned_versions(self):
+        assert 'apt_or_pip python3-influxdb3 "influxdb3-python==${INFLUXDB3_PYTHON_VERSION}"' in SCRIPT_TEXT
+        assert 'apt_or_pip python3-torch "torch==${TORCH_VERSION}"' in SCRIPT_TEXT
+        r = subprocess.run(["sh", "-c", "\n".join(line for line in SCRIPT_TEXT.splitlines()
+                                                  if line.startswith(("INFLUXDB3_PYTHON_VERSION=", "TORCH_VERSION=")))
+                            + '\necho "$INFLUXDB3_PYTHON_VERSION $TORCH_VERSION"'],
+                           capture_output=True, text=True, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        assert r.stdout.split() == ["0.21.0", "2.8.0"]
