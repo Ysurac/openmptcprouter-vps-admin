@@ -118,8 +118,12 @@ def _no_ts(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def reset_backend():
+def reset_backend(tmp_path, monkeypatch):
     """Reset backend, decision-model, EMA and auto-learning state between tests."""
+    # the EMAs the workers share: not the machine's /run
+    monkeypatch.setattr(omr_metrics, "EMA_STATE_FILE", str(tmp_path / "weight-ema.json"))
+    # nor its decision model: a fresh one is saved now
+    monkeypatch.setattr(omr_metrics, "DECISION_MODEL_FILE", str(tmp_path / "omr-decision-model.pt"))
     orig_backend = omr_metrics._backend
     orig_model  = omr_metrics._decision_model
     orig_ema    = dict(omr_metrics._weight_ema)
@@ -167,6 +171,21 @@ class TestApplyEma:
         result = omr_metrics._apply_ema("alice", {"wan": 1.0, "wan2": 0.0})
 
         assert result == {"wan": 1.0, "wan2": 0.0}
+
+    def test_shared_by_the_workers(self):
+        # One worker answered the last poll, another this one: each kept
+        # its own average, and the router got the two in turn.
+        omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
+        omr_metrics._weight_ema = {}   # the other worker's memory
+        result = omr_metrics._apply_ema("alice", {"wan": 0.8, "wan2": 0.2})
+        assert result == pytest.approx({"wan": 0.59, "wan2": 0.41})
+
+    def test_unreadable_state_falls_back_to_the_workers_own(self):
+        with open(omr_metrics.EMA_STATE_FILE, "w") as f:   # noqa: SIM115 (real file under tmp_path)
+            f.write("{")
+        omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
+        result = omr_metrics._apply_ema("alice", {"wan": 0.8, "wan2": 0.2})
+        assert result == pytest.approx({"wan": 0.59, "wan2": 0.41})
 
     def test_interface_removal_renormalises_remaining_probabilities(self):
         omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
@@ -2532,6 +2551,10 @@ class TestParseSince:
     def test_raw_integer_below_60_clamped_to_60(self):
         assert omr_metrics._parse_since("30") == 60
 
+    def test_window_capped(self):
+        # any user asked for years of history
+        assert omr_metrics._parse_since("999999999") == omr_metrics.SINCE_MAX_SECONDS == 2592000
+
     def test_invalid_string_returns_default_3600(self):
         assert omr_metrics._parse_since("badvalue") == 3600
 
@@ -2776,6 +2799,17 @@ class TestInfluxBackendHistory:
         assert list(result.keys()) == ["wan", "wan2"]
         assert [entry["timestamp"] for entry in result["wan"]] == [1_700_000_000, 1_700_000_060]
         assert [entry["timestamp"] for entry in result["wan2"]] == [1_700_000_030, 1_700_000_090]
+
+    def test_latest_query_returns_one_row_per_interface(self):
+        backend, mock_client = self._make_backend()
+        mock_client.query.return_value = self._fake_all_table([])
+        backend.read_all()
+        backend.read_user("alice")
+        for call in mock_client.query.call_args_list:
+            sql = call.args[0]
+            assert "ROW_NUMBER() OVER (PARTITION BY username, interface ORDER BY time DESC)" in sql
+            assert sql.rstrip().endswith("WHERE rn = 1")
+        assert "username = $username" in mock_client.query.call_args_list[1].args[0]
 
     def test_all_interfaces_query_limits_inside_sql(self):
         backend, mock_client = self._make_backend()
@@ -4346,6 +4380,48 @@ class TestModelSharedAcrossWorkers:
             with patch.object(omr_metrics, "_load_model_file") as lm:
                 assert omr_metrics._get_model() is model
             lm.assert_not_called()
+
+
+class TestFreshModelSharedAcrossWorkers:
+    def test_new_model_saved_for_the_other_workers(self, torch_env):
+        fresh = _FakeModel()
+        with (
+            patch.object(omr_metrics, "_make_model", return_value=fresh),
+            patch.object(omr_metrics, "_save_model") as save,
+        ):
+            assert omr_metrics._get_model() is fresh
+        save.assert_called_once_with(fresh)
+
+    def test_model_another_worker_saved_meanwhile_is_loaded(self, torch_env):
+        # this worker found no usable file, the other saved one before it
+        # got the lock: that one, not a model of its own
+        theirs = _FakeModel()
+        loads = iter([None, theirs])
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch.object(omr_metrics, "_load_model_file", side_effect=lambda: next(loads)),
+            patch.object(omr_metrics, "_make_model") as make,
+            patch.object(omr_metrics, "_save_model") as save,
+        ):
+            assert omr_metrics._get_model() is theirs
+        make.assert_not_called()
+        save.assert_not_called()
+
+    def test_ensure_decision_model_replaces_an_unusable_file(self, torch_env):
+        fresh = _FakeModel()
+        loads = iter([None, None, fresh])   # the installer's 19-feature file, twice, then ours
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch.object(omr_metrics, "_load_model_file", side_effect=lambda: next(loads)),
+            patch.object(omr_metrics, "_make_model", return_value=fresh),
+            patch.object(omr_metrics, "_save_model") as save,
+        ):
+            assert omr_metrics.ensure_decision_model() is True
+        save.assert_called_once_with(fresh)
+
+    def test_ensure_decision_model_without_torch(self):
+        with patch.object(omr_metrics, "_TORCH_AVAILABLE", False):
+            assert omr_metrics.ensure_decision_model() is False
 
 
 class TestAutoLearningLeader:

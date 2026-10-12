@@ -26,6 +26,7 @@ Marked real_env: conftest's autouse patch_env fixture (mocked open/subprocess)
 is skipped for this module since it drives real processes in tmp_path.
 """
 
+import json
 import os
 import re
 import shutil
@@ -486,3 +487,88 @@ class TestDatabaseCreation:
         assert r.returncode == 0, r.stdout + r.stderr
         assert "Database already exists." in r.stdout
         assert "Database ready." in r.stdout
+
+
+# ===========================================================================
+# 8. omr-admin-config.json update
+# ===========================================================================
+
+
+def _config_section():
+    start = SCRIPT_TEXT.index("# 8. Inject influxdb block")
+    end = SCRIPT_TEXT.index("# Done")
+    return SCRIPT_TEXT[start:end]
+
+
+class TestConfigUpdate:
+    @staticmethod
+    def _run(tmp_path, content):
+        config = tmp_path / "omr-admin-config.json"
+        if content is not None:
+            config.write_text(content)
+            config.chmod(0o644)
+        fakebin = tmp_path / "bin"
+        fakebin.mkdir()
+        log = tmp_path / "calls.log"
+        systemctl = fakebin / "systemctl"
+        # the restart sees the config as it is then
+        systemctl.write_text('#!/bin/sh\necho "systemctl $* $(cat "$OMR_CONFIG_FILE" | tr -d "\\n ")" >> "$FAKE_LOG"\n')
+        systemctl.chmod(0o755)
+        harness = tmp_path / "config.sh"
+        harness.write_text("\n".join([
+            "#!/bin/sh",
+            "set -eu",
+            _function("log"),
+            _function("die"),
+            _function("step"),
+            f'OMR_CONFIG_FILE="{config}"',
+            'INFLUX_HOST="http://127.0.0.1:65501"',
+            'INFLUX_ORG="omr"',
+            'INFLUX_BUCKET="omr_metrics"',
+            'ADMIN_TOKEN="test-token"',
+            'INFLUX_RETENTION_DAYS="60"',
+            _config_section(),
+            "",
+        ]))
+        env = {**os.environ, "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+               "LC_ALL": "C", "FAKE_LOG": str(log), "OMR_CONFIG_FILE": str(config)}
+        r = subprocess.run(["sh", str(harness)], env=env, capture_output=True, text=True, timeout=30)
+        calls = log.read_text().splitlines() if log.exists() else []
+        return r, config, calls
+
+    def test_trailing_comma_kept_users_restart_after_the_write(self, tmp_path):
+        r, config, calls = self._run(tmp_path, '{"users": [{"openmptcprouter": {"userid": 0,}}], "port": 65500,}')
+        assert r.returncode == 0, r.stdout + r.stderr
+        data = json.loads(config.read_text())
+        assert data["users"] == [{"openmptcprouter": {"userid": 0}}]
+        assert data["influxdb"]["token"] == "test-token"
+        assert stat.S_IMODE(config.stat().st_mode) == 0o600
+        # restarted once, with the influxdb block already there
+        assert len(calls) == 1 and calls[0].startswith("systemctl restart omr-admin")
+        assert '"influxdb"' in calls[0]
+
+    def test_unreadable_config_left_as_it_is(self, tmp_path):
+        broken = '{"users": [{"openmptcprouter": {"userid": 0'
+        r, config, calls = self._run(tmp_path, broken)
+        assert r.returncode == 1
+        assert "could not parse" in r.stderr
+        assert config.read_text() == broken
+        assert not list(tmp_path.glob("omr-admin-config.json.*"))
+        assert calls == []
+
+    def test_temp_file_never_world_readable(self):
+        # created 0600, not chmod-ed after the replace
+        section = _config_section()
+        assert "os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)" in section
+        assert 'open(tmp, "w")' not in section
+
+
+class TestDecisionModel:
+    def test_model_made_by_omr_metrics_not_a_copy(self):
+        # A copy of the network kept here drifted (19 features, other
+        # layers): omr-admin refused it and each worker made its own.
+        assert "InterfaceScorer" not in SCRIPT_TEXT
+        assert "N_FEATURES" not in SCRIPT_TEXT
+        assert "omr_metrics.ensure_decision_model()" in SCRIPT_TEXT
+        # once omr_metrics.py is there
+        assert SCRIPT_TEXT.index("omr_metrics.ensure_decision_model()") > SCRIPT_TEXT.index('-o "$dest"')

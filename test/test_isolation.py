@@ -240,7 +240,11 @@ class TestProxyRedirectIsolation:
             paths[service] = str(p)
         monkeypatch.setattr(omr_admin, "PROXY_REDIRECT_CONFIGS", paths)
         monkeypatch.setattr(omr_admin, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
-        with patch("omr_admin._schedule_proxy_restart") as restart:
+        # not the sockets of the machine running the tests
+        with (
+            patch("omr_admin._schedule_proxy_restart") as restart,
+            patch("omr_admin.psutil.net_connections", return_value=[]),
+        ):
             yield paths, restart
 
     @staticmethod
@@ -266,6 +270,38 @@ class TestProxyRedirectIsolation:
         # VLESS Reality on 443, the API inbound: the daemon could not start.
         assert omr_admin.xray_add_port(PRIMARY, port, "tcp", "x", "192.168.1.2", port) == \
             "Port already in use on the server"
+
+    @staticmethod
+    def _listener(port, pid):
+        return MagicMock(laddr=MagicMock(ip="0.0.0.0", port=port), raddr=(), status="LISTEN", pid=pid)
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_port_another_daemon_listens_on_refused(self, configs, service):
+        # pihole on 53: the proxy's restart could not bind it, for every user
+        paths, _ = configs
+        names = {100: "pihole-FTL"}
+        with (
+            patch("omr_admin.psutil.net_connections", return_value=[self._listener(53, 100)]),
+            patch("omr_admin._process_name", side_effect=names.get),
+        ):
+            add = getattr(omr_admin, f"{service}_add_port")
+            assert add(PRIMARY, "53", "tcp", "x", "192.168.1.2", "53") == "Port used by the server"
+            assert add(OTHER, "50-60", "tcp", "x", "192.168.2.2", "") == "Port used by the server"
+            assert add(OTHER, "54", "tcp", "x", "192.168.2.2", "") is None
+        assert "_redir_tcp_53" not in open(paths[service]).read()
+
+    @pytest.mark.real_env
+    def test_proxys_own_socket_left_to_its_config(self, configs):
+        # a redirect removed a moment ago still listens until the delayed restart
+        names = {200: "xray", 201: "v2ray"}
+        with (
+            patch("omr_admin.psutil.net_connections",
+                  return_value=[self._listener(8080, 200), self._listener(8081, 201)]),
+            patch("omr_admin._process_name", side_effect=names.get),
+        ):
+            assert omr_admin.xray_add_port(OTHER, "8080", "tcp", "x", "192.168.2.2", "80") is None
+            assert omr_admin.v2ray_add_port(OTHER, "8081", "tcp", "x", "192.168.2.2", "80") is None
 
     @pytest.mark.real_env
     @pytest.mark.parametrize("service", ["v2ray", "xray"])
@@ -537,6 +573,19 @@ class TestVpnIpsOwnership:
         body, _ = self._post(other_client, config, remoteip="10.255.255.10", localip="10.255.255.1")
         assert body["result"] == "done"
 
+    def test_localip_of_another_user_blocks_nobody(self, other_client):
+        # Stored as a localip by any user, read-only too: the router's own
+        # address was then refused to it as "already used".
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnremoteip="10.255.252.6", vpnlocalip="10.255.252.9")
+        with patch("omr_admin._vps_ipv4_addresses", return_value={"10.255.252.1"}):
+            body, _ = self._post(other_client, config, remoteip="10.255.252.9", localip="10.255.252.1")
+        assert body["result"] == "done"
+        # the VPS end of a tunnel, really the VPS's: never a router's address
+        with patch("omr_admin._vps_ipv4_addresses", return_value={"10.255.252.1", "10.255.252.9"}):
+            body, modif = self._post(other_client, config, remoteip="10.255.252.9", localip="10.255.252.1")
+        assert body["reason"] == "Invalid remoteip" and not modif.called
+
     def test_invalid_stored_ula_of_another_user_blocks_nobody(self, other_client):
         # an older release stored ::/0, which overlaps every ULA
         config = _config()
@@ -706,6 +755,20 @@ class TestCheck6in4Confs:
         applied, users = self._run(config, files)
         assert applied[0].startswith("LOCALIP=10.255.255.1\nREMOTEIP=10.255.255.2\n") and applied[2] is None
         assert users["openmptcprouter"]["vpnremoteip"] == "10.255.255.2"
+        assert "vpnremoteip" not in users["readonly"]
+
+    def test_localip_of_another_user_drops_nothing(self):
+        # A localip that is no address of the VPS was another router's
+        # address stored by a user that is not that router.
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnlocalip="10.255.252.9", vpnremoteip="10.255.252.6")
+        config["users"][0]["readonly"].update(vpnlocalip="10.255.252.1", vpnremoteip="10.255.252.9")
+        with patch("omr_admin._vps_ipv4_addresses", return_value={"10.255.252.1"}):
+            _, users = self._run(config, {})
+        assert users["readonly"]["vpnremoteip"] == "10.255.252.9"
+        # really the VPS's: dropped, as before
+        with patch("omr_admin._vps_ipv4_addresses", return_value={"10.255.252.1", "10.255.252.9"}):
+            _, users = self._run(config, {})
         assert "vpnremoteip" not in users["readonly"]
 
     def test_same_dynamic_address_dropped_for_both(self):

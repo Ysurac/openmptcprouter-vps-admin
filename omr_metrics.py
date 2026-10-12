@@ -195,6 +195,34 @@ EMA_ALPHA: float = 0.3
 
 _weight_ema: dict = {}   # {username: {interface: float}}
 _ema_lock = threading.Lock()
+# Shared by the uvicorn workers: with a state of its own in each, a router's
+# polls, answered by one worker then the other, got the weights of two
+# different averages, alternating. Under /run: nothing to keep past a reboot.
+EMA_STATE_FILE = '/run/omr-admin-weight-ema.json'
+
+
+def _read_ema_state() -> Optional[dict]:
+    """The EMAs every worker shares, {} without the file, None if unreadable."""
+    try:
+        with open(EMA_STATE_FILE) as f:
+            text = f.read()
+        state = json.loads(text) if text.strip() else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        LOG.debug("omr_metrics: EMA state %s not read (%s)", EMA_STATE_FILE, exc)
+        return None
+    return state if isinstance(state, dict) else {}
+
+
+def _write_ema_state(state: dict) -> None:
+    tmp = EMA_STATE_FILE + '.tmp'
+    try:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as f:
+            json.dump(state, f)
+        os.replace(tmp, EMA_STATE_FILE)
+    except OSError as exc:
+        LOG.debug("omr_metrics: EMA state %s not written (%s)", EMA_STATE_FILE, exc)
 
 
 def _apply_ema(username: str, probs: dict) -> dict:
@@ -207,8 +235,13 @@ def _apply_ema(username: str, probs: dict) -> dict:
     """
     if not probs:
         return probs
-    with _ema_lock:
+    with _ema_lock, _file_lock(EMA_STATE_FILE + '.lock'):
+        state = _read_ema_state()
+        if state is not None:
+            _weight_ema[username] = state.get(username) or {}
         prev = _weight_ema.get(username, {})
+        if not isinstance(prev, dict):
+            prev = {}
         new_ema: dict = {}
         for iface, p_new in probs.items():
             p_new = float(p_new)
@@ -227,6 +260,9 @@ def _apply_ema(username: str, probs: dict) -> dict:
         if total > 0.0:
             new_ema = {iface: value / total for iface, value in new_ema.items()}
         _weight_ema[username] = new_ema
+        if state is not None:
+            state[username] = new_ema
+            _write_ema_state(state)
     return new_ema
 
 
@@ -615,20 +651,21 @@ class InfluxBackend:
 
     def _query(self, username: Optional[str] = None) -> dict:
         """Return {username: {interface: payload}} for the latest data point."""
+        # The latest row of each interface only, picked by InfluxDB: every
+        # row of the window was sent back and parsed, a day of polls of
+        # every router at each call.
+        where = f"time >= now() - interval '{self._LATEST_WINDOW}'"
+        params: dict = {}
         if username:
-            sql = (
-                f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
-                f"WHERE time >= now() - interval '{self._LATEST_WINDOW}' AND username = $username "
-                f"ORDER BY time DESC"
-            )
-            params: dict = {"username": username}
-        else:
-            sql = (
-                f"SELECT username, interface, json_payload FROM {self._MEASUREMENT} "
-                f"WHERE time >= now() - interval '{self._LATEST_WINDOW}' "
-                f"ORDER BY time DESC"
-            )
-            params = {}
+            where += " AND username = $username"
+            params = {"username": username}
+        sql = (
+            "SELECT username, interface, json_payload FROM ("
+            "SELECT username, interface, json_payload, "
+            "ROW_NUMBER() OVER (PARTITION BY username, interface ORDER BY time DESC) AS rn "
+            f"FROM {self._MEASUREMENT} WHERE {where}"
+            ") AS ranked WHERE rn = 1"
+        )
         try:
             table = self._client.query(sql, query_parameters=params or None)
         except Exception as exc:
@@ -646,7 +683,7 @@ class InfluxBackend:
             ):
                 key = (uname, iface)
                 if key in seen:
-                    continue  # ORDER BY time DESC — first occurrence is latest
+                    continue  # one row per interface (rn = 1): the first one
                 seen.add(key)
                 try:
                     result.setdefault(uname, {})[iface] = json.loads(payload_str)
@@ -1006,13 +1043,18 @@ _SINCE_PRESETS: dict = {
 }
 
 
+# The longest window a history request reads: any user, read-only too, asked
+# for years, and InfluxDB scanned every file it kept for it.
+SINCE_MAX_SECONDS = _SINCE_PRESETS["30d"]
+
+
 def _parse_since(since: str) -> int:
     """Return seconds for a shorthand like '1h', '7d', or a raw integer string."""
     s = since.strip().lower()
     if s in _SINCE_PRESETS:
         return _SINCE_PRESETS[s]
     try:
-        return max(60, int(s))
+        return min(SINCE_MAX_SECONDS, max(60, int(s)))
     except ValueError:
         return 3600  # default: 1 h
 
@@ -2114,10 +2156,34 @@ def _get_model():
                 _decision_model_mtime = mtime
                 _stats_update(model_loaded_at=time.time())
                 return _decision_model
-        _decision_model = _make_model()
-        _decision_model_mtime = _model_file_mtime()
+        # No usable file: a new model, saved, under a lock every worker
+        # takes. Each worker made its own (randomly seeded) one and kept it
+        # to itself, and a router's polls got the weights of each in turn.
+        with _file_lock(DECISION_MODEL_FILE + '.lock'):
+            m = None
+            if os.path.isfile(DECISION_MODEL_FILE):
+                mtime = _model_file_mtime()
+                m = _load_model_file()   # saved by another worker meanwhile
+            if m is not None:
+                _decision_model = m
+                _decision_model_mtime = mtime
+            else:
+                _decision_model = _make_model()
+                _decision_model_mtime = _model_file_mtime()
+                _save_model(_decision_model)
         _stats_update(model_loaded_at=time.time())
         return _decision_model
+
+
+def ensure_decision_model() -> bool:
+    """Make DECISION_MODEL_FILE hold a model this module loads, keeping one
+    that already does. For the installer: the model it built itself had
+    another feature count and layers, refused at every start. True once
+    the file is usable."""
+    if not _TORCH_AVAILABLE:
+        return False
+    _get_model()
+    return os.path.isfile(DECISION_MODEL_FILE) and _load_model_file() is not None
 
 
 def _save_model(model):

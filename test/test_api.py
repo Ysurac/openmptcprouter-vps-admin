@@ -2803,6 +2803,34 @@ class TestMqvpn:
         assert r.status_code == 200
         assert r.json()["mqvpn"]["pinned_pubkey"] == ""
 
+    @pytest.mark.parametrize("change", [
+        {"scheduler": "fastest"},                       # mqvpn exits on it, for every user
+        {"scheduler": ""},
+        {"reorder": {"enabled": "on", "max_wait_ms": -1, "cap_packets": 1024}},
+        {"reorder": {"enabled": "on", "max_wait_ms": 30, "cap_packets": 1000}},   # not a power of two
+        {"reorder": {"enabled": "on", "max_wait_ms": 30, "cap_packets": 0}},
+        {"reorder": {"enabled": "maybe"}},
+        {"reorder_rules": [{"proto": "icmp", "port": 443, "profile": "fiber_lte"}]},
+        {"reorder_rules": [{"proto": "udp", "port": 70000, "profile": "fiber_lte"}]},
+        {"reorder_rules": [{"proto": "udp", "port": 443, "profile": "fast"}]},
+        {"reorder_rules": [{"proto": "udp", "port": p, "profile": "fiber_lte"} for p in range(17)]},
+    ])
+    def test_values_mqvpn_does_not_take_refused(self, user_client, change):
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin._atomic_write_json") as write,
+        ):
+            r = user_client.post("/mqvpn", json={**self._PAYLOAD, **change})
+        assert r.status_code == 422
+        assert not write.called
+
+    @pytest.mark.parametrize("scheduler", ["minrtt", "wlb", "backup", "backup_fec", "rap", "wlb_udp_pin",
+                                           "wrtt", "wrr", "redundant", "dscp"])
+    def test_every_scheduler_of_mqvpn_written(self, user_client, scheduler):
+        r, written = self._post_capture(user_client, {**self._PAYLOAD, "scheduler": scheduler})
+        assert r.json()["result"] == "done"
+        assert written["scheduler"] == scheduler
+
     def test_reorder_written_to_config(self, user_client):
         """POST /mqvpn with reorder must persist the reorder object."""
         capture = io.StringIO()

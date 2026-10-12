@@ -11,6 +11,7 @@ Covers:
     reports its uuid as reverse_key
 """
 
+import contextlib
 import io
 import json
 from unittest.mock import MagicMock, patch
@@ -322,6 +323,7 @@ class TestXrayLiveUsers:
                    if str(p) == "/etc/xray/xray-server.json" else _REAL_OPEN(p, *a, **k)), \
              patch("omr_admin._atomic_write_json", side_effect=lambda p, d: written.update(data=d)), \
              patch("omr_admin._schedule_proxy_restart"), \
+             patch("omr_admin._omr_config_lock", side_effect=lambda *a, **k: contextlib.nullcontext()), \
              patch("subprocess.run", side_effect=run):
             func(*args)
         return written.get("data"), calls

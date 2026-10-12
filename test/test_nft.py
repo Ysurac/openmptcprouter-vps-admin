@@ -1187,7 +1187,7 @@ class TestAddGreTunnels:
         # At import time: above a function it reaches, it failed with a NameError
         import inspect
         src = inspect.getsource(omr_admin)
-        call = src.index("\n        add_gre_tunnels()\n")
+        call = src.index("\n            add_gre_tunnels()\n")
         for name in ("def _proxy_drop_user(", "def xray_del_user(", "def xray_add_user(",
                      "def _nft_sync_gre_snat(", "def _proxy_gre_user_sync("):
             assert src.index(name) < call, name

@@ -303,8 +303,13 @@ class TestAddUserChecks:
         ({"username": "DEFAULT"}, "Invalid username"),
         ({"username": "u" * 65}, "Invalid username"),
         ({"username": "new", "userid": 2}, "Userid already used"),
-        ({"username": "new", "userid": 64}, "Invalid userid, 1 to 63"),
-        ({"username": "new", "userid": -1}, "Invalid userid, 1 to 63"),
+        ({"username": "new", "userid": 64}, "Invalid userid, 2 to 63"),
+        ({"username": "new", "userid": -1}, "Invalid userid, 2 to 63"),
+        # 65001 and 65401: userid 0's glorytun and dsvpn ports
+        ({"username": "new", "userid": 1}, "Invalid userid, 2 to 63"),
+        ({"username": "new", "ips": ["0.0.0.0/0"]}, "Invalid IP"),
+        ({"username": "new", "ips": ["not an ip"]}, "Invalid IP"),
+        ({"username": "new", "shadowsocks_port": 65101}, "Shadowsocks port already used"),
         ({"username": "new", "user_key": ""}, "Password too short, 8 characters at least"),
         ({"username": "new", "user_key": "MySecretKey"}, "Template password"),
     ])
@@ -313,6 +318,70 @@ class TestAddUserChecks:
             r = admin_client.post("/add_user", json=payload)
         assert r.json()["reason"] == reason
         assert not persist.called
+
+    def test_ip_of_another_user_refused(self, admin_client):
+        config = _config()
+        config["users"][0]["readonly"]["public_ips"] = ["203.0.113.9"]
+        with (
+            patch("builtins.open", side_effect=_open_with({CONFIG_PATH: json.dumps(config)})),
+            patch("omr_admin._mutate_omr_config") as persist,
+        ):
+            r = admin_client.post("/add_user", json={"username": "new", "ips": ["203.0.113.9"]})
+        assert r.json()["reason"] == "IP already given to another user"
+        assert not persist.called
+
+    def test_shadowsocks_port_of_manager_json_or_a_listener_refused(self, admin_client):
+        manager = {"port_conf": {"65120": {"key": "a", "userid": 7}}}
+        listener = MagicMock(laddr=MagicMock(ip="0.0.0.0", port=8388), raddr=(), status="LISTEN", pid=None)
+        with (
+            patch("builtins.open", side_effect=_open_with({"/etc/shadowsocks-libev/manager.json": json.dumps(manager)})),
+            patch("omr_admin.psutil.net_connections", return_value=[listener]),
+            patch("omr_admin.add_ss_user") as add,
+        ):
+            for port in (65120, 8388):
+                r = admin_client.post("/add_user", json={"username": "new", "shadowsocks_port": port})
+                assert r.json()["reason"] == "Shadowsocks port already used"
+        assert not add.called
+
+    def test_failed_step_undoes_the_user(self, admin_client):
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in ("/etc/shadowsocks-libev/manager.json",
+                                                                "/etc/glorytun-tcp/tun0")),
+            patch("omr_admin.add_ss_user", return_value=65130),
+            patch("omr_admin.proxy_isolate_reverse_tunnels"),
+            patch("omr_admin._mutate_omr_config"),
+            patch("omr_admin.add_glorytun_tcp", side_effect=OSError("disk full")),
+            patch("omr_admin._teardown_user") as teardown,
+        ):
+            r = admin_client.post("/add_user", json={"username": "new", "userid": 9})
+        assert r.json() == {"result": "error", "reason": "User creation failed", "route": "add_user"}
+        name, udata, users = teardown.call_args.args
+        assert name == "new"
+        assert udata["userid"] == "9" and udata["shadowsocks_port"] == 65130
+        assert users["new"] is udata and "openmptcprouter" in users
+
+    def test_port_made_before_the_failed_step_undone(self, admin_client):
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in ("/etc/shadowsocks-libev/manager.json",
+                                                                "/etc/shadowsocks-go/server.json")),
+            patch("omr_admin.add_ss_user", return_value=65131),
+            patch("omr_admin.add_ss_go_user", side_effect=OSError("ss-go down")),
+            patch("omr_admin._teardown_user") as teardown,
+        ):
+            r = admin_client.post("/add_user", json={"username": "new"})
+        assert r.json()["reason"] == "User creation failed"
+        assert teardown.call_args.args[1]["shadowsocks_port"] == 65131
+
+    def test_teardown_of_a_half_made_user_does_not_raise(self):
+        # glorytun-udp's key without its config, dsvpn's config without its key
+        present = {"/etc/glorytun-udp/tun9.key", "/etc/dsvpn/dsvpn9"}
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in present),
+            patch("os.remove") as remove,
+        ):
+            omr_admin.remove_glorytun_udp(9)
+            omr_admin.remove_dsvpn(9)
+        assert sorted(c.args[0] for c in remove.call_args_list) == sorted(present)
 
     def test_modify_user_refuses_an_empty_password(self, admin_client):
         r = admin_client.post("/modify_user", json={"username": "readonly", "user_password": ""})
@@ -1015,3 +1084,256 @@ def test_api_tls_handshakes(tmp_path):
     # the only suite it negotiated before
     assert handshake(v.TLSv1_2, v.TLSv1_2, "ECDHE-RSA-AES256-SHA") is None
     assert handshake(v.TLSv1, v.TLSv1_1, "ALL:@SECLEVEL=0") is None
+
+
+# ---------------------------------------------------------------------------
+# A trailing comma in the config
+# ---------------------------------------------------------------------------
+
+class TestConfigTrailingComma:
+    TEXT = json.dumps(MOCK_CONFIG)[:-1] + ',"vxlan_test": 1,}'
+
+    def test_vxlan_reads_it(self):
+        with patch("builtins.open", side_effect=_open_with({CONFIG_PATH: self.TEXT})):
+            assert omr_admin.get_vxlan_config("openmptcprouter", 0)["mode"] == "l3"
+
+    def test_main_does_not_parse_the_file_again(self):
+        # load_startup_config read it at import, a trailing comma included:
+        # a plain json.load in __main__ then crash-looped the service.
+        source = _REAL_OPEN(omr_admin.__file__).read()
+        main = source[source.index("if __name__ == '__main__':"):]
+        code = "\n".join(line for line in main.splitlines() if not line.strip().startswith("#"))
+        assert "json.load" not in code
+        assert "omr-admin-config.json" not in code
+
+
+# ---------------------------------------------------------------------------
+# Workers starting together
+# ---------------------------------------------------------------------------
+
+class _TrackLock:
+    """Stand-in for _omr_config_lock recording whether it is held."""
+    def __init__(self):
+        self.depth = 0
+        self.exclusive = []
+
+    def __call__(self, exclusive=True):
+        import contextlib
+
+        @contextlib.contextmanager
+        def held():
+            self.exclusive.append(exclusive)
+            self.depth += 1
+            try:
+                yield
+            finally:
+                self.depth -= 1
+        return held()
+
+
+class TestStartupRaces:
+    def test_ss_go_users_synced_under_the_lock(self):
+        lock = _TrackLock()
+        seen = []
+        with (
+            patch("omr_admin._omr_config_lock", side_effect=lock),
+            patch("omr_admin._sync_ss_go_users_locked", side_effect=lambda: seen.append(lock.depth)),
+        ):
+            omr_admin.sync_ss_go_users()
+        assert seen == [1] and lock.exclusive == [True]
+
+    @pytest.mark.parametrize("func", ["xray_add_user", "v2ray_add_user", "xray_del_user", "v2ray_del_user"])
+    def test_proxy_users_changed_under_the_lock(self, func):
+        lock = _TrackLock()
+        seen = []
+        with (
+            patch("omr_admin._omr_config_lock", side_effect=lock),
+            patch(f"omr_admin._{func}_locked", side_effect=lambda *a: seen.append(lock.depth)),
+        ):
+            getattr(omr_admin, func)("alice")
+        assert seen == [1] and lock.exclusive == [True]
+
+    @pytest.mark.parametrize("func,render", [
+        ("_nft_sync_ports", "_render_fw_ports"),
+        ("_nft_sync_gre_snat", "_render_gre_snat"),
+        ("_nft_sync_client2client", "_render_client2client"),
+        ("_nft_resync_dscp_classify", "_dscp_classify_by_class"),
+    ])
+    def test_nft_rules_read_and_loaded_under_the_lock(self, func, render):
+        lock = _TrackLock()
+        seen = []
+
+        def track(name, value):
+            def side_effect(*a, **k):
+                seen.append((name, lock.depth))
+                return value
+            return side_effect
+
+        empty_classes = {dscp: {4: [], 6: []} for dscp in omr_admin.DSCP_CLASSIFY_CLASSES}
+        with (
+            patch("omr_admin._omr_config_lock", side_effect=lock),
+            patch("omr_admin.read_omr_config", side_effect=track("read", _config())),
+            patch(f"omr_admin.{render}", side_effect=track("render", empty_classes if "dscp" in render else ([], []) if "fw" in render else [])),
+            patch("omr_admin._nft_run", side_effect=track("nft", True)),
+        ):
+            getattr(omr_admin, func)()
+        assert seen and all(depth >= 1 for _, depth in seen), seen
+        assert lock.exclusive[0] is True
+
+    def test_v2ray_users_pushed_through_a_private_file(self):
+        server = {"inbounds": [{"tag": "omrin-tunnel", "settings": {"clients": []}}]}
+        pushed = []
+
+        def run(cmd, **kwargs):
+            if cmd[:3] == ["v2ray", "api", "adi"]:
+                path = cmd[-1]
+                pushed.append((path, oct(os.stat(path).st_mode & 0o777), json.loads(_REAL_OPEN(path).read())))
+            return MagicMock(returncode=0)
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/v2ray"),
+            patch("os.path.isfile", return_value=True),
+            patch("os.remove", side_effect=os.unlink),
+            patch("builtins.open", side_effect=lambda p, *a, **k: io.StringIO(json.dumps(server))
+                  if str(p) == "/etc/v2ray/v2ray-server.json" else _REAL_OPEN(p, *a, **k)),
+            patch("omr_admin.file_as_bytes", return_value=b"x"),
+            patch("omr_admin._atomic_write_json"),
+            patch("omr_admin._omr_config_lock", side_effect=_TrackLock()),
+            patch("subprocess.run", side_effect=run),
+        ):
+            omr_admin.v2ray_add_user("alice", "u-alice", restart=0)
+        assert len(pushed) == 1
+        path, mode, config = pushed[0]
+        assert path != "/etc/v2ray/newconfig.json" and mode == "0o600"
+        assert config["inbounds"][0]["settings"]["clients"][-1]["email"] == "alice"
+        assert not os.path.exists(path)
+
+
+# ---------------------------------------------------------------------------
+# /config: the xray settings of now, for every router
+# ---------------------------------------------------------------------------
+
+class TestConfigXrayFresh:
+    SERVER = {"inbounds": [
+        {"tag": "omrin-tunnel", "port": 65248, "settings": {"clients": [{"id": "u-ro", "email": "readonly"}]},
+         "streamSettings": {"network": "xhttp"}},
+        {"tag": "omrin-shadowsocks-tunnel", "settings": {"password": "srv", "method": "2022-blake3-chacha20-poly1305",
+                                                         "clients": [{"email": "readonly", "password": "usr"}]}},
+        {"tag": "omrin-vless-reality", "port": 443},
+    ]}
+
+    def test_secondary_router_gets_what_the_main_router_set(self, other_client):
+        config = _config()
+        # stored at its first /config, before the main router changed them
+        config["users"][0]["readonly"]["xray"] = {
+            "key": "u-ro", "port": "65248", "sskey": "srv:usr", "vless_reality": False, "vless_reality_key": "",
+            "ss_method": "2022-blake3-aes-256-gcm", "transport": "tcp", "reverse_key": "rev"}
+        files = {CONFIG_PATH: json.dumps(config), "/etc/xray/xray-server.json": json.dumps(self.SERVER)}
+        real_isfile = os.path.isfile
+        with (
+            patch("builtins.open", side_effect=_open_with(files)),
+            patch("os.path.isfile", side_effect=lambda p: p in files or real_isfile(p)),
+            patch("omr_admin.xray_user_reverse_key", return_value="rev"),
+            patch("omr_admin.modif_config_user") as modif,
+        ):
+            body = other_client.get("/config").json()
+        xray = body["xray"]["config"]
+        assert xray["transport"] == "xhttp"
+        assert xray["ss_method"] == "2022-blake3-chacha20-poly1305"
+        assert xray["vless_reality"] is True
+        assert xray["key"] == "u-ro" and xray["sskey"] == "srv:usr" and xray["reverse_key"] == "rev"
+        modif.assert_any_call("readonly", {"xray": xray})
+
+
+# ---------------------------------------------------------------------------
+# /config: what another user, or a file, lacks is no 500
+# ---------------------------------------------------------------------------
+
+class TestConfigMissingKeys:
+    def test_missing_port_method_mqvpn_key_and_lanips(self, other_client):
+        config = _config()
+        config["client2client"] = True
+        config["users"][0]["openmptcprouter"]["lanips"] = []
+        manager = {"port_conf": {}, "plugin": "obfs-server"}   # no port, no method, no plugin_opts
+        mqvpn = {"users": [{"name": "readonly"}]}              # no key
+        files = {CONFIG_PATH: json.dumps(config),
+                 "/etc/shadowsocks-libev/manager.json": json.dumps(manager),
+                 "/etc/mqvpn/server.json": json.dumps(mqvpn)}
+        real_isfile = os.path.isfile
+        with (
+            patch("builtins.open", side_effect=_open_with(files)),
+            patch("os.path.isfile", side_effect=lambda p: p in files or real_isfile(p)),
+            patch("omr_admin.mqvpn_server_pin", return_value=""),
+        ):
+            r = other_client.get("/config")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["shadowsocks"]["key"] == "" and body["shadowsocks"]["method"] == "chacha20"
+        assert body["mqvpn"]["key"] == ""
+        assert body["client2client"]["lanips"] == []
+
+    def test_openvpn_certificate_made_under_the_lock(self, other_client):
+        lock = _TrackLock()
+        made = []
+
+        def run(cmd, **kwargs):
+            if cmd[:2] == ["./easyrsa", "--batch"]:
+                made.append(lock.depth)
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+        real_isfile = os.path.isfile
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/openvpn/tun0.conf" or real_isfile(p)),
+            patch("omr_admin._omr_config_lock", side_effect=lock),
+            patch("omr_admin._pki_retire_user_certs"),
+            patch("subprocess.run", side_effect=run),
+        ):
+            other_client.get("/config")
+        assert made == [1]
+
+
+# ---------------------------------------------------------------------------
+# The docs cookie: only as that cookie, from the address it was given to
+# ---------------------------------------------------------------------------
+
+class TestDocsCookieToken:
+    @staticmethod
+    def _login(client):
+        import base64
+        creds = base64.b64encode(b"admin:adminpassword").decode()
+        r = client.get("/login_basic", headers={"Authorization": f"Basic {creds}"}, follow_redirects=False)
+        cookie = r.headers.get("set-cookie", "")
+        return cookie.split("Authorization=", 1)[1].split(";", 1)[0].strip('"')
+
+    def test_cookie_works_where_it_was_given(self, unauth_client):
+        cookie = self._login(unauth_client)
+        r = unauth_client.get("/docs", headers={"Cookie": f'Authorization="{cookie}"'})
+        assert r.status_code == 200
+
+    def test_its_token_refused_as_a_header(self, unauth_client):
+        cookie = self._login(unauth_client)
+        token = cookie.replace("Bearer ", "").replace("\\040", " ").split()[-1]
+        r = unauth_client.get("/status", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 403
+
+    def test_its_token_refused_from_another_address(self):
+        user = omr_admin.get_user(MOCK_CONFIG["users"][0], "admin")
+        token = omr_admin.create_access_token(data={
+            "sub": "admin", "pwd": omr_admin._password_fingerprint(user.user_password),
+            "use": "docs", "ip": "198.51.100.7"})
+
+        def request(host, headers=None):
+            return MagicMock(client=MagicMock(host=host), headers=headers or {})
+
+        assert omr_admin.get_current_user(request("198.51.100.7"), token).username == "admin"
+        with pytest.raises(omr_admin.HTTPException):
+            omr_admin.get_current_user(request("203.0.113.9"), token)
+        with pytest.raises(omr_admin.HTTPException):
+            omr_admin.get_current_user(request("198.51.100.7", {"Authorization": f"Bearer {token}"}), token)
+
+    def test_api_token_unchanged(self):
+        user = omr_admin.get_user(MOCK_CONFIG["users"][0], "admin")
+        token = omr_admin.create_access_token(data={
+            "sub": "admin", "pwd": omr_admin._password_fingerprint(user.user_password)})
+        r = MagicMock(client=MagicMock(host="203.0.113.9"), headers={"Authorization": f"Bearer {token}"})
+        assert omr_admin.get_current_user(r, token).username == "admin"

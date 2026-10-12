@@ -54,7 +54,9 @@ require a JWT bearer token.
 - `GET /logout` — clears the `Authorization` cookie.
 
 The token is accepted either as an `Authorization: Bearer <token>` header or as the
-`Authorization` cookie.
+`Authorization` cookie. The cookie's token (30 minutes) works only as that cookie,
+from the address that logged in, and for same-origin requests: a browser sends the
+cookie to every HTTPS port of the VPS.
 
 ### Permissions
 
@@ -114,7 +116,7 @@ Configuration endpoints return a JSON object of the form:
 | POST | `/glorytun` | `GlorytunConfig` | Glorytun key, port, chacha20 toggle |
 | POST | `/dsvpn` | `DSVPN` | DSVPN key and port |
 | POST | `/mlvpn` | `MLVPN` | MLVPN password, timeout, reorder buffer, loss tolerance, cleartext |
-| POST | `/mqvpn` | `MQVPN` | MQVPN key, scheduler, port (default 443), FEC (xor/reed_solomon/…), reinjection, congestion control (bbr2/bbr/cubic/…), reorder profile and per-port reorder rules |
+| POST | `/mqvpn` | `MQVPN` | MQVPN scheduler (`minrtt`, `wlb`, `backup`, `backup_fec`, `rap`, `wlb_udp_pin`, `wrtt`, `wrr`, `redundant`, `dscp`), port (default 443), FEC (xor/reed_solomon/…), reinjection, congestion control (bbr2/bbr/cubic/…), reorder (`cap_packets` a power of two) and up to 16 per-port reorder rules (`proto` udp/tcp, `port` 0-65535, `profile` cellular_bond/fiber_lte/quic_bulk/low_latency/default_udp). The `key` sent is ignored |
 | POST | `/mqvpn_user` | `MQVPNUser` | Admin only: set or clear a fixed IP for an MQVPN user |
 | GET | `/mqvpn_users` | — | Admin only: list MQVPN users with, per name, `configured` (present in `/etc/mqvpn/server.json`, plus its `fixed_ip`), `known` (accepted by the running daemon, from the control socket's `list_users`) and `connected` (has a live session, from `get_status`); `known`/`connected` are `null` and `control.error` is set when the control socket can't be reached. Sessions authenticated with the server-wide `auth_key` (reported by the daemon as user `(global)`) are not listed as users but counted in `global_key_clients`. The control socket address is read from `control_listen` in `server.json` (default `127.0.0.1:9090`, wildcard binds reached via loopback) and echoed as `control.address`; warns if MQVPN isn't installed |
 | POST | `/mqvpn_dscp` | `MQVPNDscpParams` | Sync the current user's per-WAN DSCP class assignments (`pins: [{iface, dscp: [...]}]`) into MQVPN's per-path `dscp_mask`, pushed live over the control socket and persisted in `/etc/mqvpn/server.json`'s `path_policy` so it survives a restart/reconnect; warns if MQVPN isn't installed |

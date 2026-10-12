@@ -961,3 +961,55 @@ class TestMqvpnWeightEndpoint:
         assert r.json()["result"] == "done"
         api.assert_not_called()
         assert _MQVPN_SERVER_JSON not in env.written
+
+
+class TestDscpClassifyOverlaps:
+    def test_overlapping_networks_merged_per_set(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_ensure_dscp_sets", return_value=True),
+            patch("omr_admin._nft_refresh_dscp_set", return_value=True) as refresh,
+            patch("omr_admin._nft_sync_dscp_mark", return_value=True),
+            patch("omr_admin.set_global_param"),
+        ):
+            r = user_client.post("/dscp_classify", json={"entries": [
+                {"dscp": "cs4", "cidr": "10.0.0.0/8"},
+                {"dscp": "cs4", "cidr": "10.1.0.0/16"},
+                {"dscp": "cs4", "cidr": "192.0.2.1"},
+                {"dscp": "cs4", "cidr": "192.0.2.1/32"},
+                {"dscp": "cs4", "cidr": "2001:db8::/33"},
+                {"dscp": "cs4", "cidr": "2001:db8:8000::/33"},
+                {"dscp": "ef", "cidr": "10.1.0.0/16"},   # another set
+            ]})
+        assert r.json()["result"] == "done"
+        calls = {(c.args[0], c.args[1]): c.args[2] for c in refresh.call_args_list}
+        assert calls[("cs4", 4)] == ["10.0.0.0/8", "192.0.2.1/32"]
+        assert calls[("cs4", 6)] == ["2001:db8::/32"]
+        assert calls[("ef", 4)] == ["10.1.0.0/16"]
+
+    def test_refused_by_nft_not_saved_nor_reported_done(self, user_client):
+        with (
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_ensure_dscp_sets", return_value=True),
+            patch("omr_admin._nft_refresh_dscp_set", side_effect=lambda d, f, c: d != "cs4"),
+            patch("omr_admin._nft_sync_dscp_mark", return_value=True),
+            patch("omr_admin._nft_base_table_exists", return_value=True),
+            patch("omr_admin.set_global_param") as set_param,
+        ):
+            r = user_client.post("/dscp_classify", json={"entries": [{"dscp": "cs4", "cidr": "10.0.0.0/8"}]})
+        assert r.json() == {"result": "error", "reason": "Classification refused by nft", "route": "dscp_classify"}
+        set_param.assert_not_called()
+
+    def test_saved_while_nftables_is_not_loaded(self, user_client):
+        # nothing to apply it to yet: the resync of nftables' start does
+        with (
+            patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
+            patch("omr_admin._nft_ensure_dscp_sets", return_value=False),
+            patch("omr_admin._nft_refresh_dscp_set", return_value=False),
+            patch("omr_admin._nft_sync_dscp_mark", return_value=False),
+            patch("omr_admin._nft_base_table_exists", return_value=False),
+            patch("omr_admin.set_global_param") as set_param,
+        ):
+            r = user_client.post("/dscp_classify", json={"entries": [{"dscp": "cs4", "cidr": "10.0.0.0/8"}]})
+        assert r.json()["result"] == "done"
+        set_param.assert_called_once_with("dscp_classify", [{"dscp": "cs4", "cidr": "10.0.0.0/8"}])

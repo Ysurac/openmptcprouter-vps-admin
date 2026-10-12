@@ -11,10 +11,10 @@ set -eu
 #      and saves it to /etc/influxdb3/omr-influxdb.env straight away
 #   4. Creates the omr_metrics database with 60-day retention (configurable)
 #   5. python3-influxdb3  (apt when available, pip fallback)
-#   6. PyTorch + pre-initialised decision model  [INSTALL_AI=true]
+#   6. PyTorch  [INSTALL_AI=true]
 #      python3-torch from Debian when available, CPU-only pip wheel fallback
-#   7. Deploys omr_metrics.py and restarts omr-admin
-#   8. Injects "influxdb" block into omr-admin-config.json
+#   7. Deploys omr_metrics.py, which initialises the decision model [INSTALL_AI=true]
+#   8. Injects "influxdb" block into omr-admin-config.json, restarts omr-admin
 #
 # Edit the variables below before running, or override the tunables from the
 # environment, e.g.:  sudo RESET_DATA=true INSTALL_AI=false sh ./install_omr-ai.sh
@@ -259,69 +259,17 @@ step "Installing influxdb3-python library..."
 apt_or_pip python3-influxdb3 influxdb3-python
 
 # ---------------------------------------------------------------------------
-# 6. PyTorch + decision model  (Debian package preferred, enabled by default)
+# 6. PyTorch  (Debian package preferred, enabled by default)
 # ---------------------------------------------------------------------------
 if [ "$INSTALL_AI" = "true" ]; then
     step "Installing PyTorch..."
     apt_or_pip python3-torch torch --index-url https://download.pytorch.org/whl/cpu
-
-    DECISION_MODEL_FILE="/etc/openmptcprouter-vps-admin/omr-decision-model.pt"
-    if [ -f "$DECISION_MODEL_FILE" ]; then
-        log "Decision model already exists — skipping init."
-    else
-        step "Pre-initialising decision model at ${DECISION_MODEL_FILE}..."
-        python3 - "$DECISION_MODEL_FILE" <<'PYEOF'
-# Mirrors _make_model() / InterfaceScorer from omr_metrics.py exactly.
-import sys, os
-import torch
-import torch.nn as nn
-
-N_FEATURES = 19
-_FEATURE_IMPORTANCES = [
-    2.0, 3.0, 1.5, 1.5, 1.0, 1.0, 0.5, 0.8, 0.5, 0.5,  # original 10
-    1.5, 0.6, 0.7, 1.0,                                   # new static 4
-    2.0,                                                    # inv_predicted_congestion
-    1.2, 1.5, 0.8, 0.8,                                   # trend 4
-]
-
-class InterfaceScorer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(N_FEATURES, 24), nn.ReLU(),
-            nn.Linear(24, 8),          nn.ReLU(),
-            nn.Linear(8, 1),
-        )
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-model = InterfaceScorer()
-imp = torch.tensor(_FEATURE_IMPORTANCES, dtype=torch.float32)
-imp = imp / imp.norm()
-with torch.no_grad():
-    nn.init.xavier_uniform_(model.net[0].weight)
-    model.net[0].weight.data[0] = imp
-    model.net[0].bias.data.zero_()
-    nn.init.xavier_uniform_(model.net[2].weight)
-    model.net[2].bias.data.zero_()
-    nn.init.xavier_uniform_(model.net[4].weight)
-    model.net[4].bias.data.zero_()
-model.eval()
-
-dest = sys.argv[1]
-os.makedirs(os.path.dirname(dest), exist_ok=True)
-tmp = dest + ".tmp"
-torch.save(model.state_dict(), tmp)
-os.replace(tmp, dest)
-print(f"Decision model saved to {dest}")
-PYEOF
-    fi
 else
     log "INSTALL_AI=false — skipping PyTorch and decision model."
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Deploy omr_metrics.py to the installed location and restart omr-admin
+# 7. Deploy omr_metrics.py to the installed location
 # ---------------------------------------------------------------------------
 step "Downloading omr_metrics.py..."
 dest=/usr/share/omr-admin/omr_metrics.py
@@ -329,17 +277,29 @@ mkdir -p /usr/share/omr-admin
 curl -fsSL "https://raw.githubusercontent.com/Ysurac/openmptcprouter-vps-admin/${OMR_ADMIN_VERSION}/omr_metrics.py" \
     -o "$dest"
 log "  -> ${dest}"
-systemctl restart omr-admin 2>/dev/null || true
-log "omr-admin restarted."
+
+# The decision model, from omr_metrics.py itself: the one built here kept
+# its own copy of the network, which drifted (19 features and other layers),
+# so omr-admin refused it at every start and each worker made its own.
+if [ "$INSTALL_AI" = "true" ]; then
+    step "Initialising the decision model..."
+    if python3 -c 'import sys; sys.path.insert(0, "/usr/share/omr-admin"); import omr_metrics; sys.exit(0 if omr_metrics.ensure_decision_model() else 1)'; then
+        log "Decision model ready."
+    else
+        log "WARNING: decision model not initialised; omr-admin makes one at first use."
+    fi
+fi
 
 # ---------------------------------------------------------------------------
-# 8. Inject influxdb block into omr-admin-config.json
+# 8. Inject influxdb block into omr-admin-config.json, then restart omr-admin
+#    (restarted before, it came up without the influxdb block until the next
+#    restart)
 # ---------------------------------------------------------------------------
 step "Updating ${OMR_CONFIG_FILE}..."
 mkdir -p "$(dirname "$OMR_CONFIG_FILE")"
 
-python3 - "$OMR_CONFIG_FILE" "$INFLUX_HOST" "$INFLUX_ORG" "$INFLUX_BUCKET" "$ADMIN_TOKEN" "$INFLUX_RETENTION_DAYS" <<'PYEOF'
-import sys, json, os, fcntl
+python3 - "$OMR_CONFIG_FILE" "$INFLUX_HOST" "$INFLUX_ORG" "$INFLUX_BUCKET" "$ADMIN_TOKEN" "$INFLUX_RETENTION_DAYS" <<'PYEOF' || die "${OMR_CONFIG_FILE} left unchanged: fix it, then run this script again"
+import sys, json, os, re, fcntl
 
 config_file, url, org, bucket, token, retention_days = sys.argv[1:]
 lock_path = os.path.join(os.path.dirname(config_file), ".omr-admin-config.lock")
@@ -347,14 +307,14 @@ lock_file = open(lock_path, "a+")
 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 try:
     with open(config_file) as f:
-        cfg = json.load(f)
+        # a trailing comma, as omr-admin reads it
+        cfg = json.loads(re.sub(r",\s*}", "}", f.read()))
 except FileNotFoundError:
     cfg = {}
-except Exception as e:
-    print(f"WARNING: could not parse {config_file} ({e}), backing up and starting fresh", flush=True)
-    import shutil, time
-    shutil.copy2(config_file, config_file + ".bak." + str(int(time.time())))
-    cfg = {}
+except ValueError as e:
+    # Not replaced with {}: that was every user, password and key lost.
+    print(f"ERROR: could not parse {config_file} ({e})", file=sys.stderr, flush=True)
+    sys.exit(1)
 
 cfg["influxdb"] = {
     "url": url, "token": token, "org": org, "bucket": bucket,
@@ -376,7 +336,10 @@ cfg.setdefault("auto_learning", {
 })
 
 tmp = config_file + ".tmp"
-with open(tmp, "w") as f:
+if os.path.lexists(tmp):
+    os.remove(tmp)
+# 0600 from the start: every user's password and VPN keys
+with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
     json.dump(cfg, f, indent=4)
     f.write("\n")
 os.replace(tmp, config_file)
@@ -386,6 +349,8 @@ print(f"Written {config_file}")
 PYEOF
 
 chmod 600 "$OMR_CONFIG_FILE"
+systemctl restart omr-admin 2>/dev/null || true
+log "omr-admin restarted."
 
 # ---------------------------------------------------------------------------
 # Done
