@@ -1,3 +1,17 @@
+omr-vps-admin (0.18+20261013) unstable; urgency=medium
+
+  * Disabled users: those disabled by an older release, when 'disabled' only refused the API's login, are suspended at startup, or when disabled again; their routers kept their VPN and proxies. While suspended, nothing gives the access back: its GRE tunnels are left as they are (set up again when it is enabled, for a public IP given or taken meanwhile), the proxy sync no longer puts its VLESS Reality clients back, /mptcp no longer restarts (so starts) its glorytun-tcp, and its shadowsocks ports are not given to another user. A port given away meanwhile (by an older release, or by hand) keeps its new user's key on resume
+  * GRE tunnels: those of a public IP the VPS does not have (yet) are kept 24 hours before being removed. An address configured after omr-admin at boot lost its tunnels, proxy users and shadowsocks ports, and the routers the settings they had for them
+  * Firewall: an entry is kept, and loaded once nft takes the chains, when nft refuses them without it too (another entry, of any user, or nft itself). Refusing it refused every new entry of every user until the faulty one was found by hand
+  * /mqvpn_dscp, /mqvpn_weight: a path_policy table an older release let grow over its limits can shrink; only growing it over them is refused. Every DSCP and weight sync of the user was refused, those removing entries too
+  * /vpnips: another user's localip no longer refuses a remoteip, one that is the VPS's own being refused already
+  * Speedtest: the slot is given back when the client goes before the body is streamed; it was kept for the life of the worker, every speedtest refused once 16 had leaked
+  * install_omr-ai.sh: on Debian 13 the pip fallback picked reactivex 5, which needs typing-extensions >= 4.15, and pip cannot replace the 4.13.2 python3-fastapi installs: influxdb3-python failed. reactivex 4.0.4 is installed with it. pip's error is no longer hidden: the retry without --break-system-packages showed its PEP 668 refusal instead, which is only left out for a pip that does not know it (Ysurac/openmptcprouter#4398)
+  * docs/api.md: the changes above
+  * Add tests for the above (test/test_hardening.py, test/test_api.py, test/test_nft.py, test/test_install_omr_ai.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 13 Oct 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20261012) unstable; urgency=medium
 
   * /xrayredirect, /v2rayredirect: refuse a port another daemon of the VPS listens on (pihole's 53 and 80...). The delayed restart of xray or v2ray couldn't bind it, and the proxy went down for every user. The proxies' own sockets are left to their configs, as a redirect removed a moment ago still listens until that restart
