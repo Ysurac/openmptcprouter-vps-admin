@@ -1017,6 +1017,23 @@ class TestXrayGreSyncAll:
         assert new["routing"]["rules"][0]["user"] == ["openmptcproutergre-user0-ip1"]
         assert self._run(new, users) is None   # nothing more to change
 
+    def test_suspended_user_gets_no_reality_client_back(self):
+        # _suspend_user_access took it out: put back here, the disabled
+        # router had its proxy access again
+        tunnel = {"public_ip": "203.0.113.9", "xray": {"uuid": "u3"}}
+        data = {"inbounds": [{"tag": "omrin-vless-reality", "settings": {"clients": []}}],
+                "outbounds": [], "routing": {"rules": []}}
+        for udata in ({"userid": 3, "username": "bob", "disabled": "true", "gre_tunnels": {"gre-user3-ip0": tunnel}},
+                      {"userid": 3, "username": "bob", "access_suspended": {}, "gre_tunnels": {"gre-user3-ip0": tunnel}}):
+            new = self._run(json.loads(json.dumps(data)), {"bob": udata})
+            assert new["inbounds"][0]["settings"]["clients"] == []
+            # its rule kept, for when it is put back
+            assert new["routing"]["rules"][0]["user"] == ["bobgre-user3-ip0"]
+        new = self._run(json.loads(json.dumps(data)), {"bob": {"userid": 3, "username": "bob",
+                                                               "gre_tunnels": {"gre-user3-ip0": tunnel}}})
+        assert new["inbounds"][0]["settings"]["clients"] == [
+            {"id": "u3", "flow": "xtls-rprx-vision", "email": "bobgre-user3-ip0"}]
+
 
 class TestProxyGreRulePlacement:
     @staticmethod
@@ -1169,12 +1186,43 @@ class TestAddGreTunnels:
             self._run(config)
         assert config["users"][0]["alice"]["gre_tunnels"] == {}
         assert [c.args[2] for c in drop.call_args_list] == ["gre-user3-ip0"]
-        # the default user keeps the tunnels of the addresses still there
+        # the default user keeps the tunnels of the addresses still there,
+        # and of one the VPS has not, for GRE_MISSING_GRACE
         with patch("omr_admin._gre_drop_tunnel") as drop:
+            self._run(config, public=_PUBLIC[:2])
+        assert not drop.called
+        with patch("omr_admin._gre_drop_tunnel") as drop, \
+             patch("time.time", return_value=__import__("time").time() + omr_admin.GRE_MISSING_GRACE + 1):
             self._run(config, public=_PUBLIC[:2])
         assert {t["public_ip"] for t in config["users"][0]["openmptcprouter"]["gre_tunnels"].values()} == \
             {"198.51.100.1", "203.0.113.5"}
         assert len(drop.call_args_list) == 1
+
+    def test_address_up_after_omr_admin_keeps_its_tunnels(self):
+        # at boot, an address configured after omr-admin started lost its
+        # tunnels, proxy users and ports: back, under other names
+        config = self._config()
+        self._run(config)
+        before = json.loads(json.dumps(config["users"][0]["openmptcprouter"]["gre_tunnels"]))
+        with patch("omr_admin._gre_drop_tunnel") as drop:
+            self._run(config, public=_PUBLIC[:2])
+            assert not drop.called
+            missing = [t for t in config["users"][0]["openmptcprouter"]["gre_tunnels"].values() if "missing_since" in t]
+            assert [t["public_ip"] for t in missing] == ["203.0.113.9"]
+            self._run(config)
+        assert config["users"][0]["openmptcprouter"]["gre_tunnels"] == before
+
+    def test_suspended_user_left_alone(self):
+        config = self._config()
+        self._run(config)
+        alice = config["users"][0]["alice"]
+        # 203.0.113.9 taken away and 203.0.113.5 given while suspended
+        alice.update(disabled="true", access_suspended={}, public_ips=["203.0.113.5"])
+        before = json.loads(json.dumps(alice))
+        with patch("omr_admin._gre_drop_tunnel") as drop:
+            self._run(config)
+        assert not drop.called
+        assert alice == before
 
     def test_dropped_tunnel_keeps_the_users_own_port(self):
         udata = {"username": "alice", "shadowsocks_port": 65120}

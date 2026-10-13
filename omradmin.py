@@ -1009,6 +1009,17 @@ def write_vxlan_conf(username, userid):
         subprocess.run(["systemctl", "-q", "enable", f"omr-vxlan@user{userid}"], check=False)
         _restart_service(f"omr-vxlan@user{userid}")
 
+def _ss_suspended_ports():
+    """The shadowsocks-libev ports a suspended user gets back: out of
+    manager.json meanwhile, not to be given to another user."""
+    try:
+        users = (read_omr_config().get('users') or [{}])[0]
+    except (OSError, ValueError):
+        return []
+    return [str(port) for udata in users.values() if isinstance(udata, dict)
+            for port in ((udata.get('access_suspended') or {}).get('shadowsocks') or {})
+            if str(port).isdigit()]
+
 def add_ss_user(port, key, userid=0, ip=''):
     # manager.json is read, changed and written back: under the lock, as
     # every other writer of it.
@@ -1026,7 +1037,7 @@ def _add_ss_user_locked(port, key, userid, ip):
     data = json.loads(content)
     if ip == '' and 'port_key' in data:
         if port is None or port == '' or port == 0 or port == 'None':
-            port = int(max(data['port_key'], key=int)) + 1
+            port = int(max(list(data['port_key']) + _ss_suspended_ports(), key=int)) + 1
         data['port_key'][str(port)] = key
     else:
         if 'port_conf' not in data:
@@ -1036,7 +1047,7 @@ def _add_ss_user_locked(port, key, userid, ip):
                 data['port_conf'][old_port] = {'key': data['port_key'][old_port]}
             del data['port_key']
         if port == '' or port == "None" or port is None or port == 0:
-            port = int(max(data['port_conf'], key=int)) + 1
+            port = int(max(list(data['port_conf']) + _ss_suspended_ports(), key=int)) + 1
         if ip != '':
             data['port_conf'][str(port)] = {'key': key, 'local_address': ip, 'userid': userid}
         else:
@@ -1572,6 +1583,8 @@ def xray_del_routing(tag, restart=1):
 GRE_V4_POOL = IPNetwork('10.255.240.0/22')
 GRE_INTF_DIR = '/etc/openmptcprouter-vps-admin/intf'
 GRE_DEFAULT_USER = 'openmptcprouter'
+# How long a public IP the VPS no longer has keeps its GRE tunnels
+GRE_MISSING_GRACE = 24 * 3600
 
 def _vps_ipv4_addresses():
     """Every IPv4 address of the VPS's interfaces, tunnels included."""
@@ -1688,14 +1701,20 @@ def _gre_drop_stale_intf(userid, tunnels):
             os.remove(safe_path_join(GRE_INTF_DIR, name))
             subprocess.run(["ip", "link", "del", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
+def _gre_drop_proxy_users(udata, user, gre_intf):
+    """Remove the xray and v2ray users of one GRE tunnel of *user*. Not
+    restarted here: the caller's _proxy_gre_sync_all() restarts what
+    changed, once for all its tunnels."""
+    proxy_user = str(udata.get('username', user)) + gre_intf
+    if os.path.isfile('/etc/xray/xray-server.json'):
+        xray_del_user(proxy_user, restart=0)
+    if os.path.isfile('/etc/v2ray/v2ray-server.json'):
+        v2ray_del_user(proxy_user, restart=0)
+
 def _gre_drop_tunnel(udata, user, gre_intf, tunnel):
     """Remove the proxy users and the shadowsocks port of one GRE tunnel of
     *user*; its file goes with _gre_drop_stale_intf()."""
-    xray_user = str(udata.get('username', user)) + gre_intf
-    if os.path.isfile('/etc/xray/xray-server.json'):
-        xray_del_user(xray_user)
-    if os.path.isfile('/etc/v2ray/v2ray-server.json'):
-        v2ray_del_user(xray_user, restart=0)
+    _gre_drop_proxy_users(udata, user, gre_intf)
     port = tunnel.get('shadowsocks_port')
     # Not the user's own port, bound to its first public IP (/add_user ips)
     if port is not None and str(port).isdigit() and str(port) != str(udata.get('shadowsocks_port')) \
@@ -1737,7 +1756,10 @@ def _proxy_gre_sync_all(service, users, md5=None):
                 emails.add(email)
                 tag = 'output-' + tunnel['public_ip']
                 changed = _proxy_gre_outbound_sync(data, tag, tunnel['public_ip']) or changed
-                changed = _proxy_gre_user_sync(data, email, gre_xray['uuid'], tag,
+                # A suspended user keeps its rule, not its VLESS Reality
+                # client: put back, it gave the router its access again
+                puuid = None if _user_access_cut(udata) else gre_xray['uuid']
+                changed = _proxy_gre_user_sync(data, email, puuid, tag,
                                                GRE_PROXIES[service]['inbounds']) or changed
         rules = data.get('routing', {}).get('rules', [])
         def stale(rule):
@@ -1790,6 +1812,12 @@ def add_gre_tunnels(only_user=None):
             if only_user is not None and user != only_user:
                 continue
             if user == 'admin' or not isinstance(udata, dict):
+                continue
+            # Left as they are while its access is cut: a new tunnel added
+            # proxy users and a shadowsocks port the suspension had not
+            # taken, and a dropped one was not there to put back.
+            # _resume_user_access() runs this again for it.
+            if _user_access_cut(udata):
                 continue
             try:
                 userid = int(udata['userid'])
@@ -1852,13 +1880,27 @@ def add_gre_tunnels(only_user=None):
                     LOG.debug("GRE tunnel of %s to %s not set up (%s)", log_safe(user), addr, exception)
             # The tunnels of an address the user no longer has (out of its
             # public_ips, or of the VPS) were kept, with their proxy users
-            # and shadowsocks port.
+            # and shadowsocks port. One the VPS has not (yet) is only
+            # dropped once missing for GRE_MISSING_GRACE: an address up
+            # after omr-admin at boot lost its tunnels, and the routers the
+            # settings they had for them.
+            now = int(time.time())
             for gre_intf, tunnel in list(tunnels.items()):
-                if tunnel.get('public_ip') not in wanted:
-                    LOG.info("Remove the GRE tunnel %s of %s, %s is no longer its",
-                             gre_intf, log_safe(user), tunnel.get('public_ip'))
-                    _gre_drop_tunnel(udata, user, gre_intf, tunnel)
-                    del tunnels[gre_intf]
+                addr = tunnel.get('public_ip')
+                if addr in wanted:
+                    tunnel.pop('missing_since', None)
+                    continue
+                if addr and addr not in allips:
+                    try:
+                        since = int(tunnel.setdefault('missing_since', now))
+                    except (TypeError, ValueError):
+                        since = tunnel['missing_since'] = now
+                    if now - since < GRE_MISSING_GRACE:
+                        continue
+                LOG.info("Remove the GRE tunnel %s of %s, %s is no longer its",
+                         gre_intf, log_safe(user), addr)
+                _gre_drop_tunnel(udata, user, gre_intf, tunnel)
+                del tunnels[gre_intf]
             if tunnels != stored:
                 modif_config_user(user, {'gre_tunnels': tunnels})
             _gre_drop_stale_intf(userid, tunnels)
@@ -2832,11 +2874,18 @@ def _fw_port_add(username, port, proto, name, fwtype, family, source_dip, dest_i
         if not _nft_sync_ports() and _nft_base_table_exists():
             # nft refused the chains with it: kept, it was reported done,
             # and every later change of any user failed the same way.
-            LOG.warning("firewall entry %s %s/%s of user %s refused by nft, not kept",
-                        log_safe(name), log_safe(proto), log_safe(port), log_safe(username))
             modif_config_user(username, {'fw_ports': previous})
-            _nft_sync_ports()
-            return 'Firewall rule refused'
+            if _nft_sync_ports():
+                LOG.warning("firewall entry %s %s/%s of user %s refused by nft, not kept",
+                            log_safe(name), log_safe(proto), log_safe(port), log_safe(username))
+                return 'Firewall rule refused'
+            # Refused without it too: another entry (any user's) or nft
+            # itself, not this one. Refusing it refused every new entry of
+            # every user until that was found by hand. Kept, loaded with
+            # the others once nft takes them.
+            LOG.error("nft refuses the firewall chains, with or without entry %s %s/%s of user %s",
+                      log_safe(name), log_safe(proto), log_safe(port), log_safe(username))
+            modif_config_user(username, {'fw_ports': ports})
     return None
 
 def _fw_port_del(username, port, proto, name, fwtype, family, source_dip='', dest_ip=''):
@@ -6115,10 +6164,14 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
             _restart_service("v2ray")
         if os.path.isfile('/etc/xray/xray-server.json'):
             _restart_service("xray")
-        # Every user's glorytun-tcp, not only the main router's tun0
+        # Every user's glorytun-tcp, not only the main router's tun0, but
+        # those of a suspended user: restart starts a stopped unit
+        cut = {str(udata.get('userid')) for udata in (read_omr_config().get('users') or [{}])[0].values()
+               if _user_access_cut(udata)}
         for conf in sorted(glob.glob('/etc/glorytun-tcp/tun*')):
-            if re.fullmatch(r'tun[0-9]+', os.path.basename(conf)):
-                _restart_service("glorytun-tcp@" + os.path.basename(conf))
+            name = os.path.basename(conf)
+            if re.fullmatch(r'tun[0-9]+', name) and name[3:] not in cut:
+                _restart_service("glorytun-tcp@" + name)
         if os.path.isfile('/etc/openvpn/tun0.conf'):
             _restart_service("openvpn@tun0")
     #set_lastchange()
@@ -7253,11 +7306,16 @@ def _mqvpn_path_policy_ifaces_with(policy, username, field):
 MQVPN_PATH_POLICY_MAX = 128
 MQVPN_MAX_USER_PATHS = 16
 
-def _mqvpn_path_policy_error(policy, username):
-    """Why *policy* (path_policy as it would be saved) can't be, None if it can."""
-    if sum(1 for e in policy if e.get('user') == username) > MQVPN_MAX_USER_PATHS:
+def _mqvpn_path_policy_error(policy, username, before):
+    """Why *policy* (path_policy as it would be saved) can't be, None if it
+    can. Over a limit only if it grew past *before* (path_policy as read):
+    a table an older release let grow over it could never shrink, every
+    user's DSCP and weight sync refused."""
+    def mine(entries):
+        return sum(1 for e in entries if isinstance(e, dict) and e.get('user') == username)
+    if mine(policy) > MQVPN_MAX_USER_PATHS and mine(policy) > mine(before):
         return 'Too many interfaces'
-    if len(policy) > MQVPN_PATH_POLICY_MAX:
+    if len(policy) > MQVPN_PATH_POLICY_MAX and len(policy) > len(before):
         return 'MQVPN path policy table full'
     return None
 
@@ -7340,7 +7398,7 @@ def mqvpn_dscp(*, params: MQVPNDscpParams, current_user: User = Depends(get_curr
         for iface, mask in desired.items():
             pushes.append((iface, {'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': mask}))
             _mqvpn_path_policy_set(policy, username, iface, 'dscp_mask', mask)
-        error = _mqvpn_path_policy_error(policy, username)
+        error = _mqvpn_path_policy_error(policy, username, json.loads(initial_policy))
         if error:
             return {'result': 'error', 'reason': error, 'route': 'mqvpn_dscp'}
         if json.dumps(policy, sort_keys=True) != initial_policy:
@@ -7388,7 +7446,7 @@ def mqvpn_weight(*, params: MQVPNWeightParams, current_user: User = Depends(get_
         for iface, weight in desired.items():
             pushes.append((iface, {'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': weight}))
             _mqvpn_path_policy_set(policy, username, iface, 'weight', weight)
-        error = _mqvpn_path_policy_error(policy, username)
+        error = _mqvpn_path_policy_error(policy, username, json.loads(initial_policy))
         if error:
             return {'result': 'error', 'reason': error, 'route': 'mqvpn_weight'}
         if json.dumps(policy, sort_keys=True) != initial_policy:
@@ -8025,11 +8083,10 @@ def _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, re
             continue
         # The VPS end of a tunnel can be shared (every OpenVPN client has
         # 10.255.252.1 as its localip), a router's address can't. Another
-        # user's localip counts if it is the VPS's: any user, read-only
-        # too, could store another router's address as its localip and so
-        # refuse it to that router.
-        if (remoteip == ucfg.get('vpnlocalip') and remoteip in vps_addresses) or \
-           (remoteip == ucfg.get('vpnremoteip') and not leased):
+        # user's localip is not checked: one that is the VPS's was refused
+        # above, and any user, read-only too, could store another router's
+        # address as its localip and so refuse it to that router.
+        if remoteip == ucfg.get('vpnremoteip') and not leased:
             return {'result': 'error', 'reason': 'remoteip already used by another user', 'route': 'vpnips'}
         if localip == ucfg.get('vpnremoteip'):
             return {'result': 'error', 'reason': 'localip already used by another user', 'route': 'vpnips'}
@@ -8439,6 +8496,8 @@ def _ss_ports_in_use(users):
         ports.add(udata.get('shadowsocks_port'))
         ports |= {tunnel.get('shadowsocks_port') for tunnel in (udata.get('gre_tunnels') or {}).values()
                   if isinstance(tunnel, dict)}
+        # A suspended user's, out of manager.json until it is put back
+        ports |= set((udata.get('access_suspended') or {}).get('shadowsocks') or {})
     try:
         with open('/etc/shadowsocks-libev/manager.json') as f:
             data = json.loads(re.sub(r",\s*}", "}", f.read()))
@@ -8712,10 +8771,7 @@ def _remove_user_resources(username, udata, users):
     md5s = {service: hashlib.md5(file_as_bytes(conf['file'])).hexdigest()
             for service, conf in GRE_PROXIES.items() if os.path.isfile(conf['file'])}
     for gre_intf in (udata.get('gre_tunnels') or {}):
-        if os.path.isfile('/etc/xray/xray-server.json'):
-            xray_del_user(str(udata.get('username', username)) + gre_intf)
-        if os.path.isfile('/etc/v2ray/v2ray-server.json'):
-            v2ray_del_user(str(udata.get('username', username)) + gre_intf, restart=0)
+        _gre_drop_proxy_users(udata, username, gre_intf)
         intf_file = safe_path_join('/etc/openmptcprouter-vps-admin/intf', gre_intf)
         if os.path.isfile(intf_file):
             os.remove(intf_file)
@@ -8829,6 +8885,11 @@ def _user_disabled(udata):
     value = udata.get('disabled') if isinstance(udata, dict) else None
     return value is True or str(value).lower() in ('true', '1', 'yes')
 
+def _user_access_cut(udata):
+    """True while *udata*'s VPN and proxy access is to stay cut: disabled,
+    or suspended and not yet put back. Nothing may give it back meanwhile."""
+    return isinstance(udata, dict) and (_user_disabled(udata) or 'access_suspended' in udata)
+
 def _user_proxy_names(username, udata):
     """The xray/v2ray user names of *username*: its own, its GRE tunnels'."""
     return {username} | {str(udata.get('username', username)) + gre for gre in (udata.get('gre_tunnels') or {})}
@@ -8916,10 +8977,17 @@ def _ss_resume(taken):
         with open('/etc/shadowsocks-libev/manager.json') as f:
             data = json.loads(re.sub(r",\s*}", "}", f.read()))
         table = data.setdefault('port_conf' if 'port_conf' in data or 'port_key' not in data else 'port_key', {})
+        readd = {}
         for port, entry in taken.items():
-            table.setdefault(port, entry)
+            # Given to another user meanwhile (by an older release, or by
+            # hand): its key stays, this user's is not pushed over it
+            if port in table and table[port] != entry:
+                LOG.warning("Shadowsocks port %s is now another user's, not put back", log_safe(port))
+                continue
+            table[port] = entry
+            readd[port] = entry
         _atomic_write_json('/etc/shadowsocks-libev/manager.json', data)
-        for port, entry in taken.items():
+        for port, entry in readd.items():
             _ss_manager_readd(port, entry)
 
 def _ccd_disable(username, disabled):
@@ -9021,6 +9089,21 @@ def _resume_user_access(username, udata, suspended):
         if softether.get('password'):
             add_softether_user(username, softether['password'])
 
+def _suspend_disabled_users():
+    """Suspend the users disabled before 'disabled' cut their access (it
+    only refused the API's login): their routers kept their VPN and proxies,
+    and re-disabling them changed nothing."""
+    with _omr_config_lock(exclusive=True):
+        users = (read_omr_config().get('users') or [{}])[0]
+        for username, udata in list(users.items()):
+            if username == 'admin' or not isinstance(udata, dict):
+                continue
+            if _user_disabled(udata) and 'access_suspended' not in udata:
+                suspended = _suspend_user_access(username, udata)
+                modif_config_user(username, {'access_suspended': suspended})
+                LOG.info("Access of disabled user %s suspended: %s", log_safe(username),
+                         ', '.join(sorted(suspended)) or 'API only')
+
 class ModifyUser(BaseModel):
     username: str = Query(..., pattern=USERNAME_PATTERN, title="Username")
     user_password: Optional[str] = Query(None, title="New password for the user")
@@ -9053,8 +9136,10 @@ def modify_user(*, params: ModifyUser, current_user: User = Depends(get_current_
     udata = content['users'][0][params.username]
     # 'disabled' only refused the API's login: the router's VPN and proxies
     # kept working. Its access is cut, and kept to be put back.
-    resume = params.disabled is False and (_user_disabled(udata) or 'access_suspended' in udata)
-    if params.disabled is True and not _user_disabled(udata) and 'access_suspended' not in udata:
+    resume = params.disabled is False and _user_access_cut(udata)
+    # Already disabled but never suspended (before this release, or the
+    # startup pass failed): suspended now
+    if params.disabled is True and 'access_suspended' not in udata:
         changes['access_suspended'] = _suspend_user_access(params.username, udata)
         LOG.info("Access of user %s suspended: %s", log_safe(params.username),
                  ', '.join(sorted(changes['access_suspended'])) or 'API only')
@@ -9066,6 +9151,11 @@ def modify_user(*, params: ModifyUser, current_user: User = Depends(get_current_
         if resume:
             entry.pop('access_suspended', None)
     _mutate_omr_config(persist)
+    # Its GRE tunnels were left alone while suspended: those of a public IP
+    # it got or lost meanwhile, once it is no longer marked suspended
+    if resume and (udata.get('public_ips') or udata.get('gre_tunnels') or params.username == GRE_DEFAULT_USER) \
+            and read_omr_config().get('gre_tunnels', True):
+        add_gre_tunnels(params.username)
     if params.disabled is not None and udata.get('wireguard_peers'):
         _write_wireguard_conf(read_omr_config())
     LOG.info("User admin (IP: " + request.client.host + ") modified user " + log_safe(params.username))
@@ -9129,6 +9219,21 @@ def _speedtest_end(username):
     else:
         _speedtests_running.pop(username, None)
 
+class _SpeedtestResponse(StreamingResponse):
+    """A StreamingResponse that gives its speedtest slot back whatever
+    happens: the generator's finally only runs once it was started, and a
+    client gone before the body was streamed left the slot taken for the
+    life of the worker (every speedtest of it refused once 16 leaked)."""
+    def __init__(self, content, release, **kwargs):
+        super().__init__(content, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
+
 def _speedtest_busy():
     return JSONResponse(status_code=429, content={'result': 'error', 'reason': 'Too many speedtests running', 'route': 'speedtest'})
 
@@ -9147,6 +9252,13 @@ async def speedtest(request: Request, size: Optional[int] = Query(10), current_u
         _speedtest_end(current_user.username)
         raise
 
+    released = False
+    def release():
+        nonlocal released
+        if not released:
+            released = True
+            _speedtest_end(current_user.username)
+
     async def generate():
         try:
             remaining = size_bytes
@@ -9155,10 +9267,11 @@ async def speedtest(request: Request, size: Optional[int] = Query(10), current_u
                 yield chunk[:send]
                 remaining -= send
         finally:
-            _speedtest_end(current_user.username)
+            release()
 
-    return StreamingResponse(
+    return _SpeedtestResponse(
         generate(),
+        release,
         media_type="application/octet-stream",
         headers={
             "Content-Length": str(size_bytes),
@@ -9272,6 +9385,11 @@ for _stale in ('/etc/xray/newconfig.json', '/etc/v2ray/newconfig.json'):
         os.remove(_stale)
     except OSError:
         pass
+# Before the GRE tunnels: they leave a suspended user's alone
+try:
+    _suspend_disabled_users()
+except Exception:
+    LOG.exception("Suspending the disabled users at startup failed")
 # Here, once every function is defined: from where the config is read, the
 # xray user of a new tunnel failed (xray_del_user -> _proxy_drop_user, not
 # defined yet). On unless set to false (the installer's GRETUNNELS=no), as

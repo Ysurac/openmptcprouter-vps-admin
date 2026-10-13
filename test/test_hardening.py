@@ -1415,6 +1415,20 @@ class TestFirewallEntryRefusedByNft:
         assert len(saved) == 2 and saved[-1] == [] and config["users"][0]["readonly"]["fw_ports"] == []
         assert sync.call_count == 2
 
+    def test_kept_when_nft_refuses_the_chains_without_it_too(self):
+        # another entry, of any user, or nft itself: refusing this one
+        # refused every new entry of every user until that was found
+        config = _config()
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin.modif_config_user", side_effect=lambda u, c: config["users"][0][u].update(c)),
+            patch("omr_admin._nft_sync_ports", return_value=False) as sync,
+            patch("omr_admin._nft_base_table_exists", return_value=True),
+        ):
+            assert omr_admin._fw_port_add("readonly", "8080", "tcp", "x", "ACCEPT", 4, "", "", "default", "") is None
+        assert len(config["users"][0]["readonly"]["fw_ports"]) == 1
+        assert sync.call_count == 2
+
     def test_kept_while_nftables_is_not_loaded(self):
         config = _config()
         with (
@@ -1582,6 +1596,20 @@ class TestMqvpnPathPolicyQuota:
         assert body["reason"] == "MQVPN path policy table full"
         assert not write.called
 
+    def test_table_over_the_limit_can_shrink(self, other_client):
+        # left over it by an older release: every sync was refused, the ones
+        # that removed entries too
+        policy = [{"user": f"u{i}", "iface": "wan", "weight": 1} for i in range(140)] + \
+                 [{"user": "readonly", "iface": f"wan{i}", "dscp_mask": 1} for i in range(3)]
+        body, write, _ = self._post(other_client, "/mqvpn_dscp", {"pins": [{"iface": "wan0", "dscp": ["cs1"]}]}, policy)
+        assert body["result"] == "done"
+        assert write.called
+        # growing it is still refused
+        body, write, _ = self._post(other_client, "/mqvpn_dscp", {"pins": [{"iface": f"wan{i}", "dscp": ["cs1"]}
+                                                                           for i in range(4)]}, policy)
+        assert body["reason"] == "MQVPN path policy table full"
+        assert not write.called
+
     def test_changing_its_own_entries_in_a_full_table(self, other_client):
         policy = [{"user": f"u{i}", "iface": "wan", "weight": 1} for i in range(127)] + \
                  [{"user": "readonly", "iface": "wan1", "weight": 1}]
@@ -1617,6 +1645,35 @@ class TestSpeedtestConcurrency:
                 r = other_client.post("/speedtest", content=b"x" * 10)
                 assert r.json()["bytes"] == 10
             assert omr_admin._speedtests_running == {}   # counted out once done
+        finally:
+            omr_admin._speedtests_running.clear()
+
+    def test_released_when_the_body_never_streams(self):
+        # the generator's finally only runs once it started: a client gone
+        # before that kept the slot for the life of the worker
+        omr_admin._speedtests_running.clear()
+        try:
+            assert omr_admin._speedtest_start("readonly")
+            released = []
+
+            def release():
+                released.append(1)
+                omr_admin._speedtest_end("readonly")
+
+            async def body():
+                yield b"x"
+
+            async def send(message):
+                raise OSError("client gone")
+
+            async def receive():
+                return {"type": "http.disconnect"}
+
+            response = omr_admin._SpeedtestResponse(body(), release)
+            with pytest.raises(Exception):
+                asyncio.run(response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send))
+            assert released == [1]
+            assert omr_admin._speedtests_running == {}
         finally:
             omr_admin._speedtests_running.clear()
 
@@ -1769,6 +1826,88 @@ class TestDisabledUserAccess:
         assert r.json()["result"] == "done"
         assert resume.call_args.args[2] == {"units": ["glorytun-tcp@tun2"]}
         assert "access_suspended" not in config["users"][0]["readonly"]
+
+    def test_user_disabled_before_suspension_existed(self, admin_client):
+        # disabled, never suspended: disabling it again changed nothing, its
+        # router kept its VPN and proxies
+        config = _config()
+        config["users"][0]["readonly"]["disabled"] = "true"
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin.modif_config_user", side_effect=lambda u, c: config["users"][0][u].update(c)),
+            patch("omr_admin._mutate_omr_config", side_effect=lambda f: f(config)),
+            patch("omr_admin._suspend_user_access", return_value={"units": ["glorytun-tcp@tun2"]}) as suspend,
+        ):
+            r = admin_client.post("/modify_user", json={"username": "readonly", "disabled": True})
+        assert r.json()["result"] == "done"
+        assert suspend.call_count == 1
+        assert config["users"][0]["readonly"]["access_suspended"] == {"units": ["glorytun-tcp@tun2"]}
+
+    def test_disabled_users_suspended_at_startup(self):
+        config = _config()
+        config["users"][0]["readonly"]["disabled"] = "true"
+        config["users"][0]["openmptcprouter"]["disabled"] = False
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin.modif_config_user", side_effect=lambda u, c: config["users"][0][u].update(c)),
+            patch("omr_admin._suspend_user_access", return_value={"units": ["glorytun-tcp@tun2"]}) as suspend,
+        ):
+            omr_admin._suspend_disabled_users()
+            omr_admin._suspend_disabled_users()   # the next worker: done already
+        assert [c.args[0] for c in suspend.call_args_list] == ["readonly"]
+        assert config["users"][0]["readonly"]["access_suspended"] == {"units": ["glorytun-tcp@tun2"]}
+        assert "access_suspended" not in config["users"][0]["openmptcprouter"]
+
+    def test_resume_sets_up_its_gre_tunnels_again(self, admin_client):
+        # left alone while suspended: a public IP given meanwhile had none
+        config = _config()
+        config["gre_tunnels"] = True
+        config["users"][0]["readonly"].update(disabled="true", access_suspended={}, public_ips=["203.0.113.9"])
+        seen = []
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin._mutate_omr_config", side_effect=lambda f: f(config)),
+            patch("omr_admin._resume_user_access"),
+            patch("omr_admin.add_gre_tunnels",
+                  side_effect=lambda u: seen.append((u, omr_admin._user_access_cut(config["users"][0][u])))),
+        ):
+            r = admin_client.post("/modify_user", json={"username": "readonly", "disabled": False})
+        assert r.json()["result"] == "done"
+        assert seen == [("readonly", False)]   # once no longer marked suspended
+
+    def test_port_of_a_suspended_user_not_given_to_another(self, tmp_path, monkeypatch):
+        manager = tmp_path / "manager.json"
+        manager.write_text(json.dumps({"port_conf": {"65101": {"key": "k1", "userid": 1}}}))
+        config = _config()
+        config["users"][0]["readonly"]["access_suspended"] = {
+            "shadowsocks": {"65105": {"key": "carol", "userid": 2}}}
+        real_open = open
+        with (
+            patch("builtins.open", side_effect=lambda p, *a, **k: real_open(str(manager) if p == "/etc/shadowsocks-libev/manager.json" else p, *a, **k)),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: manager.write_text(json.dumps(d))),
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin.OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock")),
+            patch("socket.socket"),
+        ):
+            assert str(omr_admin.add_ss_user("", "dave", 3)) == "65106"
+
+    def test_resume_leaves_a_port_given_to_another_user(self, tmp_path):
+        manager = tmp_path / "manager.json"
+        manager.write_text(json.dumps({"port_conf": {"65105": {"key": "dave", "userid": 3},
+                                                     "65106": {"key": "x", "userid": 4}}}))
+        real_open = open
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=lambda p, *a, **k: real_open(str(manager) if p == "/etc/shadowsocks-libev/manager.json" else p, *a, **k)),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: manager.write_text(json.dumps(d))),
+            patch("omr_admin.OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock")),
+            patch("omr_admin._ss_manager_readd") as readd,
+        ):
+            omr_admin._ss_resume({"65105": {"key": "carol", "userid": 2}, "65107": {"key": "carol", "userid": 2}})
+        table = json.loads(manager.read_text())["port_conf"]
+        assert table["65105"] == {"key": "dave", "userid": 3}
+        assert table["65107"] == {"key": "carol", "userid": 2}
+        assert [c.args[0] for c in readd.call_args_list] == ["65107"]
 
     def test_wireguard_peers_of_a_disabled_user_left_out(self):
         key = __import__("base64").b64encode(b"k" * 32).decode()

@@ -1779,6 +1779,16 @@ class TestMPTCPListenerRestarts:
         restarted = [c for c in calls if "restart glorytun-tcp" in c]
         assert restarted == ["systemctl -q restart glorytun-tcp@tun0", "systemctl -q restart glorytun-tcp@tun3"]
 
+    def test_suspended_users_glorytun_tcp_left_stopped(self, user_client):
+        # restart starts a stopped unit: a disabled router's tunnel came back
+        config = json.loads(json.dumps(MOCK_CONFIG))
+        config["users"][0]["carol"] = {"userid": 3, "username": "carol", "disabled": "true",
+                                       "access_suspended": {"units": ["glorytun-tcp@tun3"]}}
+        with patch("omr_admin.read_omr_config", return_value=config):
+            calls = self._post_and_collect(user_client, {"/etc/glorytun-tcp/tun0", "/etc/glorytun-tcp/tun3"})
+        restarted = [c for c in calls if "restart glorytun-tcp" in c]
+        assert restarted == ["systemctl -q restart glorytun-tcp@tun0"]
+
     def test_value_the_kernel_refuses_not_saved(self, user_client):
         written = {}
 
