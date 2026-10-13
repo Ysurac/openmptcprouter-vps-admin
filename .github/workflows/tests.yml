@@ -58,7 +58,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends python3 python3-fastapi python3-uvicorn \
             python3-jwt python3-requests python3-netaddr python3-netifaces python3-psutil \
-            python3-pydantic python3-multipart python3-httpx python3-pytest
+            python3-pydantic python3-python-multipart python3-httpx python3-pytest
 
       - name: Run unit tests
         run: python3 -m pytest test/ -q
