@@ -576,10 +576,83 @@ class TestDecisionModel:
 
 class TestPipPinned:
     def test_pip_fallback_installs_pinned_versions(self):
-        assert 'apt_or_pip python3-influxdb3 "influxdb3-python==${INFLUXDB3_PYTHON_VERSION}"' in SCRIPT_TEXT
+        assert ('apt_or_pip python3-influxdb3 "influxdb3-python==${INFLUXDB3_PYTHON_VERSION}"'
+                ' "reactivex==${REACTIVEX_VERSION}"') in SCRIPT_TEXT
         assert 'apt_or_pip python3-torch "torch==${TORCH_VERSION}"' in SCRIPT_TEXT
         r = subprocess.run(["sh", "-c", "\n".join(line for line in SCRIPT_TEXT.splitlines()
-                                                  if line.startswith(("INFLUXDB3_PYTHON_VERSION=", "TORCH_VERSION=")))
-                            + '\necho "$INFLUXDB3_PYTHON_VERSION $TORCH_VERSION"'],
+                                                  if line.startswith(("INFLUXDB3_PYTHON_VERSION=", "TORCH_VERSION=",
+                                                                      "REACTIVEX_VERSION=")))
+                            + '\necho "$INFLUXDB3_PYTHON_VERSION $TORCH_VERSION $REACTIVEX_VERSION"'],
                            capture_output=True, text=True, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
-        assert r.stdout.split() == ["0.21.0", "2.8.0"]
+        # reactivex 5 wants typing-extensions >= 4.15, which pip cannot put in
+        # place of the Debian 13 one (Ysurac/openmptcprouter#4398)
+        assert r.stdout.split() == ["0.21.0", "2.8.0", "4.0.4"]
+
+
+FAKE_PIP3 = r'''#!/bin/sh
+# Stand-in for pip3: --help lists --break-system-packages unless
+# FAKE_PIP_OLD=1; an install is logged to $FAKE_LOG and fails when
+# FAKE_PIP_FAIL=1, with the error on stderr, as Debian's pip does
+echo "pip3 $*" >> "$FAKE_LOG"
+if [ "$2" = "--help" ]; then
+    echo "  --user"
+    [ "${FAKE_PIP_OLD:-0}" = "1" ] || echo "  --break-system-packages  Allow pip to modify an EXTERNALLY-MANAGED Python"
+    exit 0
+fi
+case " $* " in
+    *" --break-system-packages "*) ;;
+    *) [ "${FAKE_PIP_OLD:-0}" = "1" ] || { echo "error: externally-managed-environment" >&2; exit 1; } ;;
+esac
+if [ "${FAKE_PIP_FAIL:-0}" = "1" ]; then
+    echo "error: uninstall-no-record-file" >&2
+    exit 1
+fi
+exit 0
+'''
+
+
+class TestAptOrPip:
+    """apt_or_pip, run from the script with fake apt-cache and pip3."""
+
+    def _run(self, tmp_path, **env):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        for name, body in (("pip3", FAKE_PIP3), ("apt-cache", "#!/bin/sh\nexit 100\n")):
+            exe = bindir / name
+            exe.write_text(body)
+            exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+        log = tmp_path / "fake.log"
+        log.write_text("")
+        harness = "\n".join([
+            "#!/bin/sh", "set -eu",
+            _function("log"), _function("die"), _function("apt_or_pip"),
+            'apt_or_pip python3-influxdb3 "influxdb3-python==0.21.0" "reactivex==4.0.4"',
+            'echo DONE', "",
+        ])
+        r = subprocess.run(["sh", "-c", harness], capture_output=True, text=True,
+                           env={"PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                                "FAKE_LOG": str(log), **env})
+        installs = [line for line in log.read_text().splitlines() if "--help" not in line]
+        return r, installs
+
+    def test_pep668_pip_installs_with_break_system_packages(self, tmp_path):
+        r, installs = self._run(tmp_path)
+        assert r.returncode == 0, r.stderr
+        assert "DONE" in r.stdout
+        assert installs == ["pip3 install --quiet --break-system-packages "
+                            "influxdb3-python==0.21.0 reactivex==4.0.4"]
+
+    def test_failure_shows_the_real_error_not_pep668(self, tmp_path):
+        # It was hidden, and the retry without the option printed the
+        # PEP 668 refusal instead (Ysurac/openmptcprouter#4398)
+        r, installs = self._run(tmp_path, FAKE_PIP_FAIL="1")
+        assert r.returncode != 0
+        assert "DONE" not in r.stdout
+        assert "uninstall-no-record-file" in r.stderr
+        assert "externally-managed-environment" not in r.stderr
+        assert len(installs) == 1
+
+    def test_old_pip_without_the_option(self, tmp_path):
+        r, installs = self._run(tmp_path, FAKE_PIP_OLD="1")
+        assert r.returncode == 0, r.stderr
+        assert installs == ["pip3 install --quiet influxdb3-python==0.21.0 reactivex==4.0.4"]

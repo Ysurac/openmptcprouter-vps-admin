@@ -41,6 +41,11 @@ INSTALL_AI="${INSTALL_AI:-true}"
 # there are some): unpinned, every install got whatever PyPI had that day.
 INFLUXDB3_PYTHON_VERSION="${INFLUXDB3_PYTHON_VERSION:-0.21.0}"
 TORCH_VERSION="${TORCH_VERSION:-2.8.0}"
+# reactivex 5 needs typing-extensions >= 4.15: pip cannot replace the 4.13.2
+# Debian 13 installs with python3-fastapi (no RECORD file), so the
+# influxdb3-python install failed. 4.0.4, the oldest influxdb3-python takes,
+# works with it.
+REACTIVEX_VERSION="${REACTIVEX_VERSION:-4.0.4}"
 
 # Commit (or branch) omr_metrics.py is downloaded from. The VPS installer sets
 # it to its OMR_ADMIN_VERSION so omr_metrics.py matches the installed omradmin.py.
@@ -70,8 +75,15 @@ apt_or_pip() {
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$apt_pkg"
     else
         log "apt: ${apt_pkg} not in archive — pip fallback: ${pip_pkg}"
-        pip3 install --quiet --break-system-packages "$pip_pkg" "$@" 2>/dev/null \
-            || pip3 install --quiet "$pip_pkg" "$@"
+        # PEP 668 (Debian 12+) refuses pip without --break-system-packages,
+        # older pips do not know it. Not tried with it, then without on any
+        # failure: the real error was thrown away and the PEP 668 refusal of
+        # the second try shown instead (Ysurac/openmptcprouter#4398).
+        if pip3 install --help 2>/dev/null | grep -q -- --break-system-packages; then
+            pip3 install --quiet --break-system-packages "$pip_pkg" "$@"
+        else
+            pip3 install --quiet "$pip_pkg" "$@"
+        fi
     fi
 }
 
@@ -261,7 +273,7 @@ log "Database ready."
 # 5. Python influxdb3-python client  (Debian package preferred)
 # ---------------------------------------------------------------------------
 step "Installing influxdb3-python library..."
-apt_or_pip python3-influxdb3 "influxdb3-python==${INFLUXDB3_PYTHON_VERSION}"
+apt_or_pip python3-influxdb3 "influxdb3-python==${INFLUXDB3_PYTHON_VERSION}" "reactivex==${REACTIVEX_VERSION}"
 
 # ---------------------------------------------------------------------------
 # 6. PyTorch  (Debian package preferred, enabled by default)
