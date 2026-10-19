@@ -5,6 +5,7 @@ omr-vps-admin (0.18+20261014) unstable; urgency=medium
   * /mptcp: pm_type 0 is applied, it was taken for "unset" and a VPS switched to the userspace path manager could not come back. Only the sysctls it sets are rewritten in 90-shadowsocks.conf: every net.mptcp line went, the installer's blackhole_timeout back to 3600 at the next boot
   * /softethervpn: the main router's password is kept as a string, the installer's jq read the object's text as the password
   * Firewall: a redirect to a GRE tunnel goes to the tunnel serving its address now. The remote address stored with the entry went, once that tunnel was dropped and its /30 reused, to another user's router
+  * /vpnips: when a router's tunnel address changes, the connections answered from the old one are deleted from conntrack (unless another router has it now). A DNAT only applies to a connection's first packet: a port forward whose client kept sending (a WireGuard keepalive) stayed on the old address, which no router had any more, until the entry was deleted by hand. conntrack is now a dependency (Ysurac/openmptcprouter#4408)
   * /xray: VLESS Reality's tcp/443 is opened only when its inbound was added, and closed whoever opened it (the admin account or the main router)
   * API: a token whose header is deeply nested JSON is refused (403). pyjwt < 2.14 (trixie has 2.10.1) json-loads the header before checking the signature and let its RecursionError through, a 500 with no token of ours (CVE-2026-102265). /token's body is limited to 8 KB: python-multipart parses the form before the login, and 1 MB of "a;a;..." took about a second of CPU in the event loop with no account (CVE-2026-53539)
   * /status, /config: the MQVPN traffic of a user is its sessions' (from mqvpn's get_status). MQVPN is one device, mqvpn0: every user read 0 and the main router everyone's traffic
@@ -15,7 +16,7 @@ omr-vps-admin (0.18+20261014) unstable; urgency=medium
   * omr_metrics: GET /metrics/report, an availability report per WAN interface over up to 30 days (InfluxDB only): availability, outages (count, total, longest, mean, MTBF, the last 50) and avg/p50/p95/max of latency, loss and jitter. InfluxDB does the aggregation, 30 days of polls are not loaded by omr-admin
   * docs/api.md: the changes above
   * Tests no longer write the real /etc/openmptcprouter-vps-admin of a VPS they run on as root
-  * Add tests for the above (test/test_hardening.py, test/test_nft.py, test/test_metrics.py, test/test_install_omr_ai.py)
+  * Add tests for the above (test/test_hardening.py, test/test_nft.py, test/test_metrics.py, test/test_install_omr_ai.py, test/test_isolation.py)
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 14 Oct 2026 00:00:00 +0200
 
