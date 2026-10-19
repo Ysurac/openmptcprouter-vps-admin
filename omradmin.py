@@ -8288,6 +8288,7 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     if stale:
         # _vpnips_error() let it through: OpenVPN leased it to this router.
         _drop_stale_remoteip(users, stale)
+    old_remoteip = omr_config_data['users'][0][current_user.username].get('vpnremoteip')
     remoteip_changed = bool(stale) or 'vpnremoteip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnremoteip'] != remoteip
     if remoteip_changed:
         LOG.debug("modif_config_user for vpnips")
@@ -8315,8 +8316,28 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     # changed -- gre_snat doesn't depend on it, only user_dnat does.
     if remoteip_changed:
         _nft_sync_ports()
+        # Unless another router has that address now: those are its own
+        if old_remoteip and old_remoteip != remoteip and \
+           not any(ucfg.get('vpnremoteip') == old_remoteip for other, ucfg in users.items() if other not in own):
+            _flush_conntrack_reply_src(old_remoteip)
 
     return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
+
+def _flush_conntrack_reply_src(addr):
+    """Delete the conntrack entries answered from *addr*, the router's old
+    tunnel address. A DNAT only applies to a connection's first packet: a
+    port forward whose client kept sending (a WireGuard keepalive every few
+    seconds) stayed on the old address, which no router had any more, until
+    the entry was deleted by hand (#4408)."""
+    conntrack = shutil.which('conntrack')
+    if conntrack is None:
+        LOG.warning("conntrack not installed, connections forwarded to %s are kept", log_safe(addr))
+        return
+    result = subprocess.run([conntrack, '-D', '-f', 'ipv4', '--reply-src', addr],
+                            capture_output=True, text=True, check=False)
+    # 1 is "0 flow entries have been deleted"
+    if result.returncode not in (0, 1):
+        LOG.warning("conntrack -D --reply-src %s failed: %s", log_safe(addr), log_safe(result.stderr.strip()))
 
 def _read_6in4_conf(userid):
     """The KEY=value lines of omr-6in4/user<id>, {} without one."""

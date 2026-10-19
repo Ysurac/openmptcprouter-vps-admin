@@ -622,6 +622,39 @@ class TestVpnIpsOwnership:
         assert body["reason"] == "remoteip already used by another user"
         assert not drop.called and not modif.called
 
+    def test_conntrack_of_the_old_address_flushed(self, user_client):
+        # #4408: a DNAT only applies to a connection's first packet, a port
+        # forward its client kept alive stayed on the old address
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnremoteip="10.255.255.6", vpnlocalip="10.255.255.1")
+        with patch("omr_admin._flush_conntrack_reply_src") as flush:
+            body, _ = self._post(user_client, config)
+        assert body["result"] == "done"
+        flush.assert_called_once_with("10.255.255.6")
+        # unchanged address: the connections are the right ones
+        config["users"][0]["openmptcprouter"]["vpnremoteip"] = "10.255.255.2"
+        with patch("omr_admin._flush_conntrack_reply_src") as flush:
+            body, _ = self._post(user_client, config, ula="fd12:3456:789a::/48")
+        assert body["result"] == "done" and not flush.called
+
+    def test_conntrack_of_another_routers_address_kept(self, user_client):
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnremoteip="10.255.255.10", vpnlocalip="10.255.255.9")
+        config["users"][0]["readonly"]["vpnremoteip"] = "10.255.255.10"
+        with patch("omr_admin._flush_conntrack_reply_src") as flush:
+            body, _ = self._post(user_client, config)
+        assert body["result"] == "done" and not flush.called
+
+    def test_flush_conntrack_reply_src(self):
+        with patch("shutil.which", return_value="/usr/sbin/conntrack"), \
+             patch("subprocess.run") as run:
+            run.return_value.returncode = 1
+            omr_admin._flush_conntrack_reply_src("10.255.220.2")
+        assert run.call_args.args[0] == ["/usr/sbin/conntrack", "-D", "-f", "ipv4", "--reply-src", "10.255.220.2"]
+        with patch("shutil.which", return_value=None), patch("subprocess.run") as run:
+            omr_admin._flush_conntrack_reply_src("10.255.220.2")
+        assert not run.called
+
 
 class TestRemoteipOwner:
     """The router address of a /vpnips is where every DNAT of the user goes:
