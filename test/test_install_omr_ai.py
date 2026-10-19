@@ -488,6 +488,15 @@ class TestDatabaseCreation:
         assert "Database already exists." in r.stdout
         assert "Database ready." in r.stdout
 
+    def test_token_passed_in_environment_not_argv(self, tmp_path):
+        # --token "$ADMIN_TOKEN" was readable by any local user in /proc/*/cmdline
+        r = self._run(tmp_path, 'echo "argv: $*"; echo "env: ${INFLUXDB3_AUTH_TOKEN:-}"')
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "env: test-token" in r.stdout
+        argv = next(line for line in r.stdout.splitlines() if line.startswith("argv: "))
+        assert "test-token" not in argv and "--token" not in argv
+        assert "--retention-period 60d" in argv
+
 
 # ===========================================================================
 # 8. omr-admin-config.json update
@@ -556,6 +565,13 @@ class TestConfigUpdate:
         assert not list(tmp_path.glob("omr-admin-config.json.*"))
         assert calls == []
 
+    def test_token_not_on_the_python_command_line(self):
+        section = _config_section()
+        python_line = next(line for line in section.splitlines() if "python3 - " in line)
+        assert "$ADMIN_TOKEN" not in python_line.split("python3 - ", 1)[1]
+        assert python_line.startswith('OMR_INFLUX_TOKEN="$ADMIN_TOKEN" python3 - ')
+        assert 'token = os.environ["OMR_INFLUX_TOKEN"]' in section
+
     def test_temp_file_never_world_readable(self):
         # created 0600, not chmod-ed after the replace
         section = _config_section()
@@ -571,7 +587,7 @@ class TestDecisionModel:
         assert "N_FEATURES" not in SCRIPT_TEXT
         assert "omr_metrics.ensure_decision_model()" in SCRIPT_TEXT
         # once omr_metrics.py is there
-        assert SCRIPT_TEXT.index("omr_metrics.ensure_decision_model()") > SCRIPT_TEXT.index('-o "$dest"')
+        assert SCRIPT_TEXT.index("omr_metrics.ensure_decision_model()") > SCRIPT_TEXT.index('mv -f "$METRICS_TMP" "$dest"')
 
 
 class TestPipPinned:
@@ -656,3 +672,266 @@ class TestAptOrPip:
         r, installs = self._run(tmp_path, FAKE_PIP_OLD="1")
         assert r.returncode == 0, r.stderr
         assert installs == ["pip3 install --quiet influxdb3-python==0.21.0 reactivex==4.0.4"]
+
+
+# ===========================================================================
+# Temp files: removed on any exit, die included
+# ===========================================================================
+
+
+def _cleanup_prelude():
+    """log/die/step, the temp-file variables, _cleanup and its traps, from the script."""
+    traps = [line for line in SCRIPT_TEXT.splitlines() if line.startswith("trap ")]
+    assert traps, "trap lines not found in install_omr-ai.sh"
+    return [
+        "#!/bin/sh", "set -eu",
+        _function("log"), _function("die"), _function("step"),
+        _assignment("GNUPG_TMP"), _assignment("METRICS_TMP"),
+        _function("_cleanup"), *traps,
+    ]
+
+
+FAKE_CURL_DOWNLOAD = r'''#!/bin/sh
+# curl -fsSL URL -o FILE: copies $FAKE_SRC to FILE, or fails like curl -f
+echo "curl $*" >> "$FAKE_LOG"
+out=""
+while [ $# -gt 0 ]; do
+    [ "$1" = "-o" ] && { out="$2"; shift; }
+    shift
+done
+[ -n "${FAKE_SRC:-}" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+cp "$FAKE_SRC" "$out"
+'''
+
+
+def _write_fake(bindir, name, body):
+    bindir.mkdir(exist_ok=True)
+    exe = bindir / name
+    exe.write_text(body)
+    exe.chmod(0o755)
+
+
+# ===========================================================================
+# 1. InfluxData key: only the pinned key reaches the signed-by keyring
+# ===========================================================================
+
+
+def _gpg(home, *args, **kw):
+    return subprocess.run(["gpg", "--batch", "--homedir", str(home), *args],
+                          capture_output=True, timeout=60, check=True, **kw)
+
+
+def _fingerprints(keyring):
+    out = subprocess.run(["gpg", "--batch", "--show-keys", "--with-colons", str(keyring)],
+                         capture_output=True, text=True, timeout=30, check=True).stdout
+    lines = out.splitlines()
+    # primary-key fingerprints only (the fpr line right after a pub line)
+    return [lines[i + 1].split(":")[9] for i, line in enumerate(lines)
+            if line.startswith("pub:") and lines[i + 1].startswith("fpr:")]
+
+
+@pytest.fixture(scope="module")
+def gpg_keys(tmp_path_factory):
+    """Two throwaway keys: (pinned fpr, other fpr, armored file of both, armored file of other)."""
+    if shutil.which("gpg") is None:
+        pytest.skip("needs gpg")
+    root = tmp_path_factory.mktemp("gpgkeys")
+    home = root / "home"
+    home.mkdir(mode=0o700)
+    try:
+        for uid in ("Pinned <pinned@example.invalid>", "Intruder <intruder@example.invalid>"):
+            _gpg(home, "--passphrase", "", "--quick-gen-key", uid, "ed25519", "sign", "never")
+        fprs = {}
+        for uid in ("pinned@example.invalid", "intruder@example.invalid"):
+            out = _gpg(home, "--with-colons", "--fingerprint", uid, text=True).stdout
+            fprs[uid] = next(line.split(":")[9] for line in out.splitlines() if line.startswith("fpr:"))
+        both = root / "both.key"
+        both.write_bytes(_gpg(home, "--armor", "--export").stdout)
+        other = root / "other.key"
+        other.write_bytes(_gpg(home, "--armor", "--export", fprs["intruder@example.invalid"]).stdout)
+    finally:
+        subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "all"], capture_output=True)
+    return fprs["pinned@example.invalid"], fprs["intruder@example.invalid"], both, other
+
+
+def _key_section():
+    start = SCRIPT_TEXT.index('step "Verifying and importing InfluxData GPG key..."')
+    end = SCRIPT_TEXT.index('step "Adding InfluxData apt repository..."')
+    return SCRIPT_TEXT[start:end]
+
+
+class TestKeyImport:
+    def _run(self, tmp_path, fingerprint, src):
+        bindir = tmp_path / "bin"
+        _write_fake(bindir, "curl", FAKE_CURL_DOWNLOAD)
+        tmpdir = tmp_path / "tmp"
+        tmpdir.mkdir()
+        keyring = tmp_path / "influxdata-archive.gpg"
+        harness = tmp_path / "key.sh"
+        harness.write_text("\n".join([
+            *_cleanup_prelude(),
+            f'INFLUX_KEY_FINGERPRINT="{fingerprint}"',
+            f'KEYRING_FILE="{keyring}"',
+            _key_section(),
+            'echo DONE', "",
+        ]))
+        env = {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+               "LC_ALL": "C", "TMPDIR": str(tmpdir), "FAKE_LOG": str(tmp_path / "calls.log"),
+               "FAKE_SRC": str(src), "HOME": str(tmp_path)}
+        r = subprocess.run(["sh", str(harness)], env=env, capture_output=True, text=True, timeout=60)
+        return r, keyring, tmpdir
+
+    def test_only_the_pinned_key_ends_up_in_the_keyring(self, tmp_path, gpg_keys):
+        pinned, other, both, _ = gpg_keys
+        r, keyring, tmpdir = self._run(tmp_path, pinned, both)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "DONE" in r.stdout
+        # the downloaded file had both keys: dearmored whole, both were trusted
+        assert _fingerprints(keyring) == [pinned]
+        assert stat.S_IMODE(keyring.stat().st_mode) == 0o644
+        assert list(tmpdir.iterdir()) == []
+
+    def test_fingerprint_mismatch_dies_and_cleans_up(self, tmp_path, gpg_keys):
+        pinned, _, _, other_only = gpg_keys
+        r, keyring, tmpdir = self._run(tmp_path, pinned, other_only)
+        assert r.returncode == 1
+        assert "Key fingerprint mismatch" in r.stderr
+        assert "DONE" not in r.stdout
+        assert not keyring.exists()
+        # the throwaway GNUPGHOME and the downloaded key, removed by the trap
+        assert list(tmpdir.iterdir()) == []
+
+
+# ===========================================================================
+# 7. omr_metrics.py download: never over the live module unchecked
+# ===========================================================================
+
+
+def _download_section(target_dir):
+    start = SCRIPT_TEXT.index("# 7. Deploy omr_metrics.py")
+    end = SCRIPT_TEXT.index("# 8. Inject influxdb block")
+    section = SCRIPT_TEXT[start:end]
+    assert "/usr/share/omr-admin" in section
+    return section.replace("/usr/share/omr-admin", str(target_dir))
+
+
+class TestMetricsDownload:
+    LIVE = "LIVE = True\n"
+
+    def _run(self, tmp_path, body):
+        bindir = tmp_path / "bin"
+        _write_fake(bindir, "curl", FAKE_CURL_DOWNLOAD)
+        target = tmp_path / "omr-admin"
+        target.mkdir()
+        dest = target / "omr_metrics.py"
+        dest.write_text(self.LIVE)
+        src = None
+        if body is not None:
+            src = tmp_path / "download.py"
+            src.write_text(body)
+        harness = tmp_path / "download.sh"
+        harness.write_text("\n".join([
+            *_cleanup_prelude(),
+            'INSTALL_AI="false"', 'OMR_ADMIN_VERSION="develop"',
+            _download_section(target),
+            'echo DONE', "",
+        ]))
+        env = {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+               "LC_ALL": "C", "FAKE_LOG": str(tmp_path / "calls.log")}
+        if src is not None:
+            env["FAKE_SRC"] = str(src)
+        r = subprocess.run(["sh", str(harness)], env=env, capture_output=True, text=True, timeout=60)
+        return r, target, dest
+
+    def test_valid_module_replaces_the_live_one(self, tmp_path):
+        r, target, dest = self._run(tmp_path, "def ensure_decision_model():\n    return True\n")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "DONE" in r.stdout
+        assert "ensure_decision_model" in dest.read_text()
+        assert stat.S_IMODE(dest.stat().st_mode) == 0o644
+        assert sorted(p.name for p in target.iterdir()) == ["omr_metrics.py"]
+
+    def test_module_that_does_not_compile_leaves_the_live_one(self, tmp_path):
+        # e.g. an HTML error page, or a truncated download
+        r, target, dest = self._run(tmp_path, "<html><body>rate limited</body></html>\n")
+        assert r.returncode == 1
+        assert "does not compile" in r.stderr
+        assert dest.read_text() == self.LIVE
+        assert sorted(p.name for p in target.iterdir()) == ["omr_metrics.py"]
+
+    def test_failed_download_leaves_the_live_one(self, tmp_path):
+        r, target, dest = self._run(tmp_path, None)
+        assert r.returncode != 0
+        assert "DONE" not in r.stdout
+        assert dest.read_text() == self.LIVE
+        assert sorted(p.name for p in target.iterdir()) == ["omr_metrics.py"]
+
+
+# ===========================================================================
+# docker-compose.yml
+# ===========================================================================
+
+COMPOSE = SCRIPT.parent / "docker-compose.yml"
+
+
+@pytest.fixture(scope="module")
+def compose():
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load(COMPOSE.read_text())
+
+
+class TestCompose:
+    def test_torch_alone_from_the_cpu_index(self, compose):
+        # download.pytorch.org/whl/cpu has no fastapi, uvicorn or influxdb3-python
+        dockerfile = compose["x-torch-build"]["build"]["dockerfile_inline"]
+        installs = [cmd.strip(" \\\n&") for cmd in dockerfile.split("pip install")[1:]]
+        cpu = [cmd for cmd in installs if "download.pytorch.org/whl/cpu" in cmd]
+        assert len(cpu) == 1
+        assert cpu[0].split() == ["--no-cache-dir", "torch", "--index-url",
+                                  "https://download.pytorch.org/whl/cpu"]
+        assert any("fastapi" in cmd and "influxdb3-python" in cmd and "index-url" not in cmd
+                   for cmd in installs)
+
+    @staticmethod
+    def _entrypoint_python(compose, path):
+        script = compose["x-app-base"]["command"][0]
+        code = script.split('python3 -c "', 1)[1].split('\n"', 1)[0]
+        # sh double quotes: nothing in it may be expanded by sh or compose
+        assert "$" not in code and '"' not in code and "`" not in code
+        default = "/etc/openmptcprouter-vps-admin/omr-admin-config.json"
+        assert default in code
+        return code.replace(default, str(path))
+
+    def _run(self, compose, tmp_path, content):
+        path = tmp_path / "omr-admin-config.json"
+        if content is not None:
+            path.write_text(content)
+            path.chmod(0o644)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "INFLUXDB_URL": "http://influxdb:8181", "INFLUXDB_TOKEN": "influx-secret",
+               "INFLUXDB_RETENTION": "30d"}
+        r = subprocess.run(["python3", "-c", self._entrypoint_python(compose, path)],
+                           env=env, capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr
+        return path
+
+    def test_existing_blocks_kept_and_file_0600(self, compose, tmp_path):
+        # auto_learning set by POST /metrics/decision/auto was lost at each start
+        # with a trailing comma, as omr-admin accepts it
+        path = self._run(compose, tmp_path, '{"auto_learning": {"enabled": false, "interval": 600,},'
+                                            ' "influxdb": {"url": "old", "token": "old"},}')
+        data = json.loads(path.read_text())
+        assert data["auto_learning"] == {"enabled": False, "interval": 600}
+        assert data["influxdb"] == {"url": "http://influxdb:8181", "token": "influx-secret",
+                                    "org": "omr", "bucket": "omr_metrics", "retention_days": 30}
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["omr-admin-config.json"]
+
+    @pytest.mark.parametrize("content", [None, "", "{not json", "[1, 2]"],
+                             ids=["missing", "empty", "invalid", "not-a-dict"])
+    def test_missing_or_invalid_config_tolerated(self, compose, tmp_path, content):
+        path = self._run(compose, tmp_path, content)
+        data = json.loads(path.read_text())
+        assert list(data) == ["influxdb"]
+        assert data["influxdb"]["token"] == "influx-secret"
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600

@@ -421,6 +421,9 @@ def patch_env(request):
         patch("fastapi.routing.run_in_threadpool", side_effect=_run_in_threadpool_direct),
         # the sockets of the machine running the tests (_server_ports)
         patch("omr_admin.psutil.net_connections", return_value=[]),
+        # /remove_user purged the metrics of the machine running the tests
+        # (as root on a VPS, its real /etc/openmptcprouter-vps-admin)
+        patch("omr_admin._omr_metrics_router", None),
     ):
         yield
 

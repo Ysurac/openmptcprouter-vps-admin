@@ -922,6 +922,52 @@ class TestBodyLimitNeedsToken:
         assert self._run("/backuppost", 2 * 1024 * 1024, [(b"authorization", b"Bearer " + forged.encode())]) == 413
         assert self._run("/backuppost", 2 * 1024 * 1024, [(b"authorization", b"Basic eDp5")]) == 413
 
+    def test_backup_with_a_nested_token_header(self):
+        nested = [(b"authorization", b"Bearer " + _nested_header_token().encode())]
+        assert self._run("/backuppost", 2 * 1024 * 1024, nested) == 413
+
+    def test_token_form_limit_even_with_a_token(self):
+        from conftest import USER_TOKEN
+        good = [(b"authorization", b"Bearer " + USER_TOKEN.encode())]
+        assert self._run("/token", omr_admin.TOKEN_MAX_SIZE + 1) == 413
+        assert self._run("/token", omr_admin.TOKEN_MAX_SIZE + 1, good) == 413
+        assert self._run("/token", omr_admin.TOKEN_MAX_SIZE) is None
+
+
+def _nested_header_token(depth=2000):
+    """A token whose header json.loads raises RecursionError on (pyjwt < 2.14)."""
+    import base64
+
+    def b64(text):
+        return base64.urlsafe_b64encode(text.encode()).rstrip(b"=").decode()
+    return b64('{"a":' + "[" * depth + "]" * depth + "}") + "." + b64("{}") + ".sig"
+
+
+class TestJwtNestedHeader:
+    def test_nested_header_is_403(self):
+        client = _ASGITestClient(app, raise_server_exceptions=False)
+        r = client.get("/config", headers={"Authorization": "Bearer " + _nested_header_token()})
+        assert r.status_code == 403, r.text
+
+    def test_any_decode_error_is_403(self):
+        request = MagicMock(client=MagicMock(host="198.51.100.7"), headers={})
+        for error in (RecursionError("nested"), ValueError("bad")):
+            with patch("omr_admin.jwt.decode", side_effect=error):
+                with pytest.raises(omr_admin.HTTPException) as exc:
+                    omr_admin.get_current_user(request, "a.b.c")
+                assert exc.value.status_code == 403
+                assert omr_admin._bearer_token_signed({"headers": [(b"authorization", b"Bearer a.b.c")]}) is False
+
+
+class TestTokenFormLimit:
+    def test_big_urlencoded_login_refused(self):
+        client = _ASGITestClient(app, raise_server_exceptions=False)
+        body = "a;" * (omr_admin.TOKEN_MAX_SIZE // 2 + 1)
+        with patch("omr_admin.authenticate_user") as authenticate:
+            r = client.post("/token", content=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        assert r.status_code == 413
+        authenticate.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # What ss-manager writes unescaped into ss-server's JSON config
@@ -1794,12 +1840,16 @@ class TestDisabledUserAccess:
             patch("builtins.open", side_effect=_open_with({"/etc/openvpn/ccd/readonly": "iroute 192.168.2.0 255.255.255.0\n"})),
             patch("omr_admin._atomic_write_text", side_effect=lambda p, t, **k: written.update({p: t})),
             patch("omr_admin._openvpn_kill") as kill,
+            patch("omr_admin._openvpn_revoke") as revoke,
             patch("subprocess.run") as run,
             patch("omr_admin._restart_service") as restart,
         ):
             suspended = omr_admin._suspend_user_access("readonly", {"userid": 2})
             assert written["/etc/openvpn/ccd/readonly"] == "iroute 192.168.2.0 255.255.255.0\ndisable\n"
             kill.assert_called_once_with("readonly")
+            # tun1 (UDP) has no ccd: only the CRL keeps it out there
+            revoke.assert_called_once_with("readonly")
+            assert suspended["openvpn"] is True
             assert [c.args[0] for c in run.call_args_list] == [
                 ["systemctl", "-q", "disable", "--now", "glorytun-tcp@tun2"],
                 ["systemctl", "-q", "disable", "--now", "dsvpn-server@dsvpn2"]]
@@ -1888,8 +1938,59 @@ class TestDisabledUserAccess:
             patch("omr_admin.read_omr_config", side_effect=lambda: config),
             patch("omr_admin.OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock")),
             patch("socket.socket"),
+            patch("omr_admin._listening_ports", return_value=[]),
+            patch("omr_admin._server_ports", return_value=[]),
         ):
-            assert str(omr_admin.add_ss_user("", "dave", 3)) == "65106"
+            # the lowest free one: 65101 manager.json's, 65102 a user's,
+            # 65105 the suspended user's
+            assert str(omr_admin.add_ss_user("", "dave", 3)) == "65103"
+
+    def test_free_shadowsocks_port_skips_listeners_and_stops_at_65535(self, tmp_path):
+        manager = tmp_path / "manager.json"
+        manager.write_text(json.dumps({"port_conf": {"65101": {"key": "k1", "userid": 1}}}))
+        config = {"users": [{}]}
+        real_open = open
+        with (
+            patch("builtins.open", side_effect=lambda p, *a, **k: real_open(str(manager) if p == "/etc/shadowsocks-libev/manager.json" else p, *a, **k)),
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin._listening_ports", side_effect=lambda proto: [(65102, 65102)] if proto == "tcp" else []),
+            patch("omr_admin._server_ports", side_effect=lambda proto: [(65102, 65102), (65103, 65200)]),
+        ):
+            assert omr_admin._ss_free_port({"65101": {}}) == 65201
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin._ss_ports_in_use", return_value=set()),
+            patch("omr_admin._server_ports", return_value=[(65101, 65535)]),
+        ):
+            with pytest.raises(ValueError):
+                omr_admin._ss_free_port({})
+
+    def test_suspension_keeps_what_was_taken_when_a_step_fails(self):
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in ("/etc/shadowsocks-go/upsks.json", "/etc/openvpn/tun0.conf")),
+            patch("builtins.open", side_effect=_open_with({"/etc/shadowsocks-go/upsks.json": json.dumps({"readonly": "upsk"})})),
+            patch("omr_admin.remove_ss_go_user"),
+            patch("omr_admin._ccd_disable", side_effect=OSError("disk full")),
+            patch("omr_admin._openvpn_revoke"),
+            patch("omr_admin._openvpn_kill"),
+            patch("subprocess.run"),
+        ):
+            suspended = omr_admin._suspend_user_access("readonly", {"userid": 2})
+        assert suspended["shadowsocks_go"] == "upsk"
+
+    def test_softether_password_of_both_forms(self):
+        assert omr_admin._softether_password({"softethervpn": "pw"}) == "pw"
+        assert omr_admin._softether_password({"softethervpn": {"password": "pw"}}) == "pw"
+        assert omr_admin._softether_password({"softethervpn": {}}) is None
+        assert omr_admin._softether_password({}) is None
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/var/lib/softether/vpn_server.config"),
+            patch("omr_admin.remove_softether_user") as remove,
+            patch("subprocess.run"),
+        ):
+            suspended = omr_admin._suspend_user_access("openmptcprouter", {"userid": 0, "softethervpn": "pw"})
+        remove.assert_called_once_with("openmptcprouter")
+        assert suspended["softether"] is True
 
     def test_resume_leaves_a_port_given_to_another_user(self, tmp_path):
         manager = tmp_path / "manager.json"
@@ -1939,3 +2040,221 @@ class TestDisabledUserAccess:
         assert written["/etc/mqvpn/server.json"] == {"users": [{"name": "openmptcprouter", "key": "a"},
                                                                {"name": "readonly", "key": "k"}]}
         api.assert_called_once_with({"cmd": "add_user", "name": "readonly", "key": "k"})
+
+    def test_mqvpn_fixed_ip_taken_meanwhile_not_put_back(self):
+        server = {"users": [{"name": "alice", "key": "a", "fixed_ip": "10.255.220.10"}]}
+        written = {}
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/mqvpn/server.json"),
+            patch("builtins.open", side_effect=_open_with({"/etc/mqvpn/server.json": json.dumps(server)})),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: written.update({p: d})),
+            patch("omr_admin.mqvpn_api", return_value={"ok": True}),
+        ):
+            omr_admin._resume_user_access("readonly", {}, {"mqvpn": {
+                "user": {"name": "readonly", "key": "k", "fixed_ip": "10.255.220.10"},
+                "path_policy": [{"user": "readonly", "iface": f"wan{i}"} for i in range(20)]}})
+        cfg = written["/etc/mqvpn/server.json"]
+        assert cfg["users"][1] == {"name": "readonly", "key": "k"}
+        assert len(cfg["path_policy"]) == omr_admin.MQVPN_MAX_USER_PATHS
+
+    def test_suspended_mqvpn_fixed_ip_reserved(self):
+        config = _config()
+        config["users"][0]["readonly"]["access_suspended"] = {
+            "mqvpn": {"user": {"name": "readonly", "key": "k", "fixed_ip": "10.255.220.10"}}}
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("builtins.open", side_effect=_open_with({"/etc/mqvpn/server.json": json.dumps({"users": []})})),
+        ):
+            assert omr_admin._mqvpn_fixed_ips() == {"10.255.220.10": "readonly"}
+
+
+class TestReviewFixes20261014:
+    """Whole-codebase review of 2026-10-14."""
+
+    _MPTCP = {"checksum": "0", "path_manager": "default", "scheduler": "default",
+              "syn_retries": 3, "congestion_control": "bbr", "version": 0}
+
+    def _mptcp(self, client, payload, sysctl_d="", v1=True):
+        written, calls = {}, []
+
+        def _run(cmd, *a, **kw):
+            calls.append(" ".join(cmd) if cmd else "")
+            return MagicMock(returncode=0)
+        v1_files = {"/proc/sys/net/mptcp/enabled", "/proc/sys/net/mptcp/pm_type", "/proc/sys/net/mptcp/scheduler",
+                    "/proc/sys/net/mptcp/path_manager", "/proc/sys/net/mptcp/syn_retries"}
+        with (
+            patch("os.path.exists", side_effect=lambda p: str(p) in v1_files if v1 else str(p) == "/proc/sys/net/mptcp/mptcp_enabled"),
+            patch("os.path.isfile", return_value=False),
+            patch("builtins.open", side_effect=_open_with({"/etc/sysctl.d/90-shadowsocks.conf": sysctl_d})),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, **k: written.update({p: t})),
+            patch("omr_admin.file_as_bytes", side_effect=[b"before", b"after"]),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            assert client.post("/mptcp", json=payload).json()["result"] == "done"
+        return written["/etc/sysctl.d/90-shadowsocks.conf"], calls
+
+    def test_mptcp_pm_type_0_applied(self, primary_client):
+        text, calls = self._mptcp(primary_client, {**self._MPTCP, "pm_type": 0}, "net.mptcp.pm_type=1\n")
+        assert "sysctl -qw net.mptcp.pm_type=0" in calls
+        assert "net.mptcp.pm_type=0" in text and "pm_type=1" not in text
+
+    def test_mptcp_pm_type_unset_left_alone(self, primary_client):
+        for payload in ({**self._MPTCP, "pm_type": ""}, self._MPTCP):
+            text, calls = self._mptcp(primary_client, payload, "net.mptcp.pm_type=1\n")
+            assert not any("pm_type" in c for c in calls)
+            assert "net.mptcp.pm_type=1" in text
+
+    def test_mptcp_keeps_the_installer_sysctls(self, primary_client):
+        installer = ("net.mptcp.enabled=1\nnet.mptcp.blackhole_timeout = 0\nnet.mptcp.close_timeout=60\n"
+                     "net.mptcp.mptcp_scheduler=redundant\nnet.mptcp.scheduler=blest\n")
+        text, _calls = self._mptcp(primary_client, self._MPTCP, installer)
+        assert "net.mptcp.blackhole_timeout = 0" in text and "net.mptcp.enabled=1" in text
+        assert "net.mptcp.close_timeout=60" in text     # not sent: kept
+        assert "mptcp_scheduler" not in text            # the other kernel kind's name
+        assert "net.mptcp.scheduler=blest" not in text  # replaced
+        text, _calls = self._mptcp(primary_client, self._MPTCP, installer, v1=False)
+        assert "net.mptcp.blackhole_timeout = 0" in text
+        assert "net.mptcp.scheduler=blest" not in text and "net.mptcp.close_timeout" not in text
+        assert "net.mptcp.mptcp_scheduler=default" in text
+
+    def test_glorytun_udp_without_glorytun_tcp(self):
+        written = {}
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/glorytun-udp/tun0"),
+            patch("builtins.open", side_effect=_open_with({"/etc/glorytun-udp/tun0": "PORT=65001\nDEV=tun0\n"})),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, **k: written.update({p: (t, k)})),
+            patch("subprocess.run"),
+            patch("omr_admin._restart_service"),
+        ):
+            omr_admin.add_glorytun_udp(3)
+        key, kwargs = written["/etc/glorytun-udp/tun3.key"]
+        assert len(key) == 64 and key == key.upper() and kwargs == {"new_mode": 0o600}
+
+    def test_glorytun_udp_shares_the_tcp_key(self):
+        written = {}
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in ("/etc/glorytun-udp/tun0", "/etc/glorytun-tcp/tun3.key")),
+            patch("builtins.open", side_effect=_open_with({"/etc/glorytun-udp/tun0": "PORT=65001\n",
+                                                           "/etc/glorytun-tcp/tun3.key": "ABCD"})),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, **k: written.update({p: t})),
+            patch("subprocess.run"),
+            patch("omr_admin._restart_service"),
+        ):
+            omr_admin.add_glorytun_udp(3)
+        assert written["/etc/glorytun-udp/tun3.key"] == "ABCD"
+
+    @pytest.mark.real_env
+    def test_openvpn_revoke_drops_the_files(self, tmp_path, monkeypatch):
+        for directory, name in (("reqs", "bob.req"), ("issued", "bob.crt"), ("private", "bob.key"), ("private", "bobby.key")):
+            (tmp_path / directory).mkdir(exist_ok=True)
+            (tmp_path / directory / name).write_text("x")
+        monkeypatch.setattr(omr_admin, "PKI_DIR", str(tmp_path))
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        with (
+            patch("subprocess.run") as run,
+            patch("omr_admin._pki_retire_user_certs", return_value=False),
+            patch("omr_admin._openvpn_gen_crl") as crl,
+        ):
+            omr_admin._openvpn_revoke("bob")
+        assert run.call_args_list[0].args[0] == ["./easyrsa", "--batch", "revoke", "bob"]
+        crl.assert_called_once()
+        assert sorted(p.name for p in tmp_path.rglob("*") if p.is_file() and p.name != ".lock") == ["bobby.key"]
+
+    def test_startup_suspension_one_failure_and_wireguard(self):
+        config = _config()
+        users = config["users"][0]
+        users["readonly"].update(disabled="true", wireguard_peers=[{"ip": "10.255.247.9", "key": "k"}])
+        users["openmptcprouter"].update(disabled="true")
+        done = []
+
+        def suspend(username, udata):
+            if username == "openmptcprouter":
+                raise OSError("disk full")
+            return {"units": ["x"]}
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin._suspend_user_access", side_effect=suspend),
+            patch("omr_admin.modif_config_user", side_effect=lambda u, c: done.append(u)),
+            patch("omr_admin._write_wireguard_conf") as wireguard,
+            patch("omr_admin._omr_config_lock"),
+        ):
+            omr_admin._suspend_disabled_users()
+        assert done == ["readonly"]
+        wireguard.assert_called_once()
+
+    def test_mqvpn_bytes_are_the_users_sessions(self):
+        status = {"ok": True, "clients": [
+            {"user": "bob", "bytes_rx": 10, "bytes_tx": 20},
+            {"user": "bob", "bytes_rx": 1, "bytes_tx": 2},
+            {"user": "alice", "bytes_rx": 100, "bytes_tx": 200},
+            {"user": "(global)", "bytes_rx": 1000, "bytes_tx": 2000}]}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.mqvpn_api", return_value=status),
+        ):
+            assert omr_admin._mqvpn_user_bytes("bob") == (11, 22)
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.mqvpn_api", return_value={"ok": False}),
+        ):
+            assert omr_admin._mqvpn_user_bytes("bob") == (0, 0)
+
+    def test_remove_user_purges_its_metrics(self, admin_client):
+        metrics = MagicMock()
+        with (
+            patch("omr_admin._teardown_user"),
+            patch.object(omr_admin, "_omr_metrics_router", metrics),
+        ):
+            r = admin_client.post("/remove_user", json={"username": "readonly"})
+        assert r.json()["result"] == "done"
+        metrics.purge_user.assert_called_once_with("readonly")
+
+    def test_softethervpn_keeps_the_installers_string(self, primary_client):
+        config = _config()
+        config["users"][0]["openmptcprouter"]["softethervpn"] = "old"
+        changes = {}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin.modif_config_user", side_effect=lambda u, c: changes.update(c)),
+            patch("requests.post"),
+        ):
+            r = primary_client.post("/softethervpn", json={"password": "newpassword"})
+        assert r.json()["result"] == "done", r.json()
+        assert changes == {"softethervpn": "newpassword"}
+
+    def test_reality_port_closed_whoever_opened_it(self, primary_client):
+        xray = {"inbounds": [{"tag": "omrin-vless-reality", "port": 443}, {"tag": "omrin-tunnel", "port": 65228}]}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/xray/xray-server.json": json.dumps(xray)})),
+            patch("omr_admin._atomic_write_json"),
+            patch("omr_admin.modif_config_user"),
+            patch("omr_admin.xray_ensure_reverse_client", return_value="r"),
+            patch("omr_admin._xray_user_conf", return_value={}),
+            patch("omr_admin._restart_service"),
+            patch("omr_admin._fw_service_port_del") as close,
+            patch("omr_admin.shorewall_del_port") as del_port,
+        ):
+            r = primary_client.post("/xray", json={"userid": "0", "vless_reality": False, "transport": "tcp", "ss_method": ""})
+        assert r.json()["result"] == "done", r.json()
+        close.assert_called_once_with("443", "tcp", "xray vless-reality")
+        del_port.assert_not_called()
+
+    def test_reality_port_not_opened_without_its_config(self, primary_client):
+        xray = {"inbounds": [{"tag": "omrin-tunnel", "port": 65228, "streamSettings": {"network": "tcp"}}]}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/xray/xray-server.json": json.dumps(xray)})),
+            patch("omr_admin._atomic_write_json"),
+            patch("omr_admin.modif_config_user"),
+            patch("omr_admin.xray_ensure_reverse_client", return_value="r"),
+            patch("omr_admin._xray_user_conf", return_value={}),
+            patch("omr_admin.xray_fix_reality_keys", return_value=None),
+            patch("omr_admin._proxy_port_elsewhere", return_value=None),
+            patch("omr_admin._restart_service"),
+            patch("omr_admin.shorewall_add_port") as add_port,
+        ):
+            r = primary_client.post("/xray", json={"userid": "0", "vless_reality": True, "transport": "grpc", "ss_method": ""})
+        assert r.status_code == 200 and r.json()["result"] == "done", r.text
+        add_port.assert_not_called()

@@ -117,7 +117,7 @@ Configuration endpoints return a JSON object of the form:
 | POST | `/dsvpn` | `DSVPN` | DSVPN key and port |
 | POST | `/mlvpn` | `MLVPN` | MLVPN password, timeout, reorder buffer, loss tolerance, cleartext |
 | POST | `/mqvpn` | `MQVPN` | MQVPN scheduler (`minrtt`, `wlb`, `backup`, `backup_fec`, `rap`, `wlb_udp_pin`, `wrtt`, `wrr`, `redundant`, `dscp`), port (default 443), FEC (xor/reed_solomon/…), reinjection, congestion control (bbr2/bbr/cubic/…), reorder (`cap_packets` a power of two) and up to 16 per-port reorder rules (`proto` udp/tcp, `port` 0-65535, `profile` cellular_bond/fiber_lte/quic_bulk/low_latency/default_udp). The `key` sent is ignored |
-| POST | `/mqvpn_user` | `MQVPNUser` | Admin only: set or clear a fixed IP for an MQVPN user |
+| POST | `/mqvpn_user` | `MQVPNUser` | Admin only: set or clear a fixed IP for an MQVPN user. The fixed IP of a suspended (disabled) user is refused to the others |
 | GET | `/mqvpn_users` | — | Admin only: list MQVPN users with, per name, `configured` (present in `/etc/mqvpn/server.json`, plus its `fixed_ip`), `known` (accepted by the running daemon, from the control socket's `list_users`) and `connected` (has a live session, from `get_status`); `known`/`connected` are `null` and `control.error` is set when the control socket can't be reached. Sessions authenticated with the server-wide `auth_key` (reported by the daemon as user `(global)`) are not listed as users but counted in `global_key_clients`. The control socket address is read from `control_listen` in `server.json` (default `127.0.0.1:9090`, wildcard binds reached via loopback) and echoed as `control.address`; warns if MQVPN isn't installed |
 | POST | `/mqvpn_dscp` | `MQVPNDscpParams` | Sync the current user's per-WAN DSCP class assignments (`pins: [{iface, dscp: [...]}]`) into MQVPN's per-path `dscp_mask`, pushed live over the control socket and persisted in `/etc/mqvpn/server.json`'s `path_policy` so it survives a restart/reconnect; warns if MQVPN isn't installed |
 | POST | `/mqvpn_weight` | `MQVPNWeightParams` | Sync the current user's per-WAN weights (`weights: [{iface, weight}]`) into MQVPN's per-path `weight`, same live + persisted push as `/mqvpn_dscp`; warns if MQVPN isn't installed |
@@ -172,7 +172,7 @@ doesn't parse, and the chain is flushed in a single transaction.
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
-| POST | `/mptcp` | `MPTCPparams` | Server MPTCP settings: checksum, path manager, scheduler, syn retries, congestion control, and protocol-version specific knobs. A value the kernel refuses is not saved in sysctl.d and is reported (`Refused by the kernel: <key>`) |
+| POST | `/mptcp` | `MPTCPparams` | Server MPTCP settings: checksum, path manager, scheduler, syn retries, congestion control, and protocol-version specific knobs. `pm_type` left blank or out keeps the VPS's value; `0` sets the in-kernel path manager. A value the kernel refuses is not saved in sysctl.d and is reported (`Refused by the kernel: <key>`). Only the sysctls it sets are rewritten in sysctl.d, the installer's other `net.mptcp` lines are kept |
 | POST | `/mptcp_dscp` | `MPTCPDscpParams` | Sync the router's per-WAN DSCP pins (`pins: [{dscp, remote_id}]`) into bpf_dscp's `dscp_remote_id` map via `mptcp-scheduler-dscp.sh`; keyed by MPTCP remote endpoint id since every subflow shares one local IP on the VPS. Warns if `mptcp-dscp-manager` isn't installed |
 | POST | `/mptcp_weight` | `MPTCPWeightParams` | Sync the router's per-WAN weights (`weights: [{remote_id, weight}]`) into bpf_weight(_rr)'s `weight_remote_id` map via `mptcp-scheduler-weight.sh`, cleaning up remote ids dropped since the previous sync. Warns if `mptcp-weight-manager` isn't installed |
 | POST | `/dscp_classify` | `DscpClassifyParams` | Mirror the router's destination→DSCP classification (`entries: [{dscp, cidr}]`) into native per-class/family nft sets plus the `dscp_mark` chain's `ip[6] dscp set` rules, so the VPS's own outbound traffic to a proxied destination carries the same DSCP as the router→VPS leg. Warns if `nft` isn't installed |
@@ -192,9 +192,9 @@ doesn't parse, and the chain is flushed in a single transaction.
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
-| POST | `/add_user` | `NewUser` | Create a user: username, permission, default VPN/proxy, optional userid, keys, Shadowsocks port, public exit IP |
-| POST | `/modify_user` | `ModifyUser` | Change password, enabled/disabled state, VPN or proxy of a user. Disabling also cuts the user's access: its xray/v2ray clients, shadowsocks ports, shadowsocks-go and MQVPN users and SoftEther account are taken out, its glorytun/DSVPN units stopped, OpenVPN refuses it (`disable` in its ccd) and its WireGuard peers are left out of wg0.conf. What was taken is kept under `access_suspended` and put back when the user is enabled again (an MQVPN fixed IP applies at mqvpn's next start). Its GRE tunnels are left as they are while suspended and updated when it is enabled again; its shadowsocks ports are not given to another user meanwhile. Users disabled by an older release are suspended at startup, or when disabled again |
-| POST | `/remove_user` | `RemoveUser` | Delete a user and all its per-user service configuration |
+| POST | `/add_user` | `NewUser` | Create a user: username, permission, default VPN/proxy, optional userid, keys, Shadowsocks port, public exit IP. Without a Shadowsocks port, it gets the lowest free one from 65101 (none in use by a user, a listener or the server's configs); an error when none is left |
+| POST | `/modify_user` | `ModifyUser` | Change password, enabled/disabled state, VPN or proxy of a user. Disabling also cuts the user's access: its xray/v2ray clients, shadowsocks ports, shadowsocks-go and MQVPN users and SoftEther account are taken out, its glorytun/DSVPN units stopped, OpenVPN refuses it (`disable` in its ccd, and its certificate revoked: the UDP instance has no ccd; `/config` issues a new one once it is enabled) and its WireGuard peers are left out of wg0.conf. What was taken is kept under `access_suspended` and put back when the user is enabled again (an MQVPN fixed IP applies at mqvpn's next start). Its GRE tunnels are left as they are while suspended and updated when it is enabled again; its shadowsocks ports and MQVPN fixed IP are not given to another user meanwhile. Users disabled by an older release are suspended at startup, or when disabled again |
+| POST | `/remove_user` | `RemoveUser` | Delete a user and all its per-user service configuration, and forget its metrics (a user created again under the name does not see them) |
 | POST | `/add_user_note` | `ExistingUser` | Attach a free-form note to a user |
 | GET | `/list_users` | — | Dump the full user table |
 | GET | `/get-number-of-users` | — | Count of users (excluding the admin) |
@@ -215,6 +215,7 @@ learning engine.
 | GET | `/metrics/all` | Metrics of all users (admin only) |
 | GET | `/metrics/user` | Current user profile and metrics DB statistics |
 | GET | `/metrics/history` | Historical metrics (requires InfluxDB) |
+| GET | `/metrics/report` | Availability report per WAN interface (requires InfluxDB) |
 | GET | `/metrics/decision` | Model-assigned weight for each WAN interface |
 | GET | `/metrics/quality/forecast` | Link-quality forecast |
 | POST | `/metrics/decision/train` | Train the decision model |
@@ -229,3 +230,13 @@ per interface. `/metrics/decision` also returns per-interface `confidence` and
 conditions such as rising loss, rising jitter, rising congestion, flapping, and
 gateway changes. `/metrics/prometheus` exposes current anomaly flags as
 `omr_interface_anomaly{username,interface,anomaly}` gauges.
+
+`/metrics/report?since=7d&interface=wan` (default 7 days, at most 30) sums up
+each interface over the window: `availability_pct` (share of samples where the
+link was online and reachable), `outages` (`count`, `total_s`, `longest_s`,
+`mean_s`, `mtbf_s` and the `recent` ones, newest first, at most 50; one still
+going has `"end": null, "ongoing": true` and lasts until the last sample) and
+`avg`/`p50`/`p95`/`max` of `latency`, `loss` and `jitter` over the samples where
+the link was up. InfluxDB computes the aggregates; at most 2000 state changes
+are read per interface, beyond that `outages.truncated` is true and the oldest
+outages are left out. Returns 501 with the JSON backend.

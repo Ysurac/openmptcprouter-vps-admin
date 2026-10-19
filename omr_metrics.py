@@ -31,6 +31,12 @@
 # GET  /metrics/prometheus       — all users' metrics in Prometheus text format (admin only)
 # GET  /metrics/history          — time-series history (InfluxDB only)
 #                                  ?interface=wwan0 &since=1h &limit=500
+# GET  /metrics/report           — availability report per interface (InfluxDB only)
+#                                  ?interface=wwan0 &since=7d (default 7d, max 30d)
+#                                  availability_pct, outages (count, total_s,
+#                                  longest_s, mean_s, mtbf_s, recent list) and
+#                                  avg/p50/p95/max of latency, loss and jitter
+#                                  over the samples where the link was up
 #
 # Decision engine
 # ---------------
@@ -116,6 +122,7 @@
 # GET  /metrics/engine           — inference/training stats + storage info (admin only)
 
 import asyncio
+import calendar
 import contextlib
 import fcntl
 import json
@@ -462,6 +469,77 @@ def _file_lock(path: str):
             os.close(fd)  # closing the descriptor releases the flock
 
 
+# Removed users: {username: epoch seconds}, rows older than it are not theirs.
+# InfluxDB 3 Core cannot delete rows (no SQL DELETE, no delete API, only a
+# whole table or database), so the history of a removed user stays until the
+# retention drops it, and recreating the name handed the new tenant the old
+# one's WAN IPs, BSSIDs and operators. Every InfluxDB read filters on this
+# cutoff instead. Kept under /etc, unlike the EMAs: the history outlives a reboot.
+PURGED_USERS_FILE = '/etc/openmptcprouter-vps-admin/omr-metrics-purged.json'
+_purged_cache: dict = {"key": None, "data": {}}
+_purged_cache_lock = threading.Lock()
+_purged_write_lock = threading.Lock()
+
+
+def _purged_users() -> dict:
+    """The cutoffs every worker shares, re-read when the file changed."""
+    try:
+        st = os.stat(PURGED_USERS_FILE)
+    except OSError:
+        return {}
+    key = (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _purged_cache_lock:
+        if _purged_cache["key"] == key:
+            return _purged_cache["data"]
+    try:
+        with open(PURGED_USERS_FILE) as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as exc:
+        # Written atomically, so not expected: the cutoffs known so far
+        # beat none, which would show the removed users' rows again.
+        LOG.warning("omr_metrics: %s not read (%s)", PURGED_USERS_FILE, exc)
+        with _purged_cache_lock:
+            return _purged_cache["data"]
+    data = {u: float(c) for u, c in raw.items()
+            if isinstance(u, str) and isinstance(c, (int, float))} if isinstance(raw, dict) else {}
+    with _purged_cache_lock:
+        _purged_cache["key"] = key
+        _purged_cache["data"] = data
+    return data
+
+
+def _purged_cutoff(username: Optional[str]) -> Optional[float]:
+    return _purged_users().get(username) if username else None
+
+
+def _record_purge(username: str) -> None:
+    with _purged_write_lock, _file_lock(PURGED_USERS_FILE + '.lock'):
+        now = time.time()
+        # No read looks further back than SINCE_MAX_SECONDS: past it, a
+        # cutoff filters nothing and is dropped, the file stays small.
+        keep_after = now - SINCE_MAX_SECONDS - 86400
+        data = {u: c for u, c in _purged_users().items() if c >= keep_after}
+        # Plus the clock skew a router's timestamp is trusted with: the
+        # removed router's last polls may be stamped up to that far ahead.
+        # A tenant recreated within it misses its first minutes, not worse.
+        data[username] = max(data.get(username, 0.0), now + _MAX_CLOCK_SKEW_S)
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(PURGED_USERS_FILE) + '.',
+                                       suffix='.tmp',
+                                       dir=os.path.dirname(PURGED_USERS_FILE) or '.')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, PURGED_USERS_FILE)
+            tmp = None
+        finally:
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+
+
 class JSONBackend:
     """Stores the latest interface metrics per user in a single JSON file."""
 
@@ -503,6 +581,10 @@ class JSONBackend:
     def read_history(self, username: str, interface: Optional[str],
                      since_seconds: int, limit: int):
         return [] if interface is not None else {}  # JSON backend: latest snapshot only
+
+    def read_report(self, username: str, interface: Optional[str],
+                    since_seconds: int) -> dict:
+        return {}  # JSON backend: no history to report on
 
     def user_stats(self, username: str) -> dict:
         """Return entry count and first/last seen timestamps for a user.
@@ -569,27 +651,43 @@ class JSONBackend:
                 return False
             data.setdefault(username, {})[payload["interface"]] = payload
             self._evict_stale(data, keep=(username, payload["interface"]))
+            return self._save(data)
+
+    def _save(self, data: dict) -> bool:
+        """Replace METRICS_FILE with *data*, under the caller's locks."""
+        tmp = None
+        try:
+            # Unique 0600 temp file: the data holds every router's WAN
+            # addresses, and a fixed name would be shared by the workers.
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(METRICS_FILE) + '.',
+                                       suffix='.tmp',
+                                       dir=os.path.dirname(METRICS_FILE) or '.')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, METRICS_FILE)
             tmp = None
+            return True
+        except Exception as exc:
+            LOG.error("omr_metrics JSON: write error: %s", exc)
+            return False
+        finally:
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+
+    def purge_user(self, username: str) -> None:
+        """Drop *username*'s snapshot (see purge_user)."""
+        with self._lock, _file_lock(METRICS_FILE + '.lock'):
             try:
-                # Unique 0600 temp file: the data holds every router's WAN
-                # addresses, and a fixed name would be shared by the workers.
-                fd, tmp = tempfile.mkstemp(prefix=os.path.basename(METRICS_FILE) + '.',
-                                           suffix='.tmp',
-                                           dir=os.path.dirname(METRICS_FILE) or '.')
-                with os.fdopen(fd, 'w') as f:
-                    json.dump(data, f, indent=4)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, METRICS_FILE)
-                tmp = None
-                return True
-            except Exception as exc:
-                LOG.error("omr_metrics JSON: write error: %s", exc)
-                return False
-            finally:
-                if tmp is not None:
-                    with contextlib.suppress(OSError):
-                        os.unlink(tmp)
+                data = self._load()
+            except (OSError, ValueError) as exc:
+                LOG.error("omr_metrics JSON: cannot read %s (%s), %s not purged",
+                          METRICS_FILE, exc, username)
+                return
+            if data.pop(username, None) is not None:
+                self._save(data)
 
 
 _influx_warned = {"ts": 0.0}
@@ -712,6 +810,14 @@ class InfluxBackend:
     # retention period so InfluxDB3 Core stays within its Parquet file scan limit.
     _LATEST_WINDOW = "1 day"
 
+    @staticmethod
+    def _purged_clause(username: str) -> str:
+        """SQL condition hiding the rows of a removed *username* (PURGED_USERS_FILE)."""
+        cutoff = _purged_cutoff(username)
+        if cutoff is None:
+            return ""
+        return " AND time > '{}'".format(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(int(cutoff))))
+
     def _query(self, username: Optional[str] = None) -> dict:
         """Return {username: {interface: payload}} for the latest data point."""
         # The latest row of each interface only, picked by InfluxDB: every
@@ -723,8 +829,8 @@ class InfluxBackend:
             where += " AND username = $username"
             params = {"username": username}
         sql = (
-            "SELECT username, interface, json_payload FROM ("
-            "SELECT username, interface, json_payload, "
+            "SELECT username, interface, json_payload, time FROM ("
+            "SELECT username, interface, json_payload, time, "
             "ROW_NUMBER() OVER (PARTITION BY username, interface ORDER BY time DESC) AS rn "
             f"FROM {self._MEASUREMENT} WHERE {where}"
             ") AS ranked WHERE rn = 1"
@@ -737,19 +843,36 @@ class InfluxBackend:
 
         result: dict = {}
         seen: set = set()
+        purged = _purged_users()
         try:
             d = table.to_pydict()
-            for uname, iface, payload_str in zip(
-                d.get("username", []),
+            names = d.get("username", [])
+            for uname, iface, payload_str, ts in zip(
+                names,
                 d.get("interface", []),
                 d.get("json_payload", []),
+                d.get("time") or [None] * len(names),
             ):
                 key = (uname, iface)
                 if key in seen:
                     continue  # one row per interface (rn = 1): the first one
                 seen.add(key)
                 try:
-                    result.setdefault(uname, {})[iface] = json.loads(payload_str)
+                    payload = json.loads(payload_str)
+                    # The latest row of a removed user's interface: older
+                    # than the cutoff, none of it is the current tenant's.
+                    cutoff = purged.get(uname)
+                    if cutoff is not None:
+                        # The payload's timestamp is the row's time (see
+                        # write_interface); arrow's naive datetime would be
+                        # read as local time.
+                        row_ts = payload.get("timestamp")
+                        if not isinstance(row_ts, (int, float)) and ts is not None:
+                            row_ts = (calendar.timegm(ts.utctimetuple())
+                                      if hasattr(ts, "utctimetuple") else ts)
+                        if not isinstance(row_ts, (int, float)) or row_ts <= int(cutoff):
+                            continue
+                    result.setdefault(uname, {})[iface] = payload
                 except Exception:
                     pass  # skip a corrupt row
         except Exception as exc:
@@ -768,6 +891,7 @@ class InfluxBackend:
             f"SELECT DISTINCT interface FROM {self._MEASUREMENT} "
             f"WHERE username = $username "
             f"AND time >= now() - interval '{self._LATEST_WINDOW}'"
+            f"{self._purged_clause(username)}"
         )
         try:
             table = self._client.query(sql, query_parameters={"username": username})
@@ -812,6 +936,7 @@ class InfluxBackend:
             f"FROM {self._MEASUREMENT} "
             f"WHERE username = $username AND interface = $interface "
             f"AND time >= now() - interval '{since_seconds} seconds'"
+            f"{self._purged_clause(username)}"
             f") AS ranked WHERE rn <= {int(limit)} "
             "ORDER BY time ASC"
         )
@@ -825,15 +950,24 @@ class InfluxBackend:
         return self._parse_history_rows(table)
 
     def _read_history_all(self, username: str, since_seconds: int, limit: int) -> dict:
+        # *limit* caps the whole answer: applied per interface only, one
+        # request loaded interfaces x 10000 payloads of ~6 KB, enough to OOM
+        # a small VPS. Ranking by rn first takes the newest rows of every
+        # interface in turn, so a quiet one still gets its share.
+        limit = int(limit)
         sql = (
+            "SELECT time, interface, json_payload FROM ("
             "SELECT time, interface, json_payload FROM ("
             f"SELECT time, interface, json_payload, "
             f"ROW_NUMBER() OVER (PARTITION BY interface ORDER BY time DESC) AS rn "
             f"FROM {self._MEASUREMENT} "
             f"WHERE username = $username "
             f"AND time >= now() - interval '{since_seconds} seconds'"
-            f") AS ranked WHERE rn <= {int(limit)} "
-            f"ORDER BY interface ASC, time ASC"
+            f"{self._purged_clause(username)}"
+            f") AS ranked WHERE rn <= {limit} "
+            f"ORDER BY rn ASC, time DESC LIMIT {limit}"
+            ") AS capped "
+            "ORDER BY interface ASC, time ASC"
         )
         try:
             table = self._client.query(sql, query_parameters={"username": username})
@@ -842,6 +976,7 @@ class InfluxBackend:
             return {}
 
         result: dict = {}
+        kept = 0
         try:
             d = table.to_pydict()
             for ts, iface, payload_str in zip(
@@ -849,17 +984,109 @@ class InfluxBackend:
                 d.get("interface", []),
                 d.get("json_payload", []),
             ):
+                if kept >= limit:
+                    break   # the SQL LIMIT already did it, a server ignoring it does not
                 try:
                     entry = json.loads(payload_str)
                     if "timestamp" not in entry and ts is not None:
                         entry["timestamp"] = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
-                    entries = result.setdefault(iface, [])
-                    if len(entries) < int(limit):
-                        entries.append(entry)
+                    result.setdefault(iface, []).append(entry)
+                    kept += 1
                 except Exception:
                     pass  # skip a corrupt row
         except Exception as exc:
             LOG.debug("omr_metrics InfluxDB history: result parse error: %s", exc)
+        return result
+
+    # A sample counts as up exactly as _is_interface_down() reads a payload:
+    # a status other than "online" or no latency is down. An absent status
+    # is written as an empty tag, which InfluxDB stores as NULL.
+    _UP_SQL = (
+        "CASE WHEN latency IS NOT NULL "
+        "AND (status IS NULL OR status = '' OR status = 'online') "
+        "THEN 1 ELSE 0 END"
+    )
+
+    def read_report(self, username: str, interface: Optional[str],
+                    since_seconds: int) -> dict:
+        """Aggregates and up/down state changes per interface over a window.
+
+        InfluxDB does the work: 30 days of polls are millions of rows, read
+        here they would OOM a small VPS. Returns {interface: {"samples",
+        "up_samples", "first_seen", "last_seen", "<metric>_<stat>"...,
+        "transitions": [(ts, up), ...] oldest first, "transitions_truncated"}}.
+        Latency, loss and jitter only count the samples where the link was up.
+        """
+        where = (
+            "WHERE username = $username"
+            + (" AND interface = $interface" if interface is not None else "")
+            + f" AND time >= now() - interval '{int(since_seconds)} seconds'"
+            + self._purged_clause(username)
+        )
+        params = {"username": username}
+        if interface is not None:
+            params["interface"] = interface
+        up_rows = (
+            f"SELECT time, interface, latency, loss, jitter, {self._UP_SQL} AS up "
+            f"FROM {self._MEASUREMENT} {where}"
+        )
+        stats = ["COUNT(*) AS samples", "SUM(up) AS up_samples",
+                 "MIN(time) AS first_seen", "MAX(time) AS last_seen"]
+        for metric in _REPORT_METRICS:
+            value = f"CASE WHEN up = 1 THEN {metric} END"
+            stats += [
+                f"AVG({value}) AS {metric}_avg",
+                f"approx_percentile_cont({value}, 0.5) AS {metric}_p50",
+                f"approx_percentile_cont({value}, 0.95) AS {metric}_p95",
+                f"MAX({value}) AS {metric}_max",
+            ]
+        summary_sql = (
+            f"SELECT interface, {', '.join(stats)} FROM ({up_rows}) AS s "
+            "GROUP BY interface"
+        )
+        # The first sample of each interface (prev IS NULL) gives its state
+        # at the start of the window; one more than the cap tells it was hit.
+        transitions_sql = (
+            "SELECT time, interface, up FROM ("
+            "SELECT time, interface, up, "
+            "ROW_NUMBER() OVER (PARTITION BY interface ORDER BY time DESC) AS rn FROM ("
+            "SELECT time, interface, up, "
+            "LAG(up) OVER (PARTITION BY interface ORDER BY time) AS prev "
+            f"FROM ({up_rows}) AS s"
+            ") AS t WHERE prev IS NULL OR up <> prev"
+            f") AS ranked WHERE rn <= {REPORT_MAX_TRANSITIONS + 1} "
+            "ORDER BY interface ASC, time ASC"
+        )
+        try:
+            summary = self._client.query(summary_sql, query_parameters=params).to_pydict()
+            changes = self._client.query(transitions_sql, query_parameters=params).to_pydict()
+        except Exception as exc:
+            _influx_warn("omr_metrics InfluxDB report: query error: %s", exc)
+            return {}
+
+        result: dict = {}
+        try:
+            columns = [c for c in summary if c != "interface"]
+            for row, iface in enumerate(summary.get("interface", [])):
+                entry = {c: summary[c][row] for c in columns}
+                entry["first_seen"] = _epoch_s(entry.get("first_seen"))
+                entry["last_seen"] = _epoch_s(entry.get("last_seen"))
+                entry["transitions"] = []
+                entry["transitions_truncated"] = False
+                result[iface] = entry
+            for ts, iface, up in zip(changes.get("time", []),
+                                     changes.get("interface", []),
+                                     changes.get("up", [])):
+                ts = _epoch_s(ts)
+                if iface in result and ts is not None and up is not None:
+                    result[iface]["transitions"].append((ts, bool(up)))
+            for entry in result.values():
+                if len(entry["transitions"]) > REPORT_MAX_TRANSITIONS:
+                    del entry["transitions"][0]
+                    entry["transitions_truncated"] = True
+        except Exception as exc:
+            LOG.debug("omr_metrics InfluxDB report: result parse error: %s", exc)
+            return {}
         return result
 
     def user_stats(self, username: str) -> dict:
@@ -869,11 +1096,13 @@ class InfluxBackend:
             f"MAX(time) as last_seen FROM {self._MEASUREMENT} "
             f"WHERE username = $username "
             f"AND time >= now() - interval '{self._LATEST_WINDOW}'"
+            f"{self._purged_clause(username)}"
         )
         iface_sql = (
             f"SELECT DISTINCT interface FROM {self._MEASUREMENT} "
             f"WHERE username = $username "
             f"AND time >= now() - interval '{self._LATEST_WINDOW}'"
+            f"{self._purged_clause(username)}"
         )
         params = {"username": username}
         try:
@@ -1097,6 +1326,40 @@ def _accept_interface(username: str, interface: str) -> bool:
     return True
 
 
+def _purge_ema(username: str) -> None:
+    with _ema_lock, _file_lock(EMA_STATE_FILE + '.lock'):
+        _weight_ema.pop(username, None)
+        state = _read_ema_state()
+        if state and state.pop(username, None) is not None:
+            _write_ema_state(state)
+
+
+def purge_user(username: str) -> None:
+    """Forget the metrics of a removed *username*: recreated, the name got
+    the previous tenant's history (WAN IPs, BSSIDs, operators) and EMAs.
+
+    InfluxDB rows cannot be deleted, a cutoff hides them (PURGED_USERS_FILE);
+    it is recorded whatever the backend, InfluxDB may only be down for now.
+    Never raises: omr-admin's user removal must not fail on the metrics.
+    Blocking (flocks, fsync): call it from a thread, not the event loop.
+    """
+    if not username:
+        return
+    steps = (
+        ("history cutoff", _record_purge),
+        ("JSON snapshot", lambda u: JSONBackend().purge_user(u)),
+        ("weight EMA", _purge_ema),
+    )
+    for name, step in steps:
+        try:
+            step(username)
+        except Exception as exc:
+            LOG.error("omr_metrics: %s of %s not purged: %s", name, username, exc)
+    # This worker's count of its interfaces, the others' expire in a minute
+    with _iface_cache_lock:
+        _iface_cache.pop(username, None)
+
+
 # Accepted shorthands for the ?since= query parameter → seconds.
 _SINCE_PRESETS: dict = {
     "15m": 900,    "30m": 1800,
@@ -1128,6 +1391,98 @@ def _read_history(username: str, interface: Optional[str], since_seconds: int, l
 
 def _user_stats(username: str) -> dict:
     return _get_backend().user_stats(username)
+
+
+# ---------------------------------------------------------------------------
+# Availability (SLA) report
+# ---------------------------------------------------------------------------
+
+# Payload fields summarised by the report (avg / p50 / p95 / max).
+_REPORT_METRICS = ("latency", "loss", "jitter")
+
+# State changes read per interface: a link flapping at every poll for 30 days
+# would send back all of its rows. Beyond it the oldest outages are left out.
+REPORT_MAX_TRANSITIONS = 2000
+
+# Most recent outages listed per interface (all of them are counted).
+REPORT_MAX_OUTAGES = 50
+
+
+def _epoch_s(ts) -> Optional[int]:
+    """Unix seconds of an InfluxDB time value; arrow's naive datetime is UTC."""
+    if ts is None:
+        return None
+    if hasattr(ts, "utctimetuple"):
+        return calendar.timegm(ts.utctimetuple())
+    try:
+        return int(ts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _round(value, ndigits: int = 3):
+    f = _as_float(value)
+    return round(f, ndigits) if f is not None and math.isfinite(f) else None
+
+
+def _report_interface(raw: dict) -> dict:
+    """One interface's report from InfluxBackend.read_report()'s raw entry.
+
+    An outage runs from its first down sample to the next up one; one still
+    going at the end of the window ends at the last sample received.
+    """
+    samples = int(raw.get("samples") or 0)
+    up_samples = int(raw.get("up_samples") or 0)
+    first_seen = raw.get("first_seen")
+    last_seen = raw.get("last_seen")
+
+    outages: list = []
+    start = None
+    for ts, up in raw.get("transitions") or []:
+        if not up and start is None:
+            start = ts
+        elif up and start is not None:
+            outages.append({"start": start, "end": ts, "duration_s": ts - start})
+            start = None
+    if start is not None:
+        end = last_seen if last_seen is not None and last_seen >= start else start
+        outages.append({"start": start, "end": None, "duration_s": end - start,
+                        "ongoing": True})
+
+    downtime = sum(o["duration_s"] for o in outages)
+    span = (last_seen - first_seen) if first_seen is not None and last_seen is not None else 0
+    count = len(outages)
+    report = {
+        "samples": samples,
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+        "availability_pct": _round(100.0 * up_samples / samples) if samples else None,
+        "outages": {
+            "count": count,
+            "total_s": downtime,
+            "longest_s": max((o["duration_s"] for o in outages), default=0),
+            "mean_s": _round(downtime / count) if count else None,
+            # Mean time between failures: the observed up time per outage
+            "mtbf_s": _round(max(0, span - downtime) / count) if count else None,
+            "truncated": bool(raw.get("transitions_truncated")),
+            "recent": outages[::-1][:REPORT_MAX_OUTAGES],
+        },
+    }
+    for metric in _REPORT_METRICS:
+        report[metric] = {
+            stat: _round(raw.get(f"{metric}_{stat}"))
+            for stat in ("avg", "p50", "p95", "max")
+        }
+    return report
+
+
+def _build_report(username: str, interface: Optional[str], since_seconds: int) -> dict:
+    raw = _get_backend().read_report(username, interface, since_seconds)
+    return {
+        "since_s": since_seconds,
+        "generated_at": int(time.time()),
+        "interfaces": {iface: _report_interface(entry) for iface, entry in sorted(raw.items())},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3418,6 +3773,20 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         since_seconds = _parse_since(since)
         return await asyncio.to_thread(_read_history, target, interface, since_seconds, limit)
 
+    @router.get('/metrics/report',
+                summary="Availability report: uptime, outages and latency/loss/jitter per WAN interface (InfluxDB only)")
+    async def get_metrics_report(
+        interface: Optional[str] = Query(None, description="WAN interface name; omit to get all interfaces"),
+        since: str = Query("7d", description="Report window: 1h 6h 12h 24h 2d 7d 30d or seconds"),
+        username: Optional[str] = Query(None),
+        current_user: User = Depends(get_current_active_user),
+    ):
+        if isinstance(_get_backend(), JSONBackend):
+            return _501_history
+        target = username if current_user.permissions == "admin" and username else current_user.username
+        since_seconds = _parse_since(since)
+        return await asyncio.to_thread(_build_report, target, interface, since_seconds)
+
     # ---- decision endpoints -----------------------------------------------
 
     _501 = JSONResponse(
@@ -3480,7 +3849,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         # EMA on raw probabilities (floats) then convert to [1, 255] integers.
         # Exploration (when auto-learning is on) perturbs after EMA so the
         # deviation is actually expressed, without polluting the EMA state.
-        smoothed_probs = _maybe_explore(_apply_ema(target, result.get("probs", {})))
+        # In a thread: the EMA state's flock and file I/O held up the loop.
+        ema_probs = await asyncio.to_thread(_apply_ema, target, result.get("probs", {}))
+        smoothed_probs = _maybe_explore(ema_probs)
         int_weights = {iface: max(1, round(p * 255)) for iface, p in smoothed_probs.items()}
         output = {k: v for k, v in result.items() if k != "probs"}
 
@@ -3638,11 +4009,16 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             return _501
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        global _decision_model, _optimizer
-        with _model_lock:
-            _decision_model = _make_model()
-            _optimizer = None   # force a fresh Adam for the new model
-            _save_model(_decision_model)
+        def _reset():
+            global _decision_model, _optimizer
+            with _model_lock:
+                _decision_model = _make_model()
+                _optimizer = None   # force a fresh Adam for the new model
+                _save_model(_decision_model)
+
+        # _model_lock waits on a training round, and the save fsyncs: in a
+        # thread, the loop answered nothing meanwhile.
+        await asyncio.to_thread(_reset)
         with _stats_lock:
             _engine_stats["model_resets"] += 1
             _engine_stats["model_loaded_at"] = time.time()
@@ -3670,7 +4046,9 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         """
         if current_user.permissions != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        persisted = _auto_set_enabled(toggle.enabled)
+        # The config flock is omr-admin's too, held through its long
+        # operations: waited for in a thread, not on the event loop.
+        persisted = await asyncio.to_thread(_auto_set_enabled, toggle.enabled)
         if toggle.enabled:
             start_auto_learning()
         return {

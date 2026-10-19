@@ -63,6 +63,20 @@ log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
+# Temporary files, removed on any exit, die included.
+GNUPG_TMP=""
+METRICS_TMP=""
+_cleanup() {
+    if [ -n "$GNUPG_TMP" ]; then
+        # gpg may have started an agent on the throwaway home
+        gpgconf --homedir "$GNUPG_TMP" --kill all 2>/dev/null || true
+        rm -rf "$GNUPG_TMP"
+    fi
+    [ -z "$METRICS_TMP" ] || rm -f "$METRICS_TMP"
+}
+trap _cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
 [ "$(id -u)" -eq 0 ] || die "Run as root (sudo $0)"
 
 # Try apt first; fall back to pip if the Debian package is absent.
@@ -101,14 +115,18 @@ DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq influxdb2 influxdb2-cli 2>/
 apt-get install -y -qq curl gnupg apt-transport-https ca-certificates python3-pip
 
 step "Verifying and importing InfluxData GPG key..."
-KEY_TMP=$(mktemp)
-curl -fsSL https://repos.influxdata.com/influxdata-archive.key -o "$KEY_TMP"
-gpg --show-keys --with-fingerprint --with-colons "$KEY_TMP" 2>&1 \
+# Imported into a throwaway keyring and only the pinned key exported: the
+# whole file dearmored into the signed-by keyring trusted any other key in it.
+GNUPG_TMP=$(mktemp -d)
+curl -fsSL https://repos.influxdata.com/influxdata-archive.key -o "$GNUPG_TMP/influxdata-archive.key"
+gpg --batch --quiet --homedir "$GNUPG_TMP" --import "$GNUPG_TMP/influxdata-archive.key" \
+    || die "Could not import the InfluxData key"
+gpg --batch --homedir "$GNUPG_TMP" --with-colons --fingerprint "$INFLUX_KEY_FINGERPRINT" 2>/dev/null \
     | grep -q "^fpr:.*${INFLUX_KEY_FINGERPRINT}:$" \
     || die "Key fingerprint mismatch — aborting for security"
-gpg --dearmor < "$KEY_TMP" > "$KEYRING_FILE"
-rm -f "$KEY_TMP"
-chmod 644 "$KEYRING_FILE"
+gpg --batch --homedir "$GNUPG_TMP" --export "$INFLUX_KEY_FINGERPRINT" > "$GNUPG_TMP/keyring.gpg"
+[ -s "$GNUPG_TMP/keyring.gpg" ] || die "Could not export the InfluxData key"
+install -m 0644 "$GNUPG_TMP/keyring.gpg" "$KEYRING_FILE"
 log "Key fingerprint verified: ${INFLUX_KEY_FINGERPRINT}"
 
 step "Adding InfluxData apt repository..."
@@ -255,10 +273,11 @@ log "Credentials saved to ${CREDS_FILE} (mode 600)."
 step "Creating database '${INFLUX_BUCKET}'..."
 RETENTION_FLAG=""
 [ -n "$INFLUX_RETENTION" ] && RETENTION_FLAG="--retention-period ${INFLUX_RETENTION}"
+# The token through the environment (the CLI reads INFLUXDB3_AUTH_TOKEN):
+# as --token, any local user could read it in /proc/*/cmdline.
 # shellcheck disable=SC2086
-if DB_OUT=$(influxdb3 create database "$INFLUX_BUCKET" \
+if DB_OUT=$(INFLUXDB3_AUTH_TOKEN="$ADMIN_TOKEN" influxdb3 create database "$INFLUX_BUCKET" \
         --host "$INFLUX_HOST" \
-        --token "$ADMIN_TOKEN" \
         $RETENTION_FLAG 2>&1); then
     [ -z "$DB_OUT" ] || printf '%s\n' "$DB_OUT"
 elif printf '%s\n' "$DB_OUT" | grep -qi "already exists"; then
@@ -291,8 +310,17 @@ fi
 step "Downloading omr_metrics.py..."
 dest=/usr/share/omr-admin/omr_metrics.py
 mkdir -p /usr/share/omr-admin
+# Into a temp file next to it, checked, then renamed: curl -o straight over
+# the live module left a truncated one (or an error page) on a failed download.
+# compile() is py_compile without a stray .pyc for the temp name.
+METRICS_TMP=$(mktemp "${dest}.XXXXXX")
 curl -fsSL "https://raw.githubusercontent.com/Ysurac/openmptcprouter-vps-admin/${OMR_ADMIN_VERSION}/omr_metrics.py" \
-    -o "$dest"
+    -o "$METRICS_TMP"
+python3 -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$METRICS_TMP" \
+    || die "Downloaded omr_metrics.py does not compile; ${dest} left unchanged"
+chmod 644 "$METRICS_TMP"
+mv -f "$METRICS_TMP" "$dest"
+METRICS_TMP=""
 log "  -> ${dest}"
 
 # The decision model, from omr_metrics.py itself: the one built here kept
@@ -315,10 +343,12 @@ fi
 step "Updating ${OMR_CONFIG_FILE}..."
 mkdir -p "$(dirname "$OMR_CONFIG_FILE")"
 
-python3 - "$OMR_CONFIG_FILE" "$INFLUX_HOST" "$INFLUX_ORG" "$INFLUX_BUCKET" "$ADMIN_TOKEN" "$INFLUX_RETENTION_DAYS" <<'PYEOF' || die "${OMR_CONFIG_FILE} left unchanged: fix it, then run this script again"
+# The token through the environment, not argv (/proc/*/cmdline).
+OMR_INFLUX_TOKEN="$ADMIN_TOKEN" python3 - "$OMR_CONFIG_FILE" "$INFLUX_HOST" "$INFLUX_ORG" "$INFLUX_BUCKET" "$INFLUX_RETENTION_DAYS" <<'PYEOF' || die "${OMR_CONFIG_FILE} left unchanged: fix it, then run this script again"
 import sys, json, os, re, fcntl
 
-config_file, url, org, bucket, token, retention_days = sys.argv[1:]
+config_file, url, org, bucket, retention_days = sys.argv[1:]
+token = os.environ["OMR_INFLUX_TOKEN"]
 lock_path = os.path.join(os.path.dirname(config_file), ".omr-admin-config.lock")
 lock_file = open(lock_path, "a+")
 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)

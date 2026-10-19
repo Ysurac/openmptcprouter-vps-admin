@@ -18,6 +18,7 @@ import contextlib
 import json
 import math
 import os
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -122,6 +123,11 @@ def reset_backend(tmp_path, monkeypatch):
     """Reset backend, decision-model, EMA and auto-learning state between tests."""
     # the EMAs the workers share: not the machine's /run
     monkeypatch.setattr(omr_metrics, "EMA_STATE_FILE", str(tmp_path / "weight-ema.json"))
+    # nor its removed users' cutoffs
+    monkeypatch.setattr(omr_metrics, "PURGED_USERS_FILE", str(tmp_path / "purged.json"))
+    # nor its JSON snapshot: run as root on a VPS, a test wrote the real one
+    monkeypatch.setattr(omr_metrics, "METRICS_FILE", str(tmp_path / "omr-metrics.json"))
+    monkeypatch.setattr(omr_metrics, "_purged_cache", {"key": None, "data": {}})
     # nor its decision model: a fresh one is saved now
     monkeypatch.setattr(omr_metrics, "DECISION_MODEL_FILE", str(tmp_path / "omr-decision-model.pt"))
     orig_backend = omr_metrics._backend
@@ -717,9 +723,12 @@ class TestJSONBackend:
 
     def test_write_interface_reports_failure(self):
         backend = omr_metrics.JSONBackend()
+        # The temp file is made with mkstemp (os.open): it passed only where
+        # METRICS_FILE's directory did not exist, and wrote it where it did.
         with (
             patch("os.path.isfile", return_value=False),
             patch("builtins.open", side_effect=OSError("disk full")),
+            patch("tempfile.mkstemp", side_effect=OSError("disk full")),
         ):
             assert backend.write_interface("alice", _WAN) is False
 
@@ -2817,22 +2826,24 @@ class TestInfluxBackendHistory:
         mock_client.query.return_value = table
         assert backend.read_history("alice", "wan", 3600, 100) == []
 
-    def test_all_interfaces_limit_applies_per_interface(self):
+    def test_all_interfaces_limit_caps_the_whole_answer(self):
+        # Per interface only, limit=10000 loaded interfaces x 10000 payloads
+        # in one request: the OOM of a small VPS.
         backend, mock_client = self._make_backend()
         rows = [
             (1_700_000_000, "wan", json.dumps({**_WAN, "timestamp": 1_700_000_000})),
-            (1_700_000_030, "wan2", json.dumps({**_WAN2, "timestamp": 1_700_000_030})),
             (1_700_000_060, "wan", json.dumps({**_WAN, "timestamp": 1_700_000_060})),
+            (1_700_000_030, "wan2", json.dumps({**_WAN2, "timestamp": 1_700_000_030})),
             (1_700_000_090, "wan2", json.dumps({**_WAN2, "timestamp": 1_700_000_090})),
-            (1_700_000_120, "wan", json.dumps({**_WAN, "timestamp": 1_700_000_120})),
+            (1_700_000_120, "wan3", json.dumps({**_WAN, "interface": "wan3"})),
         ]
         mock_client.query.return_value = self._fake_all_table(rows)
 
-        result = backend.read_history("alice", None, 3600, 2)
+        result = backend.read_history("alice", None, 3600, 3)
 
-        assert list(result.keys()) == ["wan", "wan2"]
+        assert sum(len(entries) for entries in result.values()) == 3
         assert [entry["timestamp"] for entry in result["wan"]] == [1_700_000_000, 1_700_000_060]
-        assert [entry["timestamp"] for entry in result["wan2"]] == [1_700_000_030, 1_700_000_090]
+        assert [entry["timestamp"] for entry in result["wan2"]] == [1_700_000_030]
 
     def test_latest_query_returns_one_row_per_interface(self):
         backend, mock_client = self._make_backend()
@@ -2853,7 +2864,367 @@ class TestInfluxBackendHistory:
         assert "ROW_NUMBER() OVER (PARTITION BY interface" in sql
         assert "ORDER BY time DESC" in sql
         assert ") AS ranked WHERE rn <= 7" in sql
-        assert "WHERE rn <= 7" in sql
+        # the newest rows of every interface in turn, 7 in all
+        assert "ORDER BY rn ASC, time DESC LIMIT 7" in sql
+        assert sql.endswith("ORDER BY interface ASC, time ASC")
+
+
+# ===========================================================================
+# Availability report — /metrics/report
+# ===========================================================================
+
+class _Ts:
+    """Arrow's naive datetime: utctimetuple() reads it as UTC."""
+    def __init__(self, v):
+        self._v = v
+
+    def utctimetuple(self):
+        return time.gmtime(self._v)
+
+
+def _report_raw(**kw):
+    raw = {"samples": 100, "up_samples": 100, "first_seen": 1_000, "last_seen": 4_000,
+           "transitions": [(1_000, True)], "transitions_truncated": False}
+    raw.update(kw)
+    return raw
+
+
+class TestReportInterface:
+    def test_no_outage(self):
+        r = omr_metrics._report_interface(_report_raw(latency_avg=20.123456, latency_p95=30))
+        assert r["availability_pct"] == 100.0
+        assert r["outages"] == {"count": 0, "total_s": 0, "longest_s": 0, "mean_s": None,
+                                "mtbf_s": None, "truncated": False, "recent": []}
+        assert r["latency"] == {"avg": 20.123, "p50": None, "p95": 30.0, "max": None}
+
+    def test_outages_from_transitions_newest_first(self):
+        r = omr_metrics._report_interface(_report_raw(
+            up_samples=90,
+            transitions=[(1_000, True), (1_500, False), (1_800, True),
+                         (2_000, False), (2_100, True)],
+        ))
+        o = r["outages"]
+        assert r["availability_pct"] == 90.0
+        assert o["count"] == 2
+        assert o["total_s"] == 400 and o["longest_s"] == 300 and o["mean_s"] == 200.0
+        # 3000 s observed, 400 s down, 2 outages
+        assert o["mtbf_s"] == 1300.0
+        assert o["recent"] == [
+            {"start": 2_000, "end": 2_100, "duration_s": 100},
+            {"start": 1_500, "end": 1_800, "duration_s": 300},
+        ]
+
+    def test_outage_still_going_ends_at_last_sample(self):
+        r = omr_metrics._report_interface(_report_raw(transitions=[(1_000, True), (3_400, False)]))
+        assert r["outages"]["recent"] == [
+            {"start": 3_400, "end": None, "duration_s": 600, "ongoing": True}]
+
+    def test_down_from_the_start_of_the_window(self):
+        r = omr_metrics._report_interface(_report_raw(transitions=[(1_000, False), (1_200, True)]))
+        assert r["outages"]["recent"] == [{"start": 1_000, "end": 1_200, "duration_s": 200}]
+
+    def test_truncated_up_first_is_skipped(self):
+        # The oldest state changes were cut: the first one kept ends an
+        # outage whose start is unknown.
+        r = omr_metrics._report_interface(_report_raw(
+            transitions=[(1_100, True), (1_500, False), (1_600, True)],
+            transitions_truncated=True,
+        ))
+        assert r["outages"]["count"] == 1 and r["outages"]["truncated"] is True
+
+    def test_recent_capped(self, monkeypatch):
+        monkeypatch.setattr(omr_metrics, "REPORT_MAX_OUTAGES", 2)
+        transitions = [(1_000, True)]
+        for t in range(1_100, 2_000, 100):
+            transitions += [(t, False), (t + 10, True)]
+        r = omr_metrics._report_interface(_report_raw(transitions=transitions))
+        assert r["outages"]["count"] == 9
+        assert [o["start"] for o in r["outages"]["recent"]] == [1_900, 1_800]
+
+    def test_no_sample(self):
+        r = omr_metrics._report_interface({"samples": 0, "up_samples": None,
+                                           "first_seen": None, "last_seen": None})
+        assert r["availability_pct"] is None
+        assert r["outages"]["count"] == 0
+
+    def test_non_finite_aggregate_is_null(self):
+        r = omr_metrics._report_interface(_report_raw(loss_avg=float("nan")))
+        assert r["loss"]["avg"] is None
+
+
+class TestInfluxBackendReport:
+    def _make_backend(self):
+        mock_client = MagicMock()
+        with patch.dict("sys.modules", {
+            "influxdb_client_3": MagicMock(InfluxDBClient3=MagicMock(return_value=mock_client))
+        }):
+            backend = omr_metrics.InfluxBackend("http://localhost", "tok", "omr", "bucket")
+        backend._client = mock_client
+        return backend, mock_client
+
+    def _tables(self, summary, transitions):
+        s, t = MagicMock(), MagicMock()
+        s.to_pydict.return_value = summary
+        t.to_pydict.return_value = transitions
+        return [s, t]
+
+    def test_parses_summary_and_transitions(self):
+        backend, client = self._make_backend()
+        client.query.side_effect = self._tables(
+            {"interface": ["wan"], "samples": [10], "up_samples": [9],
+             "first_seen": [_Ts(1_000)], "last_seen": [_Ts(1_270)], "latency_avg": [21.5]},
+            {"time": [_Ts(1_000), _Ts(1_100), _Ts(1_130)], "interface": ["wan"] * 3,
+             "up": [1, 0, 1]},
+        )
+        r = backend.read_report("alice", None, 3600)
+        assert r["wan"]["samples"] == 10 and r["wan"]["latency_avg"] == 21.5
+        assert r["wan"]["first_seen"] == 1_000 and r["wan"]["last_seen"] == 1_270
+        assert r["wan"]["transitions"] == [(1_000, True), (1_100, False), (1_130, True)]
+        assert r["wan"]["transitions_truncated"] is False
+
+    def test_transitions_over_the_cap_drop_the_oldest(self, monkeypatch):
+        monkeypatch.setattr(omr_metrics, "REPORT_MAX_TRANSITIONS", 2)
+        backend, client = self._make_backend()
+        client.query.side_effect = self._tables(
+            {"interface": ["wan"], "samples": [10], "up_samples": [9],
+             "first_seen": [_Ts(1_000)], "last_seen": [_Ts(1_270)]},
+            {"time": [_Ts(1_000), _Ts(1_100), _Ts(1_130)], "interface": ["wan"] * 3,
+             "up": [1, 0, 1]},
+        )
+        r = backend.read_report("alice", None, 3600)
+        assert r["wan"]["transitions"] == [(1_100, False), (1_130, True)]
+        assert r["wan"]["transitions_truncated"] is True
+        sql = client.query.call_args_list[1].args[0]
+        assert "AS ranked WHERE rn <= 3 " in sql
+
+    def test_query_error_returns_empty(self):
+        backend, client = self._make_backend()
+        client.query.side_effect = Exception("connection refused")
+        assert backend.read_report("alice", None, 3600) == {}
+
+    def test_queries_are_parameterised_and_windowed(self):
+        backend, client = self._make_backend()
+        client.query.side_effect = self._tables({"interface": []}, {"time": []})
+        backend.read_report("bob", "lte0", 86400)
+        for call in client.query.call_args_list:
+            sql = call.args[0]
+            assert "username = $username AND interface = $interface" in sql
+            assert "interval '86400 seconds'" in sql
+            assert call.kwargs["query_parameters"] == {"username": "bob", "interface": "lte0"}
+        summary_sql, transitions_sql = (c.args[0] for c in client.query.call_args_list)
+        assert "approx_percentile_cont(CASE WHEN up = 1 THEN latency END, 0.95)" in summary_sql
+        assert "GROUP BY interface" in summary_sql
+        assert "LAG(up) OVER (PARTITION BY interface ORDER BY time)" in transitions_sql
+        assert "WHERE prev IS NULL OR up <> prev" in transitions_sql
+
+    def test_all_interfaces_has_no_interface_filter(self):
+        backend, client = self._make_backend()
+        client.query.side_effect = self._tables({"interface": []}, {"time": []})
+        backend.read_report("bob", None, 3600)
+        assert "$interface" not in client.query.call_args_list[0].args[0]
+        assert client.query.call_args_list[0].kwargs["query_parameters"] == {"username": "bob"}
+
+    def test_purged_user_rows_hidden(self):
+        backend, client = self._make_backend()
+        client.query.side_effect = self._tables({"interface": []}, {"time": []})
+        with patch.object(omr_metrics, "_purged_cutoff", return_value=1_700_000_000):
+            backend.read_report("bob", None, 3600)
+        for call in client.query.call_args_list:
+            assert "AND time > '2023-11-14T22:13:20Z'" in call.args[0]
+
+
+class TestGetMetricsReport:
+    def _influx(self, raw=None):
+        mock_influx = MagicMock(spec=omr_metrics.InfluxBackend)
+        mock_influx.read_report.return_value = raw or {}
+        return mock_influx
+
+    def test_returns_501_with_json_backend(self, user_client):
+        with patch.object(omr_metrics, "_get_backend",
+                          return_value=omr_metrics.JSONBackend()):
+            r = user_client.get("/metrics/report")
+        assert r.status_code == 501
+
+    def test_report_per_interface(self, user_client):
+        mock_influx = self._influx({"wan2": _report_raw(), "wan": _report_raw(up_samples=50)})
+        with patch.object(omr_metrics, "_get_backend", return_value=mock_influx):
+            r = user_client.get("/metrics/report")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["since_s"] == 7 * 86400
+        assert list(body["interfaces"]) == ["wan", "wan2"]
+        assert body["interfaces"]["wan"]["availability_pct"] == 50.0
+        assert mock_influx.read_report.call_args.args == ("openmptcprouter", None, 7 * 86400)
+
+    def test_since_and_interface_forwarded_since_capped(self, user_client):
+        mock_influx = self._influx()
+        with patch.object(omr_metrics, "_get_backend", return_value=mock_influx):
+            user_client.get("/metrics/report?interface=wan2&since=99999999")
+        assert mock_influx.read_report.call_args.args == (
+            "openmptcprouter", "wan2", omr_metrics.SINCE_MAX_SECONDS)
+
+    def test_user_cannot_read_another_user(self, user_client):
+        mock_influx = self._influx()
+        with patch.object(omr_metrics, "_get_backend", return_value=mock_influx):
+            user_client.get("/metrics/report?username=someone")
+        assert mock_influx.read_report.call_args.args[0] == "openmptcprouter"
+
+    def test_admin_can_read_another_user(self, admin_client):
+        mock_influx = self._influx()
+        with patch.object(omr_metrics, "_get_backend", return_value=mock_influx):
+            admin_client.get("/metrics/report?username=someone")
+        assert mock_influx.read_report.call_args.args[0] == "someone"
+
+    def test_unauthenticated_returns_403(self, unauth_client):
+        assert unauth_client.get("/metrics/report").status_code == 403
+
+
+# ===========================================================================
+# purge_user — a removed user's metrics
+# ===========================================================================
+
+class TestPurgeUser:
+    """Recreated, a removed user's name got the previous tenant's history
+    (WAN IPs, BSSIDs, operators) and weight EMAs."""
+
+    def _influx(self):
+        mock_client = MagicMock()
+        with patch.dict("sys.modules", {
+            "influxdb_client_3": MagicMock(InfluxDBClient3=MagicMock(return_value=mock_client))
+        }):
+            backend = omr_metrics.InfluxBackend("http://localhost", "tok", "omr", "bucket")
+        backend._client = mock_client
+        return backend, mock_client
+
+    def test_drops_json_snapshot_of_that_user_only(self, tmp_path):
+        metrics_file = tmp_path / "omr-metrics.json"
+        now = int(time.time())
+        metrics_file.write_text(json.dumps({
+            "alice": {"wan": {**_WAN, "timestamp": now}},
+            "bob": {"wan": {**_WAN, "timestamp": now}},
+        }))
+        with (
+            patch("builtins.open", new=_REAL_OPEN),
+            patch("os.replace", new=_REAL_REPLACE),
+            patch.object(omr_metrics, "METRICS_FILE", str(metrics_file)),
+        ):
+            omr_metrics.purge_user("alice")
+        assert sorted(json.loads(metrics_file.read_text())) == ["bob"]
+
+    def test_drops_ema_of_that_user_only(self):
+        omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
+        omr_metrics._apply_ema("bob", {"wan": 1.0})
+        with patch("os.replace", new=_REAL_REPLACE):
+            omr_metrics.purge_user("alice")
+        with _REAL_OPEN(omr_metrics.EMA_STATE_FILE) as f:
+            assert sorted(json.load(f)) == ["bob"]
+        assert "alice" not in omr_metrics._weight_ema
+        # the new tenant starts from its own probabilities, not the old EMA
+        assert omr_metrics._apply_ema("alice", {"wan": 1.0, "wan2": 0.0}) == {"wan": 1.0, "wan2": 0.0}
+
+    def test_records_a_cutoff_past_the_clock_skew(self):
+        before = time.time()
+        with patch("os.replace", new=_REAL_REPLACE):
+            omr_metrics.purge_user("alice")
+        cutoff = omr_metrics._purged_cutoff("alice")
+        assert cutoff >= before + omr_metrics._MAX_CLOCK_SKEW_S
+        assert omr_metrics._purged_cutoff("bob") is None
+
+    def test_old_cutoffs_dropped(self):
+        old = time.time() - omr_metrics.SINCE_MAX_SECONDS - 2 * 86400
+        with _REAL_OPEN(omr_metrics.PURGED_USERS_FILE, "w") as f:
+            json.dump({"gone": old, "recent": time.time()}, f)
+        with patch("os.replace", new=_REAL_REPLACE):
+            omr_metrics.purge_user("alice")
+        assert sorted(omr_metrics._purged_users()) == ["alice", "recent"]
+
+    def test_influx_reads_of_a_purged_user_filter_on_the_cutoff(self):
+        backend, mock_client = self._influx()
+        with patch("os.replace", new=_REAL_REPLACE):
+            omr_metrics.purge_user("alice")
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(omr_metrics._purged_cutoff("alice"))))
+        mock_client.query.return_value = MagicMock(to_pydict=MagicMock(return_value={}))
+        backend.read_history("alice", None, 3600, 10)
+        backend.read_history("alice", "wan", 3600, 10)
+        backend.interfaces("alice")
+        backend.user_stats("alice")
+        sqls = [call.args[0] for call in mock_client.query.call_args_list]
+        assert len(sqls) == 5
+        assert all(f"AND time > '{iso}'" in sql for sql in sqls)
+        mock_client.query.reset_mock()
+        backend.read_history("bob", None, 3600, 10)
+        assert "AND time > '" not in mock_client.query.call_args.args[0]
+
+    def test_latest_snapshot_hides_rows_before_the_cutoff(self):
+        backend, mock_client = self._influx()
+        cutoff = 1_700_000_100
+        with _REAL_OPEN(omr_metrics.PURGED_USERS_FILE, "w") as f:
+            json.dump({"alice": cutoff}, f)
+        mock_client.query.return_value = MagicMock(to_pydict=MagicMock(return_value={
+            "username": ["alice", "alice", "bob"],
+            "interface": ["old", "wan", "wan"],
+            "json_payload": [json.dumps({**_WAN, "interface": "old", "timestamp": cutoff - 50}),
+                             json.dumps({**_WAN, "timestamp": cutoff + 50}),
+                             json.dumps({**_WAN, "timestamp": cutoff - 50})],
+            "time": [None, None, None],
+        }))
+        data = backend.read_all()
+        assert sorted(data["alice"]) == ["wan"]   # the new tenant's only
+        assert sorted(data["bob"]) == ["wan"]     # not purged, untouched
+
+    def test_never_raises(self):
+        omr_metrics._iface_cache["alice"] = (time.monotonic(), {"wan"})
+        with (
+            patch.object(omr_metrics, "_record_purge", side_effect=OSError("read-only")),
+            patch.object(omr_metrics.JSONBackend, "purge_user", side_effect=ValueError("corrupt")),
+            patch.object(omr_metrics, "_purge_ema", side_effect=RuntimeError("boom")),
+        ):
+            omr_metrics.purge_user("alice")
+        assert "alice" not in omr_metrics._iface_cache   # the rest still done
+
+
+# ===========================================================================
+# Blocking calls kept off the event loop
+# ===========================================================================
+
+class TestBlockingCallsOffLoop:
+    """flocks, file I/O and fsync in an async handler held up every request."""
+
+    def _spy(self, threads, result=None):
+        def _record(*args, **kwargs):
+            threads.append(threading.get_ident())
+            return result
+        return _record
+
+    def test_decision_ema_in_a_thread(self, user_client):
+        threads = []
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_compute_weights_heuristic",
+                         return_value={"scores": {}, "probs": {"wan": 1.0}}),
+            patch.object(omr_metrics, "_apply_ema", side_effect=self._spy(threads, {"wan": 1.0})),
+        ):
+            r = user_client.get("/metrics/decision?preemptive=false")
+        assert r.status_code == 200
+        assert threads and threads[0] != threading.get_ident()
+
+    def test_auto_toggle_in_a_thread(self, admin_client):
+        threads = []
+        with patch.object(omr_metrics, "_auto_set_enabled", side_effect=self._spy(threads, True)):
+            r = admin_client.post("/metrics/decision/auto", json={"enabled": False})
+        assert r.status_code == 200
+        assert threads and threads[0] != threading.get_ident()
+
+    def test_reset_in_a_thread(self, admin_client):
+        threads = []
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_make_model", return_value=MagicMock()),
+            patch.object(omr_metrics, "_save_model", side_effect=self._spy(threads)),
+        ):
+            r = admin_client.post("/metrics/decision/reset")
+        assert r.status_code == 200
+        assert threads and threads[0] != threading.get_ident()
 
 
 # ===========================================================================
@@ -4352,7 +4723,7 @@ class TestDisabledUserRefused:
         app.dependency_overrides.pop(omr_admin.get_current_user, None)
 
     @pytest.mark.parametrize("path", [
-        "/metrics", "/metrics/all", "/metrics/user", "/metrics/history",
+        "/metrics", "/metrics/all", "/metrics/user", "/metrics/history", "/metrics/report",
         "/metrics/decision", "/metrics/quality/forecast", "/metrics/decision/auto",
         "/metrics/prometheus", "/metrics/engine",
     ])

@@ -17,7 +17,8 @@ x-app-base: &app-base
     - |
       mkdir -p /etc/openmptcprouter-vps-admin
       python3 -c "
-      import os, json
+      import os, json, re, tempfile
+      path  = '/etc/openmptcprouter-vps-admin/omr-admin-config.json'
       url   = os.getenv('INFLUXDB_URL',    '')
       token = os.getenv('INFLUXDB_TOKEN',  '')
       if url and token:
@@ -29,15 +30,33 @@ x-app-base: &app-base
               retention_days = int(retention[:-1])
           else:
               retention_days = 60
-          cfg = {'influxdb': {
+          # Only the influxdb block is updated: rewritten from scratch, the
+          # auto_learning block set by POST /metrics/decision/auto was lost.
+          try:
+              with open(path) as f:
+                  # a trailing comma, as omr-admin reads it
+                  cfg = json.loads(re.sub(r',\s*}', '}', f.read()))
+              if not isinstance(cfg, dict):
+                  cfg = {}
+          except (OSError, ValueError):
+              cfg = {}
+          cfg['influxdb'] = {
               'url':    url,
               'token':  token,
               'org':    os.getenv('INFLUXDB_ORG',    'omr'),
               'bucket': os.getenv('INFLUXDB_BUCKET', 'omr_metrics'),
               'retention_days': retention_days,
-          }}
-          with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-              json.dump(cfg, f)
+          }
+          # 0600 from the start (the InfluxDB token), replaced atomically
+          fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.omr-admin-config.')
+          try:
+              with os.fdopen(fd, 'w') as f:
+                  json.dump(cfg, f, indent=4)
+                  f.write('\n')
+              os.replace(tmp, path)
+          except BaseException:
+              os.unlink(tmp)
+              raise
       "
       exec uvicorn omr_metrics_standalone:app --host 0.0.0.0 --port 8080
   ports:
@@ -55,8 +74,10 @@ x-torch-build: &torch-build
     dockerfile_inline: |
       FROM python:3.12-slim
       WORKDIR /app
-      RUN pip install --no-cache-dir fastapi "uvicorn[standard]" influxdb3-python \
-            torch --index-url https://download.pytorch.org/whl/cpu
+      # torch alone from the CPU index: it has no fastapi, uvicorn or
+      # influxdb3-python, those come from PyPI
+      RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+       && pip install --no-cache-dir fastapi "uvicorn[standard]" influxdb3-python
       COPY omr_metrics.py omr_metrics_standalone.py ./
 
 x-torch-image-build: &torch-image-build

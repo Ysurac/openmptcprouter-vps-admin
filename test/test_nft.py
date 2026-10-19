@@ -104,18 +104,35 @@ class TestRenderFwPorts:
         _accept, dnat = omr_admin._render_fw_ports(config)
         assert dnat == []
 
-    def test_explicit_vpn_override_wins_over_vpnremoteip(self):
+    def test_gre_redirect_goes_to_the_tunnel_of_its_address(self):
         config = _config({
             "alice": {
                 "userid": 3, "vpnremoteip": "10.255.220.6",
+                "gre_tunnels": {"gre-user3-ip0": {"public_ip": "203.0.113.9", "remote_ip": "10.255.249.6"}},
                 "fw_ports": [{
                     "name": "gre-port", "port": "443", "proto": "tcp", "fwtype": "DNAT",
-                    "family": 4, "vpn": "10.255.249.2",
+                    "family": 4, "source_dip": "203.0.113.9", "vpn": "10.255.249.2",
                 }],
             },
         })
         _accept, dnat = omr_admin._render_fw_ports(config)
-        assert "dnat ip to 10.255.249.2" in dnat[0]
+        # the tunnel's address now, not the one stored with the entry
+        assert "dnat ip to 10.255.249.6" in dnat[0]
+
+    def test_gre_redirect_of_a_dropped_tunnel_renders_nothing(self):
+        # Its /30 reused by another router's tunnel: the stored remote
+        # address is that router's now.
+        config = _config({
+            "alice": {
+                "userid": 3, "vpnremoteip": "10.255.220.6", "gre_tunnels": {},
+                "fw_ports": [{
+                    "name": "gre-port", "port": "443", "proto": "tcp", "fwtype": "DNAT",
+                    "family": 4, "source_dip": "203.0.113.9", "vpn": "10.255.249.2",
+                }],
+            },
+        })
+        _accept, dnat = omr_admin._render_fw_ports(config)
+        assert not any("10.255.249.2" in rule for rule in dnat)
 
     def test_source_dip_and_dest_ip_add_daddr_saddr_matches(self):
         config = _config({
