@@ -1,3 +1,17 @@
+omr-vps-admin (0.18+20261022) unstable; urgency=medium
+
+  * Disabled users: the OpenVPN certificate is revoked in easyrsa's index and its files are kept. Enabled again, the same certificate is valid again: the router had a revoked one, and OpenVPN stayed down until it fetched /config again, which nothing told it to do. When it can't be put back (its files gone, or one valid issued meanwhile by hand) a new one is issued at the next /config, the files of a valid one are left alone. /config no longer issues a certificate to a suspended user: one asked for it (?username=) let its router back into the UDP instance, that has only the CRL
+  * /mptcp: close_timeout, stale_loss_cnt and syn_retrans_before_tcp_fallback 0 are applied, blank or out keeps the VPS's value, as pm_type. Since only its own lines are rewritten in 90-shadowsocks.conf, a value written once could not be set back to 0
+  * /status, /config: mqvpn's get_status is shared for 2 seconds, its failure too, and logged. Every router's poll asked for the status of every client and path; with the daemon stalled each one waited its 5 s timeout in turn, and over 128 KB ('response too large') every user's traffic read 0 with nothing said
+  * /remove_user: the user's metrics are purged once the config lock is released. Their flocks and fsync, or a decision holding the weight smoothing's flock, held every config request meanwhile
+  * /add_user: the free shadowsocks port lists the listening sockets once, it did twice per protocol under the config lock
+  * Firewall: a redirect to a GRE tunnel that has none (any more) on its address is logged when it is left out
+  * omr_metrics: an empty interface status is no status for the routing weights too, as for /metrics/report and the rest of omr_metrics: the engine took for down the samples the report counted up
+  * docs/api.md: the changes above
+  * Add tests for the above (test/test_hardening.py, test/test_metrics.py, test/test_nft.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 22 Oct 2026 00:00:00 +0200
+
 omr-vps-admin (0.18+20261014) unstable; urgency=medium
 
   * Disabled users: their OpenVPN certificate is revoked. The UDP instance (tun1) has no ccd and no management port, so the "disable" in the ccd left them in over UDP; /config issues a new certificate once the user is enabled. The SoftEther account of the main router, whose password the installer stores as a string, is taken out too. Their MQVPN fixed IP is not given to another user meanwhile (/mqvpn_user, /vpnips); one taken by hand is not put back on resume, and the path_policy put back is kept within its limits. Each step of the suspension is recorded as it is taken: one failing lost what the steps before had taken (the shadowsocks key lived only in manager.json, the proxy uuids only in their configs), and the user could not be put back. At startup one user failing no longer leaves the next ones with their access, and wg0.conf is rewritten for those that had WireGuard peers
