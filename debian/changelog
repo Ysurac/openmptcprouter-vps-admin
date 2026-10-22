@@ -7,8 +7,12 @@ omr-vps-admin (0.18+20261022) unstable; urgency=medium
   * /add_user: the free shadowsocks port lists the listening sockets once, it did twice per protocol under the config lock
   * Firewall: a redirect to a GRE tunnel that has none (any more) on its address is logged when it is left out
   * omr_metrics: an empty interface status is no status for the routing weights too, as for /metrics/report and the rest of omr_metrics: the engine took for down the samples the report counted up
+  * /vpnips: a router can't take as its remote address the end of another router's GRE or VXLAN tunnel, nor a slice of their pools still free, only those of its own tunnels. That router's port forwards went with it
+  * V2Ray: the shared reverse portal is the main router's alone. The other users' GRE tunnel accounts (alicegre-user3-ip0) were let in as its bridge, as were those a removed user left: another router could be the main router's bridge
+  * /wireguard: a key that isn't canonical base64 is refused. Python ignores the unused low bits of its last character, wg does not, and refused the whole wg0.conf over one router's key, for every user. One stored before is left out of wg0.conf
+  * /vxlan: a VNI another enabled user has is refused unless the administrator merged them on purpose (/vxlan_user force=true, now recorded as vni_shared on each of them) or gave it to each. A user's default VNI (userid + 1), given to another user, put the router of that userid on that user's L2 bridge, on a port of its own choosing
   * docs/api.md: the changes above
-  * Add tests for the above (test/test_hardening.py, test/test_metrics.py, test/test_nft.py)
+  * Add tests for the above (test/test_hardening.py, test/test_metrics.py, test/test_nft.py, test/test_isolation.py, test/test_api.py, test/test_vxlan.py)
 
  -- OpenMPTCProuter <contact@openmptcprouter.com>  Thu, 22 Oct 2026 00:00:00 +0200
 
