@@ -4512,6 +4512,13 @@ class TestInterfaceMetricsValidation:
         r, _ = self._post(user_client, {**_WAN, "status": ""})
         assert r.status_code == 200
 
+    def test_empty_status_is_no_status(self):
+        # stored as the same empty tag, counted up by /metrics/report
+        assert not omr_metrics._is_interface_down({"status": "", "latency": 20})
+        assert not omr_metrics._is_interface_down({"latency": 20})
+        assert omr_metrics._is_interface_down({"status": "offline", "latency": 20})
+        assert omr_metrics._is_interface_down({"status": ""})
+
     def test_oversized_text_rejected(self, user_client):
         r, _ = self._post(user_client, {**_WAN, "asn": "A" * 10_000})
         assert r.status_code == 422

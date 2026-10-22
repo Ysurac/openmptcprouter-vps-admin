@@ -999,8 +999,8 @@ class InfluxBackend:
         return result
 
     # A sample counts as up exactly as _is_interface_down() reads a payload:
-    # a status other than "online" or no latency is down. An absent status
-    # is written as an empty tag, which InfluxDB stores as NULL.
+    # a status other than "online" or no latency is down. An absent or empty
+    # status is written as an empty tag, which InfluxDB stores as NULL.
     _UP_SQL = (
         "CASE WHEN latency IS NOT NULL "
         "AND (status IS NULL OR status = '' OR status = 'online') "
@@ -2171,9 +2171,12 @@ def _extract_features(payload: dict, history: Optional[list] = None) -> list:
 
 
 def _is_interface_down(payload: dict) -> bool:
-    """Return True when an interface should not be trusted for routing."""
+    """Return True when an interface should not be trusted for routing.
+    An empty status is no status, as everywhere else here: it is written
+    as the same empty tag as an absent one, and /metrics/report counted
+    as up the samples this took for down."""
     status = payload.get("status")
-    return (status is not None and status != "online") or payload.get("latency") is None
+    return bool(status and status != "online") or payload.get("latency") is None
 
 
 def _valid_history(history: Optional[list]) -> list:

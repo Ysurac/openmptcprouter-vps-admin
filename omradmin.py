@@ -501,26 +501,60 @@ def _pki_retire_user_certs(username):
     second valid certificate for a subject), then regenerate the CRL.
     The lines used to be deleted instead: a revoked certificate then left
     the next CRL and worked again, and a valid one could never be revoked.
-    True if a certificate was revoked."""
+    The serials of the certificates revoked, empty if none was."""
     index_file = os.path.join(PKI_DIR, 'index.txt')
     if not os.path.isfile(index_file):
-        return False
+        return []
     with open(index_file, 'r') as f:
         lines = f.readlines()
     revoked_at = time.strftime('%y%m%d%H%M%SZ', time.gmtime())
-    changed = False
+    serials = []
     for i, line in enumerate(lines):
         fields = line.rstrip('\r\n').split('\t')
         if len(fields) >= 6 and fields[0] == 'V' and _pki_index_line_is(line, username):
             fields[0] = 'R'
             fields[2] = revoked_at
             lines[i] = '\t'.join(fields) + '\n'
-            changed = True
-    if changed:
+            serials.append(fields[3])
+    if serials:
         LOG.debug("Revoking the previous certificate of %s", log_safe(username))
         _atomic_write_text(index_file, ''.join(lines))
         _openvpn_gen_crl()
-    return changed
+    return serials
+
+def _pki_user_has_valid_cert(username):
+    """True if easyrsa's index.txt has a valid certificate of *username*."""
+    try:
+        with open(os.path.join(PKI_DIR, 'index.txt'), 'r') as f:
+            return any(line.startswith('V\t') and _pki_index_line_is(line, username) for line in f)
+    except OSError:
+        return False
+
+def _pki_restore_user_certs(username, serials):
+    """Valid again, the newest certificate of *username* among *serials*
+    that _pki_retire_user_certs() revoked, and the CRL regenerated: the
+    router connects again with the certificate it has. Not when its files
+    are gone or another one is valid (openssl refuses two valid ones for a
+    subject). The serial restored, None if none was."""
+    index_file = os.path.join(PKI_DIR, 'index.txt')
+    if not serials or not os.path.isfile(index_file) or \
+       not os.path.isfile(safe_path_join(os.path.join(PKI_DIR, 'issued'), username + '.crt')) or \
+       not os.path.isfile(safe_path_join(os.path.join(PKI_DIR, 'private'), username + '.key')):
+        return None
+    if _pki_user_has_valid_cert(username):
+        return None
+    with open(index_file, 'r') as f:
+        lines = f.readlines()
+    for i in reversed(range(len(lines))):
+        fields = lines[i].rstrip('\r\n').split('\t')
+        if len(fields) >= 6 and fields[0] == 'R' and fields[3] in serials and _pki_index_line_is(lines[i], username):
+            fields[0] = 'V'
+            fields[2] = ''
+            lines[i] = '\t'.join(fields) + '\n'
+            _atomic_write_text(index_file, ''.join(lines))
+            _openvpn_gen_crl()
+            return fields[3]
+    return None
 
 def _openvpn_gen_crl():
     env = os.environ.copy()
@@ -1018,8 +1052,10 @@ def _ss_free_port(table):
     removed, onto the installer's 65201, sshd's 65222, and past 65535."""
     used = _ss_ports_in_use((read_omr_config().get('users') or [{}])[0])
     used |= {int(port) for port in table if str(port).isdigit()}
+    # What listens is in _ss_ports_in_use(): _server_ports() listed the
+    # sockets a second time, under the config lock
     for proto in ('tcp', 'udp'):
-        used |= {port for first, last in _server_ports(proto) for port in range(first, last + 1)}
+        used |= {port for first, last in _configured_server_ports(proto) for port in range(first, last + 1)}
     port = next((port for port in range(SS_FIRST_PORT, 65536) if port not in used), None)
     if port is None:
         raise ValueError('No free shadowsocks port left')
@@ -2795,6 +2831,12 @@ def _render_fw_entry(username, udata, entry, exclude=()):
             target = udata.get('vpnremoteip', '')
         else:
             target = _user_tunnel_ip6(udata.get('userid'), 2)
+        if not target and vpn != 'default':
+            # Its GRE tunnel gone (GRE disabled, the IP given back): the
+            # port forward went with no word
+            LOG.warning("skipping firewall entry %s %s/%s of user %s: no GRE tunnel with a remote address on %s",
+                        log_safe(name), log_safe(proto), log_safe(port), log_safe(username), log_safe(source_dip))
+            return None
         if not target:
             return None  # no known tunnel address yet -- nothing to redirect to
         if _addr_family(target) != family or '/' in target:
@@ -4460,7 +4502,10 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
     def openvpn_cert_missing():
         return not os.path.isfile('/etc/openvpn/ca/pki/private/' + username + '.key') or \
             not os.path.isfile('/etc/openvpn/ca/pki/issued/' + username + '.crt')
-    if openvpn_cert_missing() and os.path.isfile('/etc/openvpn/tun0.conf'):
+    # Not to a suspended user: revoked at its suspension, a new certificate
+    # let its router back into tun1, that has no ccd and only the CRL.
+    if openvpn_cert_missing() and os.path.isfile('/etc/openvpn/tun0.conf') and \
+       not _user_access_cut(user_config):
         # Under the lock, as /add_user and /remove_user: easyrsa's
         # index.txt and serial are read and rewritten by each run, two at
         # once (two workers, a router syncing while a user is added) lost
@@ -4470,13 +4515,7 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
             if openvpn_cert_missing():
                 LOG.debug("OpenVPN cert missing for %s, creating it", username)
                 _pki_retire_user_certs(username)
-                for stale in [
-                    f"/etc/openvpn/ca/pki/reqs/{username}.req",
-                    f"/etc/openvpn/ca/pki/private/{username}.key",
-                    f"/etc/openvpn/ca/pki/issued/{username}.crt",
-                ]:
-                    if os.path.isfile(stale):
-                        os.remove(stale)
+                _openvpn_drop_cert_files(username)
                 env = os.environ.copy()
                 env['EASYRSA_CERT_EXPIRE'] = '3650'
                 result = subprocess.run(["./easyrsa", "--batch", "build-client-full", username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
@@ -5413,7 +5452,12 @@ def _server_ports(proto):
     """[(first, last)] of the ports the VPS itself uses with *proto*, on more
     than the loopback: what listens now, and what the proxies and MQVPN are
     configured to listen on even while stopped."""
-    spans = _listening_ports(proto)
+    return _listening_ports(proto) + _configured_server_ports(proto)
+
+def _configured_server_ports(proto):
+    """[(first, last)] of the ports the proxies and MQVPN are configured to
+    listen on with *proto*, on more than the loopback, running or not."""
+    spans = []
     for config in PROXY_REDIRECT_CONFIGS.values():
         try:
             with open(config) as f:
@@ -6088,12 +6132,15 @@ class MPTCPparams(BaseModel):
     syn_retries: int
     congestion_control: str
     version: int = 0
-    close_timeout: int = 0
     # None when the router left it unset: 0 (in-kernel path manager) is a
     # value, and taken for "unset" it could never undo a 1 (userspace).
+    # The same for the other v1 knobs: since /mptcp keeps the lines it does
+    # not write, a 0 dropped as "unset" could never replace a value written
+    # before (close_timeout=120 applied again at every boot).
     pm_type: Optional[int] = None
-    stale_loss_cnt: int = 0
-    syn_retrans_before_tcp_fallback: int = 0
+    close_timeout: Optional[int] = None
+    stale_loss_cnt: Optional[int] = None
+    syn_retrans_before_tcp_fallback: Optional[int] = None
 
     # The router (openmptcprouter-vps's _set_mptcp_vps) builds this JSON body
     # from `uci -q get network.globals.mptcp_*`, quoting every value as a
@@ -6104,19 +6151,17 @@ class MPTCPparams(BaseModel):
     # than omitting the key. Pydantic rejects "" for an int field outright,
     # which surfaces to the router as a bare FastAPI 422 instead of this
     # route's own {'result': 'error', ...} contract -- see issue #4350.
-    # Coercing blank to 0 here restores each field's documented default and
-    # lets the route's existing "not <field>" checks handle it normally.
-    @field_validator(
-        'syn_retries', 'version', 'close_timeout',
-        'stale_loss_cnt', 'syn_retrans_before_tcp_fallback', mode='before'
-    )
+    # Blank is coerced to 0 for syn_retries/version (the route's "not
+    # <field>" checks), to None (left unset) for the v1-only knobs.
+    @field_validator('syn_retries', 'version', mode='before')
     @classmethod
     def _blank_str_to_zero(cls, v):
         if isinstance(v, str) and v.strip() == '':
             return 0
         return v
 
-    @field_validator('pm_type', mode='before')
+    @field_validator('pm_type', 'close_timeout', 'stale_loss_cnt',
+                     'syn_retrans_before_tcp_fallback', mode='before')
     @classmethod
     def _blank_str_to_none(cls, v):
         if isinstance(v, str) and v.strip() == '':
@@ -6167,7 +6212,7 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
             settings.append(('net.mptcp.pm_type', pm_type))
         for key, value in (('close_timeout', close_timeout), ('stale_loss_cnt', stale_loss_cnt),
                            ('syn_retrans_before_tcp_fallback', syn_retrans_before_tcp_fallback)):
-            if value:
+            if value is not None:
                 settings.append(('net.mptcp.' + key, value))
     settings.append(('net.ipv4.tcp_congestion_control', congestion_control))
     # Saved only once the kernel took it: a value it refused (a scheduler
@@ -7064,15 +7109,40 @@ def mqvpn_api(cmd: dict) -> dict:
         LOG.debug("MQVPN control API error (%s)", e)
         return {'ok': False, 'error': 'MQVPN control API unreachable or invalid reply'}
 
+# Short: /status's traffic counters are the router's rate, a poll within
+# it gets the same bytes again
+MQVPN_STATUS_TTL = 2
+_mqvpn_status_cache = {'at': 0.0, 'status': None}
+_mqvpn_status_lock = threading.Lock()
+
+def _mqvpn_status():
+    """The daemon's get_status, shared for MQVPN_STATUS_TTL seconds: every
+    router's /status and /config asked for every client and path, N full
+    dumps a polling cycle. None if it can't be had. A failure is shared
+    too: with the daemon stalled, each router's request waited its 5 s
+    timeout in turn behind the lock, and logged it."""
+    with _mqvpn_status_lock:
+        now = time.monotonic()
+        if _mqvpn_status_cache['status'] is not None and now - _mqvpn_status_cache['at'] < MQVPN_STATUS_TTL:
+            return _mqvpn_status_cache['status'] or None
+        status = mqvpn_api({'cmd': 'get_status'})
+        if not status.get('ok'):
+            # Past 128 KB the daemon answers 'response too large': every
+            # user's traffic read 0, and nothing said why
+            LOG.warning("MQVPN get_status failed: %s", log_safe(status.get('error', status)))
+            status = {}
+        _mqvpn_status_cache.update(at=time.monotonic(), status=status)
+        return status or None
+
 def _mqvpn_user_bytes(username):
     """(rx, tx) of *username*'s MQVPN sessions, from the daemon. MQVPN is
     one server on one device (mqvpn0): mqvpn<userid> did not exist, every
     user read 0 and the main router everyone's traffic."""
     if not os.path.isfile('/etc/mqvpn/server.json'):
         return 0, 0
-    status = mqvpn_api({'cmd': 'get_status'})
+    status = _mqvpn_status() or {}
     rx = tx = 0
-    for client in (status.get('clients') or []) if status.get('ok') else []:
+    for client in status.get('clients') or []:
         if isinstance(client, dict) and client.get('user') == username:
             try:
                 rx += int(client.get('bytes_rx') or 0)
@@ -8714,13 +8784,7 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
         LOG.debug("Create user " + log_safe(params.username) + " in OpenVPN")
         # A certificate left valid for this CN would make easyrsa refuse to reissue
         _pki_retire_user_certs(params.username)
-        for stale in [
-            safe_path_join('/etc/openvpn/ca/pki/reqs', params.username + '.req'),
-            safe_path_join('/etc/openvpn/ca/pki/private', params.username + '.key'),
-            safe_path_join('/etc/openvpn/ca/pki/issued', params.username + '.crt'),
-        ]:
-            if os.path.isfile(stale):
-                os.remove(stale)
+        _openvpn_drop_cert_files(params.username)
         env = os.environ.copy()
         env['EASYRSA_CERT_EXPIRE'] = '3650'
         result = subprocess.run(["./easyrsa", "--batch", "build-client-full", params.username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
@@ -8933,8 +8997,20 @@ def _teardown_user(username, udata, users):
     _nft_sync_gre_snat()
 
 @app.post('/remove_user', summary="Remove an user")
-@_serialise_config_write
 def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user), request: Request):
+    result = _remove_user(params, current_user)
+    if result['result'] != 'done':
+        return result
+    # Recreated, the name got this one's metrics history (WAN IPs, BSSIDs).
+    # Out of the config lock: its flocks and fsync, or a decision holding
+    # the EMA's flock, held every config request meanwhile.
+    if _omr_metrics_router is not None and hasattr(_omr_metrics_router, 'purge_user'):
+        _omr_metrics_router.purge_user(params.username)
+    LOG.info("User admin (IP: " + request.client.host + ") removed user " + log_safe(params.username))
+    return result
+
+@_serialise_config_write
+def _remove_user(params, current_user):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
     content = read_omr_config()
@@ -8951,10 +9027,6 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     if userid == 0:
         return {'result': 'not allowed', 'reason': 'Userid 0 is protected', 'route': 'remove_user'}
     _teardown_user(params.username, content['users'][0][params.username], content['users'][0])
-    # Recreated, the name got this one's metrics history (WAN IPs, BSSIDs)
-    if _omr_metrics_router is not None and hasattr(_omr_metrics_router, 'purge_user'):
-        _omr_metrics_router.purge_user(params.username)
-    LOG.info("User admin (IP: " + request.client.host + ") removed user " + log_safe(params.username))
     return {'result': 'done', 'reason': 'user removed', 'route': 'remove_user'}
 
 def _openvpn_revoke(username):
@@ -8966,10 +9038,15 @@ def _openvpn_revoke(username):
         # in the index, which also regenerates the CRL.
         if not _pki_retire_user_certs(username):
             _openvpn_gen_crl()
-        for directory, suffix in (('reqs', '.req'), ('issued', '.crt'), ('private', '.key')):
-            stale = safe_path_join(os.path.join(PKI_DIR, directory), username + suffix)
-            if os.path.isfile(stale):
-                os.remove(stale)
+        _openvpn_drop_cert_files(username)
+
+def _openvpn_drop_cert_files(username):
+    """Delete *username*'s certificate, key and request: /config issues a
+    new certificate when they are missing."""
+    for directory, suffix in (('reqs', '.req'), ('issued', '.crt'), ('private', '.key')):
+        stale = safe_path_join(os.path.join(PKI_DIR, directory), username + suffix)
+        if os.path.isfile(stale):
+            os.remove(stale)
 
 def _openvpn_kill(username):
     """Disconnect *username*'s OpenVPN session, through the management port."""
@@ -9193,7 +9270,18 @@ def _suspend_user_access(username, udata):
         # The UDP instance (tun1) has no ccd and no management port: only
         # the CRL, that both check, kept the user out of it.
         suspended['openvpn'] = True
-        _openvpn_revoke(username)
+        # Revoked in the index, its files kept: put back, the router's own
+        # certificate is valid again. They were deleted, and the router kept
+        # a revoked certificate until it fetched /config again.
+        with _omr_config_lock(exclusive=True):
+            serials = _pki_retire_user_certs(username)
+        if serials:
+            suspended['openvpn'] = {'serials': serials}
+        else:
+            # No valid line in the index (revoked already, index rebuilt):
+            # revoked by easyrsa and its files dropped, as before; kept,
+            # they were handed out by /config, revoked, after it was put back
+            _openvpn_revoke(username)
         _openvpn_kill(username)
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         step('openvpn', openvpn)
@@ -9248,6 +9336,17 @@ def _resume_user_access(username, udata, suspended):
         if not result.get('ok'):
             LOG.warning("MQVPN control API add_user failed for %s: %s", log_safe(username), log_safe(result.get('error', result)))
     if os.path.isfile('/etc/openvpn/tun0.conf'):
+        openvpn = suspended.get('openvpn')
+        if isinstance(openvpn, dict):
+            with _omr_config_lock(exclusive=True):
+                if not _pki_restore_user_certs(username, openvpn.get('serials') or []) and \
+                   not _pki_user_has_valid_cert(username):
+                    # Its revoked files left, /config handed them out
+                    # forever: a new one at its router's next /config.
+                    # Not those of a certificate issued meanwhile (by hand)
+                    LOG.warning("OpenVPN certificate of %s not put back, a new one is issued at the next /config",
+                                log_safe(username))
+                    _openvpn_drop_cert_files(username)
         _ccd_disable(username, False)
     for unit in suspended.get('units') or []:
         subprocess.run(["systemctl", "-q", "enable", unit], check=False)

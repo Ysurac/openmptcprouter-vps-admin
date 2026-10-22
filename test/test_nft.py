@@ -131,8 +131,11 @@ class TestRenderFwPorts:
                 }],
             },
         })
-        _accept, dnat = omr_admin._render_fw_ports(config)
+        with patch.object(omr_admin.LOG, "warning") as warning:
+            _accept, dnat = omr_admin._render_fw_ports(config)
         assert not any("10.255.249.2" in rule for rule in dnat)
+        # gone, but not without a word
+        assert "no GRE tunnel" in warning.call_args.args[0]
 
     def test_source_dip_and_dest_ip_add_daddr_saddr_matches(self):
         config = _config({

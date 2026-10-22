@@ -424,6 +424,8 @@ def patch_env(request):
         # /remove_user purged the metrics of the machine running the tests
         # (as root on a VPS, its real /etc/openmptcprouter-vps-admin)
         patch("omr_admin._omr_metrics_router", None),
+        # one test's MQVPN get_status, served to the next one's
+        patch.dict("omr_admin._mqvpn_status_cache", {"at": 0.0, "status": None}),
     ):
         yield
 

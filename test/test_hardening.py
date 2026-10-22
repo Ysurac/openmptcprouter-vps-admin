@@ -291,6 +291,49 @@ class TestPkiRetire:
             assert not omr_admin._pki_retire_user_certs("alice")
         assert not write.called and not gen_crl.called
 
+    def test_retired_serials_returned(self):
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/openvpn/ca/pki/index.txt": self._INDEX})),
+            patch("omr_admin._atomic_write_text"),
+            patch("omr_admin._openvpn_gen_crl"),
+        ):
+            assert omr_admin._pki_retire_user_certs("bob") == ["02"]
+
+    _SUSPENDED = ("R\t360101000000Z\t250101000000Z\t01\tunknown\t/CN=bob\n"
+                  "R\t360101000000Z\t260101000000Z\t02\tunknown\t/CN=bob\n"
+                  "V\t360101000000Z\t\t03\tunknown\t/CN=bobby\n")
+
+    def test_suspended_certificate_valid_again(self):
+        written = {}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/openvpn/ca/pki/index.txt": self._SUSPENDED})),
+            patch("omr_admin._atomic_write_text", side_effect=lambda p, t, new_mode=0o644: written.update({p: t})),
+            patch("omr_admin._openvpn_gen_crl") as gen_crl,
+        ):
+            assert omr_admin._pki_restore_user_certs("bob", ["01", "02"]) == "02"
+        lines = written["/etc/openvpn/ca/pki/index.txt"].splitlines()
+        assert lines[0] == self._SUSPENDED.splitlines()[0]       # revoked before: stays
+        assert lines[1] == "V\t360101000000Z\t\t02\tunknown\t/CN=bob"
+        assert lines[2] == self._SUSPENDED.splitlines()[2]
+        gen_crl.assert_called_once()
+
+    def test_not_restored_without_its_files_or_with_another_valid(self):
+        with (
+            patch("os.path.isfile", side_effect=lambda p: not p.endswith("bob.key")),
+            patch("omr_admin._atomic_write_text") as write,
+        ):
+            assert omr_admin._pki_restore_user_certs("bob", ["02"]) is None
+        index = self._SUSPENDED + "V\t360101000000Z\t\t04\tunknown\t/CN=bob\n"
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/openvpn/ca/pki/index.txt": index})),
+            patch("omr_admin._atomic_write_text") as write,
+        ):
+            assert omr_admin._pki_restore_user_certs("bob", ["02"]) is None
+        assert not write.called
+
 
 # ---------------------------------------------------------------------------
 # Users
@@ -1339,6 +1382,26 @@ class TestConfigMissingKeys:
             other_client.get("/config")
         assert made == [1]
 
+    def test_no_openvpn_certificate_for_a_suspended_user(self, admin_client):
+        config = _config()
+        config["users"][0]["readonly"].update(disabled="true", access_suspended={"openvpn": True})
+        files = {CONFIG_PATH: json.dumps(config)}
+        made = []
+
+        def run(cmd, **kwargs):
+            if cmd[:1] == ["./easyrsa"]:
+                made.append(cmd)
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+        real_isfile = os.path.isfile
+        with (
+            patch("builtins.open", side_effect=_open_with(files)),
+            patch("os.path.isfile", side_effect=lambda p: p in files or p == "/etc/openvpn/tun0.conf" or real_isfile(p)),
+            patch("subprocess.run", side_effect=run),
+        ):
+            r = admin_client.get("/config", params={"username": "readonly"})
+        assert r.status_code == 200, r.text
+        assert made == []
+
 
 # ---------------------------------------------------------------------------
 # The docs cookie: only as that cookie, from the address it was given to
@@ -1841,21 +1904,44 @@ class TestDisabledUserAccess:
             patch("omr_admin._atomic_write_text", side_effect=lambda p, t, **k: written.update({p: t})),
             patch("omr_admin._openvpn_kill") as kill,
             patch("omr_admin._openvpn_revoke") as revoke,
+            patch("omr_admin._pki_retire_user_certs", return_value=["02"]) as retire,
+            patch("omr_admin._pki_restore_user_certs", return_value="02") as restore,
+            patch("omr_admin._openvpn_drop_cert_files") as drop,
             patch("subprocess.run") as run,
             patch("omr_admin._restart_service") as restart,
         ):
             suspended = omr_admin._suspend_user_access("readonly", {"userid": 2})
             assert written["/etc/openvpn/ccd/readonly"] == "iroute 192.168.2.0 255.255.255.0\ndisable\n"
             kill.assert_called_once_with("readonly")
-            # tun1 (UDP) has no ccd: only the CRL keeps it out there
-            revoke.assert_called_once_with("readonly")
-            assert suspended["openvpn"] is True
+            # tun1 (UDP) has no ccd: only the CRL keeps it out there; the
+            # files are kept, for the router's certificate to be put back
+            retire.assert_called_once_with("readonly")
+            assert not revoke.called
+            assert suspended["openvpn"] == {"serials": ["02"]}
             assert [c.args[0] for c in run.call_args_list] == [
                 ["systemctl", "-q", "disable", "--now", "glorytun-tcp@tun2"],
                 ["systemctl", "-q", "disable", "--now", "dsvpn-server@dsvpn2"]]
             run.reset_mock()
             omr_admin._resume_user_access("readonly", {"userid": 2}, suspended)
-        assert [c.args[0] for c in restart.call_args_list] == ["glorytun-tcp@tun2", "dsvpn-server@dsvpn2"]
+            restore.assert_called_once_with("readonly", ["02"])
+            assert not drop.called
+            assert written["/etc/openvpn/ccd/readonly"] == "iroute 192.168.2.0 255.255.255.0\n"
+            # not put back: a new one at /config
+            restore.return_value = None
+            with patch("omr_admin._pki_user_has_valid_cert", return_value=False):
+                omr_admin._resume_user_access("readonly", {"userid": 2}, suspended)
+            drop.assert_called_once_with("readonly")
+            # but not the files of a certificate issued meanwhile
+            drop.reset_mock()
+            with patch("omr_admin._pki_user_has_valid_cert", return_value=True):
+                omr_admin._resume_user_access("readonly", {"userid": 2}, suspended)
+            assert not drop.called
+            # no valid certificate to revoke in the index: easyrsa, as before
+            retire.return_value = []
+            suspended = omr_admin._suspend_user_access("readonly", {"userid": 2})
+            revoke.assert_called_once_with("readonly")
+            assert suspended["openvpn"] is True
+        assert [c.args[0] for c in restart.call_args_list][:2] == ["glorytun-tcp@tun2", "dsvpn-server@dsvpn2"]
 
     def test_modify_user_suspends_then_resumes(self, admin_client):
         config = _config()
@@ -1939,7 +2025,7 @@ class TestDisabledUserAccess:
             patch("omr_admin.OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock")),
             patch("socket.socket"),
             patch("omr_admin._listening_ports", return_value=[]),
-            patch("omr_admin._server_ports", return_value=[]),
+            patch("omr_admin._configured_server_ports", return_value=[]),
         ):
             # the lowest free one: 65101 manager.json's, 65102 a user's,
             # 65105 the suspended user's
@@ -1953,14 +2039,16 @@ class TestDisabledUserAccess:
         with (
             patch("builtins.open", side_effect=lambda p, *a, **k: real_open(str(manager) if p == "/etc/shadowsocks-libev/manager.json" else p, *a, **k)),
             patch("omr_admin.read_omr_config", side_effect=lambda: config),
-            patch("omr_admin._listening_ports", side_effect=lambda proto: [(65102, 65102)] if proto == "tcp" else []),
-            patch("omr_admin._server_ports", side_effect=lambda proto: [(65102, 65102), (65103, 65200)]),
+            patch("omr_admin._listening_ports", side_effect=lambda proto: [(65102, 65102)] if proto == "tcp" else []) as listening,
+            patch("omr_admin._configured_server_ports", side_effect=lambda proto: [(65103, 65200)]),
         ):
             assert omr_admin._ss_free_port({"65101": {}}) == 65201
+        # the sockets listed once per protocol, not twice
+        assert listening.call_count == 2
         with (
             patch("omr_admin.read_omr_config", side_effect=lambda: config),
             patch("omr_admin._ss_ports_in_use", return_value=set()),
-            patch("omr_admin._server_ports", return_value=[(65101, 65535)]),
+            patch("omr_admin._configured_server_ports", return_value=[(65101, 65535)]),
         ):
             with pytest.raises(ValueError):
                 omr_admin._ss_free_port({})
@@ -2104,6 +2192,13 @@ class TestReviewFixes20261014:
             assert not any("pm_type" in c for c in calls)
             assert "net.mptcp.pm_type=1" in text
 
+    def test_mptcp_v1_knob_0_replaces_a_written_value(self, primary_client):
+        text, calls = self._mptcp(primary_client, {**self._MPTCP, "close_timeout": 0, "stale_loss_cnt": ""},
+                                  "net.mptcp.close_timeout=120\nnet.mptcp.stale_loss_cnt=8\n")
+        assert "sysctl -qw net.mptcp.close_timeout=0" in calls
+        assert "net.mptcp.close_timeout=0" in text and "close_timeout=120" not in text
+        assert "net.mptcp.stale_loss_cnt=8" in text     # unset: kept
+
     def test_mptcp_keeps_the_installer_sysctls(self, primary_client):
         installer = ("net.mptcp.enabled=1\nnet.mptcp.blackhole_timeout = 0\nnet.mptcp.close_timeout=60\n"
                      "net.mptcp.mptcp_scheduler=redundant\nnet.mptcp.scheduler=blest\n")
@@ -2190,14 +2285,23 @@ class TestReviewFixes20261014:
             {"user": "(global)", "bytes_rx": 1000, "bytes_tx": 2000}]}
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.mqvpn_api", return_value=status),
+            patch("omr_admin.mqvpn_api", return_value=status) as api,
         ):
             assert omr_admin._mqvpn_user_bytes("bob") == (11, 22)
+            # one get_status for every user of the polling cycle
+            assert omr_admin._mqvpn_user_bytes("alice") == (100, 200)
+            assert api.call_count == 1
+        omr_admin._mqvpn_status_cache.update(at=0.0, status=None)
         with (
             patch("os.path.isfile", return_value=True),
-            patch("omr_admin.mqvpn_api", return_value={"ok": False}),
+            patch("omr_admin.mqvpn_api", return_value={"ok": False, "error": "response too large"}) as api,
+            patch.object(omr_admin.LOG, "warning") as warning,
         ):
             assert omr_admin._mqvpn_user_bytes("bob") == (0, 0)
+            # the failure shared as well: one timeout, one warning
+            assert omr_admin._mqvpn_user_bytes("alice") == (0, 0)
+        assert "response too large" in str(warning.call_args)
+        assert api.call_count == 1 and warning.call_count == 1
 
     def test_remove_user_purges_its_metrics(self, admin_client):
         metrics = MagicMock()
@@ -2208,6 +2312,19 @@ class TestReviewFixes20261014:
             r = admin_client.post("/remove_user", json={"username": "readonly"})
         assert r.json()["result"] == "done"
         metrics.purge_user.assert_called_once_with("readonly")
+
+    def test_remove_user_purges_out_of_the_config_lock(self, admin_client):
+        depths = []
+        metrics = MagicMock()
+        metrics.purge_user.side_effect = lambda u: depths.append(getattr(omr_admin._omr_config_lock_state, "depth", 0))
+        with (
+            patch("omr_admin._teardown_user"),
+            patch.object(omr_admin, "_omr_metrics_router", metrics),
+        ):
+            admin_client.post("/remove_user", json={"username": "readonly"})
+            # refused: nothing purged
+            admin_client.post("/remove_user", json={"username": "ghost"})
+        assert depths == [0]
 
     def test_softethervpn_keeps_the_installers_string(self, primary_client):
         config = _config()
