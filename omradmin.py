@@ -988,7 +988,10 @@ def get_vxlan_config(username, userid):
         'remoteip': vxlan_config.get('remoteip', default_remoteip),
         'localip6': vxlan_config.get('localip6', default_localip6),
         'remoteip6': vxlan_config.get('remoteip6', default_remoteip6),
-        'mtu': vxlan_config.get('mtu', 1380)
+        'mtu': vxlan_config.get('mtu', 1380),
+        # merged on purpose by the admin (/vxlan_user force) with the
+        # users sharing its VNI
+        'vni_shared': bool(vxlan_config.get('vni_shared', False)),
     }
 
 def write_vxlan_conf(username, userid):
@@ -5793,8 +5796,17 @@ def _proxy_isolate_reverse(service, config, users):
             changed = True
     if service == 'v2ray':
         # The primary's bridge logs in with the primary's client, whatever
-        # its email: everyone's but the other users'.
-        primary = sorted(emails - set(others)) or ['omr-reverse']
+        # its email: everyone's but the other users'. Their GRE tunnels'
+        # accounts too (alicegre-user3-ip0): only their own names were left
+        # out, and another router could be the main router's bridge.
+        mine, foreign = set(), set()
+        for name, udata in users.items():
+            if isinstance(udata, dict):
+                names = _user_proxy_names(name, udata)
+                (mine if _is_primary_userid(udata.get('userid')) else foreign).update(names)
+        # a tunnel's account left behind by its removed user
+        foreign |= {e for e in emails if _GRE_PROXY_USER_RE.fullmatch(e) and e not in mine}
+        primary = sorted(emails - foreign) or ['omr-reverse']
         for rule in config.get('routing', {}).get('rules', []):
             if rule.get('outboundTag') == 'OMRLan' and _v2ray_bridge_rule(rule) and rule.get('user') != primary:
                 rule['user'] = primary
@@ -6568,7 +6580,8 @@ def _vxlan_assignments(exclude_username=None):
         except (TypeError, ValueError):
             continue
         cfg = get_vxlan_config(username, userid)
-        assignments[username] = {'vni': _vxlan_as_int(cfg['vni']), 'port': _vxlan_as_int(cfg['port'])}
+        assignments[username] = {'vni': _vxlan_as_int(cfg['vni']), 'port': _vxlan_as_int(cfg['port']),
+                                 'enabled': cfg['enabled'], 'userid': userid}
     return assignments
 
 def _vxlan_conflicts(username, vni, port):
@@ -6580,6 +6593,27 @@ def _vxlan_conflicts(username, vni, port):
             continue
         (same_port if cfg['port'] == port else other_port).append(other)
     return sorted(same_port), sorted(other_port)
+
+def _vxlan_vni_taken_error(username, userid, cfg):
+    """API conflict if the VNI of *cfg* is another enabled user's and the
+    admin did not merge them, None otherwise. A user without a VNI has
+    userid+1: given by the admin to another one, the next user of that
+    userid landed on that one's L2 bridge, with a port of its own choosing.
+    A merge is the admin's when this user was merged (/vxlan_user force),
+    or when none of them is on its default VNI (the admin gave it to each)."""
+    vni = _vxlan_as_int(cfg['vni'])
+    sharing = {other: a for other, a in _vxlan_assignments(exclude_username=username).items()
+               if a['enabled'] and a['vni'] == vni}
+    if not sharing or cfg.get('vni_shared'):
+        return None
+    if vni != userid + 1 and all(a['vni'] != a['userid'] + 1 for a in sharing.values()):
+        return None
+    return {
+        'result': 'conflict',
+        'reason': 'VNI ' + str(vni) + ' already used by: ' + ', '.join(sorted(sharing))
+                  + ' (the administrator assigns another VNI, or merges them on purpose with /vxlan_user force=true)',
+        'route': 'vxlan'
+    }
 
 def _vxlan_hard_conflict(route, vni, port, users):
     return {
@@ -6663,6 +6697,9 @@ def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user))
         same_port, _other_port = _vxlan_conflicts(current_user.username, vxlan_user_config['vni'], vxlan_user_config['port'])
         if same_port:
             return _vxlan_hard_conflict('vxlan', vxlan_user_config['vni'], vxlan_user_config['port'], same_port)
+        error = _vxlan_vni_taken_error(current_user.username, userid, vxlan_user_config)
+        if error:
+            return error
     LOG.debug("modif_config_user for vxlan setting")
     modif_config_user(current_user.username, {'vxlan': vxlan_user_config})
     write_vxlan_conf(current_user.username, userid)
@@ -6724,6 +6761,15 @@ def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get
                       + ' they already use a different port so both devices can coexist)',
             'route': 'vxlan_user'
         }
+    if params.vni is not None:
+        # Merged on purpose: /vxlan lets them share it, each of them
+        vxlan_user_config['vni_shared'] = bool(other_port)
+        for other in other_port:
+            try:
+                other_userid = int(data['users'][0][other].get('userid'))
+            except (KeyError, TypeError, ValueError):
+                continue
+            modif_config_user(other, {'vxlan': _merge_vxlan_config(other, other_userid, vni_shared=True)})
     modif_config_user(params.username, {'vxlan': vxlan_user_config})
     write_vxlan_conf(params.username, userid)
     return {'result': 'done', 'reason': 'changes applied', 'vxlan': vxlan_user_config, 'route': 'vxlan_user'}
@@ -7714,8 +7760,12 @@ def _wireguard_peer_error(key, ip):
     The file is one `Key = value` per line and wg-quick runs the hook
     directives of an [Interface] section as root, so a newline in either
     value would add one."""
+    # Canonical base64 only: b64decode() ignores the 2 unused low bits of
+    # the last character, wg does not, and refused the whole wg0.conf (for
+    # every user) over one router's key with them set.
     try:
-        valid_key = isinstance(key, str) and len(key) == 44 and len(base64.b64decode(key, validate=True)) == 32
+        valid_key = isinstance(key, str) and len(key) == 44 and \
+            base64.b64encode(base64.b64decode(key, validate=True)).decode() == key
     except (binascii.Error, ValueError):
         valid_key = False
     if not valid_key:
@@ -8167,6 +8217,30 @@ def _mqvpn_fixed_ips():
                 fixed[str(net.network_address)] = entry.get('name')
     return fixed
 
+_GRE_NET4 = ipaddress.ip_network(str(GRE_V4_POOL))
+
+def _tunnel_pool_remoteip_error(users, userid, own, addr):
+    """Why *addr*, in the GRE or VXLAN pools, isn't a remoteip of the users
+    *own* (of *userid*), None if it may be: within one of their GRE tunnels'
+    /30 or their VXLAN /30 (configured, or by default)."""
+    if addr in _GRE_NET4:
+        for name in own:
+            for tunnel in ((users.get(name) or {}).get('gre_tunnels') or {}).values():
+                network = _gre_network(tunnel) if isinstance(tunnel, dict) else None
+                if network is not None and addr in ipaddress.ip_network(str(network)):
+                    return None
+        return 'Invalid remoteip'
+    if any(addr in pool for pool in _VXLAN_TUNNEL_POOLS[4]):
+        defaults = _vxlan_default_v4(userid)
+        for name in own:
+            cfg = (users.get(name) or {}).get('vxlan') or {}
+            nets = [_vxlan_tunnel_net(str(cfg.get(key, default) or ''), 4)
+                    for key, default in zip(('localip', 'remoteip'), defaults)]
+            if any(net is not None and addr in net for net in nets):
+                return None
+        return 'Invalid remoteip'
+    return None
+
 def _remoteip_owner_error(users, userid, remoteip, leases=None):
     """Why *remoteip* isn't the router address of *userid* to claim, None if
     it may be. Every DNAT of the user goes to it, so another router's address
@@ -8189,6 +8263,12 @@ def _remoteip_owner_error(users, userid, remoteip, leases=None):
                 return 'Invalid remoteip'
     if addr in _MLVPN_NET4 and userid != 0:
         return 'Invalid remoteip'
+    # The GRE and VXLAN /30s: unchecked, a router took another's tunnel end
+    # and with it that router's port forwards. Its own tunnels' only, as
+    # the slices still free are given to the next tunnels.
+    error = _tunnel_pool_remoteip_error(users, userid, own, addr)
+    if error:
+        return error
     for name, ucfg in users.items():
         if name in own:
             continue

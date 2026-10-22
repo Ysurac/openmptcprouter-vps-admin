@@ -3267,6 +3267,9 @@ class TestWireGuard:
             ({"ip": "10.0.0.2", "key": "base64key=="}, "Invalid key"),
             ({"ip": "10.0.0.2", "key": self._KEY + "\n[Interface]\nPostUp = id"}, "Invalid key"),
             ({"ip": "10.0.0.2", "key": self._KEY[:-1] + "!"}, "Invalid key"),
+            # same 32 bytes for Python ('g' -> 'h' only sets the unused low
+            # bits), refused by wg: the whole wg0.conf with it
+            ({"ip": "10.0.0.2", "key": self._KEY[:-2] + "h="}, "Invalid key"),
             ({"ip": "10.0.0.2\n[Interface]\nPostUp = id", "key": self._KEY}, "Invalid ip"),
             ({"ip": "10.0.0.2 x", "key": self._KEY}, "Invalid ip"),
             ({"ip": "", "key": self._KEY}, "Invalid ip"),

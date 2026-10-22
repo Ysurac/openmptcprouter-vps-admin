@@ -376,6 +376,24 @@ class TestProxyRedirectIsolation:
         assert not omr_admin._proxy_isolate_reverse("v2ray", data, _USERS)
 
     @pytest.mark.real_env
+    def test_v2ray_shared_portal_not_to_other_users_gre_accounts(self, configs):
+        paths, _ = configs
+        data = self._load(paths["v2ray"])
+        users = json.loads(json.dumps(_USERS))
+        users["readonly"]["gre_tunnels"] = {"gre-user2-ip0": {}}
+        users["openmptcprouter"]["gre_tunnels"] = {"gre-user0-ip0": {}}
+        tunnel = next(ib for ib in data["inbounds"] if ib["tag"] == "omrin-tunnel")
+        # readonly's tunnel account, the main router's, and one of a removed user
+        tunnel["settings"]["clients"] += [{"id": "g2", "email": "readonlygre-user2-ip0"},
+                                          {"id": "g0", "email": "openmptcproutergre-user0-ip0"},
+                                          {"id": "g5", "email": "gonegre-user5-ip0"}]
+        assert omr_admin._proxy_isolate_reverse("v2ray", data, users)
+        shared = next(r for r in data["routing"]["rules"] if r["outboundTag"] == "OMRLan")
+        # another router can't be the main router's bridge
+        assert "readonlygre-user2-ip0" not in shared["user"] and "gonegre-user5-ip0" not in shared["user"]
+        assert "openmptcprouter" in shared["user"] and "openmptcproutergre-user0-ip0" in shared["user"]
+
+    @pytest.mark.real_env
     def test_xray_isolation_replaces_the_shared_uuid_once(self, configs):
         paths, _ = configs
         data = self._load(paths["xray"])
@@ -705,6 +723,25 @@ class TestRemoteipOwner:
         assert self._error(2, "10.255.252.6", leases={"10.255.252.6": "readonly"}) is None
         # the main router logged in as admin: its certificate is still its own
         assert self._error(0, "10.255.252.6", leases={"10.255.252.6": "openmptcprouter"}) is None
+
+    def test_gre_and_vxlan_tunnel_ends_of_another_user(self):
+        users = json.loads(json.dumps(self._USERS))
+        users["third"]["gre_tunnels"] = {"gre-user3-ip0": {"network": "10.255.240.4/30", "remote_ip": "10.255.240.6"}}
+        users["readonly"]["gre_tunnels"] = {"gre-user2-ip0": {"network": "10.255.240.8/30", "remote_ip": "10.255.240.10"}}
+        users["third"]["vxlan"] = {"enabled": True, "remoteip": "10.255.224.6/30", "localip": "10.255.224.5/30"}
+
+        def error(userid, remoteip):
+            with patch("omr_admin._mqvpn_fixed_ips", return_value={}):
+                return omr_admin._remoteip_owner_error(users, userid, remoteip)
+        # another router's GRE end: its port forwards went with it
+        assert error(2, "10.255.240.6") == "Invalid remoteip"
+        assert error(2, "10.255.240.14") == "Invalid remoteip"      # nobody's yet
+        assert error(2, "10.255.240.10") is None                   # its own tunnel
+        # another router's VXLAN end, configured or by default
+        assert error(2, "10.255.224.6") == "Invalid remoteip"
+        assert error(2, "10.255.249.14") == "Invalid remoteip"     # userid 3's default
+        assert error(2, "10.255.249.10") is None                   # its own default
+        assert error(3, "10.255.224.6") is None
 
     def test_openvpn_leases_parsed(self):
         status = ["OpenVPN CLIENT LIST\n", "Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since\n",

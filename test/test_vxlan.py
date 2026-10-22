@@ -394,6 +394,46 @@ class TestVxlanEndpoint:
         _, changes = modif.call_args[0]
         assert changes["vxlan"]["port"] == 4791
 
+    def test_default_vni_given_to_another_user_refused(self, user_client):
+        """userid 0's default VNI (1) given by the admin to another user: its
+        router landed on that user's L2 bridge, on a port of its choosing."""
+        env = _FileEnv({_CONFIG_PATH: _two_users(my_port=4789, other_port=4790, my_vni=1, other_vni=1)})
+        with (
+            patch("builtins.open", side_effect=env),
+            patch("omr_admin.write_vxlan_conf") as write_conf,
+            patch("omr_admin.modif_config_user") as modif,
+        ):
+            r = user_client.post("/vxlan", json={"enable": True, "port": 4791})
+        assert r.json()["result"] == "conflict"
+        assert "otheruser" in r.json()["reason"] and "force" in r.json()["reason"]
+        modif.assert_not_called()
+        write_conf.assert_not_called()
+
+    def test_default_vni_merged_by_the_admin_accepted(self, user_client):
+        config = json.loads(_two_users(my_port=4789, other_port=4790, my_vni=1, other_vni=1))
+        config["users"][0]["openmptcprouter"]["vxlan"]["vni_shared"] = True
+        env = _FileEnv({_CONFIG_PATH: json.dumps(config)})
+        with (
+            patch("builtins.open", side_effect=env),
+            patch("omr_admin.write_vxlan_conf"),
+            patch("omr_admin.modif_config_user") as modif,
+        ):
+            r = user_client.post("/vxlan", json={"enable": True})
+        assert r.json()["result"] == "done"
+        assert modif.call_args[0][1]["vxlan"]["vni_shared"] is True
+
+    def test_vni_of_a_disabled_user_not_taken(self, user_client):
+        config = json.loads(_two_users(my_port=4789, other_port=4790, my_vni=1, other_vni=1))
+        config["users"][0]["otheruser"]["vxlan"]["enabled"] = False
+        env = _FileEnv({_CONFIG_PATH: json.dumps(config)})
+        with (
+            patch("builtins.open", side_effect=env),
+            patch("omr_admin.write_vxlan_conf"),
+            patch("omr_admin.modif_config_user"),
+        ):
+            r = user_client.post("/vxlan", json={"enable": True})
+        assert r.json()["result"] == "done"
+
     def test_disable_skips_pair_check(self, user_client):
         env = _FileEnv({_CONFIG_PATH: _two_users(my_port=4789, other_port=4789)})
         with (
@@ -470,12 +510,16 @@ class TestVxlanUser:
         with (
             patch("builtins.open", side_effect=env),
             patch("omr_admin.write_vxlan_conf"),
+            patch("omr_admin.modif_config_user") as modif,
         ):
             r = admin_client.post(
                 "/vxlan_user",
                 json={"username": "openmptcprouter", "vni": 5, "force": True},
             )
         assert r.json()["result"] == "done"
+        # merged on purpose: /vxlan lets each of them share it
+        flagged = {c.args[0]: c.args[1]["vxlan"]["vni_shared"] for c in modif.call_args_list}
+        assert flagged == {"otheruser": True, "openmptcprouter": True}
 
     def test_same_vni_same_port_rejected_even_with_force(self, admin_client):
         """force merges L2 segments, but it can't make the kernel accept two
