@@ -288,6 +288,14 @@ class TestScriptText:
         assert "\n_save_creds\n" in SCRIPT_TEXT
         assert SCRIPT_TEXT.index("\n_save_creds\n") < SCRIPT_TEXT.index("# 4. Create database")
 
+    def test_query_file_limit_covers_the_longest_window(self):
+        # 432 by default (about 72 hours): /metrics/report's 7 days and
+        # /metrics/history's 30 failed past that
+        assert 'INFLUX_QUERY_FILE_LIMIT="${INFLUX_QUERY_FILE_LIMIT:-4500}"' in SCRIPT_TEXT
+        conf = SCRIPT_TEXT[SCRIPT_TEXT.index('cat > "$INFLUX_CONF" <<EOF'):]
+        assert 'query-file-limit = "${INFLUX_QUERY_FILE_LIMIT}"' in conf[:conf.index("\nEOF")]
+        assert 4500 >= 30 * 24 * 6
+
     def test_config_update_uses_same_process_lock_as_api(self):
         assert '".omr-admin-config.lock"' in SCRIPT_TEXT
         assert "fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)" in SCRIPT_TEXT
@@ -935,3 +943,68 @@ class TestCompose:
         assert list(data) == ["influxdb"]
         assert data["influxdb"]["token"] == "influx-secret"
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+# ===========================================================================
+# debian/postinst: omr-admin.service left to debhelper
+# ===========================================================================
+
+
+class TestDebianPostinst:
+    """The postinst enabled and restarted omr-admin.service at each configure,
+    under sh -e: a unit the administrator masked failed `systemctl enable`
+    and left the package half-configured, a disabled one came back at every
+    upgrade."""
+
+    POSTINST = SCRIPT.parent / "debian" / "postinst"
+    RULES = SCRIPT.parent / "debian" / "rules"
+
+    def _run(self, tmp_path, args, modules_ok=True, systemd=True):
+        log = tmp_path / "calls"
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        for name in ("systemctl", "deb-systemd-invoke"):
+            (bindir / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\n')
+            (bindir / name).chmod(0o755)
+        (bindir / "python3").write_text(f"#!/bin/sh\nexit {0 if modules_ok else 1}\n")
+        (bindir / "python3").chmod(0o755)
+        run_dir = tmp_path / "systemd"
+        if systemd:
+            run_dir.mkdir()
+        text = self.POSTINST.read_text()
+        text = text.replace(". /usr/share/debconf/confmodule", "db_stop() { :; }")
+        text = text.replace("/run/systemd/system", str(run_dir))
+        script = tmp_path / "postinst"
+        script.write_text(text)
+        env = {"PATH": f"{bindir}:/usr/bin:/bin"}
+        r = subprocess.run(["sh", "-e", str(script), *args], env=env, capture_output=True, text=True, timeout=30)
+        calls = log.read_text().splitlines() if log.exists() else []
+        return r, calls
+
+    def test_parses_as_posix_sh(self):
+        r = subprocess.run(["sh", "-n", str(self.POSTINST)], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr
+
+    def test_no_enable_of_its_own(self):
+        # debhelper's snippet enables it at the first install only, and
+        # leaves a masked or disabled unit alone
+        code = "\n".join(l for l in self.POSTINST.read_text().splitlines() if not l.lstrip().startswith("#"))
+        assert "systemctl enable" not in code and "systemctl restart" not in code
+        assert "#DEBHELPER#" in self.POSTINST.read_text()
+        assert "dh_systemd_start --no-start" in self.RULES.read_text()
+
+    @pytest.mark.parametrize("args,action", [(["configure"], "start"), (["configure", "0.18"], "restart")])
+    def test_started_or_restarted_through_deb_systemd_invoke(self, tmp_path, args, action):
+        r, calls = self._run(tmp_path, args)
+        assert r.returncode == 0, r.stderr
+        assert calls == ["systemctl --system daemon-reload", f"deb-systemd-invoke {action} omr-admin.service"]
+
+    def test_not_started_without_its_modules(self, tmp_path):
+        r, calls = self._run(tmp_path, ["configure", "0.18"], modules_ok=False)
+        assert r.returncode == 0
+        assert calls == ["systemctl --system daemon-reload"]
+        assert "not (re)started" in r.stderr
+
+    def test_nothing_without_systemd(self, tmp_path):
+        r, calls = self._run(tmp_path, ["configure"], systemd=False)
+        assert r.returncode == 0 and calls == []

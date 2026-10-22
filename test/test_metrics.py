@@ -386,6 +386,19 @@ class TestPostMetrics:
         r = unauth_client.post("/metrics", json=_WAN)
         assert r.status_code == 403
 
+    def test_posted_too_often_refused(self, user_client):
+        # a router posting in a loop rewrote and fsynced the shared file at
+        # each one, starving every other router
+        with (
+            patch.object(omr_metrics, "METRICS_POST_MIN_INTERVAL_S", 2.0),
+            patch.object(omr_metrics, "_write_interface") as write,
+        ):
+            assert user_client.post("/metrics", json=_WAN).status_code == 200
+            assert user_client.post("/metrics", json=_WAN).status_code == 429
+            # another interface is not
+            assert user_client.post("/metrics", json={**_WAN, "interface": "wan2"}).status_code == 200
+        assert write.call_count == 2
+
     def test_storage_failure_returns_503(self, user_client):
         with patch.object(omr_metrics, "_write_interface", return_value=False):
             r = self._post(user_client, _WAN)
@@ -1166,6 +1179,15 @@ class TestPredictPayload:
         predicted = omr_metrics._predict_payload(hist, horizon_seconds=30)
         assert predicted["congestion"]["score"] > 30.0
 
+    def test_interface_down_now_stays_down(self):
+        # a null latency marks it down: extrapolated from the older samples,
+        # the interface got routing weight again
+        hist = _history_at(_WAN, [{"latency": 30.0 + i} for i in range(8)] + [{"latency": None}])
+        assert omr_metrics._is_interface_down(hist[-1])
+        predicted = omr_metrics._predict_payload(hist, horizon_seconds=300)
+        assert predicted["latency"] is None
+        assert omr_metrics._is_interface_down(predicted)
+
     def test_non_predictable_fields_preserved(self):
         hist = _history_at(_WAN, [{"latency": 25.0}] * 3)
         predicted = omr_metrics._predict_payload(hist, horizon_seconds=60)
@@ -1341,6 +1363,20 @@ class TestDscpClassWeights:
         for entry in result.values():
             assert entry["weights"]["wan2"] == 1
             assert entry["best_interface"] == "wan"
+
+    def test_idle_online_link_keeps_the_offline_one_out(self):
+        # cs1 scores bandwidth only: an idle online link scores 0, and the
+        # equal shares that followed gave the dead WAN about a third
+        user_data = {
+            "wan":  {"interface": "wan", "status": "online", "latency": 20.0, "rx_bps": 0, "tx_bps": 0},
+            "wan2": {"interface": "wan2", "status": "offline", "latency": None},
+        }
+        result = omr_metrics._dscp_class_weights(user_data, {}, {"wan": 1.0, "wan2": 0.0})
+        assert result["cs1"]["weights"]["wan2"] == 1
+        assert result["cs1"]["weights"]["wan"] == 255
+        # nothing online at all: equal shares, as before
+        assert omr_metrics._apply_cost([0.0, 0.0], ["wan", "wan2"],
+                                       {"wan": {"status": "offline"}, "wan2": {"latency": None}}) == [0.5, 0.5]
 
     def test_missing_latency_treated_as_offline(self):
         user_data = {
@@ -2727,14 +2763,16 @@ class TestInfluxBackendHistory:
         return backend, mock_client
 
     def _fake_table(self, rows):
-        """rows: list of (ts, json_str) tuples."""
-        class _Ts:
-            def __init__(self, v): self._v = v
-            def timestamp(self): return self._v
+        """rows: list of (ts, json_str) tuples. The times as arrow gives
+        them without pandas: naive datetimes, in UTC."""
+        import datetime as _dt
+
+        def _naive_utc(v):
+            return _dt.datetime.fromtimestamp(v, _dt.timezone.utc).replace(tzinfo=None)
 
         table = MagicMock()
         table.to_pydict.return_value = {
-            "time":         [_Ts(ts) for ts, _ in rows],
+            "time":         [_naive_utc(ts) for ts, _ in rows],
             "json_payload": [js       for _, js in rows],
         }
         return table
@@ -2787,6 +2825,20 @@ class TestInfluxBackendHistory:
         mock_client.query.return_value = self._fake_table([row])
         result = backend.read_history("alice", "wan", 3600, 100)
         assert result[0]["timestamp"] == 1_700_005_000
+
+    def test_naive_utc_time_not_shifted_by_the_local_zone(self, monkeypatch):
+        # .timestamp() took arrow's naive UTC time for local time
+        import time as _time
+        monkeypatch.setenv("TZ", "Europe/Paris")
+        _time.tzset()
+        try:
+            backend, mock_client = self._make_backend()
+            payload_no_ts = {k: v for k, v in _WAN.items() if k != "timestamp"}
+            mock_client.query.return_value = self._fake_table([(1_700_005_000, json.dumps(payload_no_ts))])
+            assert backend.read_history("alice", "wan", 3600, 100)[0]["timestamp"] == 1_700_005_000
+        finally:
+            monkeypatch.delenv("TZ")
+            _time.tzset()
 
     def test_query_uses_correct_username_and_interface(self):
         backend, mock_client = self._make_backend()
@@ -2997,10 +3049,11 @@ class TestInfluxBackendReport:
         sql = client.query.call_args_list[1].args[0]
         assert "AS ranked WHERE rn <= 3 " in sql
 
-    def test_query_error_returns_empty(self):
+    def test_query_error_is_no_report(self):
+        # not an empty one: no interface, no outage
         backend, client = self._make_backend()
-        client.query.side_effect = Exception("connection refused")
-        assert backend.read_report("alice", None, 3600) == {}
+        client.query.side_effect = Exception("query would exceed file limit of 432 parquet files")
+        assert backend.read_report("alice", None, 3600) is None
 
     def test_queries_are_parameterised_and_windowed(self):
         backend, client = self._make_backend()
@@ -3044,6 +3097,13 @@ class TestGetMetricsReport:
                           return_value=omr_metrics.JSONBackend()):
             r = user_client.get("/metrics/report")
         assert r.status_code == 501
+
+    def test_query_failure_is_503(self, user_client):
+        mock_influx = MagicMock(spec=omr_metrics.InfluxBackend)
+        mock_influx.read_report.return_value = None
+        with patch.object(omr_metrics, "_get_backend", return_value=mock_influx):
+            r = user_client.get("/metrics/report")
+        assert r.status_code == 503
 
     def test_report_per_interface(self, user_client):
         mock_influx = self._influx({"wan2": _report_raw(), "wan": _report_raw(up_samples=50)})
@@ -4018,6 +4078,20 @@ class TestAutoCfg:
             cfg = omr_metrics._auto_cfg(force=True)
         assert cfg["interval"] == 300
 
+    @pytest.mark.parametrize("block,enabled", [(True, True), (False, False), ("yes", True), ([1], True)])
+    def test_block_not_a_dict(self, block, enabled):
+        # true raised at raw.get: every /metrics/decision a 500, the
+        # learning loop dead; false was taken for "unset"
+        with _auto_config_open(block):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["enabled"] is enabled
+        assert cfg["interval"] == 300
+
+    def test_infinite_interval_falls_back_to_default(self):
+        with _auto_config_open({"interval": float("inf")}):
+            cfg = omr_metrics._auto_cfg(force=True)
+        assert cfg["interval"] == 300
+
     def test_enabled_string_false_is_false(self):
         with _auto_config_open({"enabled": "false"}):
             cfg = omr_metrics._auto_cfg(force=True)
@@ -4630,7 +4704,15 @@ class TestForecastBounds:
 
     def _per_iface(self):
         horizons = {c[4] for c in omr_metrics._DSCP_CLASSES}
-        return len(horizons) * len(omr_metrics._PREDICTABLE)
+        # the metrics the latest sample has: one it lacks isn't predicted
+        latest = self._hist()[-1]
+
+        def has(path):
+            v = latest
+            for key in path:
+                v = v.get(key) if isinstance(v, dict) else None
+            return v is not None
+        return len(horizons) * sum(1 for path, *_ in omr_metrics._PREDICTABLE if has(path))
 
     def test_small_request_unchanged(self):
         assert self._torch_calls(2) == 2 * self._per_iface()

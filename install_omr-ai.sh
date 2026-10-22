@@ -26,6 +26,8 @@ INFLUX_RETENTION_DAYS="${INFLUX_RETENTION_DAYS-60}"  # must match INFLUX_RETENTI
 INFLUX_HOST="http://127.0.0.1:65501"
 INFLUX_NODE_ID="omr-node"
 INFLUX_DATA_DIR="/var/lib/influxdb3/data"
+# Parquet files a query may read: 30 days of 10-minute files, and a margin
+INFLUX_QUERY_FILE_LIMIT="${INFLUX_QUERY_FILE_LIMIT:-4500}"
 
 # Set to "true" ONLY if you want to wipe all InfluxDB 3 data and start fresh.
 # Needed when a previous admin token exists but the creds file was lost.
@@ -150,6 +152,10 @@ http-bind    = "127.0.0.1:65501"
 # Allow health and ping without a token so monitoring tools and this script
 # can reach them regardless of whether auth is enabled.
 disable-authz = "health,ping"
+# The Parquet files a query may read: 432 by default, about 72 hours of
+# 10-minute files, and /metrics/report (7 days by default) and
+# /metrics/history go back 30 days. More memory for those queries.
+query-file-limit = "${INFLUX_QUERY_FILE_LIMIT}"
 EOF
 # Ensure data dir is owned by the service user
 mkdir -p "$INFLUX_DATA_DIR"

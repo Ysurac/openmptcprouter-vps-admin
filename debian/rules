@@ -6,3 +6,8 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
 %:
 	dh $@ --with python3
+
+# Started by the postinst, once omradmin.py's modules are there (compat 10:
+# dh_systemd_start; dh_installsystemd from compat 11)
+override_dh_systemd_start:
+	dh_systemd_start --no-start

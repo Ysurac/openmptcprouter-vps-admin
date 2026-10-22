@@ -232,6 +232,9 @@ services:
       - --data-dir=/var/lib/influxdb3
       - --admin-token-file=/var/lib/influxdb3/admin-token.json
       - --disable-authz=health,ping
+      # 432 by default, about 72 hours: /metrics/report and /metrics/history
+      # go back 30 days
+      - --query-file-limit=${INFLUX_QUERY_FILE_LIMIT:-4500}
     depends_on:
       influxdb-token-init:
         condition: service_completed_successfully

@@ -17,7 +17,17 @@ import io
 import json
 from unittest.mock import patch
 
+import pytest
+
 from conftest import _mock_open, omr_admin
+
+
+@pytest.fixture(autouse=True)
+def _users():
+    """alice, bob and testuser are users: a name no user has is not added."""
+    config = {"users": [{"alice": {"userid": 2}, "bob": {"userid": 3}, "testuser": {"userid": 4}}]}
+    with patch.object(omr_admin, "read_omr_config", return_value=config):
+        yield config
 
 # ---------------------------------------------------------------------------
 # Fixture data
@@ -254,3 +264,18 @@ class TestSyncSsGoUsers:
 
         mock_xray.assert_called_once_with("alice", "", "alicekey==")
         mock_mqvpn.assert_called_once_with("alice")
+
+
+class TestSyncSsGoUsersOnlyUsers:
+    def test_removed_or_suspended_user_not_added(self, _users):
+        # remove_ss_go_user failed: its name, with its old uPSK, stayed
+        _users["users"][0] = {"bob": {"userid": 3, "access_suspended": {}}}
+        with (
+            patch("os.path.isfile", side_effect=_isfile_for(SS_GO_CFG, XRAY_CFG, MQVPN_CFG)),
+            patch("builtins.open", side_effect=_open_with(upsks=_UPSKS_TWO, xray=_XRAY_EMPTY, mqvpn=_MQVPN_EMPTY)),
+            patch.object(omr_admin, "xray_add_user") as mock_xray,
+            patch.object(omr_admin, "add_mqvpn") as mock_mqvpn,
+        ):
+            omr_admin.sync_ss_go_users()
+        mock_xray.assert_not_called()
+        mock_mqvpn.assert_not_called()

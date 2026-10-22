@@ -316,6 +316,20 @@ class TestProxyRedirectIsolation:
 
     @pytest.mark.real_env
     @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_redirect_removed_without_its_destination(self, configs, service):
+        # the router's IPv6 cleanup sends no destip nor destport
+        paths, _ = configs
+        add = getattr(omr_admin, f"{service}_add_port")
+        delete = getattr(omr_admin, f"{service}_del_port")
+        assert add(OTHER, "809", "tcp", "x", "fd00::10", "80") is None
+        assert add(OTHER, "8091", "tcp", "x", "fd00::10", "80") is None
+        delete(OTHER, "809", "tcp", "x", "", "")
+        text = open(paths[service]).read()
+        assert "_redir_tcp_809_" not in text
+        assert "_redir_tcp_8091_" in text     # another port's
+
+    @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
     def test_same_user_new_destination_replaces_the_redirect(self, configs, service):
         paths, _ = configs
         add = getattr(omr_admin, f"{service}_add_port")
@@ -392,6 +406,19 @@ class TestProxyRedirectIsolation:
         # another router can't be the main router's bridge
         assert "readonlygre-user2-ip0" not in shared["user"] and "gonegre-user5-ip0" not in shared["user"]
         assert "openmptcprouter" in shared["user"] and "openmptcproutergre-user0-ip0" in shared["user"]
+
+    @pytest.mark.real_env
+    def test_every_users_reality_client_added_at_startup(self, configs):
+        # added before /add_user gave them one: their routers were refused
+        paths, _ = configs
+        with patch("omr_admin.read_omr_config", return_value={"users": [_USERS], "xray_reverse_per_user": True}), \
+             patch("omr_admin.set_global_param") as set_param:
+            omr_admin.proxy_isolate_reverse_tunnels()
+        reality = next(ib for ib in self._load(paths["xray"])["inbounds"] if ib["tag"] == "omrin-vless-reality")
+        assert sorted((c["email"], c["id"]) for c in reality["settings"]["clients"]) == \
+            [("openmptcprouter", "u0"), ("readonly", "u2")]
+        assert all(c["flow"] == "xtls-rprx-vision" for c in reality["settings"]["clients"])
+        set_param.assert_not_called()
 
     @pytest.mark.real_env
     def test_xray_isolation_replaces_the_shared_uuid_once(self, configs):
@@ -640,6 +667,17 @@ class TestVpnIpsOwnership:
         assert body["reason"] == "remoteip already used by another user"
         assert not drop.called and not modif.called
 
+    def test_conntrack_of_a_taken_over_address_flushed(self, other_client):
+        # the flows the previous holder's DNATs set up reached this router
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnremoteip="10.255.252.6", vpnlocalip="10.255.252.1")
+        with patch("omr_admin._openvpn_leases", return_value={"10.255.252.6": "readonly"}), \
+             patch("omr_admin._drop_stale_remoteip"), \
+             patch("omr_admin._flush_conntrack_reply_src") as flush:
+            body, _ = self._post(other_client, config, remoteip="10.255.252.6", localip="10.255.252.1")
+        assert body["result"] == "done"
+        assert "10.255.252.6" in [c.args[0] for c in flush.call_args_list]
+
     def test_conntrack_of_the_old_address_flushed(self, user_client):
         # #4408: a DNAT only applies to a connection's first packet, a port
         # forward its client kept alive stayed on the old address
@@ -672,6 +710,59 @@ class TestVpnIpsOwnership:
         with patch("shutil.which", return_value=None), patch("subprocess.run") as run:
             omr_admin._flush_conntrack_reply_src("10.255.220.2")
         assert not run.called
+
+
+class TestConntrackOfClosedRedirects:
+    """A DNAT only applies to a connection's first packet: closed, or its
+    user removed, an established flow kept reaching the router."""
+
+    def test_closed_redirect_flushed(self):
+        config = _config()
+        entry = {"name": "wg", "port": "51820", "proto": "udp", "fwtype": "DNAT", "family": 4,
+                 "source_dip": "", "dest_ip": "", "vpn": "default", "comment": ""}
+        config["users"][0]["readonly"].update(vpnremoteip="10.255.255.10", fw_ports=[entry])
+        with (
+            patch("omr_admin.read_omr_config", return_value=config),
+            patch("omr_admin.modif_config_user"),
+            patch("omr_admin._nft_sync_ports"),
+            patch("omr_admin._conntrack_delete") as delete,
+        ):
+            omr_admin._fw_port_del("readonly", "51820", "udp", "wg", "DNAT", 4)
+        assert delete.call_args.args[0] == ["-f", "ipv4", "-p", "udp", "--reply-src", "10.255.255.10",
+                                            "--reply-port-src", "51820"]
+        # another of its redirects still has the port: its flows are kept
+        config["users"][0]["readonly"]["fw_ports"] = [entry, dict(entry, name="wg2")]
+        with (
+            patch("omr_admin.read_omr_config", return_value=config),
+            patch("omr_admin.modif_config_user"),
+            patch("omr_admin._nft_sync_ports"),
+            patch("omr_admin._conntrack_delete") as delete,
+        ):
+            omr_admin._fw_port_del("readonly", "51820", "udp", "wg", "DNAT", 4)
+        assert not delete.called
+
+    def test_large_range_left_to_expire(self):
+        with patch("omr_admin._conntrack_delete") as delete:
+            omr_admin._flush_conntrack_dnat("10.255.255.10", 4, "tcp", "1000-1009")
+            assert delete.call_count == 10
+            delete.reset_mock()
+            omr_admin._flush_conntrack_dnat("10.255.255.10", 4, "tcp", "1000-9000")
+            assert not delete.called
+
+    def test_removed_users_connections_flushed(self):
+        users = _config()["users"][0]
+        users["readonly"].update(vpnremoteip="10.255.255.10",
+                                 gre_tunnels={"gre-user2-ip0": {"remote_ip": "10.255.240.6"}})
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("omr_admin._remove_user_resources"),
+            patch("omr_admin._mutate_omr_config"),
+            patch("omr_admin._nft_sync_ports"),
+            patch("omr_admin._nft_sync_gre_snat"),
+            patch("omr_admin._flush_conntrack_reply_src") as flush,
+        ):
+            omr_admin._teardown_user("readonly", users["readonly"], users)
+        assert [c.args[0] for c in flush.call_args_list] == ["10.255.255.10", "10.255.240.6"]
 
 
 class TestRemoteipOwner:
@@ -918,6 +1009,23 @@ class TestLanNetworks:
     def test_router_lan_accepted(self, lan):
         assert omr_admin._lan_network(lan) is not None
 
+    @pytest.mark.parametrize("lan,ok", [("192.168.0.0/16", False), ("172.16.0.0/12", False), ("10.0.0.0/9", False),
+                                        ("192.168.16.0/20", True), ("10.1.0.0/16", True), ("100.64.0.0/10", False)])
+    def test_another_router_cant_claim_a_whole_range(self, other_client, lan, ok):
+        # with client2client: every other router's LAN a conflict, and the
+        # whole range pushed to every OpenVPN client
+        with patch("omr_admin.modif_config_user") as modif:
+            r = other_client.post("/lan", json={"lanips": [lan]})
+        assert (r.json()["result"] == "done") is ok, r.json()
+        if not ok:
+            assert r.json()["reason"] == "LAN too wide" and not modif.called
+
+    def test_another_router_lans_capped(self, other_client):
+        lans = [f"192.168.{i}.0/24" for i in range(omr_admin.LAN_MAX_NETS + 1)]
+        with patch("omr_admin.modif_config_user") as modif:
+            r = other_client.post("/lan", json={"lanips": lans})
+        assert r.json()["reason"] == "Too many lanips" and not modif.called
+
     def test_lan_of_another_router_refused_with_client2client(self, user_client):
         config = _config()
         config["client2client"] = True
@@ -1077,6 +1185,64 @@ class TestBackupNames:
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
+
+class TestSerialEnforcedOnEveryRoute:
+    """The routers send their serial to /config and /status only: credentials
+    from another device, or from none, gave every other route (backups with
+    all the router's keys...)."""
+
+    @staticmethod
+    def _token(n):
+        claims = {"sub": "openmptcprouter", "exp": datetime.utcnow() + timedelta(hours=1, seconds=n),
+                  "pwd": omr_admin._password_fingerprint("userpassword")}
+        return jwt.encode(claims, SECRET_KEY, algorithm=ALGORITHM)
+
+    def test_token_good_once_shown_with_the_serial(self, unauth_client):
+        config = _config()
+        config["serial_enforce"] = True
+        config["users"][0]["openmptcprouter"]["serial"] = "S1"
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin._mutate_omr_config", side_effect=lambda f, **k: f(config)),
+        ):
+            token = self._token(1)
+            auth = {"Authorization": f"Bearer {token}"}
+            r = unauth_client.get("/vpn_list", headers=auth)
+            assert r.status_code == 403 and r.json()["detail"] == "Serial not verified"
+            # another device's serial: refused there, and still elsewhere
+            assert unauth_client.get("/status", params={"serial": "S2"}, headers=auth).json() == \
+                {"error": "False serial number"}
+            assert unauth_client.get("/vpn_list", headers=auth).status_code == 403
+            # its router's
+            assert "vps" in unauth_client.get("/status", params={"serial": "S1"}, headers=auth).json()
+            assert unauth_client.get("/vpn_list", headers=auth).status_code == 200
+            # another token of the same credentials is not
+            other = {"Authorization": f"Bearer {self._token(2)}"}
+            assert unauth_client.get("/vpn_list", headers=other).status_code == 403
+        assert len(config["users"][0]["openmptcprouter"]["serial_tokens"]) == 1
+
+    def test_not_enforced_or_no_serial_yet(self, unauth_client):
+        auth = {"Authorization": f"Bearer {self._token(3)}"}
+        config = _config()
+        with patch("omr_admin.read_omr_config", side_effect=lambda: config):
+            assert unauth_client.get("/vpn_list", headers=auth).status_code == 200
+            config["serial_enforce"] = True   # its router never sent one
+            assert unauth_client.get("/vpn_list", headers=auth).status_code == 200
+
+    def test_tokens_kept_capped(self):
+        config = _config()
+        config["serial_enforce"] = True
+        config["users"][0]["openmptcprouter"]["serial"] = "S1"
+        with (
+            patch("omr_admin.read_omr_config", side_effect=lambda: config),
+            patch("omr_admin._mutate_omr_config", side_effect=lambda f, **k: f(config)),
+        ):
+            for n in range(omr_admin.SERIAL_TOKENS_MAX + 3):
+                assert omr_admin.check_username_serial("openmptcprouter", "S1", f"t{n}")
+        tokens = config["users"][0]["openmptcprouter"]["serial_tokens"]
+        assert len(tokens) == omr_admin.SERIAL_TOKENS_MAX
+        assert tokens[-1] == omr_admin._token_fingerprint(f"t{omr_admin.SERIAL_TOKENS_MAX + 2}")
+
 
 class TestTokensTiedToThePassword:
     @staticmethod

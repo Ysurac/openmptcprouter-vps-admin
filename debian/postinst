@@ -22,20 +22,46 @@ OMR_ADMIN_PASS=$(od -vN "32" -An -tx1 /dev/urandom | tr '[:lower:]' '[:upper:]' 
 #	openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -keyout /etc/openmptcprouter-vps-admin/key.pem -out /etc/openmptcprouter-vps-admin/cert.pem -subj "/C=US/ST=Oregon/L=Portland/O=OpenMPTCProuterVPS/OU=Org/CN=www.openmptcprouter.vps"
 #fi
 
-# pick up debian/omr-admin.service and the nftables.service.d drop-in.
-# Without a running systemd (a chroot, an image build, a container)
-# systemctl failed and, with sh -e, the whole install with it.
-if [ -d /run/systemd/system ]; then
-	systemctl daemon-reload
-	systemctl enable omr-admin.service
-	systemctl restart omr-admin.service
-else
-	systemctl enable omr-admin.service 2>/dev/null || true
-fi
-
+# omradmin.py's modules are Recommends, not Depends: on Debian 12 and Ubuntu
+# the installer takes them from pip (Debian 12 has pydantic 1 only, Ubuntu's
+# python3-jwt is removed for pip's). Without them omr-admin died at its
+# import and systemd restarted it forever.
+omr_admin_modules_ok() {
+	python3 -c 'import fastapi, jwt, starlette, pydantic, importlib.util as u
+assert int(pydantic.VERSION.split(".")[0]) >= 2
+assert u.find_spec("python_multipart") or u.find_spec("multipart")' 2>/dev/null
+}
 
 db_stop
 
+# debhelper enables omr-admin.service at the first install only, and leaves
+# alone a unit the administrator disabled or masked. It was enabled and
+# restarted here at each configure as well: a disabled unit came back at
+# every upgrade, and a masked one failed `systemctl enable`, the postinst
+# with it (sh -e), and the package was left half-configured.
 #DEBHELPER#
+
+# Started as dh_systemd_start does (debian/rules gives it --no-start), once
+# omradmin.py can be imported: deb-systemd-invoke leaves a disabled or
+# masked unit alone, and a failure doesn't fail the install.
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
+	# without a running systemd (a chroot, an image build, a container):
+	# nothing to start
+	if [ -d /run/systemd/system ]; then
+		# the unit, and the nftables.service.d drop-in
+		systemctl --system daemon-reload >/dev/null || true
+		if omr_admin_modules_ok; then
+			if [ -n "$2" ]; then
+				_dh_action=restart
+			else
+				_dh_action=start
+			fi
+			deb-systemd-invoke $_dh_action 'omr-admin.service' >/dev/null || true
+		else
+			echo "omr-vps-admin: fastapi, starlette, PyJWT, pydantic >= 2 or python-multipart missing, omr-admin not (re)started" >&2
+		fi
+	fi
+fi
+
 exit 0
 # vim:set ai et sts=2 sw=2 tw=0:

@@ -499,7 +499,78 @@ class TestAddUserChecks:
         gre.assert_not_called()
 
 
+class TestXrayRealityClients:
+    def test_new_user_gets_a_reality_client(self):
+        server = {"inbounds": [{"tag": "omrin-tunnel", "protocol": "vless", "settings": {"clients": []}},
+                               {"tag": "omrin-vless-reality", "protocol": "vless",
+                                "settings": {"clients": [{"id": "main", "flow": "xtls-rprx-vision"}]}}]}
+        written = {}
+        with (
+            patch("shutil.which", return_value="/usr/bin/xray"),
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/xray/xray-server.json": json.dumps(server)})),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: written.update({p: d})),
+            patch("omr_admin._xray_live_user") as live,
+        ):
+            omr_admin.xray_add_user("carol", "uuid-c", "k")
+        reality = written["/etc/xray/xray-server.json"]["inbounds"][1]["settings"]["clients"]
+        assert {"id": "uuid-c", "flow": "xtls-rprx-vision", "email": "carol"} in reality
+        assert {"id": "main", "flow": "xtls-rprx-vision"} in reality
+        assert "omrin-vless-reality" in [c.args[0]["tag"] for c in live.call_args_list]
+
+    def test_reality_turned_on_gets_every_users_client(self):
+        config = {"inbounds": [{"tag": "omrin-tunnel", "settings": {"clients": [
+            {"id": "u0", "email": "openmptcprouter"}, {"id": "u2", "email": "readonly"},
+            {"id": "rev", "email": "omr-reverse", "reverse": {"tag": "OMRLan"}}]}}]}
+        reality = {"tag": "omrin-vless-reality", "settings": {"clients": [{"id": "u0", "flow": "xtls-rprx-vision"}]}}
+        assert omr_admin._xray_reality_clients_from_tunnel(config, reality)
+        assert reality["settings"]["clients"] == [{"id": "u0", "flow": "xtls-rprx-vision"},
+                                                  {"id": "u2", "flow": "xtls-rprx-vision", "email": "readonly"}]
+        assert not omr_admin._xray_reality_clients_from_tunnel(config, reality)
+
+
+class TestRemoveMqvpn:
+    _SERVER = json.dumps({"users": [{"name": "readonly", "key": "k2"}, {"name": "openmptcprouter", "key": "k0"}]})
+
+    def _remove(self, api):
+        with (
+            patch("builtins.open", side_effect=_open_with({"/etc/mqvpn/server.json": self._SERVER})),
+            patch("omr_admin._atomic_write_json"),
+            patch("omr_admin.mqvpn_api", return_value=api),
+            patch("subprocess.run") as run,
+        ):
+            omr_admin.remove_mqvpn("readonly")
+        return [c.args[0] for c in run.call_args_list]
+
+    def test_restarted_when_the_control_api_failed(self):
+        # the running mqvpn still had the key: the user kept its access
+        assert self._remove({"ok": False, "error": "unreachable"}) == \
+            [["systemctl", "-q", "try-restart", "mqvpn"]]
+
+    def test_not_restarted_when_removed_live(self):
+        assert self._remove({"ok": True}) == []
+
+
 class TestRemoveUserTeardown:
+    def test_gre_links_of_the_user_deleted(self):
+        # omr-service removes no tunnel without its file: the link kept its
+        # /30, which the next user's tunnel was given
+        udata = {"userid": 5, "gre_tunnels": {"gre-user5-ip0": {"network": "10.255.240.4/30"}}}
+        with (
+            patch("os.path.isfile", return_value=False),
+            patch("os.listdir", return_value=["gre-user5-ip1", "gre-user50-ip0"]),
+            patch("os.remove") as remove,
+            patch("omr_admin._gre_drop_proxy_users"),
+            patch("omr_admin._remove_user_openvpn_lan"),
+            patch("omr_admin._apply_6in4_conf"),
+            patch("omr_admin._remove_tunnel_unit"),
+            patch("subprocess.run") as run,
+        ):
+            omr_admin._remove_user_resources("c", udata, {"c": udata})
+        deleted = [c.args[0][3] for c in run.call_args_list if c.args[0][:3] == ["ip", "link", "del"]]
+        assert deleted == ["gre-user5-ip0", "gre-user5-ip1"]
+        assert [os.path.basename(c.args[0]) for c in remove.call_args_list] == ["gre-user5-ip1"]
+
     def test_every_shadowsocks_port_of_the_user_removed(self):
         manager = {"port_conf": {"65102": {"key": "a", "userid": 2}, "65103": {"key": "a", "userid": "2"},
                                  "65101": {"key": "b", "userid": 0}}}
@@ -600,6 +671,12 @@ class TestSharedDaemons:
             assert r.json()["reason"] == "Port already used by another user"
             r = other_client.post("/glorytun", json={"key": "k" * 64, "port": 65500, "chacha": True})
             assert r.json()["reason"] == "Port used by the server"
+            # the default port of a userid not made yet: /add_user writes it
+            # for that user with no check
+            for port in (65005, 65405):
+                r = other_client.post("/glorytun", json={"key": "k" * 64, "port": port, "chacha": True})
+                assert r.json()["reason"] == "Port reserved for another user", port
+        assert omr_admin._tunnel_port_error(OTHER, 65402, ("tcp",), []) is None   # its own DSVPN default
 
     def test_glorytun_empty_key_refused(self, other_client):
         with patch("os.path.isfile", return_value=True):
@@ -849,7 +926,7 @@ class TestWireGuardInterface:
             patch("omr_admin._wg_syncconf") as sync,
             patch("omr_admin.shorewall_add_port", return_value=None) as add,
         ):
-            assert omr_admin._write_wireguard_conf(config, PRIMARY)
+            assert omr_admin._write_wireguard_conf(config)
         return out.getvalue(), sync.call_args.args[0], add
 
     def test_interface_kept(self):
@@ -865,6 +942,23 @@ class TestWireGuardInterface:
         assert live == ("[Interface]\nPrivateKey = " + self._SERVER + "\nListenPort = 65311\n\n"
                         "[Peer]\nPublicKey  = " + self._PEER + "\nAllowedIPs = 10.255.247.2\n")
         assert add.call_args.args[1:3] == ("65311", "udp")
+        # as the main router's, whoever's change it was
+        assert add.call_args.args[0].username == "openmptcprouter"
+
+    def test_port_moved_to_the_main_router(self):
+        # opened as the first user whose /wireguard changed wg0.conf: its
+        # removal closed every user's WireGuard
+        config = _config()
+        config["users"][0]["readonly"]["fw_ports"] = [
+            {"name": "wireguard", "port": "65311", "proto": "udp", "fwtype": "ACCEPT", "family": 4}]
+        with (
+            patch("omr_admin.read_omr_config", return_value=config),
+            patch("omr_admin._fw_port_del") as delete,
+            patch("omr_admin.shorewall_add_port") as add,
+        ):
+            omr_admin._wireguard_port_to_main_router("65311")
+        delete.assert_called_once_with("readonly", "65311", "udp", "wireguard", "ACCEPT", 4)
+        assert add.call_args.args[0].username == "openmptcprouter"
 
     def test_lost_address_put_back(self):
         out, _live, _add = self._write("[Interface]\nListenPort = 65311\nPrivateKey = " + self._SERVER + "\n")
@@ -1222,6 +1316,37 @@ class _TrackLock:
         return held()
 
 
+class TestMqvpnRestart:
+    _PAYLOAD = {"key": "k", "scheduler": "wlb", "port": 443, "fec_enable": True, "fec_scheme": "reed_solomon",
+                "reinjection_control": True, "reinjection_mode": "deadline", "cc": "bbr2"}
+    _SERVER = {"listen": "0.0.0.0:443", "scheduler": "wlb", "fec_enable": True, "fec_scheme": "reed_solomon",
+               "reinjection_control": True, "reinjection_mode": "deadline", "cc": "bbr2", "users": []}
+
+    def _post(self, client, server, payload):
+        lock = _TrackLock()
+        restarts = []
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/mqvpn/server.json": server})),
+            patch("omr_admin._atomic_write_json") as write,
+            patch("omr_admin._omr_config_lock", side_effect=lock),
+            patch("omr_admin._restart_service", side_effect=lambda unit: restarts.append(lock.depth)),
+        ):
+            r = client.post("/mqvpn", json=payload)
+        assert r.json()["result"] == "done"
+        return write, restarts
+
+    def test_same_settings_in_another_layout_no_restart(self, primary_client):
+        # written with indent=2 by add_mqvpn: every session of every user cut
+        write, restarts = self._post(primary_client, json.dumps(self._SERVER, indent=2), self._PAYLOAD)
+        assert not write.called and restarts == []
+
+    def test_restart_out_of_the_config_lock(self, primary_client):
+        write, restarts = self._post(primary_client, json.dumps(self._SERVER), dict(self._PAYLOAD, scheduler="minrtt"))
+        assert write.call_args.kwargs.get("indent") == 2
+        assert restarts == [0]
+
+
 class TestStartupRaces:
     def test_ss_go_users_synced_under_the_lock(self):
         lock = _TrackLock()
@@ -1381,6 +1506,26 @@ class TestConfigMissingKeys:
         ):
             other_client.get("/config")
         assert made == [1]
+
+    def test_no_openvpn_certificate_for_a_user_removed_meanwhile(self, other_client):
+        # /remove_user ran (certificate revoked and dropped) between the
+        # read of the config and the lock: a new one let the router back in
+        made = []
+
+        def run(cmd, **kwargs):
+            if cmd[:1] == ["./easyrsa"]:
+                made.append(cmd)
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+        real_isfile = os.path.isfile
+        for latest in ({"users": [{}]},
+                       {"users": [{"readonly": {"userid": 2, "disabled": "true", "access_suspended": {}}}]}):
+            with (
+                patch("os.path.isfile", side_effect=lambda p: p == "/etc/openvpn/tun0.conf" or real_isfile(p)),
+                patch("omr_admin._read_omr_config_unlocked", return_value=latest),
+                patch("subprocess.run", side_effect=run),
+            ):
+                other_client.get("/config")
+        assert made == []
 
     def test_no_openvpn_certificate_for_a_suspended_user(self, admin_client):
         config = _config()
@@ -1757,6 +1902,33 @@ class TestSpeedtestConcurrency:
         finally:
             omr_admin._speedtests_running.clear()
 
+    def test_stalled_upload_gives_its_slot_back(self, monkeypatch):
+        # a WAN dropped mid-upload (no FIN, no RST): nothing timed the body
+        # out, and the slot was kept for the life of the worker
+        monkeypatch.setattr(omr_admin, "SPEEDTEST_IDLE_TIMEOUT", 0.05)
+        omr_admin._speedtests_running.clear()
+
+        class _Request:
+            client = type("C", (), {"host": "192.0.2.1"})()
+
+            async def stream(self):
+                yield b"x" * 10
+                await asyncio.sleep(10)
+                yield b"never"
+        try:
+            with patch("omr_admin._mptcp_status_for_ip", return_value="no"):
+                r = asyncio.run(omr_admin.speedtestul(_Request(), current_user=OTHER))
+            assert r.status_code == 408
+            assert omr_admin._speedtests_running == {}
+            # over the longest: measured over what came by then
+            monkeypatch.setattr(omr_admin, "SPEEDTEST_MAX_DURATION", 0.03)
+            with patch("omr_admin._mptcp_status_for_ip", return_value="no"):
+                r = asyncio.run(omr_admin.speedtestul(_Request(), current_user=OTHER))
+            assert r["bytes"] == 10
+            assert omr_admin._speedtests_running == {}
+        finally:
+            omr_admin._speedtests_running.clear()
+
     def test_released_when_the_body_never_streams(self):
         # the generator's finally only runs once it started: a client gone
         # before that kept the slot for the life of the worker
@@ -1880,11 +2052,16 @@ class TestDisabledUserAccess:
         with (
             patch("os.path.isfile", side_effect=lambda p: str(p) == str(xray) or (real_isfile(p) and str(p).startswith(str(xray.parent)))),
             patch("omr_admin._schedule_proxy_restart") as restart,
+            patch("omr_admin.modif_config_user") as modif,
         ):
             suspended = omr_admin._suspend_user_access("readonly", udata)
             during = json.loads(xray.read_text())
             emails = [c["email"] for c in during["inbounds"][0]["settings"]["clients"]]
-            assert emails == ["openmptcprouter", "omr-reverse@readonly"]   # its reverse tunnel stays
+            # its reverse tunnel too: its router's bridge logs in with it, its
+            # redirected ports went on reaching its LAN
+            assert emails == ["openmptcprouter"]
+            # saved as soon as taken, marked partial until the caller saves it
+            assert modif.call_args.args == ("readonly", {"access_suspended": dict(suspended, _partial=True)})
             assert during["inbounds"][1]["settings"]["accounts"] == []
             json.dumps(suspended)   # kept in the config
             omr_admin._resume_user_access("readonly", udata, suspended)
@@ -1894,6 +2071,28 @@ class TestDisabledUserAccess:
                 assert sorted(map(json.dumps, ib_before["settings"].get(field, []))) == \
                     sorted(map(json.dumps, ib_after["settings"].get(field, [])))
         assert restart.call_count == 2
+
+    def test_partial_suspension_completed_not_redone(self):
+        # stopped after its openvpn step: run again, that step would revoke
+        # with easyrsa and drop the certificate it kept
+        udata = {"userid": 2, "disabled": "true",
+                 "access_suspended": {"_partial": True, "openvpn": {"serials": ["02"]}}}
+        assert omr_admin._suspension_incomplete(udata)
+        assert not omr_admin._suspension_incomplete({"access_suspended": {"openvpn": True}})
+        assert omr_admin._suspension_incomplete({})
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in ("/etc/openvpn/tun0.conf", "/etc/glorytun-tcp/tun2")),
+            patch("omr_admin._ccd_disable") as ccd,
+            patch("omr_admin._pki_retire_user_certs") as retire,
+            patch("omr_admin._openvpn_revoke") as revoke,
+            patch("omr_admin._openvpn_kill"),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("subprocess.run"),
+        ):
+            suspended = omr_admin._suspend_user_access("readonly", udata)
+        assert not ccd.called and not retire.called and not revoke.called
+        assert suspended == {"openvpn": {"serials": ["02"]}, "units": ["glorytun-tcp@tun2"]}
+        assert modif.call_args.args[1]["access_suspended"]["_partial"] is True
 
     def test_tunnels_stopped_openvpn_refused_and_back(self):
         present = {"/etc/glorytun-tcp/tun2", "/etc/dsvpn/dsvpn2", "/etc/openvpn/tun0.conf"}
@@ -2097,6 +2296,32 @@ class TestDisabledUserAccess:
         assert table["65105"] == {"key": "dave", "userid": 3}
         assert table["65107"] == {"key": "carol", "userid": 2}
         assert [c.args[0] for c in readd.call_args_list] == ["65107"]
+
+    def test_resume_into_a_file_turned_to_port_conf(self, tmp_path):
+        # taken from port_key, the file turned to port_conf meanwhile
+        manager = tmp_path / "manager.json"
+        manager.write_text(json.dumps({"port_conf": {"65101": {"key": "main"}}}))
+        real_open = open
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=lambda p, *a, **k: real_open(str(manager) if p == "/etc/shadowsocks-libev/manager.json" else p, *a, **k)),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: manager.write_text(json.dumps(d))),
+            patch("omr_admin.OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock")),
+            patch("omr_admin._ss_manager_readd"),
+        ):
+            omr_admin._ss_resume({"65105": "carolkey"}, 2)
+        assert json.loads(manager.read_text())["port_conf"]["65105"] == {"key": "carolkey", "userid": 2}
+        # and the other way round
+        manager.write_text(json.dumps({"port_key": {"65101": "main"}}))
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=lambda p, *a, **k: real_open(str(manager) if p == "/etc/shadowsocks-libev/manager.json" else p, *a, **k)),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: manager.write_text(json.dumps(d))),
+            patch("omr_admin.OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock")),
+            patch("omr_admin._ss_manager_readd"),
+        ):
+            omr_admin._ss_resume({"65105": {"key": "carolkey", "userid": 2}}, 2)
+        assert json.loads(manager.read_text())["port_key"]["65105"] == "carolkey"
 
     def test_wireguard_peers_of_a_disabled_user_left_out(self):
         key = __import__("base64").b64encode(b"k" * 32).decode()
@@ -2357,6 +2582,40 @@ class TestReviewFixes20261014:
         assert r.json()["result"] == "done", r.json()
         close.assert_called_once_with("443", "tcp", "xray vless-reality")
         del_port.assert_not_called()
+
+    def test_xray_ss_method_checked(self, primary_client):
+        # the PSK and uPSKs are 32 bytes: an aes-128 or unknown method made
+        # xray refuse its config, every user's proxy down
+        xray = {"inbounds": [{"tag": "omrin-shadowsocks-tunnel", "settings": {"method": "2022-blake3-aes-256-gcm"}}]}
+        written = {}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/xray/xray-server.json": json.dumps(xray)})),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: written.update({p: d})),
+            patch("omr_admin.modif_config_user"),
+            patch("omr_admin.xray_ensure_reverse_client", return_value="r"),
+            patch("omr_admin._xray_user_conf", return_value={}),
+            patch("omr_admin._restart_service") as restart,
+        ):
+            r = primary_client.post("/xray", json={"userid": "0", "ss_method": "rc4-md5"})
+            assert r.json() == {"result": "error", "reason": "Invalid ss_method", "route": "xray"}
+            assert not written and not restart.called
+            r = primary_client.post("/xray", json={"userid": "0", "ss_method": "2022-blake3-aes-128-gcm"})
+            assert r.json()["result"] == "done"
+        assert written["/etc/xray/xray-server.json"]["inbounds"][0]["settings"]["method"] == "2022-blake3-aes-256-gcm"
+
+    def test_reality_refused_on_a_port_something_listens_on(self, primary_client):
+        xray = {"inbounds": [{"tag": "omrin-tunnel", "port": 65228}]}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=_open_with({"/etc/xray/xray-server.json": json.dumps(xray)})),
+            patch("omr_admin._proxy_port_elsewhere", return_value=None),
+            patch("omr_admin._listening_ports", return_value=[(443, 443)]),
+            patch("omr_admin._atomic_write_json") as write,
+        ):
+            r = primary_client.post("/xray", json={"userid": "0", "vless_reality": True})
+        assert r.json()["reason"] == "Port 443 already in use on the server"
+        assert not write.called
 
     def test_reality_port_not_opened_without_its_config(self, primary_client):
         xray = {"inbounds": [{"tag": "omrin-tunnel", "port": 65228, "streamSettings": {"network": "tcp"}}]}

@@ -11,4 +11,5 @@ Package: omr-vps-admin
 Architecture: all
 Multi-Arch: foreign
 Depends: ${misc:Depends}, ${python3:Depends}, python3-uvicorn, python3-requests, python3-netaddr, python3-pip, python3-netifaces, python3-aiofiles, python3-psutil, jq, ipcalc, nftables, conntrack
+Recommends: python3-fastapi, python3-starlette, python3-jwt, python3-pydantic (>= 2), python3-python-multipart
 Description: OpenMPTCProuter VPS admin rest api

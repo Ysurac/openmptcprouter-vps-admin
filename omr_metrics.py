@@ -920,7 +920,9 @@ class InfluxBackend:
                 try:
                     entry = json.loads(payload_str)
                     if "timestamp" not in entry and ts is not None:
-                        entry["timestamp"] = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
+                        # .timestamp() took arrow's naive UTC time for local
+                        # time: shifted by the VPS's offset
+                        entry["timestamp"] = _epoch_s(ts)
                     result.append(entry)
                 except Exception:
                     pass  # skip a corrupt row
@@ -989,7 +991,9 @@ class InfluxBackend:
                 try:
                     entry = json.loads(payload_str)
                     if "timestamp" not in entry and ts is not None:
-                        entry["timestamp"] = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
+                        # .timestamp() took arrow's naive UTC time for local
+                        # time: shifted by the VPS's offset
+                        entry["timestamp"] = _epoch_s(ts)
                     result.setdefault(iface, []).append(entry)
                     kept += 1
                 except Exception:
@@ -1062,7 +1066,7 @@ class InfluxBackend:
             changes = self._client.query(transitions_sql, query_parameters=params).to_pydict()
         except Exception as exc:
             _influx_warn("omr_metrics InfluxDB report: query error: %s", exc)
-            return {}
+            return None   # not an empty report: no interface, no outage
 
         result: dict = {}
         try:
@@ -1111,15 +1115,12 @@ class InfluxBackend:
             counts = d.get("entry_count", [None])
             entry_count = int(counts[0]) if counts and counts[0] is not None else 0
 
-            def _ts(v):
-                if v is None:
-                    return None
-                return int(v.timestamp()) if hasattr(v, "timestamp") else int(v)
-
+            # Arrow's naive datetimes are UTC: .timestamp() took them for
+            # local time, first/last_seen shifted on a VPS not in UTC
             firsts = d.get("first_seen", [None])
             lasts  = d.get("last_seen",  [None])
-            first_seen = _ts(firsts[0]) if firsts else None
-            last_seen  = _ts(lasts[0])  if lasts  else None
+            first_seen = _epoch_s(firsts[0]) if firsts else None
+            last_seen  = _epoch_s(lasts[0])  if lasts  else None
         except Exception as exc:
             _influx_warn("omr_metrics InfluxDB user_stats: %s", exc)
             entry_count, first_seen, last_seen = 0, None, None
@@ -1298,6 +1299,31 @@ _MAX_CLOCK_SKEW_S: int = 300
 # A router has a handful of WANs: cap the distinct interfaces stored per user
 # so one account cannot grow the store (and every per-interface loop) at will.
 MAX_INTERFACES_PER_USER: int = 32
+# One sample per interface this often at most, per worker. Nothing limited
+# POST /metrics: a router posting in a loop rewrote and fsynced the shared
+# JSON file under its flock at each one, starving every other router's
+# writes and decisions, or grew InfluxDB without bound. The routers post
+# every 5 s at the fastest (omr-metrics-send, 30 s by default).
+METRICS_POST_MIN_INTERVAL_S = 2.0
+_metrics_last_post: dict = {}
+_metrics_last_post_lock = threading.Lock()
+
+
+def _metrics_post_allowed(username: str, interface: str) -> bool:
+    now = time.monotonic()
+    key = (username, interface)
+    with _metrics_last_post_lock:
+        last = _metrics_last_post.get(key)
+        if last is not None and now - last < METRICS_POST_MIN_INTERVAL_S:
+            return False
+        _metrics_last_post[key] = now
+        if len(_metrics_last_post) > 65536:
+            # the users and interfaces gone: what was not posted lately
+            for k in [k for k, t in _metrics_last_post.items() if now - t > 3600]:
+                del _metrics_last_post[k]
+    return True
+
+
 # Known interfaces per user, refreshed from the backend after this many
 # seconds so each POST does not cost an extra InfluxDB query.
 _IFACE_CACHE_TTL: float = 60.0
@@ -1478,6 +1504,11 @@ def _report_interface(raw: dict) -> dict:
 
 def _build_report(username: str, interface: Optional[str], since_seconds: int) -> dict:
     raw = _get_backend().read_report(username, interface, since_seconds)
+    if raw is None:
+        # A failed query (InfluxDB down, or past its Parquet file limit on a
+        # long window) answered 200 with no interface: a router seemingly
+        # never up, and no outage
+        raise HTTPException(status_code=503, detail="Metrics query failed")
     return {
         "since_s": since_seconds,
         "generated_at": int(time.time()),
@@ -1966,6 +1997,14 @@ def _predict_payload(history: list, horizon_seconds: int = 300) -> dict:
     target_ts = float(latest_ts) + horizon_seconds
 
     for path, lo, hi, halflife in _PREDICTABLE:
+        # Not where the latest sample has none: a null latency (the check
+        # failed) is what marks an interface down, and the extrapolation
+        # from the older samples gave it routing weight again.
+        current: object = payload
+        for key in path:
+            current = (current or {}).get(key) if isinstance(current, dict) else None
+        if current is None:
+            continue
         timestamps: list = []
         values: list = []
         for p in history:
@@ -2657,8 +2696,14 @@ def _apply_cost(raw: list, interfaces: list, user_data: dict) -> list:
     scaled = [raw[i] * _cost_factor(user_data[interfaces[i]]) for i in range(len(interfaces))]
     total = sum(scaled)
     if total == 0.0:
-        eq = 1.0 / len(interfaces) if interfaces else 1.0
-        return [eq] * len(interfaces)
+        # Equal shares between the online ones: an idle link scores 0 on a
+        # bandwidth-only DSCP class (cs1), and the offline interfaces got
+        # their share of it too. Every interface when none is online.
+        online = [not _is_interface_down(user_data[iface]) for iface in interfaces]
+        if not any(online):
+            online = [True] * len(interfaces)
+        eq = 1.0 / sum(online) if interfaces else 1.0
+        return [eq if up else 0.0 for up in online]
     return [v / total for v in scaled]
 
 
@@ -2903,14 +2948,20 @@ def _auto_cfg(force: bool = False) -> dict:
     raw: dict = {}
     try:
         with open(OMR_CONFIG_FILE) as f:
-            raw = _parse_admin_config(f).get("auto_learning") or {}
+            raw = _parse_admin_config(f).get("auto_learning")
     except Exception as exc:
         LOG.debug("omr_auto: config read: %s", exc)
+    # "auto_learning": true raised at raw.get (every /metrics/decision a
+    # 500, the learning loop dead), and false was taken for "unset"
+    if isinstance(raw, bool):
+        raw = {"enabled": raw}
+    elif not isinstance(raw, dict):
+        raw = {}
 
     def _num(key, lo, hi, cast=float):
         try:
             return max(lo, min(hi, cast(raw.get(key, _AUTO_DEFAULTS[key]))))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):   # int(1e999)
             return _AUTO_DEFAULTS[key]
 
     def _bool(key):
@@ -3183,10 +3234,20 @@ async def _auto_learn_loop():
     """
     LOG.info("omr_auto: background auto-learning loop started")
     while True:
-        await asyncio.sleep(_auto_cfg()["interval"])
+        # Out of the try below, an error here ended the loop for good
+        try:
+            interval = _auto_cfg()["interval"]
+        except Exception as exc:
+            LOG.warning("omr_auto: config unusable (%s), default interval", exc)
+            interval = _AUTO_DEFAULTS["interval"]
+        await asyncio.sleep(interval)
         # Read after the sleep: read before it, a round ran once more after
         # auto-learning was disabled.
-        cfg = _auto_cfg()
+        try:
+            cfg = _auto_cfg()
+        except Exception as exc:
+            LOG.warning("omr_auto: config unusable (%s), round skipped", exc)
+            continue
         if not cfg["enabled"]:
             continue
         if not _auto_leader():
@@ -3726,6 +3787,8 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         # Keep accepting it, stamped with the receive time instead.
         if payload.get('timestamp') is None or abs(payload['timestamp'] - now) > _MAX_CLOCK_SKEW_S:
             payload['timestamp'] = now
+        if not _metrics_post_allowed(target, payload['interface']):
+            raise HTTPException(status_code=429, detail="Metrics posted too often for this interface")
         accepted = await asyncio.to_thread(_accept_interface, target, payload['interface'])
         if not accepted:
             raise HTTPException(

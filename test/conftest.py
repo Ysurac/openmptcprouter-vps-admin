@@ -426,6 +426,9 @@ def patch_env(request):
         patch("omr_admin._omr_metrics_router", None),
         # one test's MQVPN get_status, served to the next one's
         patch.dict("omr_admin._mqvpn_status_cache", {"at": 0.0, "status": None}),
+        # the tests post an interface many times in a row
+        patch("omr_metrics.METRICS_POST_MIN_INTERVAL_S", 0.0),
+        patch.dict("omr_metrics._metrics_last_post", {}, clear=True),
     ):
         yield
 

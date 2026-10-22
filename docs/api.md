@@ -93,7 +93,7 @@ Configuration endpoints return a JSON object of the form:
 | GET | `/openapi.json` | OpenAPI schema (auth required) |
 | GET | `/docs` | Swagger UI (auth required, see `/login_basic`) |
 | GET | `/speedtest?size=N` | Download speed test: streams N MiB (1–100, default 10) of zeroes; `X-MPTCP` header reports MPTCP status. At most 8 running per user and 16 per worker (429 beyond) |
-| POST | `/speedtest` | Upload speed test: measures the received request body, returns bytes/duration/speed |
+| POST | `/speedtest` | Upload speed test: measures the received request body, returns bytes/duration/speed. Measured over 300 s at most; an upload with nothing received for 30 s is answered 408 and gives its slot back |
 
 ### Proxy configuration
 
@@ -104,17 +104,17 @@ Configuration endpoints return a JSON object of the form:
 | POST | `/shadowsocks` | `ShadowsocksConfigparams` | Shadowsocks-libev settings: port, method, key, fast_open, reuse_port, no_delay, MPTCP, obfs (v2ray/obfs plugin, tls/http) |
 | POST | `/shadowsocks-go` | `ShadowsocksGoConfigparams` | Shadowsocks-Go settings: port, method, fast_open, reuse_port, MPTCP |
 | POST | `/v2ray` | `V2rayconfig` | Refresh V2Ray key/port in the user config |
-| POST | `/xray` | `Xrayconfig` | XRay settings: VLESS Reality toggle (auto-heals an empty/placeholder x25519 key pair), Shadowsocks 2022 method, transport (`tcp`, `grpc`, `xhttp`); also ensures the `omrin-tunnel` inbound carries a VLESS Reverse Proxy client (`reverse_key` in the response) used for VPS→LAN port forwarding |
+| POST | `/xray` | `Xrayconfig` | XRay settings: VLESS Reality toggle (auto-heals an empty/placeholder x25519 key pair), Shadowsocks 2022 method (`2022-blake3-aes-256-gcm` or `2022-blake3-chacha20-poly1305`; `2022-blake3-aes-128-gcm` is set as aes-256, the keys being 32 bytes; anything else is refused), transport (`tcp`, `grpc`, `xhttp`); also ensures the `omrin-tunnel` inbound carries a VLESS Reverse Proxy client (`reverse_key` in the response) used for VPS→LAN port forwarding |
 | POST | `/v2rayredirect` / `/xrayredirect` | `V2rayparams` / `Xrayparams` | Redirect a server port to the router through V2Ray/XRay (name, port, proto, optional destip/destport) |
-| POST | `/v2rayunredirect` / `/xrayunredirect` | idem | Remove such a redirection |
+| POST | `/v2rayunredirect` / `/xrayunredirect` | idem | Remove such a redirection; without `destip`, the redirection of that port and protocol whatever its destination |
 
 ### VPN configuration
 
 | Method | Path | Body model | Description |
 |--------|------|------------|-------------|
 | POST | `/vpn` | `Vpn` | Select the VPN used by the current user (`openvpn`, `openvpn_bonding`, `glorytun_tcp`, `glorytun_udp`, `dsvpn`, `mlvpn`, `mqvpn`, `softether`, `none`) |
-| POST | `/glorytun` | `GlorytunConfig` | Glorytun key, port, chacha20 toggle |
-| POST | `/dsvpn` | `DSVPN` | DSVPN key and port |
+| POST | `/glorytun` | `GlorytunConfig` | Glorytun key, port, chacha20 toggle. A router other than the main one can't take another user's port, a server port, or the default port of another userid (65000-65063, 65400-65463) |
+| POST | `/dsvpn` | `DSVPN` | DSVPN key and port, with the same port restrictions as `/glorytun` |
 | POST | `/mlvpn` | `MLVPN` | MLVPN password, timeout, reorder buffer, loss tolerance, cleartext |
 | POST | `/mqvpn` | `MQVPN` | MQVPN scheduler (`minrtt`, `wlb`, `backup`, `backup_fec`, `rap`, `wlb_udp_pin`, `wrtt`, `wrr`, `redundant`, `dscp`), port (default 443), FEC (xor/reed_solomon/…), reinjection, congestion control (bbr2/bbr/cubic/…), reorder (`cap_packets` a power of two) and up to 16 per-port reorder rules (`proto` udp/tcp, `port` 0-65535, `profile` cellular_bond/fiber_lte/quic_bulk/low_latency/default_udp). The `key` sent is ignored |
 | POST | `/mqvpn_user` | `MQVPNUser` | Admin only: set or clear a fixed IP for an MQVPN user. The fixed IP of a suspended (disabled) user is refused to the others |
@@ -178,7 +178,7 @@ doesn't parse, and the chain is flushed in a single transaction.
 | POST | `/dscp_classify` | `DscpClassifyParams` | Mirror the router's destination→DSCP classification (`entries: [{dscp, cidr}]`) into native per-class/family nft sets plus the `dscp_mark` chain's `ip[6] dscp set` rules, so the VPS's own outbound traffic to a proxied destination carries the same DSCP as the router→VPS leg. Warns if `nft` isn't installed |
 | POST | `/bypass` | `ByPass` | IPs to bypass (direct out via `intf` instead of the tunnel) |
 | POST | `/wan` | `Wanips` | Router WAN IPs (written to the Shadowsocks ACL white list) |
-| POST | `/lan` | `Lanips` | Current user LAN subnets (also updates OpenVPN iroutes when client2client is enabled) |
+| POST | `/lan` | `Lanips` | Current user LAN subnets (also updates OpenVPN iroutes when client2client is enabled). A router other than the main one has at most 16, none wider than a /16 of 10.0.0.0/8, 172.16.0.0/12 or 100.64.0.0/10, or a /20 of 192.168.0.0/16 |
 
 ### Backup
 
@@ -199,7 +199,7 @@ doesn't parse, and the chain is flushed in a single transaction.
 | GET | `/list_users` | — | Dump the full user table |
 | GET | `/get-number-of-users` | — | Count of users (excluding the admin) |
 | POST | `/client2client` | `ClienttoClient` | Enable/disable client-to-client communication |
-| POST | `/serialenforce` | `SerialEnforce` | Enable/disable router serial-number enforcement |
+| POST | `/serialenforce` | `SerialEnforce` | Enable/disable router serial-number enforcement. Once a router's serial is recorded, its token is only taken by the other routes after it was shown with that serial to `/config` or `/status` (403 `Serial not verified` before) |
 
 ### Metrics and decision engine (`omr_metrics` module)
 
@@ -211,11 +211,11 @@ learning engine.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/metrics` | Stored router metrics for the current user |
-| POST | `/metrics` | Store metrics for one WAN interface |
+| POST | `/metrics` | Store metrics for one WAN interface; one sample per interface every 2 s at most (429) |
 | GET | `/metrics/all` | Metrics of all users (admin only) |
 | GET | `/metrics/user` | Current user profile and metrics DB statistics |
 | GET | `/metrics/history` | Historical metrics (requires InfluxDB) |
-| GET | `/metrics/report` | Availability report per WAN interface (requires InfluxDB) |
+| GET | `/metrics/report` | Availability report per WAN interface (requires InfluxDB); 503 when the query fails |
 | GET | `/metrics/decision` | Model-assigned weight for each WAN interface |
 | GET | `/metrics/quality/forecast` | Link-quality forecast |
 | POST | `/metrics/decision/train` | Train the decision model |
