@@ -3263,24 +3263,32 @@ class TestWireGuard:
 
     def test_peer_injection_refused(self, user_client):
         # wg-quick runs an [Interface] section's hook directives as root
-        for peer, reason in (
-            ({"ip": "10.0.0.2", "key": "base64key=="}, "Invalid key"),
-            ({"ip": "10.0.0.2", "key": self._KEY + "\n[Interface]\nPostUp = id"}, "Invalid key"),
-            ({"ip": "10.0.0.2", "key": self._KEY[:-1] + "!"}, "Invalid key"),
+        for key in (
+            "base64key==",
+            self._KEY + "\n[Interface]\nPostUp = id",
+            self._KEY[:-1] + "!",
             # same 32 bytes for Python ('g' -> 'h' only sets the unused low
             # bits), refused by wg: the whole wg0.conf with it
-            ({"ip": "10.0.0.2", "key": self._KEY[:-2] + "h="}, "Invalid key"),
-            ({"ip": "10.0.0.2\n[Interface]\nPostUp = id", "key": self._KEY}, "Invalid ip"),
-            ({"ip": "10.0.0.2 x", "key": self._KEY}, "Invalid ip"),
-            ({"ip": "", "key": self._KEY}, "Invalid ip"),
+            self._KEY[:-2] + "h=",
         ):
             with (
                 patch("os.path.isfile", return_value=True),
                 patch("omr_admin.move") as move,
             ):
-                r = user_client.post("/wireguard", json={"peers": [peer]})
-            assert r.json() == {"result": "error", "reason": reason, "route": "wireguard"}, peer
-            assert not move.called, peer
+                r = user_client.post("/wireguard", json={"peers": [{"ip": "10.255.247.2", "key": key}]})
+            assert r.json() == {"result": "error", "reason": "Invalid key", "route": "wireguard"}, key
+            assert not move.called, key
+
+    def test_peer_with_an_address_that_is_not_one_is_refused(self, user_client):
+        # refused, not left out: its only peer left out, the router's peers
+        # were all removed with a 'done'. Its text never reaches wg0.conf.
+        for ip in ("10.255.247.2\n[Interface]\nPostUp = id", "10.255.247.2 x", ""):
+            config = self._config()
+            r, modif, write_conf = self._post(user_client, config, [{"ip": ip, "key": self._KEY},
+                                                                    {"ip": "10.255.247.5", "key": self._KEY3}])
+            assert r.json() == {"result": "error", "reason": "Invalid ip", "route": "wireguard"}, ip
+            modif.assert_not_called()
+            write_conf.assert_not_called()
 
     _KEY2 = "uKU1qOpAj/4jKsjk3ZqdpQ6GNZpI7mGTWArxpvzSg1I="
     _KEY3 = "8M3Pm2kz4tXyq0bQK7y1VH3WbJ5dL2bF7hYQqkq0z0A="
@@ -3342,6 +3350,15 @@ class TestWireGuard:
                                                                  {"ip": "10.255.247.5", "key": self._KEY3}])
             assert r.json()["result"] == "done", ip
             modif.assert_called_once_with("openmptcprouter", {"wireguard_peers": [{"ip": "10.255.247.5", "key": self._KEY3}]})
+
+    def test_peer_outside_the_vpn_skipped_before_its_key_is_checked(self, user_client):
+        # an interface to another server, with a key wg0 would not take, no
+        # longer refuses the router its peer of this server
+        config = self._config()
+        r, modif, _write = self._post(user_client, config, [{"ip": "10.255.252.2", "key": "base64key=="},
+                                                             {"ip": "10.255.247.5", "key": self._KEY3}])
+        assert r.json()["result"] == "done"
+        modif.assert_called_once_with("openmptcprouter", {"wireguard_peers": [{"ip": "10.255.247.5", "key": self._KEY3}]})
 
     def test_conf_rendered_from_every_users_peers(self):
         wg_conf = ("[Interface]\nListenPort = 65311\nPrivateKey = " + self._KEY + "\n"

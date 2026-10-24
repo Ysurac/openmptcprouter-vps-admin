@@ -128,29 +128,74 @@ def _omr_config_lock(exclusive=True):
             _omr_config_lock_state.depth -= 1
         return
 
-    with _omr_config_thread_lock:
-        lock_file = None
-        lock_acquired = False
-        try:
-            lock_file = open(OMR_CONFIG_LOCK_FILE, 'a+')
+    deferred = []   # (action, unit) of _systemctl_after_lock, run once the lock is released
+    try:
+        with _omr_config_thread_lock:
+            lock_file = None
+            lock_acquired = False
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-                lock_acquired = True
-            except (OSError, ValueError, AttributeError):
-                # Some tests use in-memory file objects without a file descriptor.
-                pass
-            _omr_config_lock_state.depth = 1
-            try:
-                yield
-            finally:
-                _omr_config_lock_state.depth = 0
-        finally:
-            if lock_file is not None:
+                lock_file = open(OMR_CONFIG_LOCK_FILE, 'a+')
                 try:
-                    if lock_acquired:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                    lock_acquired = True
+                except (OSError, ValueError, AttributeError):
+                    # Some tests use in-memory file objects without a file descriptor.
+                    pass
+                _omr_config_lock_state.depth = 1
+                _omr_config_lock_state.deferred = deferred
+                _omr_config_lock_state.sockets = {}
+                try:
+                    yield
                 finally:
-                    lock_file.close()
+                    _omr_config_lock_state.depth = 0
+                    _omr_config_lock_state.deferred = None
+                    _omr_config_lock_state.sockets = None
+            finally:
+                if lock_file is not None:
+                    try:
+                        if lock_acquired:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        lock_file.close()
+    finally:
+        # Each on its own: one that raised skipped the others, and replaced
+        # what the request returned (or raised)
+        for action, unit in deferred:
+            try:
+                if action == 'restart':
+                    _restart_service_now(unit)
+                else:
+                    _systemctl_now(action, unit)
+            except Exception:   # pylint: disable=broad-except
+                LOG.exception("systemctl %s %s failed", action, unit)
+
+
+def _drop_deferred(unit):
+    """Drop what waits for the config lock to be released for *unit*, and
+    return its name without '.service': under both spellings, one unit was
+    restarted twice, or stopped and restarted anyway."""
+    unit = unit[:-len('.service')] if unit.endswith('.service') else unit
+    deferred = getattr(_omr_config_lock_state, 'deferred', None)
+    if deferred:
+        deferred[:] = [entry for entry in deferred if entry[1] != unit]
+    return unit
+
+
+def _systemctl_after_lock(action, unit):
+    """systemctl *action* *unit*, once the config lock is released when it
+    is held: every request of every router (its token check included)
+    waited for the unit to stop, up to systemd's timeout. The last action
+    asked for a unit wins: one restarted then stopped (user removed,
+    suspended) was started again once the lock was released. True if it
+    did, None when it is deferred."""
+    unit = _drop_deferred(unit)
+    deferred = getattr(_omr_config_lock_state, 'deferred', None)
+    if getattr(_omr_config_lock_state, 'depth', 0) and deferred is not None:
+        deferred.append((action, unit))
+        return None
+    if action == 'restart':
+        return _restart_service_now(unit)
+    return _systemctl_now(action, unit)
 
 
 def _serialise_config_write(func):
@@ -400,11 +445,33 @@ def _sysctl_set(key, value):
     return True
 
 def _restart_service(unit):
+    """systemctl restart *unit*, once the config lock is released (see
+    _systemctl_after_lock)."""
+    return _systemctl_after_lock('restart', unit)
+
+def _stop_service(unit, disable=False, defer=True):
+    """systemctl stop (and disable) *unit*, dropping a restart of it asked
+    for meanwhile. The stop waits for the config lock to be released when
+    *defer*: not when what the unit reads is removed right after, by its
+    ExecStop (omr-vxlan@, omr6in4@), its EnvironmentFile (glorytun-udp@) or
+    the restart of Restart=always (glorytun, dsvpn), nor when its
+    interface is (gt-udp-tunN, recreated by a restart in between)."""
+    if disable:
+        subprocess.run(["systemctl", "-q", "disable", unit], check=False)
+    if defer:
+        return _systemctl_after_lock('stop', unit)
+    return _systemctl_now('stop', _drop_deferred(unit))
+
+def _restart_service_now(unit):
     """systemctl restart *unit*; True if it did. A unit that fails to start
     (a config it refuses, a port taken) was not even logged."""
-    result = subprocess.run(["systemctl", "-q", "restart", unit], capture_output=True, text=True, check=False)
+    return _systemctl_now('restart', unit)
+
+def _systemctl_now(action, unit):
+    """systemctl *action* *unit*; True if it did, the failure logged."""
+    result = subprocess.run(["systemctl", "-q", action, unit], capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        LOG.warning("systemctl restart %s failed (%s): %s", unit, result.returncode,
+        LOG.warning("systemctl %s %s failed (%s): %s", action, unit, result.returncode,
                     (result.stderr or '').strip()[:300] if isinstance(result.stderr, str) else '')
         return False
     return True
@@ -997,8 +1064,43 @@ def _vxlan_bridge_name(vni):
     name = 'br-vxlan' + str(vni)
     return name if len(name) <= 15 else 'br-vx{:06x}'.format(int(vni))
 
-def get_vxlan_config(username, userid):
-    omr_config_data = read_omr_config()
+VXLAN_DEFAULT_PORT = 4789
+
+def _user_vxlan_stored(username, data=None):
+    """The user's stored 'vxlan' entry, as is ({} without), from *data*
+    when the config is parsed already."""
+    if data is None:
+        data = read_omr_config()
+    udata = (data.get('users') or [{}])[0].get(username)
+    return (udata.get('vxlan') or {}) if isinstance(udata, dict) else {}
+
+def _vxlan_port_users(port, data=None):
+    """Sorted users whose enabled VXLAN has UDP *port*: vxlan_input drops it
+    from outside the VPN, and their kernel socket takes it once their tunnel
+    is up. A service moved there while that tunnel was down (no socket to
+    see) was unreachable for every router."""
+    if data is None:
+        data = read_omr_config()
+    return sorted(username for username, udata in ((data.get('users') or [{}])[0]).items()
+                  if isinstance(udata, dict) and _vxlan_enabled_port(udata.get('vxlan')) == _vxlan_as_int(port))
+
+def _vxlan_enabled_port(vxlan_config):
+    """The UDP port (int) of a stored 'vxlan' entry the omr-vxlan@ unit
+    binds, None when it is disabled or its port isn't one."""
+    if not isinstance(vxlan_config, dict) or not vxlan_config.get('enabled', False):
+        return None
+    try:
+        port = int(vxlan_config.get('port', VXLAN_DEFAULT_PORT))
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+def get_vxlan_config(username, userid, omr_config_data=None):
+    """The user's VXLAN settings, defaults filled in, from *omr_config_data*
+    when the caller has it parsed already: the loops over every user parsed
+    the config file once per user, under the config lock."""
+    if omr_config_data is None:
+        omr_config_data = read_omr_config()
     user_config = omr_config_data['users'][0].get(username, {})
     vxlan_config = user_config.get('vxlan') or {}
     mode = vxlan_config.get('mode', 'l3')
@@ -1010,7 +1112,7 @@ def get_vxlan_config(username, userid):
         'enabled': bool(vxlan_config.get('enabled', False)),
         'mode': mode,
         'vni': vxlan_config.get('vni', userid + 1),
-        'port': vxlan_config.get('port', 4789),
+        'port': vxlan_config.get('port', VXLAN_DEFAULT_PORT),
         'localip': vxlan_config.get('localip', default_localip),
         'remoteip': vxlan_config.get('remoteip', default_remoteip),
         'localip6': vxlan_config.get('localip6', default_localip6),
@@ -1023,55 +1125,55 @@ def get_vxlan_config(username, userid):
 
 def write_vxlan_conf(username, userid):
     userid = int(userid)
-    vxlan_config = get_vxlan_config(username, userid)
+    omr_config_data = read_omr_config()
+    vxlan_config = get_vxlan_config(username, userid, omr_config_data)
     vxlan_file = '/etc/openmptcprouter-vps-admin/omr-vxlan/user' + str(userid)
     if not vxlan_config['enabled']:
         if os.path.isfile(vxlan_file):
-            subprocess.run(["systemctl", "-q", "stop", f"omr-vxlan@user{userid}"], check=False)
-            subprocess.run(["systemctl", "-q", "disable", f"omr-vxlan@user{userid}"], check=False)
+            # Now: its ExecStop reads the file removed below
+            _stop_service(f"omr-vxlan@user{userid}", disable=True, defer=False)
             os.remove(vxlan_file)
         return
-    omr_config_data = read_omr_config()
     user_config = omr_config_data['users'][0].get(username, {})
     underlay_localip = user_config.get('vpnlocalip', '')
     underlay_remoteip = user_config.get('vpnremoteip', '')
     if not underlay_localip or not underlay_remoteip:
         LOG.debug("No VPN IPs known for user %s, vxlan config not written", log_safe(username))
         return
-    if os.path.isfile(vxlan_file):
-        initial_md5 = hashlib.md5(file_as_bytes(vxlan_file)).hexdigest()
+    n = io.StringIO()
+    n.write('VNI=' + str(vxlan_config['vni']) + "\n")
+    n.write('PORT=' + str(vxlan_config['port']) + "\n")
+    n.write('LOCALIP=' + underlay_localip.split('/')[0] + "\n")
+    n.write('REMOTEIP=' + underlay_remoteip.split('/')[0] + "\n")
+    n.write('MODE=' + vxlan_config['mode'] + "\n")
+    if vxlan_config['mode'] == 'l2':
+        # Bridge name is derived from the VNI so every client sharing that
+        # VNI lands on the same server-side bridge (shared L2 segment)
+        n.write('BRIDGE=' + _vxlan_bridge_name(vxlan_config['vni']) + "\n")
     else:
-        initial_md5 = ''
+        # Stored values are written again on every call, and older
+        # releases stored them unchecked: never let one that isn't an
+        # address into the file omr-vxlan-run reads as root.
+        for key, family in (('localip', 4), ('localip6', 6)):
+            if vxlan_config[key] and _vxlan_tunnel_net(vxlan_config[key], family) is None:
+                LOG.warning("Ignoring invalid VXLAN %s of user %s", key, log_safe(username))
+                vxlan_config[key] = None
+        if vxlan_config['localip']:
+            n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
+        if vxlan_config['localip6']:
+            n.write('LOCALTUNIP6=' + vxlan_config['localip6'] + "\n")
+        if not vxlan_config['localip'] and not vxlan_config['localip6']:
+            LOG.warning("No VXLAN L3 tunnel address for user %s: userid %d is past the derived pools, set localip/localip6 explicitly", log_safe(username), userid)
+    n.write('MTU=' + str(vxlan_config['mtu']) + "\n")
+    # Written only when it changes, and replaced at once: each router sync
+    # (/vpnips) truncated and rewrote it in place, and omr-vxlan-run (root)
+    # starting meanwhile could read it empty or half written
+    if os.path.isfile(vxlan_file) and file_as_bytes(vxlan_file) == n.getvalue().encode():
+        return
     os.makedirs('/etc/openmptcprouter-vps-admin/omr-vxlan', exist_ok=True)
-    with open(vxlan_file, 'w+') as n:
-        n.write('VNI=' + str(vxlan_config['vni']) + "\n")
-        n.write('PORT=' + str(vxlan_config['port']) + "\n")
-        n.write('LOCALIP=' + underlay_localip.split('/')[0] + "\n")
-        n.write('REMOTEIP=' + underlay_remoteip.split('/')[0] + "\n")
-        n.write('MODE=' + vxlan_config['mode'] + "\n")
-        if vxlan_config['mode'] == 'l2':
-            # Bridge name is derived from the VNI so every client sharing that
-            # VNI lands on the same server-side bridge (shared L2 segment)
-            n.write('BRIDGE=' + _vxlan_bridge_name(vxlan_config['vni']) + "\n")
-        else:
-            # Stored values are written again on every call, and older
-            # releases stored them unchecked: never let one that isn't an
-            # address into the file omr-vxlan-run reads as root.
-            for key, family in (('localip', 4), ('localip6', 6)):
-                if vxlan_config[key] and _vxlan_tunnel_net(vxlan_config[key], family) is None:
-                    LOG.warning("Ignoring invalid VXLAN %s of user %s", key, log_safe(username))
-                    vxlan_config[key] = None
-            if vxlan_config['localip']:
-                n.write('LOCALTUNIP=' + vxlan_config['localip'] + "\n")
-            if vxlan_config['localip6']:
-                n.write('LOCALTUNIP6=' + vxlan_config['localip6'] + "\n")
-            if not vxlan_config['localip'] and not vxlan_config['localip6']:
-                LOG.warning("No VXLAN L3 tunnel address for user %s: userid %d is past the derived pools, set localip/localip6 explicitly", log_safe(username), userid)
-        n.write('MTU=' + str(vxlan_config['mtu']) + "\n")
-    final_md5 = hashlib.md5(file_as_bytes(vxlan_file)).hexdigest()
-    if initial_md5 != final_md5:
-        subprocess.run(["systemctl", "-q", "enable", f"omr-vxlan@user{userid}"], check=False)
-        _restart_service(f"omr-vxlan@user{userid}")
+    _atomic_write_text(vxlan_file, n.getvalue())
+    subprocess.run(["systemctl", "-q", "enable", f"omr-vxlan@user{userid}"], check=False)
+    _restart_service(f"omr-vxlan@user{userid}")
 
 SS_FIRST_PORT = 65101
 
@@ -1370,11 +1472,11 @@ def _xray_reality_clients_from_tunnel(xray_config, reality_inbound):
             added = True
     return added
 
-def xray_add_user(user,xrayuuid='',ukeyss2022='',restart=1, ip=''):
+def xray_add_user(user,xrayuuid='',ukeyss2022=''):
     with _omr_config_lock(exclusive=True):
-        return _xray_add_user_locked(user, xrayuuid, ukeyss2022, restart, ip)
+        return _xray_add_user_locked(user, xrayuuid, ukeyss2022)
 
-def _xray_add_user_locked(user,xrayuuid, ukeyss2022, restart, ip):
+def _xray_add_user_locked(user,xrayuuid, ukeyss2022):
     if xrayuuid == '':
         xrayuuid = str(uuid.uuid1())
     if ukeyss2022 == '':
@@ -1413,13 +1515,6 @@ def _xray_add_user_locked(user,xrayuuid, ukeyss2022, restart, ip):
     _atomic_write_json('/etc/xray/xray-server.json', data)
     for inbound, client in pushed:
         _xray_live_user(inbound, user, client)
-    if ip != '':
-        try:
-            xray_tag = 'output-' + str(ip)
-            xray_add_routing(xray_tag,user,0)
-            xray_add_outbound(xray_tag,str(ip),0)
-        except Exception as exception:
-            LOG.debug("XRay outbound for %s not added (%s)", ip, exception)
     # No xray restart: users are pushed live through the xray API above
     return xrayuuid
 
@@ -1548,126 +1643,10 @@ def _proxy_gre_user_sync(data, user, puuid, tag, inbounds=None):
         changed = True
     return changed
 
-def v2ray_add_outbound(tag,ip, restart=1):
-    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    with open('/etc/v2ray/v2ray-server.json') as f:
-        data = json.load(f)
-        data['outbounds'].append({'protocol': 'freedom', 'settings': { 'userLevel': 0 }, 'tag': tag, 'sendThrough': ip})
-    _atomic_write_json('/etc/v2ray/v2ray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("v2ray")
-
-def xray_add_outbound(tag,ip, restart=1):
-    if not os.path.isfile('/etc/xray/xray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    with open('/etc/xray/xray-server.json') as f:
-        data = json.load(f)
-        data['outbounds'].append({'protocol': 'freedom', 'settings': { 'userLevel': 0 }, 'tag': tag, 'sendThrough': ip})
-    _atomic_write_json('/etc/xray/xray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("xray")
-
-def v2ray_del_outbound(tag, restart=1):
-    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    with open('/etc/v2ray/v2ray-server.json') as f:
-        data = json.load(f)
-        for outbounds in list(data['outbounds']):
-            if outbounds['tag'] == tag:
-                data['outbounds'].remove(outbounds)
-    _atomic_write_json('/etc/v2ray/v2ray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("v2ray")
-
-def xray_del_outbound(tag, restart=1):
-    if not os.path.isfile('/etc/xray/xray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    with open('/etc/xray/xray-server.json') as f:
-        data = json.load(f)
-        for outbounds in list(data['outbounds']):
-            if outbounds['tag'] == tag:
-                data['outbounds'].remove(outbounds)
-    _atomic_write_json('/etc/xray/xray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("xray")
-
-def v2ray_add_routing(tag, user, restart=1):
-    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    with open('/etc/v2ray/v2ray-server.json') as f:
-        data = json.load(f)
-        if user == "":
-                data['routing']['rules'].append({'type': 'field', 'inboundTag': ( 'omrin-tunnel' ), 'outboundTag': tag})
-        else:
-                _proxy_gre_user_sync(data, user, '', tag, V2RAY_TUNNEL_INBOUNDS)
-
-    _atomic_write_json('/etc/v2ray/v2ray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("v2ray")
-
 # Every inbound a router reaches xray through, one per protocol it can pick
 # (xray.omrout.protocol on the router)
 XRAY_TUNNEL_INBOUNDS = ('omrin-tunnel', 'omrin-vmess-tunnel', 'omrin-trojan-tunnel',
                         'omrin-socks-tunnel', 'omrin-shadowsocks-tunnel', 'omrin-vless-reality')
-
-def xray_add_routing(tag, user, restart=1):
-    if not os.path.isfile('/etc/xray/xray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    with open('/etc/xray/xray-server.json') as f:
-        data = json.load(f)
-        if user == "":
-                data['routing']['rules'].insert(0,{'type': 'field', 'inboundTag': ( 'omrin-tunnel' ), 'outboundTag': tag})
-        else:
-                # A user's rule on omrin-tunnel alone only held for VLESS: a
-                # router on VMess, Trojan, SOCKS, Shadowsocks (shadowsocks-rust
-                # included) or VLESS Reality left through the main address.
-                # After the "blocked" rules, not ahead of them.
-                _proxy_gre_user_sync(data, user, '', tag)
-    _atomic_write_json('/etc/xray/xray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("xray")
-
-def v2ray_del_routing(tag, restart=1):
-    if not os.path.isfile('/etc/v2ray/v2ray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    with open('/etc/v2ray/v2ray-server.json') as f:
-        data = json.load(f)
-        for rules in list(data['routing']['rules']):
-            if rules['outboundTag'] == tag:
-                data['routing']['rules'].remove(rules)
-    _atomic_write_json('/etc/v2ray/v2ray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/v2ray/v2ray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("v2ray")
-
-def xray_del_routing(tag, restart=1):
-    if not os.path.isfile('/etc/xray/xray-server.json'):
-        return
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    with open('/etc/xray/xray-server.json') as f:
-        data = json.load(f)
-        for rules in list(data['routing']['rules']):
-            if rules['outboundTag'] == tag:
-                data['routing']['rules'].remove(rules)
-    _atomic_write_json('/etc/xray/xray-server.json', data)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/xray/xray-server.json')).hexdigest()
-    if initial_md5 != final_md5 and restart == 1:
-        _restart_service("xray")
-
 
 # The /30 of each GRE tunnel (a public IP of the VPS for a router), server
 # side .1, router side .2. They were taken from 10.255.249.0/24 in order,
@@ -1890,13 +1869,18 @@ def add_gre_tunnels(only_user=None):
     LOG.debug("Add gre-tunnels now...")
     public = _vps_public_ipv4s()
     allips = [addr for _, addr, _ in public]
-    if len(public) > 1:
+    # Tunnels are made with more than one public IPv4 only. Down to one,
+    # those of the address gone were kept for good (their proxy users,
+    # shadowsocks port, SNAT and /config entry): still removed then.
+    multi = len(public) > 1
+    content = read_omr_config()
+    if multi or any(isinstance(udata, dict) and udata.get('gre_tunnels')
+                    for udata in ((content.get('users') or [{}])[0]).values()):
         xray_file = '/etc/xray/xray-server.json'
         v2ray_file = '/etc/v2ray/v2ray-server.json'
         md5s = {service: hashlib.md5(file_as_bytes(conf['file'])).hexdigest()
                 for service, conf in GRE_PROXIES.items() if os.path.isfile(conf['file'])}
         ss_added = False
-        content = read_omr_config()
         users = (content.get('users') or [{}])[0]
         used = {str(net) for udata in users.values() if isinstance(udata, dict)
                 for net in (_gre_network(t) for t in (udata.get('gre_tunnels') or {}).values() if isinstance(t, dict))
@@ -1922,6 +1906,10 @@ def add_gre_tunnels(only_user=None):
             else:
                 wanted = [addr for addr in allips if addr in (udata.get('public_ips') or [])]
             stored = udata.get('gre_tunnels') or {}
+            if not multi:
+                # no new one: those it has on the address left are kept
+                wanted = [addr for addr in wanted
+                          if any(isinstance(t, dict) and t.get('public_ip') == addr for t in stored.values())]
             if not wanted and not stored:
                 continue
             # Deep: the xray email set below went into the stored tunnel as
@@ -2040,8 +2028,8 @@ def remove_glorytun_tcp(userid):
     # tun0 is the template every user's config is built from.
     if userid == 0 or not os.path.isfile('/etc/glorytun-tcp/tun' + str(userid) + '.key'):
         return
-    subprocess.run(["systemctl", "-q", "disable", f"glorytun-tcp@tun{userid}"], check=False)
-    subprocess.run(["systemctl", "-q", "stop", f"glorytun-tcp@tun{userid}"], check=False)
+    # Now: its files (and gt-udp link) are removed below, Restart=always
+    _stop_service(f"glorytun-tcp@tun{userid}", disable=True, defer=False)
     os.remove('/etc/glorytun-tcp/tun' + str(userid) + '.key')
     # The config was left behind, and /config kept reading the removed
     # user's tunnel addresses from it.
@@ -2088,8 +2076,8 @@ def remove_glorytun_udp(userid):
     # tun0 is the template every user's config is built from.
     if userid == 0 or not os.path.isfile('/etc/glorytun-udp/tun' + str(userid) + '.key'):
         return
-    subprocess.run(["systemctl", "-q", "disable", f"glorytun-udp@tun{userid}"], check=False)
-    subprocess.run(["systemctl", "-q", "stop", f"glorytun-udp@tun{userid}"], check=False)
+    # Now: its files (and gt-udp link) are removed below, Restart=always
+    _stop_service(f"glorytun-udp@tun{userid}", disable=True, defer=False)
     # glorytun-udp runs with OPTIONS="persist", so its interface outlives the
     # service (glorytun-udp-run names it gt-udp-<config name>).
     subprocess.run(["ip", "link", "del", f"gt-udp-tun{userid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -2129,8 +2117,8 @@ def remove_dsvpn(userid):
     # dsvpn0 is the template every user's config is built from.
     if userid == 0 or not os.path.isfile('/etc/dsvpn/dsvpn' + str(userid)):
         return
-    subprocess.run(["systemctl", "-q", "disable", f"dsvpn-server@dsvpn{userid}"], check=False)
-    subprocess.run(["systemctl", "-q", "stop", f"dsvpn-server@dsvpn{userid}"], check=False)
+    # Now: its files (and gt-udp link) are removed below, Restart=always
+    _stop_service(f"dsvpn-server@dsvpn{userid}", disable=True, defer=False)
     for name in ('/etc/dsvpn/dsvpn' + str(userid), '/etc/dsvpn/dsvpn' + str(userid) + '.key'):
         if os.path.isfile(name):
             os.remove(name)
@@ -2229,10 +2217,7 @@ def remove_mqvpn(username):
         # The running mqvpn still had its key: a removed or suspended user
         # kept its session, and could reconnect, until mqvpn restarted for
         # another reason. It reloads server.json; not started if stopped.
-        result = subprocess.run(["systemctl", "-q", "try-restart", "mqvpn"], capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            LOG.warning("systemctl try-restart mqvpn failed (%s): %s", result.returncode,
-                        (result.stderr or '').strip()[:300] if isinstance(result.stderr, str) else '')
+        _systemctl_after_lock('try-restart', 'mqvpn')
 
 
 def ordered(obj):
@@ -2558,8 +2543,11 @@ def _proxy_del_port(service, user, port, proto, destip, destport):
     # stayed, forwarding into the user's LAN.
     any_dest = _proxy_redirect_tag(user, port, proto, '', '', False) + '_to_' if destip == '' else None
     def removed(inbound_tag):
+        # Its own only: a user named "<user>_redir_tcp_80_to_x" had its
+        # redirects matched by the prefix as well
         return any(_proxy_tag_matches(inbound_tag, tag) for tag in tags) or \
-            (any_dest is not None and inbound_tag.startswith(any_dest))
+            (any_dest is not None and inbound_tag.startswith(any_dest)
+             and _proxy_redirect_owner(inbound_tag) == user.username)
     with _omr_config_lock(exclusive=True):
         with open(config) as f:
             data = json.load(f)
@@ -2793,7 +2781,12 @@ def _user_tunnel_ip6(userid, host):
 # redirect of e.g. udp/53 would otherwise send the connections every other
 # router makes through its own tunnel, to any destination, to that user.
 NFT_VPNCL_IFACES = ('client-wg*',)
-_NFT_FROM_NET = 'iifname != ' + _nft_iface_set(NFT_VPN_IFACES + NFT_VPNCL_IFACES)
+def _nft_from_net(extra=()):
+    """The match of what doesn't come from a VPN interface (the routers',
+    the client-wg* clients'), nor from *extra*."""
+    return 'iifname != ' + _nft_iface_set(NFT_VPN_IFACES + NFT_VPNCL_IFACES + tuple(extra))
+
+_NFT_FROM_NET = _nft_from_net()
 
 def _dedicated_ips(config_data):
     """{username: [network]} of the public IPs each user has to itself
@@ -2946,7 +2939,10 @@ def _nft_sync_ports():
             return False
         accept_rules, dnat_rules = _render_fw_ports(config_data)
         dnat_rules = _render_bulk_redirect(config_data) + dnat_rules
-        return _nft_flush_chain('user_accept', accept_rules) and _nft_flush_chain('user_dnat', dnat_rules)
+        accept_ok = _nft_flush_chain('user_accept', accept_rules)
+        # Whatever user_accept: skipped, the DNATs of a removed user or entry
+        # stayed live, to an address that may be another router's now
+        return _nft_flush_chain('user_dnat', dnat_rules) and accept_ok
 
 def _fw_port_key(entry):
     return (entry.get('name'), str(entry.get('port')), entry.get('proto'),
@@ -3096,6 +3092,117 @@ def _nft_sync_client2client():
         config_data = read_omr_config()
         enabled = bool(config_data.get('client2client', False)) if config_data else False
         return _nft_flush_chain('client2client', _render_client2client(enabled))
+
+# --- VXLAN ports from the VPN only (vxlan_input chain) -------------------
+
+# The kernel binds a VXLAN port on every address and takes a packet of its
+# VNI from any source: reaching it from the internet (a port of the base
+# 65000-65535 accept, or one a user opened in user_accept) put frames into
+# that router's tunnel, or its L2 bridge. The tunnels run over the VPN, so
+# what reaches these ports from elsewhere is dropped, in a chain of its own
+# hooked before the base input chain: a drop there is final, whatever the
+# base chain or user_accept accept after it.
+NFT_VXLAN_INPUT_PRIORITY = -1
+
+def _render_vxlan_input(config_data, reserved=()):
+    """Pure: the vxlan_input rules dropping the VXLAN ports of every
+    enabled user when they don't come from a VPN interface (lo and the
+    client-wg* clients too, the base input chain accepts both first).
+    *reserved* [(first, last)]: ports of the VPS's own services, never
+    dropped: a VXLAN port stored on one (before /vxlan checked it) took
+    that service from every router."""
+    ports = set()
+    for udata in (config_data.get('users') or [{}])[0].values():
+        port = _vxlan_enabled_port(udata.get('vxlan')) if isinstance(udata, dict) else None
+        if port is not None and not any(a <= port <= b for a, b in reserved):
+            ports.add(port)
+    if not ports:
+        return []
+    port_set = '{ ' + ', '.join(str(port) for port in sorted(ports)) + ' }'
+    from_net = _nft_from_net(('lo',))
+    return [f'{from_net} udp dport {port_set} drop comment "OMR VXLAN from the VPN only"']
+
+def _wireguard_listen_ports():
+    """[(port, port)] of the ListenPort of every WireGuard config: a kernel
+    socket, with no process to see it by."""
+    spans = []
+    for conf in glob.glob('/etc/wireguard/*.conf'):
+        try:
+            with open(conf) as f:
+                for line in f:
+                    key, sep, value = line.partition('=')
+                    if sep and key.strip().lower() == 'listenport' and value.strip().isdigit():
+                        spans.append((int(value.strip()),) * 2)
+        except OSError:
+            continue
+    return spans
+
+def _tunnel_udp_config_ports():
+    """[(port, port)] the UDP instances of OpenVPN (tun1, bonding*: UDP
+    unless 'proto tcp*', on 'port'/'lport' or 1194, OpenVPN's defaults; a
+    client config, with 'client' or 'remote', listens on none) and MLVPN
+    (its 'bindport's) are configured on."""
+    spans = []
+    for conf in glob.glob('/etc/openvpn/*.conf') + glob.glob('/etc/mlvpn/*.conf'):
+        openvpn = conf.startswith('/etc/openvpn/')
+        udp, client, ports = True, False, []   # MLVPN is UDP only
+        try:
+            with open(conf) as f:
+                for line in f:
+                    words = line.replace('=', ' ').split()
+                    if not words:
+                        continue
+                    if openvpn and words[0] in ('client', 'remote'):
+                        client = True
+                    elif len(words) < 2:
+                        continue
+                    elif openvpn and words[0] == 'proto':
+                        udp = words[1].startswith('udp')
+                    elif words[0] in ('port', 'lport', 'bindport') and words[1].isdigit():
+                        ports.append((int(words[1]),) * 2)
+        except OSError:
+            continue
+        if openvpn and not ports:
+            ports = [(1194, 1194)]
+        if udp and not client:
+            spans += ports
+    return spans
+
+def _vxlan_service_ports(config_data, listening=None):
+    """[(first, last)] of the UDP ports of the VPS's own services a VXLAN
+    port must not take: what a process listens on (*listening*, the
+    kernel's VXLAN sockets have none), what the proxies, MQVPN,
+    shadowsocks-libev, glorytun-udp, OpenVPN's and MLVPN's UDP instances
+    and WireGuard (a kernel socket too) are configured on, running or not, and the glorytun 650NN of every
+    userid, given or not. Only what listened at the time was: WireGuard,
+    a daemon not started yet, or a userid given later lost their port."""
+    if listening is None:
+        listening = _listening_ports('udp', skip_kernel=True)
+    spans = listening + _configured_server_ports('udp') + _wireguard_listen_ports() + _tunnel_udp_config_ports()
+    spans += [(port, port) for port in _ss_configured_ports((config_data.get('users') or [{}])[0])]
+    for conf in glob.glob('/etc/glorytun-udp/tun*'):
+        if not conf.endswith('.key'):
+            spans += [(port, port) for port in _tunnel_file_ports(conf)]
+    glorytun_base = TUNNEL_DEFAULT_PORT_BASES[0]
+    spans.append((glorytun_base, glorytun_base + USERID_MAX))
+    return spans
+
+def _nft_sync_vxlan_input():
+    listening = _listening_ports('udp', skip_kernel=True)   # sockets, outside the lock when not held yet
+    with _omr_config_lock(exclusive=True):
+        config_data = read_omr_config()
+        if not config_data:
+            return False
+        reserved = _vxlan_service_ports(config_data, listening)
+        # Not in the base ruleset: "add chain" creates it (and does nothing
+        # when it exists), and it goes with the `flush ruleset` of every
+        # ruleset load, before nftables.service restarts us.
+        script = (f'add chain {NFT_FAMILY} {NFT_TABLE} vxlan_input'
+                  f' {{ type filter hook input priority {NFT_VXLAN_INPUT_PRIORITY}; policy accept; }}\n')
+        script += f'flush chain {NFT_FAMILY} {NFT_TABLE} vxlan_input\n'
+        for line in _render_vxlan_input(config_data, reserved):
+            script += f'add rule {NFT_FAMILY} {NFT_TABLE} vxlan_input {line}\n'
+        return _nft_run(script)
 
 def _sync_openvpn_client2client(enabled):
     """Reapply the persisted client2client choice to OpenVPN's own
@@ -3290,17 +3397,21 @@ def _nft_resync_all():
     Also covers /etc/openvpn/tun0.conf getting regenerated from its shipped
     template on every VPS update (see _sync_openvpn_client2client()).
     Called once at process startup."""
-    config_data = read_omr_config()
     if _nft_base_table_exists():
         _nft_sync_ports()
         _nft_sync_gre_snat()
         _nft_sync_client2client()
+        _nft_sync_vxlan_input()
         _nft_resync_dscp_classify()
         # sipalg defaults to *off*: the router's own default is off (uci
         # openmptcprouter.settings.sipalg unset) and the installer blacklists
         # nf_conntrack_sip, so defaulting to on just made every fresh install
         # log ct-helper failures at startup (issue 4361).
-        _nft_sync_sipalg(bool(config_data.get('sipalg', False)) if config_data else False)
+        # Read with the lock held, as the syncs above: read before them, a
+        # /sipalg meanwhile was undone, the config saying otherwise.
+        with _omr_config_lock(exclusive=True):
+            config_data = read_omr_config()
+            _nft_sync_sipalg(bool(config_data.get('sipalg', False)) if config_data else False)
     else:
         # Install/update path: our deb (re)starts this service before the new
         # base ruleset is loaded, so there's nothing to repopulate yet -- see
@@ -3311,7 +3422,9 @@ def _nft_resync_all():
                  "(it runs again when nftables.service restarts this service)",
                  NFT_FAMILY, NFT_TABLE)
     # Unrelated to nftables state (a plain config file), so always resync.
-    _sync_openvpn_client2client(bool(config_data.get('client2client', False)) if config_data else False)
+    with _omr_config_lock(exclusive=True):
+        config_data = read_omr_config()
+        _sync_openvpn_client2client(bool(config_data.get('client2client', False)) if config_data else False)
 
 def _fw_service_port_del(port, proto, name):
     """Close the old port of a server-wide service (mqvpn, openvpn...) in
@@ -5041,10 +5154,16 @@ def _shadowsocks_port_error(data, user, port):
     over its key, and been recorded as this user's: removing this user then
     removed the other's port. Only the main router (or the administrator)
     picks a new port, another user keeps the one /add_user gave it."""
-    users = (read_omr_config().get('users') or [{}])[0]
+    omr_config_data = read_omr_config()
+    users = (omr_config_data.get('users') or [{}])[0]
     for other, ucfg in users.items():
         if other != user.username and str(ucfg.get('shadowsocks_port')) == str(port):
             return 'Port already used by another user'
+    # A new port only: a key posted again for the one it has stays accepted
+    if str(port) != str((users.get(user.username) or {}).get('shadowsocks_port')):
+        vxlan_users = _vxlan_port_users(port, omr_config_data) if str(port).isdigit() else []
+        if vxlan_users:
+            return 'Port used by the VXLAN of: ' + ', '.join(vxlan_users)
     conf = (data.get('port_conf') or {}).get(str(port))
     if isinstance(conf, dict) and conf.get('userid') is not None and str(conf['userid']) != str(user.userid):
         return 'Port already used by another user'
@@ -5518,14 +5637,26 @@ def _process_name(pid):
     except (psutil.Error, OSError):
         return None
 
-def _listening_ports(proto, skip_processes=()):
+def _net_connections(kind):
+    """psutil.net_connections(kind), listed once per hold of the config
+    lock: one /vxlan request listed every socket of the VPS three times
+    with it held."""
+    memo = getattr(_omr_config_lock_state, 'sockets', None)
+    if memo is None:
+        return psutil.net_connections(kind=kind)
+    if kind not in memo:
+        memo[kind] = psutil.net_connections(kind=kind)
+    return memo[kind]
+
+def _listening_ports(proto, skip_processes=(), skip_kernel=False):
     """[(port, port)] of what listens now with *proto* on more than the
-    loopback, but the sockets of the processes named in *skip_processes*."""
+    loopback, but the sockets of the processes named in *skip_processes*,
+    and with *skip_kernel* the kernel's own (VXLAN, WireGuard: no pid)."""
     spans = []
     if proto not in ('tcp', 'udp'):
         return spans
     try:
-        for conn in psutil.net_connections(kind=proto):
+        for conn in _net_connections(proto):
             if not conn.laddr or (proto == 'tcp' and conn.status != psutil.CONN_LISTEN) or \
                (proto == 'udp' and conn.raddr):
                 continue
@@ -5535,6 +5666,8 @@ def _listening_ports(proto, skip_processes=()):
             except ValueError:
                 pass  # not an address we know: count it
             if skip_processes and conn.pid and _process_name(conn.pid) in skip_processes:
+                continue
+            if skip_kernel and not conn.pid:
                 continue
             spans.append((conn.laddr.port, conn.laddr.port))
     except (psutil.Error, OSError):
@@ -5571,6 +5704,20 @@ def _configured_server_ports(proto):
             pass  # no MQVPN port known
     return spans
 
+def _dnat_entries(omr_config_data, proto, first, last, families=None, exclude=None):
+    """(username, entry) of the DNAT redirects of *proto* whose ports meet
+    first-last, of every user but *exclude*, and of *families* when given."""
+    for username, udata in ((omr_config_data.get('users') or [{}])[0]).items():
+        if username == exclude or not isinstance(udata, dict):
+            continue
+        for entry in udata.get('fw_ports') or []:
+            if entry.get('fwtype') != 'DNAT' or entry.get('proto') != proto or \
+               (families is not None and entry.get('family') not in families):
+                continue
+            span = _proxy_port_range(entry.get('port', ''))
+            if span and span[0] <= last and first <= span[1]:
+                yield username, entry
+
 def _fw_dnat_error(omr_config_data, username, port, proto, families, source_dip):
     """Why a router other than the main one can't redirect port/proto (on
     source_dip, or every public IP of the VPS without), None if it can.
@@ -5583,29 +5730,32 @@ def _fw_dnat_error(omr_config_data, username, port, proto, families, source_dip)
         # Within a dedicated IP, not just overlapping one: a network
         # around it (0.0.0.0/0) is on the shared IPs as well.
         return bool(address) and bool(_public_ip_owners(omr_config_data, address, contained=True))
-    for other, udata in ((omr_config_data.get('users') or [{}])[0]).items():
-        if other == username:
+    for _other, entry in _dnat_entries(omr_config_data, proto, first, last, families, exclude=username):
+        other_dip = entry.get('source_dip', '')
+        if source_dip and other_dip:
+            a, b = _ip_network(source_dip), _ip_network(other_dip)
+            if a is None or b is None or a.version != b.version or not a.overlaps(b):
+                continue
+        elif dedicated(source_dip) or dedicated(other_dip):
+            # A redirect without address leaves out the dedicated IPs.
             continue
-        for entry in udata.get('fw_ports') or []:
-            if entry.get('fwtype') != 'DNAT' or entry.get('proto') != proto or entry.get('family') not in families:
-                continue
-            span = _proxy_port_range(entry.get('port', ''))
-            if not span or span[1] < first or last < span[0]:
-                continue
-            other_dip = entry.get('source_dip', '')
-            if source_dip and other_dip:
-                a, b = _ip_network(source_dip), _ip_network(other_dip)
-                if a is None or b is None or a.version != b.version or not a.overlaps(b):
-                    continue
-            elif dedicated(source_dip) or dedicated(other_dip):
-                # A redirect without address leaves out the dedicated IPs.
-                continue
-            return 'Port already redirected by another user'
+        return 'Port already redirected by another user'
     # The user's own dedicated IP is only its own routers' business.
     if not dedicated(source_dip):
         if any(a <= last and first <= b for a, b in _server_ports(proto)):
             return 'Port used by the server'
     return None
+
+def _port_redirected_by(omr_config_data, port, proto):
+    """Users whose DNAT takes *port*/*proto* on the shared IPs of the VPS
+    (their dedicated IPs are theirs): user_dnat rewrites it before the VPS
+    sees it, so a service of the server moved or turned on there was
+    unreachable for every user, with nothing to tell. The reverse of the
+    'Port used by the server' check of _fw_dnat_error, every family: the
+    server's services listen on both."""
+    return sorted({username for username, entry in _dnat_entries(omr_config_data, proto, port, port)
+                   if not (entry.get('source_dip') and
+                           _public_ip_owners(omr_config_data, entry['source_dip'], contained=True))})
 
 def _firewall_open(params, current_user, route):
     if current_user.permissions == "ro":
@@ -5656,6 +5806,7 @@ def _firewall_open_locked(params, current_user, route):
         error = _fw_dnat_error(omr_config_data, current_user.username, str(port), proto, families, source_dip)
         if error:
             return {'result': 'error', 'reason': error, 'route': route}
+    previous_ports = copy.deepcopy(omr_config_data['users'][0][current_user.username].get('fw_ports', []))
     if 4 in families:
         source_net = _ip_network(source_dip) if source_dip else None
         for tunnel in (omr_config_data['users'][0][current_user.username].get('gre_tunnels') or {}).values():
@@ -5673,6 +5824,13 @@ def _firewall_open_locked(params, current_user, route):
         # taking vpn's position.
         error = shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, 'default', comment)
         if error:
+            # The IPv4 rule of the same request is taken back: kept live
+            # with an error answered (the IPv6 one past the entries limit,
+            # refused by nft), the router retried it at every sync, half
+            # applied for good.
+            if 4 in families and (read_omr_config()['users'][0].get(current_user.username) or {}).get('fw_ports', []) != previous_ports:
+                modif_config_user(current_user.username, {'fw_ports': previous_ports})
+                _nft_sync_ports()
             return {'result': 'error', 'reason': error, 'route': route}
     return {'result': 'done', 'reason': 'changes applied'}
 
@@ -5725,8 +5883,11 @@ def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_use
     if not _is_server_admin(current_user):
         return _server_wide_refusal('sipalg')
     enable = params.enable
-    set_global_param('sipalg', enable)
-    if not _nft_sync_sipalg(enable):
+    # The flag and the helpers as one step, as _nft_resync_all reads them
+    with _omr_config_lock(exclusive=True):
+        set_global_param('sipalg', enable)
+        applied = _nft_sync_sipalg(enable)
+    if not applied:
         return {'result': 'error', 'reason': 'SIP conntrack helpers not applied (nf_conntrack_sip kernel module unavailable?)', 'route': 'sipalg'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'sipalg'}
 
@@ -6083,6 +6244,9 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
             or any(a <= 443 <= b for a, b in _listening_ports('tcp', ('xray',)))
         if taken:
             return {'result': 'error', 'reason': 'Port 443 already in use on the server', 'route': 'xray'}
+        redirected = _port_redirected_by(read_omr_config(), 443, 'tcp')
+        if redirected:
+            return {'result': 'error', 'reason': 'Port 443 redirected by: ' + ', '.join(redirected), 'route': 'xray'}
     xray_reverse_key = xray_ensure_reverse_client(xray_config, _proxy_reverse_tag(current_user.username, _router_userid(current_user)))
     vr_inbound = xray_fix_reality_keys() if params.vless_reality else None
     # Its port opened only with it: no Reality config, nothing listens there
@@ -6669,7 +6833,7 @@ def _vxlan_as_int(value):
     except (TypeError, ValueError):
         return value
 
-def _vxlan_assignments(exclude_username=None):
+def _vxlan_assignments(exclude_username=None, data=None):
     """Return {username: {'vni', 'port'}} for every user carrying a userid,
     admin or not, as the omr-vxlan@ units would create the devices.
 
@@ -6682,7 +6846,8 @@ def _vxlan_assignments(exclude_username=None):
     is legal, and how they land on the same server-side bridge (shared L2
     segment) in L2 mode.
     """
-    data = read_omr_config()
+    if data is None:
+        data = read_omr_config()
     assignments = {}
     if not data or 'users' not in data:
         return assignments
@@ -6693,22 +6858,22 @@ def _vxlan_assignments(exclude_username=None):
             userid = int(ucfg.get('userid'))
         except (TypeError, ValueError):
             continue
-        cfg = get_vxlan_config(username, userid)
+        cfg = get_vxlan_config(username, userid, data)
         assignments[username] = {'vni': _vxlan_as_int(cfg['vni']), 'port': _vxlan_as_int(cfg['port']),
                                  'enabled': cfg['enabled'], 'userid': userid}
     return assignments
 
-def _vxlan_conflicts(username, vni, port):
+def _vxlan_conflicts(username, vni, port, data=None):
     """Other users sharing *vni*, split into (same UDP port, other port) lists."""
     same_port, other_port = [], []
     vni, port = _vxlan_as_int(vni), _vxlan_as_int(port)
-    for other, cfg in _vxlan_assignments(exclude_username=username).items():
+    for other, cfg in _vxlan_assignments(username, data).items():
         if cfg['vni'] != vni:
             continue
         (same_port if cfg['port'] == port else other_port).append(other)
     return sorted(same_port), sorted(other_port)
 
-def _vxlan_vni_taken_error(username, userid, cfg):
+def _vxlan_vni_taken_error(username, userid, cfg, data=None):
     """API conflict if the VNI of *cfg* is another enabled user's and the
     admin did not merge them, None otherwise. A user without a VNI has
     userid+1: given by the admin to another one, the next user of that
@@ -6716,7 +6881,7 @@ def _vxlan_vni_taken_error(username, userid, cfg):
     A merge is the admin's when this user was merged (/vxlan_user force),
     or when none of them is on its default VNI (the admin gave it to each)."""
     vni = _vxlan_as_int(cfg['vni'])
-    sharing = {other: a for other, a in _vxlan_assignments(exclude_username=username).items()
+    sharing = {other: a for other, a in _vxlan_assignments(username, data).items()
                if a['enabled'] and a['vni'] == vni}
     if not sharing or cfg.get('vni_shared'):
         return None
@@ -6738,31 +6903,53 @@ def _vxlan_hard_conflict(route, vni, port, users):
         'route': route
     }
 
-def _merge_vxlan_config(username, userid, **overrides):
+def _merge_vxlan_config(username, userid, data=None, **overrides):
     """Merge overrides onto the user's current vxlan config (modif_config_user
     replaces the whole 'vxlan' key rather than deep-merging it, so callers
     must pass the full desired dict or previously set fields, VNI included,
     get silently wiped on the next partial update)."""
-    merged = get_vxlan_config(username, userid)
+    merged = get_vxlan_config(username, userid, data)
     merged.update({k: v for k, v in overrides.items() if v is not None})
     return merged
 
+def _vxlan_port_error(username, userid, port, route, data=None):
+    """API error when *port*, a new VXLAN port of the user, is one of the
+    VPS's own UDP ports, None otherwise. The kernel binds it on every
+    address and vxlan_input drops it from outside the VPN: on e.g.
+    shadowsocks' 65101 it took that UDP from every router. Admin or not.
+    The kernel listens on the VXLAN ports of the other users: one of them
+    is shared, unless a process (or a proxy, MQVPN) has it too."""
+    if port is None:
+        return None
+    if data is None:
+        data = read_omr_config()
+    if port == _vxlan_as_int(get_vxlan_config(username, userid, data)['port']):
+        return None
+    vxlan_ports = {a['port'] for a in _vxlan_assignments(username, data).values()}
+    spans = _vxlan_service_ports(data) + [span for span in _listening_ports('udp') if span[0] not in vxlan_ports]
+    if any(a <= port <= b for a, b in spans):
+        return {'result': 'error', 'reason': 'Port used by the server', 'route': route}
+    return None
+
 # Set VXLAN tunnel over the VPN, either routed (L3) or bridged into the LAN (L2)
-def _vxlan_tunnel_ip_error(username, vxlanconfig):
+def _vxlan_tunnel_ip_error(username, userid, vxlanconfig, data=None):
     """API error for the first tunnel address of a /vxlan request that isn't
     a /30 (/126) of the VXLAN pools, or whose slice another user has (as
-    configured, or by default)."""
+    configured, or by default), or is the default of another userid: one
+    not given yet got it at /add_user, and the same address on two
+    devices."""
     fields = (('localip', vxlanconfig.localip, 4), ('remoteip', vxlanconfig.remoteip, 4),
               ('localip6', vxlanconfig.localip6, 6), ('remoteip6', vxlanconfig.remoteip6, 6))
     for name, value, family in fields:
         if value and _vxlan_tunnel_net(value, family) is None:
             return {'result': 'error', 'reason': f'Invalid {name}', 'route': 'vxlan'}
-    data = read_omr_config()
+    if data is None:
+        data = read_omr_config()
     for other, ucfg in (data.get('users') or [{}])[0].items():
         if other == username:
             continue
         try:
-            other_cfg = get_vxlan_config(other, int(ucfg.get('userid')))
+            other_cfg = get_vxlan_config(other, int(ucfg.get('userid')), data)
         except (TypeError, ValueError, OSError, KeyError):
             continue
         for name, value, family in fields:
@@ -6772,7 +6959,31 @@ def _vxlan_tunnel_ip_error(username, vxlanconfig):
             theirs = [_vxlan_tunnel_net(other_cfg.get(key) or '', family) for key in (name, name.replace('local', 'remote'))]
             if any(net is not None and mine.overlaps(net) for net in theirs):
                 return {'result': 'error', 'reason': f'{name} already used by another user', 'route': 'vxlan'}
+    # An address the user already has is left as it is: one stored before
+    # this check refused every /vxlan of that router, disabling it included
+    stored = _user_vxlan_stored(username, data)
+    fields = [(name, value, family) for name, value, family in fields
+              if not (value and stored.get(name) and
+                      _vxlan_tunnel_net(value, family) == _vxlan_tunnel_net(str(stored[name]), family))]
+    for other_userid in range(USERID_MAX + 1):
+        if other_userid == userid:
+            continue
+        defaults = {4: _vxlan_default_v4(other_userid)[0], 6: _vxlan_default_v6(other_userid)[0]}
+        for name, value, family in fields:
+            if value and name.startswith('local') and defaults[family] and \
+               _vxlan_tunnel_net(value, family).overlaps(_vxlan_tunnel_net(defaults[family], family)):
+                return {'result': 'error', 'reason': f'{name} is the default of another userid', 'route': 'vxlan'}
     return None
+
+def _save_vxlan_config(username, userid, vxlan_config, data=None):
+    """Store *vxlan_config* as the user's, resync vxlan_input when its
+    enabled port changes, and write its omr-vxlan file: each route that
+    stored it had to remember the resync."""
+    port_before = _vxlan_enabled_port(_user_vxlan_stored(username, data))
+    modif_config_user(username, {'vxlan': vxlan_config})
+    if _vxlan_enabled_port(vxlan_config) != port_before:
+        _nft_sync_vxlan_input()
+    write_vxlan_conf(username, userid)
 
 @app.post('/vxlan', summary="Set VXLAN tunnel over the VPN for the current user")
 @_serialise_config_write   # the conflict checks and the save, as one step
@@ -6788,35 +6999,31 @@ def vxlan(*, vxlanconfig: Vxlan, current_user: User = Depends(get_current_user))
     userid = int(userid)
     if vxlanconfig.vni is not None and current_user.permissions != "admin":
         return {'result': 'permission', 'reason': 'VNI is admin-assigned, ask your administrator', 'route': 'vxlan'}
-    # The kernel binds the VXLAN port on every address: a router picking
-    # e.g. shadowsocks' 65101 took its UDP from every user at boot. VXLAN
-    # ports (the user's own, another user's) are shared by the kernel.
-    if vxlanconfig.port is not None and current_user.permissions != "admin" and \
-       vxlanconfig.port != get_vxlan_config(current_user.username, userid)['port'] and \
-       vxlanconfig.port not in {a['port'] for a in _vxlan_assignments(current_user.username).values()} and \
-       any(a <= vxlanconfig.port <= b for a, b in _server_ports('udp')):
-        return {'result': 'error', 'reason': 'Port used by the server', 'route': 'vxlan'}
-    error = _vxlan_tunnel_ip_error(current_user.username, vxlanconfig)
+    # Parsed once for every check: it was once per check, and per user in
+    # the loops over them, under the config lock
+    data = read_omr_config()
+    error = _vxlan_port_error(current_user.username, userid, vxlanconfig.port, 'vxlan', data) or \
+        _vxlan_tunnel_ip_error(current_user.username, userid, vxlanconfig, data)
     if error:
         return error
     mode = vxlanconfig.mode if vxlanconfig.mode in ('l2', 'l3') else None
     vxlan_user_config = _merge_vxlan_config(
-        current_user.username, userid,
+        current_user.username, userid, data,
         enabled=vxlanconfig.enable, mode=mode, vni=vxlanconfig.vni,
         port=vxlanconfig.port, localip=vxlanconfig.localip or None,
         remoteip=vxlanconfig.remoteip or None, localip6=vxlanconfig.localip6 or None,
         remoteip6=vxlanconfig.remoteip6 or None, mtu=vxlanconfig.mtu
     )
     if vxlan_user_config['enabled']:
-        same_port, _other_port = _vxlan_conflicts(current_user.username, vxlan_user_config['vni'], vxlan_user_config['port'])
+        same_port, _other_port = _vxlan_conflicts(current_user.username, vxlan_user_config['vni'],
+                                                  vxlan_user_config['port'], data)
         if same_port:
             return _vxlan_hard_conflict('vxlan', vxlan_user_config['vni'], vxlan_user_config['port'], same_port)
-        error = _vxlan_vni_taken_error(current_user.username, userid, vxlan_user_config)
+        error = _vxlan_vni_taken_error(current_user.username, userid, vxlan_user_config, data)
         if error:
             return error
     LOG.debug("modif_config_user for vxlan setting")
-    modif_config_user(current_user.username, {'vxlan': vxlan_user_config})
-    write_vxlan_conf(current_user.username, userid)
+    _save_vxlan_config(current_user.username, userid, vxlan_user_config, data)
     return {'result': 'done', 'reason': 'changes applied', 'vxlan': vxlan_user_config}
 
 @app.get('/vxlan_vnis', summary="Admin: list every user's VXLAN VNI and port assignment")
@@ -6832,7 +7039,7 @@ def vxlan_vnis(current_user: User = Depends(get_current_user)):
             userid = int(ucfg.get('userid'))
         except (TypeError, ValueError):
             continue
-        cfg = get_vxlan_config(username, userid)
+        cfg = get_vxlan_config(username, userid, data)
         users[username] = {'userid': userid, 'enabled': cfg['enabled'], 'mode': cfg['mode'], 'vni': cfg['vni'], 'port': cfg['port']}
     return {'result': 'done', 'users': users}
 
@@ -6856,10 +7063,13 @@ def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get
         return {'result': 'error', 'reason': 'User has no userid', 'route': 'vxlan_user'}
     if params.mode is not None and params.mode not in ('l2', 'l3'):
         return {'result': 'error', 'reason': 'mode must be l2 or l3', 'route': 'vxlan_user'}
-    vxlan_user_config = _merge_vxlan_config(params.username, userid, vni=params.vni, port=params.port, mode=params.mode)
+    error = _vxlan_port_error(params.username, userid, params.port, 'vxlan_user', data)
+    if error:
+        return error
+    vxlan_user_config = _merge_vxlan_config(params.username, userid, data, vni=params.vni, port=params.port, mode=params.mode)
     if params.enable is not None:
         vxlan_user_config['enabled'] = params.enable
-    same_port, other_port = _vxlan_conflicts(params.username, vxlan_user_config['vni'], vxlan_user_config['port'])
+    same_port, other_port = _vxlan_conflicts(params.username, vxlan_user_config['vni'], vxlan_user_config['port'], data)
     # A VNI+port pair another user already holds is never accepted, force or
     # not (see _vxlan_assignments); the only exception is a request that
     # merely disables an already colliding user, since that removes a device
@@ -6883,9 +7093,8 @@ def vxlan_user_set_config(*, params: VxlanUser, current_user: User = Depends(get
                 other_userid = int(data['users'][0][other].get('userid'))
             except (KeyError, TypeError, ValueError):
                 continue
-            modif_config_user(other, {'vxlan': _merge_vxlan_config(other, other_userid, vni_shared=True)})
-    modif_config_user(params.username, {'vxlan': vxlan_user_config})
-    write_vxlan_conf(params.username, userid)
+            modif_config_user(other, {'vxlan': _merge_vxlan_config(other, other_userid, data, vni_shared=True)})
+    _save_vxlan_config(params.username, userid, vxlan_user_config, data)
     return {'result': 'done', 'reason': 'changes applied', 'vxlan': vxlan_user_config, 'route': 'vxlan_user'}
 
 class PROXY(str, Enum):
@@ -6994,11 +7203,16 @@ def _tunnel_port_error(user, port, protos, own_files):
     *own_files*) to *port*, None if it can. These daemons listen on every
     address and restart forever: on a port of the server (this API, SSH...)
     or of another user's tunnel, whichever started first took it from the
-    other, at each boot. The administrator and the main router pick any."""
-    if _is_server_admin(user):
-        return None
+    other, at each boot. The administrator and the main router pick any,
+    but a UDP port a user's VXLAN has (see _vxlan_port_users)."""
     own = set().union(*(_tunnel_file_ports(conf) for conf in own_files)) if own_files else set()
     if port in own:
+        return None
+    if 'udp' in protos:
+        vxlan_users = _vxlan_port_users(port)
+        if vxlan_users:
+            return 'Port used by the VXLAN of: ' + ', '.join(vxlan_users)
+    if _is_server_admin(user):
         return None
     for pattern in _TUNNEL_PORT_FILES:
         for conf in glob.glob(pattern):
@@ -7435,6 +7649,18 @@ def _mqvpn_set_config_locked(params, current_user):
     mqvpn_listen = mqvpn_cfg.get('listen', '0.0.0.0:443')
     host_part = mqvpn_listen.rsplit(':', 1)[0]
     old_port = mqvpn_listen.rsplit(':', 1)[-1]
+    if str(params.port) != old_port:
+        # Moved onto a port a router redirects, or another service has,
+        # MQVPN was unreachable (or could not bind it) for every user
+        omr_config_data = read_omr_config()
+        redirected = _port_redirected_by(omr_config_data, params.port, 'udp')
+        if redirected:
+            return {'result': 'error', 'reason': 'Port redirected by: ' + ', '.join(redirected), 'route': 'mqvpn'}, False
+        vxlan_users = _vxlan_port_users(params.port, omr_config_data)
+        if vxlan_users:
+            return {'result': 'error', 'reason': 'Port used by the VXLAN of: ' + ', '.join(vxlan_users), 'route': 'mqvpn'}, False
+        if any(a <= params.port <= b for a, b in _listening_ports('udp', ('mqvpn',))):
+            return {'result': 'error', 'reason': 'Port used by the server', 'route': 'mqvpn'}, False
     # Not the server-wide auth_key: mqvpn checks it before the users' keys,
     # so the router's sessions were the "(global)" user's (its per-user
     # DSCP and weight pushes found no session) and its key kept working
@@ -7931,9 +8157,12 @@ WIREGUARD_SERVER_IP = ipaddress.ip_address('10.255.247.1')
 WIREGUARD_MAX_USER_PEERS = 8
 
 def _wireguard_peer_in_vpn(ip):
-    """True if every AllowedIPs of a (valid) peer is one router address of
-    the WireGuard VPN."""
-    for net in _wireguard_peer_nets(ip):
+    """True if every AllowedIPs of a peer is one router address of the
+    WireGuard VPN, False too when one isn't an address or prefix."""
+    nets = _wireguard_peer_nets(ip)
+    if not nets:
+        return False
+    for net in nets:
         if net.version != 4 or net.num_addresses != 1 or not net.subnet_of(WIREGUARD_NET):
             return False
         if net.network_address in (WIREGUARD_NET.network_address, WIREGUARD_NET.broadcast_address, WIREGUARD_SERVER_IP):
@@ -8061,14 +8290,22 @@ def _wg_syncconf(text):
 def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'wireguard'}
-    peers = [{'ip': peer.ip, 'key': peer.key} for peer in params.peers]
-    for peer in peers:
-        error = _wireguard_peer_error(peer['key'], peer['ip'])
-        if error:
-            return {'result': 'error', 'reason': error, 'route': 'wireguard'}
     # The router sends the address of each of its WireGuard interfaces, the
     # ones to other servers too: only those of this server's VPN are peers.
-    peers = [peer for peer in peers if _wireguard_peer_in_vpn(peer['ip'])]
+    # Left out before the key check: one interface to another server, its
+    # address not this VPN's or its key not one wg takes, refused the router
+    # the peers of this one. An ip that isn't an address is refused: left
+    # out, the router's peers were all removed with a 'done'.
+    peers = []
+    for peer in params.peers:
+        if _wireguard_peer_nets(peer.ip) is None:
+            return {'result': 'error', 'reason': 'Invalid ip', 'route': 'wireguard'}
+        if not _wireguard_peer_in_vpn(peer.ip):
+            continue
+        error = _wireguard_peer_error(peer.key, peer.ip)
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'wireguard'}
+        peers.append({'ip': peer.ip, 'key': peer.key})
     if len(peers) > WIREGUARD_MAX_USER_PEERS:
         # one router took the addresses of the whole /24, every other router
         # was then refused its own
@@ -8185,10 +8422,11 @@ _LAN_IP_RE = re.compile(r'\d{1,3}(?:\.\d{1,3}){3}(?:/(?:\d{1,2}|\d{1,3}(?:\.\d{1
 _LAN_NETS = tuple(ipaddress.ip_network(net) for net in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10'))
 _VPS_TUNNEL_NET = ipaddress.ip_network('10.255.0.0/16')
 
-def _lan_parse(value):
+def _lan_parse(value, lenient=False):
     """The IPv4 network of *value* as the router sends a LAN, None if it
-    isn't one."""
-    if not isinstance(value, str) or not _LAN_IP_RE.fullmatch(value):
+    isn't one. *lenient*: whatever ip_network takes, as a release that did
+    not check them stored."""
+    if not isinstance(value, str) or not (lenient or _LAN_IP_RE.fullmatch(value)):
         return None
     try:
         return ipaddress.ip_network(value[:-1] if value.endswith('/') else value, strict=False)
@@ -8277,11 +8515,11 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
                     desired_lan_networks.add(_lan_route(configured_ip))
         managed_lan_networks = set(desired_lan_networks)
         for previous_lan in previous_lanips:
-            try:
-                previous_ip = IPNetwork(previous_lan)
-            except Exception:
-                continue
-            managed_lan_networks.add((str(previous_ip.network), str(previous_ip.netmask)))
+            # The router's "ip/prefix/" too (_lan_parse): IPNetwork refused
+            # it, and the push route of that LAN stayed in tun0.conf for good
+            previous_ip = _lan_parse(str(previous_lan), lenient=True)
+            if previous_ip is not None:
+                managed_lan_networks.add(_lan_route(previous_ip))
 
         initial_md5 = hashlib.md5(file_as_bytes('/etc/openvpn/tun0.conf')).hexdigest()
         n = io.StringIO()
@@ -8543,8 +8781,8 @@ def _apply_6in4_conf(userid, text):
 
 def _remove_tunnel_unit(unit, conf):
     if os.path.isfile(conf):
-        subprocess.run(["systemctl", "-q", "stop", unit], check=False)
-        subprocess.run(["systemctl", "-q", "disable", unit], check=False)
+        # Now: its ExecStop reads *conf*, removed below
+        _stop_service(unit, disable=True, defer=False)
         os.remove(conf)
 
 def _drop_stale_remoteip(users, names):
@@ -8601,8 +8839,9 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     if error:
         return error
     users = omr_config_data['users'][0]
-    if 'vpnremoteip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnremoteip'] == remoteip and 'vpnlocalip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnlocalip'] == localip and ula and ('ula' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['ula'] == ula):
-        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
+    # The same addresses again go on: what follows only writes what differs.
+    # Refused, an omr-6in4 file that had lost its ULA (a post without it)
+    # or was never written (6in4 turned on later) stayed so.
     userid = int(current_user.userid if current_user.userid is not None else 0)
     own = _userid_names(users, userid) | {current_user.username}
     stale = [other for other, ucfg in users.items() if other not in own and ucfg.get('vpnremoteip') == remoteip]
@@ -8941,6 +9180,15 @@ class permissions(str, Enum):
 def _ss_ports_in_use(users):
     """The shadowsocks-libev ports of every user (theirs, their public IPs'
     and GRE tunnels'), and what else listens on the VPS."""
+    ports = _ss_configured_ports(users)
+    for proto in ('tcp', 'udp'):
+        ports |= {port for first, last in _listening_ports(proto) for port in range(first, last + 1)}
+    return ports
+
+def _ss_configured_ports(users):
+    """The shadowsocks-libev ports of every user (theirs, their public IPs'
+    and GRE tunnels', a suspended user's) and of manager.json, running or
+    not."""
     ports = set()
     for udata in users.values():
         if not isinstance(udata, dict):
@@ -8955,11 +9203,8 @@ def _ss_ports_in_use(users):
             data = json.loads(re.sub(r",\s*}", "}", f.read()))
         ports |= set(data.get('port_key') or {}) | set(data.get('port_conf') or {})
     except (OSError, ValueError, AttributeError):
-        pass  # the users' ports and the listeners only
-    ports = {int(port) for port in ports if str(port).isdigit()}
-    for proto in ('tcp', 'udp'):
-        ports |= {port for first, last in _listening_ports(proto) for port in range(first, last + 1)}
-    return ports
+        pass  # the users' ports only
+    return {int(port) for port in ports if str(port).isdigit()}
 
 class NewUser(BaseModel):
     username: str = Query(..., pattern=USERNAME_PATTERN, title="Username")
@@ -8989,9 +9234,11 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     if params.username in users:
         return {'result': 'error', 'reason': 'User already exists', 'route': 'add_user'}
     # DEFAULT is the ccd OpenVPN uses for every client without its own,
-    # ipp_*.txt its address pools in the same directory. A leading '-' made
-    # the name an option of the xray and easyrsa commands it is given to.
-    if len(params.username) > USERNAME_MAX_LEN or params.username in ('DEFAULT', 'ipp_tcp.txt', 'ipp_udp.txt') \
+    # ipp_*.txt its address pools in the same directory. 'server' is the CN
+    # of OpenVPN's own certificate: a user of that name had it revoked and
+    # replaced by a client one, OpenVPN down for every router. A leading '-'
+    # made the name an option of the xray and easyrsa commands it is given to.
+    if len(params.username) > USERNAME_MAX_LEN or params.username in ('DEFAULT', 'ipp_tcp.txt', 'ipp_udp.txt', 'server') \
             or params.username.startswith('-'):
         return {'result': 'error', 'reason': 'Invalid username', 'route': 'add_user'}
     used_userids = set()
@@ -9278,6 +9525,8 @@ def _teardown_user(username, udata, users):
     # Its DNATs, open ports and GRE SNAT stayed live until another change.
     _nft_sync_ports()
     _nft_sync_gre_snat()
+    if _vxlan_enabled_port(udata.get('vxlan')) is not None:
+        _nft_sync_vxlan_input()
     # and the connections they had set up went on reaching its router (or
     # whichever router got its address next)
     others = {u.get('vpnremoteip') for name, u in users.items() if name != username and isinstance(u, dict)}
@@ -9380,9 +9629,11 @@ def _user_proxy_names(username, udata):
     return {username} | {str(udata.get('username', username)) + gre for gre in (udata.get('gre_tunnels') or {})}
 
 def _user_tunnel_units(userid):
+    # mlvpn0, the only MLVPN instance, is the main router's (userid 0): with
+    # a password, no certificate, nothing else kept it from the tunnel
     units = []
     for conf, unit in (('/etc/glorytun-tcp/tun{}', 'glorytun-tcp@tun{}'), ('/etc/glorytun-udp/tun{}', 'glorytun-udp@tun{}'),
-                       ('/etc/dsvpn/dsvpn{}', 'dsvpn-server@dsvpn{}')):
+                       ('/etc/dsvpn/dsvpn{}', 'dsvpn-server@dsvpn{}'), ('/etc/mlvpn/mlvpn{}.conf', 'mlvpn@mlvpn{}')):
         if userid is not None and os.path.isfile(conf.format(userid)):
             units.append(unit.format(userid))
     return units
@@ -9614,7 +9865,7 @@ def _suspend_user_access(username, udata):
     def units():
         for unit in _user_tunnel_units(userid):
             suspended.setdefault('units', []).append(unit)
-            subprocess.run(["systemctl", "-q", "disable", "--now", unit], check=False)
+            _stop_service(unit, disable=True)
     step('tunnels', units, 'units')
 
     def softether():
@@ -9778,9 +10029,12 @@ class ClienttoClient(BaseModel):
 def client2client(*, params: ClienttoClient, current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'client2client'}
-    set_global_param('client2client', params.enable)
-    _sync_openvpn_client2client(params.enable)
-    _nft_sync_client2client()
+    # As one step: two toggles together left tun0.conf with
+    # client-to-client and the flag and the nft chain without
+    with _omr_config_lock(exclusive=True):
+        set_global_param('client2client', params.enable)
+        _sync_openvpn_client2client(params.enable)
+        _nft_sync_client2client()
     return {'result': 'done'}
 
 class SerialEnforce(BaseModel):

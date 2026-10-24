@@ -1307,6 +1307,10 @@ MAX_INTERFACES_PER_USER: int = 32
 METRICS_POST_MIN_INTERVAL_S = 2.0
 _metrics_last_post: dict = {}
 _metrics_last_post_lock = threading.Lock()
+# The names refused past the interface cap, per user, the last few: their
+# repeats are throttled without a key each in _metrics_last_post.
+_METRICS_REFUSED_PER_USER = 8
+_metrics_refused: dict = {}   # {username: {interface: monotonic ts}}
 
 
 def _metrics_post_allowed(username: str, interface: str) -> bool:
@@ -1314,6 +1318,8 @@ def _metrics_post_allowed(username: str, interface: str) -> bool:
     key = (username, interface)
     with _metrics_last_post_lock:
         last = _metrics_last_post.get(key)
+        if last is None:
+            last = _metrics_refused.get(username, {}).get(interface)
         if last is not None and now - last < METRICS_POST_MIN_INTERVAL_S:
             return False
         _metrics_last_post[key] = now
@@ -1322,6 +1328,29 @@ def _metrics_post_allowed(username: str, interface: str) -> bool:
             for k in [k for k, t in _metrics_last_post.items() if now - t > 3600]:
                 del _metrics_last_post[k]
     return True
+
+
+def _metrics_post_forget(username: str, interface: str) -> None:
+    """Move the key _metrics_post_allowed just recorded for a POST refused
+    past the interface cap to the user's last few refused names: kept, a
+    router posting a new name each time grew the table without bound,
+    every POST then scanning it; dropped, the repeats of a refused name were
+    no longer throttled, each one a backend query once the cache expired.
+    One key for them all held back a new interface the cap had room for."""
+    with _metrics_last_post_lock:
+        last = _metrics_last_post.pop((username, interface), None)
+        if last is None:
+            return
+        refused = _metrics_refused.setdefault(username, {})
+        refused.pop(interface, None)
+        refused[interface] = last
+        while len(refused) > _METRICS_REFUSED_PER_USER:
+            del refused[next(iter(refused))]
+        if len(_metrics_refused) > 256:
+            # the users gone (removed in another worker): nothing refused lately
+            for user in [user for user, names in _metrics_refused.items()
+                         if all(last - t > 3600 for t in names.values())]:
+                del _metrics_refused[user]
 
 
 # Known interfaces per user, refreshed from the backend after this many
@@ -1384,6 +1413,13 @@ def purge_user(username: str) -> None:
     # This worker's count of its interfaces, the others' expire in a minute
     with _iface_cache_lock:
         _iface_cache.pop(username, None)
+    # and its throttling: a user recreated meanwhile got a 429 for the
+    # names of the previous one (the other workers' expire, see
+    # _metrics_post_forget)
+    with _metrics_last_post_lock:
+        _metrics_refused.pop(username, None)
+        for key in [key for key in _metrics_last_post if key[0] == username]:
+            del _metrics_last_post[key]
 
 
 # Accepted shorthands for the ?since= query parameter → seconds.
@@ -2922,6 +2958,11 @@ _auto_bad_streak: int = 0
 
 _AUTO_CFG_TTL: float = 60.0
 _auto_cfg_cache: dict = {"ts": 0.0, "cfg": None}
+# A toggle the config file could not take (see _auto_set_enabled), with the
+# file's mtime then: applied over each reload of it until the process
+# restarts, one is persisted, or the file is written again (a toggle another
+# worker persisted, an edit: this worker forced its stale one forever).
+_auto_enabled_override: Optional[tuple] = None
 
 # Per-interface history points fetched per round (window / 30 s poll ≈ 30).
 _AUTO_HISTORY_LIMIT: int = 240
@@ -2938,6 +2979,7 @@ def _auto_cfg(force: bool = False) -> dict:
     """Return the sanitised auto_learning config block (cached for 60 s, or
     until the config file changes: a toggle received by another worker, the
     leader one maybe, was seen a minute later)."""
+    global _auto_enabled_override
     now = time.time()
     cached = _auto_cfg_cache["cfg"]
     mtime = _config_mtime()
@@ -2983,6 +3025,12 @@ def _auto_cfg(force: bool = False) -> dict:
         "exploration_scale": _num("exploration_scale", 0.01, 1.0),
         "min_available_mb":  _num("min_available_mb",  0,    1_000_000, int),
     }
+    if _auto_enabled_override is not None:
+        wanted, override_mtime = _auto_enabled_override
+        if mtime != override_mtime:
+            _auto_enabled_override = None
+        else:
+            cfg["enabled"] = wanted
     _auto_cfg_cache["ts"] = now
     _auto_cfg_cache["cfg"] = cfg
     _auto_cfg_cache["mtime"] = mtime
@@ -3307,15 +3355,20 @@ def _auto_set_enabled(enabled: bool) -> bool:
     The in-memory config cache is updated immediately so the change takes
     effect on the next loop iteration even when the config file cannot be
     written (read-only filesystem, missing file); in that degraded case the
-    toggle lasts until the next process restart and a warning is logged.
+    toggle lasts until the next process restart (in this worker only), or
+    until the file is written again, and a warning is logged.
     Returns True when the config file was successfully updated.
     """
+    global _auto_enabled_override
     persisted = False
     try:
         with _config_write_lock():
             with open(OMR_CONFIG_FILE) as f:
                 cfg_file = _parse_admin_config(f)
-            block = cfg_file.get("auto_learning") or {}
+            block = cfg_file.get("auto_learning")
+            # "auto_learning": true (see _auto_cfg) raised at the assignment
+            if not isinstance(block, dict):
+                block = {}
             block["enabled"] = bool(enabled)
             cfg_file["auto_learning"] = block
             tmp = '{}.tmp.{}.{}'.format(OMR_CONFIG_FILE, os.getpid(), threading.get_ident())
@@ -3344,8 +3397,13 @@ def _auto_set_enabled(enabled: bool) -> bool:
         LOG.warning("omr_auto: could not persist auto_learning.enabled=%s: %s",
                     bool(enabled), exc)
 
+    # runtime effect even if persistence failed: the 60 s reload of the
+    # file put the old value back
+    _auto_enabled_override = None
+    if not persisted:
+        _auto_enabled_override = (bool(enabled), _config_mtime())
     cfg = _auto_cfg(force=True)
-    cfg["enabled"] = bool(enabled)   # runtime effect even if persistence failed
+    cfg["enabled"] = bool(enabled)
     _auto_cfg_cache["cfg"] = cfg
     _auto_cfg_cache["ts"] = time.time()
     _auto_cfg_cache["mtime"] = _config_mtime()
@@ -3791,6 +3849,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             raise HTTPException(status_code=429, detail="Metrics posted too often for this interface")
         accepted = await asyncio.to_thread(_accept_interface, target, payload['interface'])
         if not accepted:
+            _metrics_post_forget(target, payload['interface'])
             raise HTTPException(
                 status_code=422,
                 detail=f"Too many interfaces for this user (max {MAX_INTERFACES_PER_USER})",

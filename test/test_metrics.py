@@ -4424,6 +4424,48 @@ class TestAutoLearningEndpoint:
         assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
 
     @pytest.mark.real_env
+    def test_persisted_over_a_bool_block(self, tmp_path, monkeypatch):
+        # "auto_learning": true raised at the assignment: never persisted
+        cfg = tmp_path / "omr-admin-config.json"
+        cfg.write_text(json.dumps({"users": [{}], "auto_learning": True}))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_FILE", str(cfg))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        assert omr_metrics._auto_set_enabled(False) is True
+        assert json.loads(cfg.read_text())["auto_learning"] == {"enabled": False}
+
+    @pytest.mark.real_env
+    def test_unpersisted_toggle_survives_the_config_reload(self, tmp_path, monkeypatch):
+        # the 60 s reload of the file put the old value back
+        missing = tmp_path / "omr-admin-config.json"
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_FILE", str(missing))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        assert omr_metrics._auto_set_enabled(False) is False
+        assert omr_metrics._auto_cfg(force=True)["enabled"] is False
+
+    def test_purge_forgets_the_throttling_of_the_user(self):
+        # recreated, its first POST of a refused name of the previous one got a 429
+        omr_metrics._metrics_refused["gone"] = {"x": 1.0}
+        omr_metrics._metrics_last_post[("gone", "wan")] = 1.0
+        omr_metrics._metrics_last_post[("kept", "wan")] = 1.0
+        with patch.object(omr_metrics, "_record_purge"), patch.object(omr_metrics, "JSONBackend"), \
+             patch.object(omr_metrics, "_purge_ema"):
+            omr_metrics.purge_user("gone")
+        assert "gone" not in omr_metrics._metrics_refused
+        assert list(omr_metrics._metrics_last_post) == [("kept", "wan")]
+
+    @pytest.mark.real_env
+    def test_unpersisted_toggle_yields_to_a_later_write_of_the_file(self, tmp_path, monkeypatch):
+        # another worker persisting a toggle, or an edit: forced over it
+        # forever in this worker, the learning loop's maybe
+        cfg = tmp_path / "omr-admin-config.json"
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_FILE", str(cfg))
+        monkeypatch.setattr(omr_metrics, "OMR_CONFIG_LOCK_FILE", str(tmp_path / ".lock"))
+        assert omr_metrics._auto_set_enabled(False) is False
+        cfg.write_text(json.dumps({"users": [{}], "auto_learning": {"enabled": True}}))
+        assert omr_metrics._auto_cfg(force=True)["enabled"] is True
+        assert omr_metrics._auto_enabled_override is None
+
+    @pytest.mark.real_env
     def test_missing_config_is_not_replaced_with_a_userless_one(self, tmp_path, monkeypatch):
         # A missing config must not be recreated without users (that would
         # lock every router out); persistence just fails and the toggle
@@ -4646,6 +4688,27 @@ class TestInterfaceMetricsValidation:
                      for name in ("wan", "wan2", "wan", "wan3")]
         assert codes == [200, 200, 200, 422]
         backend.interfaces.assert_called_once_with("openmptcprouter")
+
+    def test_refused_interface_not_kept_in_the_rate_table(self, user_client):
+        # a new name each time grew the table without bound, every POST then
+        # scanning it on the event loop
+        backend = MagicMock()
+        backend.interfaces.return_value = [f"wan{i}" for i in range(omr_metrics.MAX_INTERFACES_PER_USER)]
+        omr_metrics._backend = backend
+        # and their repeats are throttled, on the user's last few refused
+        # names: dropped, each one queried the backend again
+        with patch.object(omr_metrics, "METRICS_POST_MIN_INTERVAL_S", 2.0):
+            codes = [self._post(user_client, {**_WAN, "interface": name})[0].status_code
+                     for name in ("extra1", "extra1", "extra2", "extra3")]
+            assert codes == [422, 429, 422, 422]
+            assert not any(key[1].startswith("extra") for key in omr_metrics._metrics_last_post)
+            for i in range(20):
+                self._post(user_client, {**_WAN, "interface": f"more{i}"})
+            assert len(omr_metrics._metrics_refused["openmptcprouter"]) == omr_metrics._METRICS_REFUSED_PER_USER
+            # nor do they hold back an interface the cap has room for
+            backend.interfaces.return_value = backend.interfaces.return_value[:-1]
+            omr_metrics._iface_cache.clear()
+            assert self._post(user_client, {**_WAN, "interface": "wan99"})[0].status_code == 200
 
 
 class TestStoredValueOverflow:

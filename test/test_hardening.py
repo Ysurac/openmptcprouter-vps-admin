@@ -6,6 +6,7 @@ port change left behind.
 """
 
 import asyncio
+import fnmatch
 import io
 import json
 import os
@@ -253,8 +254,12 @@ class TestWireGuardNewline:
         assert omr_admin._wireguard_peer_nets("10.255.247.5, 10.255.247.6") is not None
 
     def test_endpoint_refuses_it(self, other_client):
-        r = other_client.post("/wireguard", json={"peers": [{"ip": "10.255.247.5,\n10.255.247.6", "key": self._KEY}]})
-        assert r.json()["reason"] == "Invalid ip"
+        assert not omr_admin._wireguard_peer_in_vpn("10.255.247.5,\n10.255.247.6")
+        with patch("omr_admin.modif_config_user") as modif, patch("omr_admin._write_wireguard_conf"), \
+             patch("os.path.isfile", return_value=True):
+            r = other_client.post("/wireguard", json={"peers": [{"ip": "10.255.247.5,\n10.255.247.6", "key": self._KEY}]})
+        assert r.json() == {"result": "error", "reason": "Invalid ip", "route": "wireguard"}
+        modif.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1451,6 +1456,9 @@ class TestConfigXrayFresh:
             patch("os.path.isfile", side_effect=lambda p: p in files or real_isfile(p)),
             patch("omr_admin.xray_user_reverse_key", return_value="rev"),
             patch("omr_admin.modif_config_user") as modif,
+            # psutil reads /proc/<pid>/stat with open(), mocked here: a
+            # process it has not seen yet broke the test
+            patch("omr_admin.checkIfProcessRunning", return_value=False),
         ):
             body = other_client.get("/config").json()
         xray = body["xray"]["config"]
@@ -2118,8 +2126,10 @@ class TestDisabledUserAccess:
             assert not revoke.called
             assert suspended["openvpn"] == {"serials": ["02"]}
             assert [c.args[0] for c in run.call_args_list] == [
-                ["systemctl", "-q", "disable", "--now", "glorytun-tcp@tun2"],
-                ["systemctl", "-q", "disable", "--now", "dsvpn-server@dsvpn2"]]
+                ["systemctl", "-q", "disable", "glorytun-tcp@tun2"],
+                ["systemctl", "-q", "stop", "glorytun-tcp@tun2"],
+                ["systemctl", "-q", "disable", "dsvpn-server@dsvpn2"],
+                ["systemctl", "-q", "stop", "dsvpn-server@dsvpn2"]]
             run.reset_mock()
             omr_admin._resume_user_access("readonly", {"userid": 2}, suspended)
             restore.assert_called_once_with("readonly", ["02"])
@@ -2634,3 +2644,346 @@ class TestReviewFixes20261014:
             r = primary_client.post("/xray", json={"userid": "0", "vless_reality": True, "transport": "grpc", "ss_method": ""})
         assert r.status_code == 200 and r.json()["result"] == "done", r.text
         add_port.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Full review of 2026-10-23
+# ---------------------------------------------------------------------------
+
+class TestReview20261023:
+    def test_username_server_refused(self, admin_client):
+        # the CN of OpenVPN's own certificate: revoked and replaced by a
+        # client one, OpenVPN down for every router
+        with patch("omr_admin._mutate_omr_config") as mutate:
+            r = admin_client.post("/add_user", json={"username": "server"})
+        assert r.json()["reason"] == "Invalid username"
+        mutate.assert_not_called()
+
+    def test_vxlan_port_of_a_server_service_refused(self, user_client):
+        with patch("omr_admin._vxlan_service_ports", return_value=[(65101, 65101)]), \
+             patch("omr_admin._listening_ports", return_value=[]), \
+             patch("omr_admin.write_vxlan_conf"), patch("omr_admin.modif_config_user") as modif:
+            r = user_client.post("/vxlan", json={"enable": True, "port": 65101})
+        assert r.json()["reason"] == "Port used by the server"
+        modif.assert_not_called()
+
+    def test_vxlan_port_of_a_server_service_refused_to_the_admin_too(self, admin_client):
+        with patch("omr_admin._vxlan_service_ports", return_value=[(65101, 65101)]), \
+             patch("omr_admin._listening_ports", return_value=[]), \
+             patch("omr_admin.write_vxlan_conf"), patch("omr_admin.modif_config_user") as modif:
+            r = admin_client.post("/vxlan", json={"enable": True, "port": 65101})
+            assert r.json()["reason"] == "Port used by the server"
+            r = admin_client.post("/vxlan_user", json={"username": "readonly", "port": 65101})
+            assert r.json() == {"result": "error", "reason": "Port used by the server", "route": "vxlan_user"}
+        modif.assert_not_called()
+
+    def test_vxlan_port_another_user_has_shared_unless_a_process_has_it(self, user_client):
+        config = _config()
+        config["users"][0]["readonly"]["vxlan"] = {"enabled": True, "port": 65200}
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin._listening_ports",   # the kernel's VXLAN socket
+                   side_effect=lambda proto, skip_processes=(), skip_kernel=False: [] if skip_kernel else [(65200, 65200)]), \
+             patch("omr_admin._configured_server_ports", return_value=[]):
+            assert omr_admin._vxlan_port_error("openmptcprouter", 0, 65200, "vxlan") is None
+            with patch("omr_admin._vxlan_service_ports", return_value=[(65200, 65200)]):
+                assert omr_admin._vxlan_port_error("openmptcprouter", 0, 65200, "vxlan")["reason"] == \
+                    "Port used by the server"
+
+    def test_vxlan_input_synced_on_a_port_change_only(self, user_client):
+        with patch("omr_admin.write_vxlan_conf"), patch("omr_admin.modif_config_user"), \
+             patch("omr_admin._nft_sync_vxlan_input") as sync:
+            r = user_client.post("/vxlan", json={"enable": False})
+        assert r.json()["result"] == "done"
+        sync.assert_not_called()
+
+    def test_vxlan_default_slice_of_a_userid_not_given_refused(self, user_client):
+        # userid 5 has no user yet: given at /add_user, its default address
+        # was on two devices
+        localip = omr_admin._vxlan_default_v4(5)[0]
+        with patch("omr_admin.write_vxlan_conf"), patch("omr_admin.modif_config_user") as modif:
+            r = user_client.post("/vxlan", json={"enable": True, "localip": localip})
+        assert r.json()["reason"] == "localip is the default of another userid"
+        modif.assert_not_called()
+
+    def test_port_redirected_by(self):
+        config = _config()
+        config["users"][0]["readonly"]["fw_ports"] = [
+            {"fwtype": "DNAT", "proto": "tcp", "port": "400-500", "family": 4, "source_dip": ""},
+            {"fwtype": "ACCEPT", "proto": "udp", "port": "443", "family": 4, "source_dip": ""}]
+        assert omr_admin._port_redirected_by(config, 443, "tcp") == ["readonly"]
+        assert omr_admin._port_redirected_by(config, 443, "udp") == []
+        assert omr_admin._port_redirected_by(config, 501, "tcp") == []
+
+    def test_mqvpn_not_moved_onto_a_redirected_port(self, user_client):
+        config = _config()
+        config["users"][0]["readonly"]["fw_ports"] = [
+            {"fwtype": "DNAT", "proto": "udp", "port": "65443", "family": 4, "source_dip": ""}]
+        with patch("os.path.isfile", return_value=True), \
+             patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin.shorewall_add_port") as add, patch("omr_admin._restart_service") as restart:
+            r = user_client.post("/mqvpn", json={**TestReview20261023._MQVPN, "port": 65443})
+        assert r.json() == {"result": "error", "reason": "Port redirected by: readonly", "route": "mqvpn"}
+        add.assert_not_called()
+        restart.assert_not_called()
+
+    _MQVPN = {"key": "k", "scheduler": "wlb", "port": 443, "fec_enable": True, "fec_scheme": "reed_solomon",
+              "reinjection_control": True, "reinjection_mode": "deadline", "cc": "bbr2"}
+
+    def test_restart_deferred_until_the_lock_is_released(self):
+        seen = []
+        with patch("omr_admin._restart_service_now", side_effect=lambda unit: seen.append(
+                (unit, getattr(omr_admin._omr_config_lock_state, 'depth', 0)))):
+            with omr_admin._omr_config_lock():
+                with omr_admin._omr_config_lock():
+                    omr_admin._restart_service("xray")
+                    omr_admin._restart_service("xray")
+                assert seen == []
+            omr_admin._restart_service("v2ray")
+        assert seen == [("xray", 0), ("v2ray", 0)]
+
+    def test_deferred_restart_that_raises_spares_the_others_and_the_result(self):
+        seen = []
+        def restart(unit):
+            seen.append(unit)
+            if unit == "glorytun-tcp@tun3":
+                raise OSError("fork failed")
+        with patch("omr_admin._restart_service_now", side_effect=restart):
+            @omr_admin._serialise_config_write
+            def body():
+                omr_admin._restart_service("glorytun-tcp@tun3")
+                omr_admin._restart_service("glorytun-udp@tun3")
+                return "done"
+            assert body() == "done"
+        assert seen == ["glorytun-tcp@tun3", "glorytun-udp@tun3"]
+
+    def test_restart_dropped_when_the_unit_is_stopped_under_the_lock(self):
+        with patch("omr_admin._restart_service_now") as restart, \
+             patch("omr_admin.subprocess.run", return_value=MagicMock(returncode=0)) as run:
+            with omr_admin._omr_config_lock():
+                omr_admin._restart_service("glorytun-tcp@tun3")
+                omr_admin._stop_service("glorytun-tcp@tun3", disable=True)
+                assert [c.args[0] for c in run.call_args_list] == [["systemctl", "-q", "disable", "glorytun-tcp@tun3"]]
+            assert run.call_args_list[-1].args[0] == ["systemctl", "-q", "stop", "glorytun-tcp@tun3"]
+        restart.assert_not_called()
+
+    def test_oneshot_stopped_at_once_its_restart_dropped(self):
+        # omr-vxlan@'s ExecStop reads the file removed right after the stop
+        with patch("omr_admin._restart_service_now") as restart, \
+             patch("omr_admin.subprocess.run", return_value=MagicMock(returncode=0)) as run:
+            with omr_admin._omr_config_lock():
+                omr_admin._restart_service("omr-vxlan@user3")
+                omr_admin._stop_service("omr-vxlan@user3", defer=False)
+                assert [c.args[0] for c in run.call_args_list] == [["systemctl", "-q", "stop", "omr-vxlan@user3"]]
+        restart.assert_not_called()
+
+    def test_one_restart_for_both_spellings_of_a_unit(self):
+        with patch("omr_admin._restart_service_now") as restart:
+            with omr_admin._omr_config_lock():
+                omr_admin._restart_service("shadowsocks-libev-manager@manager.service")
+                omr_admin._restart_service("shadowsocks-libev-manager@manager")
+        restart.assert_called_once_with("shadowsocks-libev-manager@manager")
+
+    def test_vxlan_port_check_parses_the_config_once(self):
+        # once per user per helper, under the config lock
+        config = _config()
+        with patch("omr_admin.read_omr_config", return_value=config) as read, \
+             patch("omr_admin._vxlan_service_ports", return_value=[]), \
+             patch("omr_admin._listening_ports", return_value=[]):
+            assert omr_admin._vxlan_port_error("openmptcprouter", 0, 65200, "vxlan") is None
+        assert read.call_count == 1
+
+    def test_previous_lan_parsed_leniently(self):
+        assert str(omr_admin._lan_parse("192.168.1.1/24/", lenient=True)) == "192.168.1.0/24"
+        assert str(omr_admin._lan_parse("192.168.1.1/255.255.255.0", lenient=True)) == "192.168.1.0/24"
+        assert omr_admin._lan_parse("not a lan", lenient=True) is None
+        assert omr_admin._lan_parse(" 192.168.1.1/24") is None
+
+    def test_removed_glorytun_udp_stopped_before_its_link_and_files_go(self):
+        # deferred, Restart=always brought it back in between and recreated
+        # the persist link, its EnvironmentFile gone
+        calls = []
+        present = {"/etc/glorytun-udp/tun9.key", "/etc/glorytun-udp/tun9"}
+        with patch("omr_admin.subprocess.run", side_effect=lambda cmd, **k: calls.append(cmd) or MagicMock(returncode=0)), \
+             patch("os.path.isfile", side_effect=lambda p: p in present), \
+             patch("os.remove", side_effect=lambda p: calls.append(["rm", p])):
+            with omr_admin._omr_config_lock():
+                omr_admin._restart_service("glorytun-udp@tun9")
+                omr_admin.remove_glorytun_udp(9)
+                assert calls.index(["systemctl", "-q", "stop", "glorytun-udp@tun9"]) < \
+                    calls.index(["ip", "link", "del", "gt-udp-tun9"]) < \
+                    calls.index(["rm", "/etc/glorytun-udp/tun9.key"])
+        assert ["systemctl", "-q", "restart", "glorytun-udp@tun9"] not in calls
+
+    def test_service_not_moved_onto_an_enabled_vxlan_port(self):
+        # vxlan_input drops it, and the tunnel's socket takes it once up
+        config = _config()
+        config["users"][0]["readonly"]["vxlan"] = {"enabled": True, "port": 5000}
+        with patch("omr_admin.read_omr_config", return_value=config):
+            assert omr_admin._vxlan_port_users(5000) == ["readonly"]
+            assert omr_admin._vxlan_port_users(5001) == []
+            assert omr_admin._tunnel_port_error(PRIMARY, 5000, ("tcp", "udp"), []) == \
+                "Port used by the VXLAN of: readonly"
+            assert omr_admin._tunnel_port_error(PRIMARY, 5000, ("tcp",), []) is None   # dsvpn: TCP
+            # the port it has already stays accepted
+            with patch("omr_admin._tunnel_file_ports", return_value={5000}):
+                assert omr_admin._tunnel_port_error(PRIMARY, 5000, ("tcp", "udp"), ["/etc/glorytun-udp/tun0"]) is None
+            assert omr_admin._shadowsocks_port_error({"port_key": {}}, PRIMARY, 5000) == \
+                "Port used by the VXLAN of: readonly"
+            assert omr_admin._shadowsocks_port_error({"port_key": {}}, PRIMARY, 65101) is None
+
+    def test_mqvpn_not_moved_onto_an_enabled_vxlan_port(self, primary_client):
+        config = _config()
+        config["users"][0]["readonly"]["vxlan"] = {"enabled": True, "port": 5000}
+        with patch("os.path.isfile", return_value=True), \
+             patch("omr_admin.read_omr_config", return_value=config), \
+             patch("builtins.open", side_effect=_open_with({"/etc/mqvpn/server.json": json.dumps(TestMqvpnRestart._SERVER)})), \
+             patch("omr_admin._atomic_write_json") as write, patch("omr_admin._restart_service") as restart:
+            r = primary_client.post("/mqvpn", json={**TestReview20261023._MQVPN, "port": 5000})
+        assert r.json() == {"result": "error", "reason": "Port used by the VXLAN of: readonly", "route": "mqvpn"}
+        write.assert_not_called()
+        restart.assert_not_called()
+
+    def test_vxlan_file_replaced_only_when_it_changes(self):
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vxlan={"enabled": True}, vpnlocalip="10.255.255.1",
+                                                     vpnremoteip="10.255.255.2")
+        written = {}
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("os.makedirs"), patch("os.path.isfile", side_effect=lambda p: p in written), \
+             patch("omr_admin.file_as_bytes", side_effect=lambda p: written[p].encode()), \
+             patch("omr_admin._atomic_write_text", side_effect=lambda p, t, **k: written.update({p: t})) as write, \
+             patch("omr_admin.subprocess.run"), patch("omr_admin._restart_service") as restart:
+            omr_admin.write_vxlan_conf("openmptcprouter", 0)
+            omr_admin.write_vxlan_conf("openmptcprouter", 0)   # each router sync
+        assert write.call_count == 1 and restart.call_count == 1
+        assert "VNI=1\n" in written["/etc/openmptcprouter-vps-admin/omr-vxlan/user0"]
+
+    def test_openvpn_defaults_reserved_clients_and_tcp_not(self):
+        files = {"/etc/openvpn/plain.conf": "dev tun5\nserver 10.9.0.0 255.255.255.0\n",
+                 "/etc/openvpn/tcp.conf": "proto tcp-server\nport 65301\n",
+                 "/etc/openvpn/client.conf": "client\nremote 1.2.3.4 1195\nport 1196\n",
+                 "/etc/mlvpn/mlvpn0.conf": "[wan1]\nbindport = 65201\n"}
+        with patch("omr_admin.glob.glob", side_effect=lambda pattern: fnmatch.filter(files, pattern)), \
+             patch("builtins.open", side_effect=_open_with(files)):
+            assert sorted(omr_admin._tunnel_udp_config_ports()) == [(1194, 1194), (65201, 65201)]
+
+    def test_vxlan_route_parses_the_config_once(self, user_client):
+        with patch("omr_admin.read_omr_config", side_effect=lambda: _config()) as read, \
+             patch("omr_admin._listening_ports", return_value=[]), \
+             patch("omr_admin._vxlan_service_ports", return_value=[]), \
+             patch("omr_admin.modif_config_user"), patch("omr_admin.write_vxlan_conf"), \
+             patch("omr_admin._nft_sync_vxlan_input"):
+            r = user_client.post("/vxlan", json={"enable": True, "port": 4790})
+        assert r.json()["result"] == "done"
+        assert read.call_count == 1
+
+    def test_mqvpn_try_restart_after_the_lock(self):
+        with patch("omr_admin.subprocess.run", return_value=MagicMock(returncode=0)) as run:
+            with omr_admin._omr_config_lock():
+                omr_admin._systemctl_after_lock("try-restart", "mqvpn")
+                run.assert_not_called()
+        assert run.call_args.args[0] == ["systemctl", "-q", "try-restart", "mqvpn"]
+
+    def test_sockets_listed_once_per_hold_of_the_lock(self):
+        with patch("omr_admin.psutil.net_connections", return_value=[]) as listing:
+            with omr_admin._omr_config_lock():
+                omr_admin._listening_ports("udp")
+                omr_admin._listening_ports("udp", skip_kernel=True)
+            assert listing.call_count == 1
+            omr_admin._listening_ports("udp")
+            assert listing.call_count == 2
+
+    def test_vxlan_service_ports_not_listening_are_reserved(self):
+        # WireGuard is a kernel socket, a daemon may not be started yet, a
+        # userid not given yet has its glorytun-udp 650NN: a stored VXLAN
+        # port on one of them was dropped from the internet for every router
+        config = _config()
+        config["users"][0]["readonly"]["shadowsocks_port"] = 65102
+        files = {"/etc/wireguard/wg0.conf": "[Interface]\nListenPort = 65311\n",
+                 "/etc/glorytun-udp/tun1": "BIND_PORT=65150\nPORT=5000\n",
+                 "/etc/openvpn/tun0.conf": "proto tcp\nport 65301\n",
+                 "/etc/openvpn/tun1.conf": "dev tun1\nproto udp\nport 65302\n",
+                 "/etc/mlvpn/mlvpn0.conf": "[wan1]\nbindport = 65201\n"}
+        with patch("omr_admin.glob.glob", side_effect=lambda pattern: fnmatch.filter(files, pattern)), \
+             patch("builtins.open", side_effect=_open_with(files)), \
+             patch("omr_admin._configured_server_ports", return_value=[]):
+            spans = omr_admin._vxlan_service_ports(config, listening=[])
+            for port in (65311, 65102, 65150, 65302, 65201, 65000 + 5, 65000 + omr_admin.USERID_MAX):
+                assert any(a <= port <= b for a, b in spans), port
+            for port in (4789, 65301):   # OpenVPN TCP's is not a UDP port
+                assert not any(a <= port <= b for a, b in spans), port
+            config["users"][0]["readonly"]["vxlan"] = {"enabled": True, "port": 65311}
+            assert omr_admin._render_vxlan_input(config, spans) == []
+
+    def test_vxlan_stored_default_of_another_userid_still_accepted(self, user_client):
+        # stored before the check: every /vxlan of that router refused,
+        # disabling it included
+        localip = omr_admin._vxlan_default_v4(5)[0]
+        config = _config()
+        config["users"][0]["openmptcprouter"]["vxlan"] = {"enabled": True, "localip": localip}
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin.write_vxlan_conf"), patch("omr_admin.modif_config_user") as modif:
+            r = user_client.post("/vxlan", json={"enable": False, "localip": localip})
+        assert r.json()["result"] == "done"
+        modif.assert_called_once()
+
+    def test_main_router_suspension_stops_mlvpn(self):
+        with patch("os.path.isfile", side_effect=lambda p: p == "/etc/mlvpn/mlvpn0.conf"):
+            assert omr_admin._user_tunnel_units(0) == ["mlvpn@mlvpn0"]
+            assert omr_admin._user_tunnel_units(2) == []
+
+    def test_unredirect_without_destip_spares_a_user_named_like_the_prefix(self):
+        data = {"inbounds": [
+            {"tag": "a_redir_tcp_80_to_192.168.1.2:80", "port": 80},
+            {"tag": "a_redir_tcp_80_to_x_redir_tcp_443_to_1.2.3.4:443", "port": 443}],
+            "routing": {"rules": []}}
+        written = {}
+        user = omr_admin.User(username="a", userid=3, permissions="rw")
+        with patch("os.path.isfile", return_value=True), \
+             patch("builtins.open", side_effect=_open_with({omr_admin.PROXY_REDIRECT_CONFIGS["xray"]: json.dumps(data)})), \
+             patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: written.update({p: d})), \
+             patch("omr_admin._schedule_proxy_restart"), patch("omr_admin._restart_service"):
+            omr_admin._proxy_del_port("xray", user, "80", "tcp", "", "")
+        tags = [ib["tag"] for ib in written[omr_admin.PROXY_REDIRECT_CONFIGS["xray"]]["inbounds"]]
+        assert tags == ["a_redir_tcp_80_to_x_redir_tcp_443_to_1.2.3.4:443"]
+
+    def test_user_dnat_rebuilt_when_user_accept_is_refused(self):
+        with patch("omr_admin.read_omr_config", return_value=_config()), \
+             patch("omr_admin._nft_flush_chain", side_effect=lambda chain, rules: chain != "user_accept") as flush:
+            assert omr_admin._nft_sync_ports() is False
+        assert [c.args[0] for c in flush.call_args_list] == ["user_accept", "user_dnat"]
+
+    def test_firewall_open_any_takes_the_ipv4_rule_back_when_ipv6_fails(self, user_client):
+        config = _config()
+        store = {"fw_ports": []}
+        def add4(*a, **k):
+            store["fw_ports"] = [{"name": "x", "family": 4}]
+        def modif(user, changes):
+            store.update(changes)
+        config["users"][0]["openmptcprouter"]["fw_ports"] = []
+        with patch("omr_admin.read_omr_config", side_effect=lambda: {**config, "users": [{
+                    **config["users"][0], "openmptcprouter": {**config["users"][0]["openmptcprouter"], **store}}]}), \
+             patch("omr_admin.shorewall_add_port", side_effect=add4), \
+             patch("omr_admin.shorewall6_add_port", return_value="No more than 1024 firewall entries per user"), \
+             patch("omr_admin.modif_config_user", side_effect=modif), \
+             patch("omr_admin._nft_sync_ports") as sync:
+            r = user_client.post("/firewallopen", json={"name": "x", "port": "8080", "proto": "tcp",
+                                                        "fwtype": "ACCEPT", "ipproto": "any"})
+        assert r.json()["result"] == "error"
+        assert store["fw_ports"] == []
+        sync.assert_called_once()
+
+    def test_vpnips_same_addresses_again_rewrite_the_6in4_file(self, user_client):
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnremoteip="10.255.255.2", vpnlocalip="10.255.255.1",
+                                                     ula="fd12::/48")
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin._vpnips_error", return_value=None), \
+             patch("omr_admin._openvpn_leases", return_value={}), \
+             patch("omr_admin.modif_config_user"), \
+             patch("omr_admin._apply_6in4_conf") as apply:
+            r = user_client.post("/vpnips", json={"remoteip": "10.255.255.2", "localip": "10.255.255.1",
+                                                  "ula": "fd12::/48"})
+        assert r.json()["result"] == "done"
+        apply.assert_called_once()
+        assert "fd12::/48" in apply.call_args.args[1]

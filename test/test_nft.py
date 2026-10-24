@@ -629,6 +629,61 @@ class TestRenderClient2Client:
             assert f'"{pattern}"' in lines[0]
 
 
+class TestRenderVxlanInput:
+    def test_no_enabled_vxlan_is_empty(self):
+        config = _config({"alice": {"userid": 1, "vxlan": {"enabled": False, "port": 4789}},
+                          "bob": {"userid": 2}})
+        assert omr_admin._render_vxlan_input(config) == []
+
+    def test_enabled_ports_dropped_from_outside_the_vpn(self):
+        # the kernel takes a VXLAN packet of its VNI from any source
+        config = _config({"alice": {"userid": 1, "vxlan": {"enabled": True}},
+                          "bob": {"userid": 2, "vxlan": {"enabled": True, "port": 65400}},
+                          "carol": {"userid": 3, "vxlan": {"enabled": False, "port": 24789}}})
+        lines = omr_admin._render_vxlan_input(config)
+        assert len(lines) == 1
+        assert lines[0].startswith("iifname != { ")
+        for pattern in omr_admin.NFT_VPN_IFACES:
+            assert f'"{pattern}"' in lines[0]
+        assert "udp dport { 4789, 65400 } drop" in lines[0]
+        assert "24789" not in lines[0]
+
+    def test_port_that_is_not_one_is_skipped(self):
+        config = _config({"alice": {"userid": 1, "vxlan": {"enabled": True, "port": "4789; accept"}},
+                          "bob": {"userid": 2, "vxlan": {"enabled": True, "port": 70000}},
+                          "carol": {"userid": 3, "vxlan": "garbage"}})
+        assert omr_admin._render_vxlan_input(config) == []
+
+    def test_lo_and_client_wg_exempted(self):
+        # the base input chain accepts both before anything: this chain,
+        # hooked before it, dropped them
+        config = _config({"alice": {"userid": 1, "vxlan": {"enabled": True}}})
+        line = omr_admin._render_vxlan_input(config)[0]
+        for pattern in omr_admin.NFT_VPNCL_IFACES + ("lo",):
+            assert f'"{pattern}"' in line
+
+    def test_port_of_a_server_service_never_dropped(self):
+        # a port stored on shadowsocks' 65101 took its UDP from every router
+        config = _config({"alice": {"userid": 1, "vxlan": {"enabled": True, "port": 65101}},
+                          "bob": {"userid": 2, "vxlan": {"enabled": True}}})
+        line = omr_admin._render_vxlan_input(config, reserved=[(65101, 65101)])[0]
+        assert "udp dport { 4789 } drop" in line
+        assert omr_admin._render_vxlan_input(_config({"alice": {"userid": 1, "vxlan": {"enabled": True, "port": 65101}}}),
+                                             reserved=[(65000, 65200)]) == []
+
+    def test_sync_creates_a_chain_hooked_before_the_base_input(self):
+        config = _config({"alice": {"userid": 1, "vxlan": {"enabled": True, "port": "14789"}}})
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin._nft_run", return_value=True) as run:
+            assert omr_admin._nft_sync_vxlan_input() is True
+        script = run.call_args.args[0]
+        # a drop in a base chain is final: before the base chain's accepts
+        assert "add chain inet omr vxlan_input { type filter hook input priority -1; policy accept; }" in script
+        assert script.index("add chain inet omr vxlan_input") < script.index("flush chain inet omr vxlan_input")
+        assert "add rule inet omr vxlan_input iifname != { " in script
+        assert "udp dport { 14789 } drop" in script
+
+
 class _NoCloseStringIO(io.StringIO):
     """A StringIO whose content survives the `with open(...) as n:` block
     that writes to it (that block calls .close() on exit)."""
@@ -869,13 +924,30 @@ class TestNftMissingBaseTable:
              patch("omr_admin._nft_sync_ports") as ports, \
              patch("omr_admin._nft_sync_gre_snat") as gre, \
              patch("omr_admin._nft_sync_client2client") as c2c, \
+             patch("omr_admin._nft_sync_vxlan_input") as vxlan, \
              patch("omr_admin._nft_resync_dscp_classify") as dscp, \
              patch("omr_admin._nft_sync_sipalg") as sipalg, \
              patch("omr_admin._sync_openvpn_client2client") as openvpn:
             omr_admin._nft_resync_all()
-        for mock in (ports, gre, c2c, dscp, sipalg):
+        for mock in (ports, gre, c2c, vxlan, dscp, sipalg):
             mock.assert_not_called()
         openvpn.assert_called_once_with(True)
+
+    def test_sipalg_read_with_the_lock_held(self):
+        # read before the other syncs, a /sipalg meanwhile was undone
+        def sync(enabled):
+            assert omr_admin._omr_config_lock_state.depth
+            return True
+        with patch("omr_admin._nft_base_table_exists", return_value=True), \
+             patch("omr_admin.read_omr_config", return_value={"sipalg": True}), \
+             patch("omr_admin._nft_sync_ports"), patch("omr_admin._nft_sync_gre_snat"), \
+             patch("omr_admin._nft_sync_client2client"), patch("omr_admin._nft_sync_vxlan_input"), \
+             patch("omr_admin._nft_resync_dscp_classify"), \
+             patch("omr_admin._nft_sync_sipalg", side_effect=sync) as sipalg, \
+             patch("omr_admin._sync_openvpn_client2client", side_effect=sync) as openvpn:
+            omr_admin._nft_resync_all()
+        sipalg.assert_called_once_with(True)
+        openvpn.assert_called_once_with(False)
 
     def test_resync_all_runs_everything_with_the_table_present(self):
         with patch("omr_admin._nft_base_table_exists", return_value=True), \
@@ -883,11 +955,12 @@ class TestNftMissingBaseTable:
              patch("omr_admin._nft_sync_ports") as ports, \
              patch("omr_admin._nft_sync_gre_snat") as gre, \
              patch("omr_admin._nft_sync_client2client") as c2c, \
+             patch("omr_admin._nft_sync_vxlan_input") as vxlan, \
              patch("omr_admin._nft_resync_dscp_classify") as dscp, \
              patch("omr_admin._nft_sync_sipalg") as sipalg, \
              patch("omr_admin._sync_openvpn_client2client") as openvpn:
             omr_admin._nft_resync_all()
-        for mock in (ports, gre, c2c, dscp):
+        for mock in (ports, gre, c2c, vxlan, dscp):
             mock.assert_called_once()
         sipalg.assert_called_once_with(True)
         openvpn.assert_called_once_with(False)
@@ -1217,6 +1290,27 @@ class TestAddGreTunnels:
         assert {t["public_ip"] for t in config["users"][0]["openmptcprouter"]["gre_tunnels"].values()} == \
             {"198.51.100.1", "203.0.113.5"}
         assert len(drop.call_args_list) == 1
+
+    def test_down_to_one_public_ip_the_tunnels_of_the_others_removed(self):
+        # with one public IPv4 left, the whole pass was skipped: the tunnels
+        # of the address gone stayed for good
+        config = self._config()
+        self._run(config)
+        with patch("omr_admin._gre_drop_tunnel") as drop:
+            self._run(config, public=_PUBLIC[:1])
+            assert not drop.called   # missing for GRE_MISSING_GRACE first
+            with patch("time.time", return_value=__import__("time").time() + omr_admin.GRE_MISSING_GRACE + 1):
+                self._run(config, public=_PUBLIC[:1])
+        users = config["users"][0]
+        assert [t["public_ip"] for t in users["openmptcprouter"]["gre_tunnels"].values()] == ["198.51.100.1"]
+        assert users["alice"]["gre_tunnels"] == {}
+        assert len(drop.call_args_list) == 3
+
+    def test_one_public_ip_makes_no_tunnel(self):
+        config = self._config()
+        modified, writes = self._run(config, public=_PUBLIC[:1])
+        modified.assert_not_called()
+        assert writes == []
 
     def test_address_up_after_omr_admin_keeps_its_tunnels(self):
         # at boot, an address configured after omr-admin started lost its

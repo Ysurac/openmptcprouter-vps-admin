@@ -429,6 +429,9 @@ def patch_env(request):
         # the tests post an interface many times in a row
         patch("omr_metrics.METRICS_POST_MIN_INTERVAL_S", 0.0),
         patch.dict("omr_metrics._metrics_last_post", {}, clear=True),
+        patch.dict("omr_metrics._metrics_refused", {}, clear=True),
+        # a toggle one test could not persist, applied to the next ones
+        patch("omr_metrics._auto_enabled_override", None),
     ):
         yield
 

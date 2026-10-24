@@ -137,7 +137,11 @@ echo "deb [signed-by=${KEYRING_FILE} arch=${ARCH}] https://repos.influxdata.com/
 
 step "Installing influxdb3-core..."
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y influxdb3-core
+# The conf written below is a conffile of the package: run again with a new
+# package changing it, dpkg asked on stdin (noninteractive doesn't cover
+# that prompt) and the install failed. Ours is kept.
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold influxdb3-core
 
 # ---------------------------------------------------------------------------
 # 2. Write config and start service
