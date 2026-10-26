@@ -1,3 +1,10 @@
+omr-vps-admin (0.18+20261026) unstable; urgency=medium
+
+  * /mqvpn: mqvpn 0.18.0's PathMTU (path_mtu, 0 or 1280-9000: mqvpn refused its config on any other, for every user) and PMTUD (pmtud), which have to match the router's, and its TUN batching (tun_offload, tun_gro, in server.json's advanced object). Each one not sent is left as it is: a router of before sends none. /config gives them to the router, with mqvpn's defaults (0, off, on, on)
+  * /mqvpn: the dgram reinjection mode, removed from mqvpn 0.18.0 which runs it as default, is still taken from a router of before and written as default. /config reports a dgram server.json has as default
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 26 Oct 2026 00:00:00 +0100
+
 omr-vps-admin (0.18+20261023) unstable; urgency=medium
 
   * VXLAN: the UDP port of every enabled user is dropped when it doesn't come from a VPN interface, client-wg* or lo, in a vxlan_input chain hooked before the base input chain (priority -1), so a drop there is final whatever the base ruleset or user_accept open. The kernel binds a VXLAN port on every address and takes a packet of its VNI from any source: reaching it from the internet (a port of the base 65000-65535 accept, or one a user opened) put frames into that router's tunnel, or its L2 bridge. A port one of the server's UDP services has is never dropped, listening or not: WireGuard's (a kernel socket, it was), shadowsocks-libev's, glorytun-udp's and the UDP instances of OpenVPN (tun1, bonding) and MLVPN as configured, and glorytun's 650NN of every userid, given or not. Synced by /vxlan, /vxlan_user and /remove_user when an enabled port changes, and by every firewall resync
