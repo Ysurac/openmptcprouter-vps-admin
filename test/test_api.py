@@ -2792,6 +2792,64 @@ class TestMqvpn:
         assert "auth_key" not in written
         assert written["users"] == MQVPN_CONFIG["users"]
 
+    def test_dgram_reinjection_written_as_default(self, user_client):
+        """mqvpn 0.18.0 has no dgram mode, it runs it as default: a router of
+        before still sends it."""
+        r, written = self._post_capture(user_client, {**self._PAYLOAD, "reinjection_mode": "dgram"})
+        assert r.json()["result"] == "done"
+        assert written["reinjection_mode"] == "default"
+
+    def test_mqvpn_0_18_settings_written(self, user_client):
+        config = dict(MQVPN_CONFIG, advanced={"udp_gso": False})
+        payload = {**self._PAYLOAD, "path_mtu": 1500, "pmtud": True, "tun_offload": False, "tun_gro": False}
+        r, written = self._post_capture(user_client, payload, json.dumps(config))
+        assert r.json()["result"] == "done"
+        assert written["path_mtu"] == 1500
+        assert written["pmtud"] is True
+        # in mqvpn's "advanced" object, what it had there kept
+        assert written["advanced"] == {"udp_gso": False, "tun_offload": False, "tun_gro": False}
+        assert "tun_offload" not in written and "tun_gro" not in written
+
+    def test_mqvpn_0_18_settings_kept_when_not_sent(self, user_client):
+        """A router of before sends none of them: what server.json has stays."""
+        config = dict(MQVPN_CONFIG, path_mtu=1500, pmtud=True, advanced={"tun_gro": False})
+        r, written = self._post_capture(user_client, self._PAYLOAD, json.dumps(config))
+        assert r.json()["result"] == "done"
+        assert written["path_mtu"] == 1500
+        assert written["pmtud"] is True
+        assert written["advanced"] == {"tun_gro": False}
+
+    def test_path_mtu_zero_taken(self, user_client):
+        config = dict(MQVPN_CONFIG, path_mtu=1500)
+        r, written = self._post_capture(user_client, {**self._PAYLOAD, "path_mtu": 0}, json.dumps(config))
+        assert r.json()["result"] == "done"
+        assert written["path_mtu"] == 0
+
+    def test_config_returns_mqvpn_0_18_settings(self, user_client):
+        config = json.dumps(dict(MQVPN_CONFIG, reinjection_mode="dgram", path_mtu=1500, pmtud=True,
+                                 advanced={"tun_offload": False}))
+
+        def _open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json":
+                return io.StringIO(config)
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("builtins.open", side_effect=_open),
+        ):
+            r = user_client.get("/config")
+        assert r.status_code == 200
+        mqvpn = r.json()["mqvpn"]
+        assert mqvpn["reinjection_mode"] == "default"
+        assert (mqvpn["path_mtu"], mqvpn["pmtud"], mqvpn["tun_offload"], mqvpn["tun_gro"]) == (1500, True, False, True)
+
+    def test_config_mqvpn_0_18_defaults(self, user_client):
+        with patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")):
+            r = user_client.get("/config")
+        mqvpn = r.json()["mqvpn"]
+        assert (mqvpn["path_mtu"], mqvpn["pmtud"], mqvpn["tun_offload"], mqvpn["tun_gro"]) == (0, False, True, True)
+
     def test_key_is_optional(self, user_client):
         payload = {k: v for k, v in self._PAYLOAD.items() if k != "key"}
         r, written = self._post_capture(user_client, payload)
@@ -2855,6 +2913,11 @@ class TestMqvpn:
         {"reorder_rules": [{"proto": "udp", "port": 70000, "profile": "fiber_lte"}]},
         {"reorder_rules": [{"proto": "udp", "port": 443, "profile": "fast"}]},
         {"reorder_rules": [{"proto": "udp", "port": p, "profile": "fiber_lte"} for p in range(17)]},
+        {"path_mtu": 1000},                             # mqvpn takes 0 or 1280-9000
+        {"path_mtu": 9001},
+        {"path_mtu": -1},
+        {"pmtud": "maybe"},
+        {"tun_offload": "maybe"},
     ])
     def test_values_mqvpn_does_not_take_refused(self, user_client, change):
         with (

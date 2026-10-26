@@ -4817,7 +4817,17 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
         mqvpn_fec_scheme = mqvpn_cfg.get('fec_scheme', 'xor')
         mqvpn_reinjection_control = mqvpn_cfg.get('reinjection_control', False)
         mqvpn_reinjection_mode = mqvpn_cfg.get('reinjection_mode', 'default')
+        if mqvpn_reinjection_mode == 'dgram':
+            # Gone from mqvpn 0.18.0, which runs it as default
+            mqvpn_reinjection_mode = 'default'
         mqvpn_cc = mqvpn_cfg.get('cc', 'bbr2')
+        mqvpn_path_mtu = mqvpn_cfg.get('path_mtu', 0)
+        mqvpn_pmtud = mqvpn_cfg.get('pmtud', False)
+        mqvpn_advanced = mqvpn_cfg.get('advanced')
+        if not isinstance(mqvpn_advanced, dict):
+            mqvpn_advanced = {}
+        mqvpn_tun_offload = mqvpn_advanced.get('tun_offload', True)
+        mqvpn_tun_gro = mqvpn_advanced.get('tun_gro', True)
         mqvpn_reorder = mqvpn_cfg.get('reorder', {'enabled': 'off', 'max_wait_ms': 30, 'cap_packets': 1024})
         mqvpn_reorder_rules = mqvpn_cfg.get('reorder_rules', [])
         mqvpn_subnet = mqvpn_cfg.get('subnet', '10.255.220.0/24')
@@ -4837,6 +4847,10 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
         mqvpn_reinjection_control = False
         mqvpn_reinjection_mode = ''
         mqvpn_cc = ''
+        mqvpn_path_mtu = 0
+        mqvpn_pmtud = False
+        mqvpn_tun_offload = True
+        mqvpn_tun_gro = True
         mqvpn_reorder = {'enabled': 'off', 'max_wait_ms': 30, 'cap_packets': 1024}
         mqvpn_reorder_rules = []
         mqvpn_host_ip = '10.255.220.1'
@@ -5124,7 +5138,7 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
 
     shorewall_redirect = "enable" if omr_config_data.get('bulk_redirect_v4') else "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules, 'pinned_pubkey': mqvpn_pinned_pubkey}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'vxlan': get_vxlan_config(username, userid), 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'path_mtu': mqvpn_path_mtu, 'pmtud': mqvpn_pmtud, 'tun_offload': mqvpn_tun_offload, 'tun_gro': mqvpn_tun_gro, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules, 'pinned_pubkey': mqvpn_pinned_pubkey}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'vxlan': get_vxlan_config(username, userid), 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -7549,6 +7563,8 @@ class MQVPNcc(str, Enum):
 class MQVPNReinjectionMode(str, Enum):
     default = "default"
     deadline = "deadline"
+    # Gone from mqvpn 0.18.0, which runs it as default: still taken from a
+    # router of before, written as default
     dgram = "dgram"
 
 class MQVPNFecScheme(str, Enum):
@@ -7621,6 +7637,21 @@ class MQVPN(BaseModel):
     cc: MQVPNcc = MQVPNcc.bbr2
     reorder: Optional[MQVPNReorder] = None
     reorder_rules: Optional[List[MQVPNReorderRule]] = Query(None, max_length=MQVPN_REORDER_MAX_RULES)
+    # mqvpn 0.18.0. None leaves server.json's value: a router of before
+    # sends none of them. PathMTU and PMTUD have to match the router's.
+    path_mtu: Optional[int] = Query(None, ge=0, le=9000)
+    pmtud: Optional[bool] = None
+    tun_offload: Optional[bool] = None
+    tun_gro: Optional[bool] = None
+
+    @field_validator('path_mtu')
+    @classmethod
+    def _mtu(cls, value):
+        # mqvpn's cfgk_int_mtu: 0 (1400-byte packets) or 1280-9000, it
+        # refused its config on any other, for every user
+        if value is not None and 0 < value < 1280:
+            raise ValueError('path_mtu must be 0 or 1280-9000')
+        return value
 
 @app.post('/mqvpn', summary="Modify MQVPN configuration")
 def mqvpn_set_config(*, params: MQVPN, current_user: User = Depends(get_current_user)):
@@ -7671,8 +7702,21 @@ def _mqvpn_set_config_locked(params, current_user):
     mqvpn_cfg['fec_enable'] = params.fec_enable
     mqvpn_cfg['fec_scheme'] = params.fec_scheme
     mqvpn_cfg['reinjection_control'] = params.reinjection_control
-    mqvpn_cfg['reinjection_mode'] = params.reinjection_mode
+    if params.reinjection_mode == MQVPNReinjectionMode.dgram:
+        mqvpn_cfg['reinjection_mode'] = MQVPNReinjectionMode.default
+    else:
+        mqvpn_cfg['reinjection_mode'] = params.reinjection_mode
     mqvpn_cfg['cc'] = params.cc
+    if params.path_mtu is not None:
+        mqvpn_cfg['path_mtu'] = params.path_mtu
+    if params.pmtud is not None:
+        mqvpn_cfg['pmtud'] = params.pmtud
+    # mqvpn reads these in its "advanced" object only
+    advanced = {k: v for k in ('tun_offload', 'tun_gro') if (v := getattr(params, k)) is not None}
+    if advanced:
+        if not isinstance(mqvpn_cfg.get('advanced'), dict):
+            mqvpn_cfg['advanced'] = {}
+        mqvpn_cfg['advanced'].update(advanced)
     if params.reorder is not None:
         mqvpn_cfg['reorder'] = params.reorder.model_dump(mode='json')
     if params.reorder_rules is not None:
