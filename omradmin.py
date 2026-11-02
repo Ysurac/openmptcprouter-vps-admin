@@ -2193,6 +2193,50 @@ def _mqvpn_drop_user_auth_key(mqvpn_config, keys=None):
     if mqvpn_config.get('auth_key') and mqvpn_config['auth_key'] in keys:
         del mqvpn_config['auth_key']
 
+def _mqvpn_reorder_enabled(value):
+    """The reorder "enabled" *value* as a boolean, None if it is none of
+    on, off, auto (run as on by mqvpn before 0.19.0), true or false."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ('on', 'auto', 'true'):
+        return True
+    if isinstance(value, str) and value.lower() in ('off', 'false'):
+        return False
+    return None
+
+def _mqvpn_reorder_enabled_bool(mqvpn_config):
+    """Write the reorder "enabled" of *mqvpn_config* as a JSON boolean, True
+    if it changed: mqvpn 0.19.0 refuses its config, for every user, on the
+    "on", "off" or "auto" a release wrote there. Not one it can't read."""
+    reorder = mqvpn_config.get('reorder')
+    if not isinstance(reorder, dict) or isinstance(reorder.get('enabled'), bool):
+        return False
+    enabled = _mqvpn_reorder_enabled(reorder.get('enabled'))
+    if enabled is None:
+        return False
+    reorder['enabled'] = enabled
+    return True
+
+def mqvpn_reorder_enabled_bool():
+    """At startup: the reorder "enabled" of /etc/mqvpn/server.json as a JSON
+    boolean (see _mqvpn_reorder_enabled_bool), and mqvpn started again when
+    it is enabled and stopped: it stopped on it at its upgrade to 0.19.0.
+    One still running (before 0.19.0) keeps its sessions."""
+    if not os.path.isfile('/etc/mqvpn/server.json'):
+        return
+    with _omr_config_lock():
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_config = json.load(f)
+        if not isinstance(mqvpn_config, dict) or not _mqvpn_reorder_enabled_bool(mqvpn_config):
+            return
+        _atomic_write_json('/etc/mqvpn/server.json', mqvpn_config, indent=2)
+    LOG.info("MQVPN reorder enabled written as a boolean in /etc/mqvpn/server.json")
+    if (subprocess.run(["systemctl", "-q", "is-enabled", "mqvpn"], check=False).returncode == 0
+            and subprocess.run(["systemctl", "-q", "is-active", "mqvpn"], check=False).returncode != 0):
+        # its start limit was reached on the refused config
+        _systemctl_now('reset-failed', 'mqvpn')
+        _restart_service_now('mqvpn')
+
 def remove_mqvpn(username):
     api_result = mqvpn_api({'cmd': 'remove_user', 'name': username})
     if not api_result.get('ok'):
@@ -2212,12 +2256,13 @@ def remove_mqvpn(username):
             _atomic_write_json('/etc/mqvpn/server.json', mqvpn_config, indent=2)
     except Exception as e:
         LOG.debug("MQVPN remove user json error (" + str(e) + ")")
-        return
-    if removed and not api_result.get('ok'):
+        return False
+    if not api_result.get('ok'):
         # The running mqvpn still had its key: a removed or suspended user
         # kept its session, and could reconnect, until mqvpn restarted for
         # another reason. It reloads server.json; not started if stopped.
-        _systemctl_after_lock('try-restart', 'mqvpn')
+        return _systemctl_now('try-restart', _drop_deferred('mqvpn'))
+    return True
 
 
 def ordered(obj):
@@ -3933,7 +3978,7 @@ async def _lifespan(app):
     # into the same failure. The API is how what broke it gets fixed.
     for step in (load_mptcp_bpf_schedulers, normalize_persisted_mptcp_path_manager, sync_ss_go_users,
                  resume_proxy_restarts, proxy_isolate_reverse_tunnels, _tighten_tunnel_keys,
-                 _tighten_router_backups):
+                 _tighten_router_backups, mqvpn_reorder_enabled_bool):
         try:
             step()
         except Exception:
@@ -4828,7 +4873,11 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
             mqvpn_advanced = {}
         mqvpn_tun_offload = mqvpn_advanced.get('tun_offload', True)
         mqvpn_tun_gro = mqvpn_advanced.get('tun_gro', True)
-        mqvpn_reorder = mqvpn_cfg.get('reorder', {'enabled': 'off', 'max_wait_ms': 30, 'cap_packets': 1024})
+        mqvpn_reorder = mqvpn_cfg.get('reorder', {'enabled': False, 'max_wait_ms': 30, 'cap_packets': 1024})
+        if isinstance(mqvpn_reorder, dict) and 'enabled' in mqvpn_reorder:
+            # "on" or "off", as a router compares its own: one that got
+            # true pushed its "on" back at every sync
+            mqvpn_reorder = dict(mqvpn_reorder, enabled='on' if _mqvpn_reorder_enabled(mqvpn_reorder['enabled']) else 'off')
         mqvpn_reorder_rules = mqvpn_cfg.get('reorder_rules', [])
         mqvpn_subnet = mqvpn_cfg.get('subnet', '10.255.220.0/24')
         mqvpn_net = ipaddress.ip_network(mqvpn_subnet, strict=False)
@@ -6571,6 +6620,11 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
                 _restart_service("glorytun-tcp@" + name)
         if os.path.isfile('/etc/openvpn/tun0.conf'):
             _restart_service("openvpn@tun0")
+        # iperf3 serves the router's speed tests over MPTCP (-m) without the
+        # proxy: a download test kept measuring the previous scheduler.
+        # try-restart: an iperf3 the admin stopped is not started.
+        if os.path.isfile('/etc/iperf3/users.csv'):
+            _systemctl_after_lock('try-restart', 'iperf3')
     #set_lastchange()
     if refused:
         return {'result': 'error', 'reason': 'Refused by the kernel: ' + ', '.join(refused), 'route': 'mptcp'}
@@ -6673,15 +6727,25 @@ def mptcp_weight(*, params: MPTCPWeightParams, current_user: User = Depends(get_
     # two workers each read the ids of before and wrote back their own, and
     # a write cut short left a file the next push read as no ids at all.
     with _omr_config_lock(exclusive=True):
+        failed = []
         for remote_id, weight in desired.items():
-            subprocess.run([script, 'set', 'id', str(remote_id), str(weight)], check=False)
+            result = subprocess.run([script, 'set', 'id', str(remote_id), str(weight)], check=False)
+            if result.returncode != 0:
+                failed.append(remote_id)
         previous_ids = set()
         if path.exists(MPTCP_WEIGHT_STATE_FILE):
             with open(MPTCP_WEIGHT_STATE_FILE) as f:
                 previous_ids = {int(x) for x in f.read().split() if x.isdigit()}
-        for stale_id in previous_ids - set(desired.keys()):
-            subprocess.run([script, 'del', 'id', str(stale_id)], check=False)
-        _atomic_write_text(MPTCP_WEIGHT_STATE_FILE, ' '.join(str(i) for i in sorted(desired.keys())), new_mode=0o600)
+        pending = set(desired)
+        for stale_id in previous_ids - set(desired):
+            result = subprocess.run([script, 'del', 'id', str(stale_id)], check=False)
+            if result.returncode != 0:
+                pending.add(stale_id)
+                failed.append(stale_id)
+        _atomic_write_text(MPTCP_WEIGHT_STATE_FILE, ' '.join(str(i) for i in sorted(pending)), new_mode=0o600)
+    if failed:
+        return {'result': 'error', 'reason': 'Weight update failed for remote IDs: ' + ', '.join(map(str, sorted(failed))),
+                'route': 'mptcp_weight'}
     return {'result': 'done', 'reason': 'changes applied'}
 
 # Mark the VPS's own outbound traffic to a synced set of destinations with a
@@ -7573,11 +7637,6 @@ class MQVPNFecScheme(str, Enum):
     reed_solomon = "reed_solomon"
     xor = "xor"
 
-class MQVPNReorderEnabled(str, Enum):
-    off = "off"
-    on = "on"
-    auto = "auto"
-
 # mqvpn's own names (src/mqvpn_sched_names.h): with any other, the daemon
 # refused its config and stopped, for every user.
 class MQVPNScheduler(str, Enum):
@@ -7597,9 +7656,19 @@ class MQVPNScheduler(str, Enum):
 MQVPN_REORDER_MAX_RULES = 16
 
 class MQVPNReorder(BaseModel):
-    enabled: MQVPNReorderEnabled = MQVPNReorderEnabled.off
+    # A JSON boolean in server.json (see _mqvpn_reorder_enabled)
+    enabled: bool = False
     max_wait_ms: int = Query(30, ge=0, le=0xffffffff)
     cap_packets: int = Query(1024, ge=1, le=1 << 31)
+
+    @field_validator('enabled', mode='before')
+    @classmethod
+    def _enabled(cls, value):
+        # The router sends "on" or "off"
+        enabled = _mqvpn_reorder_enabled(value)
+        if enabled is None:
+            raise ValueError('enabled must be on, off, auto, true or false')
+        return enabled
 
     @field_validator('cap_packets')
     @classmethod
@@ -7719,6 +7788,8 @@ def _mqvpn_set_config_locked(params, current_user):
         mqvpn_cfg['advanced'].update(advanced)
     if params.reorder is not None:
         mqvpn_cfg['reorder'] = params.reorder.model_dump(mode='json')
+    else:
+        _mqvpn_reorder_enabled_bool(mqvpn_cfg)
     if params.reorder_rules is not None:
         mqvpn_cfg['reorder_rules'] = [r.model_dump(mode='json') for r in params.reorder_rules]
     changed = mqvpn_cfg != initial
@@ -8262,7 +8333,6 @@ def _write_wireguard_conf(config_data):
         # Lost to a release that only kept those two: the installer's.
         interface.append('Address = {}/{}'.format(WIREGUARD_SERVER_IP, WIREGUARD_NET.prefixlen))
 
-    initial_md5 = hashlib.md5(file_as_bytes('/etc/wireguard/wg0.conf')).hexdigest()
     n = io.StringIO()
     peers = io.StringIO()
     for username, user_config in config_data.get('users', [{}])[0].items():
@@ -8280,12 +8350,12 @@ def _write_wireguard_conf(config_data):
     n.write('\n'.join(interface) + '\n' + peers.getvalue())
     # wg0.conf holds the server's private key: 0600 if it is ever created.
     _atomic_write_text('/etc/wireguard/wg0.conf', n.getvalue(), new_mode=0o600)
-    final_md5 = hashlib.md5(file_as_bytes('/etc/wireguard/wg0.conf')).hexdigest()
-    if initial_md5 != final_md5:
-        _wg_syncconf('\n'.join(['[Interface]'] + wg_interface) + '\n' + peers.getvalue())
+    # The file records desired state, not whether wg accepted it. Reconcile
+    # even an unchanged file so a failed removal is retried at the next sync.
+    applied = _wg_syncconf('\n'.join(['[Interface]'] + wg_interface) + '\n' + peers.getvalue())
     if wg_port:
         _wireguard_port_to_main_router(str(wg_port))
-    return True
+    return applied is not False
 
 def _wireguard_port_to_main_router(port):
     """Open wg0's port as the main router's, and only there. It was opened
@@ -8321,8 +8391,11 @@ def _wg_syncconf(text):
         result = subprocess.run(["wg", "syncconf", "wg0", path], capture_output=True, text=True, check=False)
         if result.returncode != 0:
             LOG.warning("wg syncconf wg0 failed: %s", log_safe((result.stderr or result.stdout or '').strip()))
+            return False
+        return True
     except OSError as exception:
         LOG.warning("wg syncconf wg0 not run (%s)", exception)
+        return False
     finally:
         if path:
             try:
@@ -8373,7 +8446,8 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
         if users[current_user.username].get('wireguard_peers') != peers:
             modif_config_user(current_user.username, {'wireguard_peers': peers})
             users[current_user.username]['wireguard_peers'] = peers
-        _write_wireguard_conf(config_data)
+        if not _write_wireguard_conf(config_data):
+            return {'result': 'error', 'reason': 'Wireguard live configuration not applied', 'route': 'wireguard'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wireguard'}
 
 class ByPass(BaseModel):
@@ -9814,29 +9888,41 @@ def _suspend_user_access(username, udata):
     marked partial ('_partial') until the caller saves the whole: kept
     until the end only, a failed write or a stop meanwhile lost the keys
     for good. A partial record is completed: the steps it has are not run
-    again (the openvpn one would drop the certificate it kept)."""
+    again (the openvpn one would drop the certificate it kept). Failed
+    steps stay in '_pending', with their recovery data, until a retry
+    succeeds; their presence must not be mistaken for completion."""
     try:
         userid = int(udata.get('userid'))
     except (TypeError, ValueError):
         userid = None
-    suspended = {k: v for k, v in (udata.get('access_suspended') or {}).items() if k != '_partial'}
+    suspended = copy.deepcopy(udata.get('access_suspended') or {})
+    suspended.pop('_partial', None)
+    pending = set(suspended.pop('_pending', []))
 
     def save():
-        modif_config_user(username, {'access_suspended': dict(suspended, _partial=True)})
+        record = dict(suspended, _partial=True)
+        if pending:
+            record['_pending'] = sorted(pending)
+        modif_config_user(username, {'access_suspended': record})
 
     def step(name, action, key=None):
         key = key or name
-        if key in suspended:
+        if key in suspended and key not in pending:
             return   # taken by a pass that stopped before the end
+        pending.add(key)
         try:
             action()
         except Exception:
             LOG.exception("Suspending %s of user %s failed", name, log_safe(username))
-        if key in suspended:
-            try:
-                save()
-            except Exception:
-                LOG.exception("Saving the suspension of user %s failed", log_safe(username))
+        else:
+            pending.discard(key)
+        if key not in suspended and key not in pending:
+            return
+        try:
+            save()
+        except Exception:
+            pending.add(key)
+            LOG.exception("Saving the suspension of user %s failed", log_safe(username))
 
     # Its XRay reverse tunnel too: its router's bridge logs in with its
     # own client there, and its redirected ports went on reaching its LAN
@@ -9864,24 +9950,22 @@ def _suspend_user_access(username, udata):
         except (OSError, ValueError, AttributeError):
             upsk = None
         if upsk:
-            suspended['shadowsocks_go'] = upsk
+            suspended.setdefault('shadowsocks_go', upsk)
             remove_ss_go_user(username)
     if os.path.isfile('/etc/shadowsocks-go/upsks.json'):
         step('shadowsocks-go', shadowsocks_go, 'shadowsocks_go')
 
     def mqvpn():
         with _omr_config_lock(exclusive=True):
-            try:
-                with open('/etc/mqvpn/server.json') as f:
-                    mqvpn_cfg = json.load(f)
-            except (OSError, ValueError):
-                mqvpn_cfg = {}
+            with open('/etc/mqvpn/server.json') as f:
+                mqvpn_cfg = json.load(f)
             entry = next((u for u in mqvpn_cfg.get('users', []) if isinstance(u, dict) and u.get('name') == username), None)
             if entry:
-                suspended['mqvpn'] = {'user': entry, 'path_policy': [e for e in mqvpn_cfg.get('path_policy', [])
-                                                                     if isinstance(e, dict) and e.get('user') == username]}
-        if entry:
-            remove_mqvpn(username)
+                suspended.setdefault('mqvpn', {'user': entry, 'path_policy': [e for e in mqvpn_cfg.get('path_policy', [])
+                                                                     if isinstance(e, dict) and e.get('user') == username]})
+        if entry or 'mqvpn' in suspended:
+            if remove_mqvpn(username) is False:
+                raise RuntimeError('MQVPN removal failed')
     if os.path.isfile('/etc/mqvpn/server.json'):
         step('mqvpn', mqvpn)
 
@@ -9889,15 +9973,17 @@ def _suspend_user_access(username, udata):
         _ccd_disable(username, True)
         # The UDP instance (tun1) has no ccd and no management port: only
         # the CRL, that both check, kept the user out of it.
-        suspended['openvpn'] = True
+        previous = suspended.get('openvpn')
+        suspended.setdefault('openvpn', True)
         # Revoked in the index, its files kept: put back, the router's own
         # certificate is valid again. They were deleted, and the router kept
         # a revoked certificate until it fetched /config again.
         with _omr_config_lock(exclusive=True):
             serials = _pki_retire_user_certs(username)
         if serials:
-            suspended['openvpn'] = {'serials': serials}
-        else:
+            old_serials = previous.get('serials', []) if isinstance(previous, dict) else []
+            suspended['openvpn'] = {'serials': list(dict.fromkeys(old_serials + serials))}
+        elif not isinstance(previous, dict):
             # No valid line in the index (revoked already, index rebuilt):
             # revoked by easyrsa and its files dropped, as before; kept,
             # they were handed out by /config, revoked, after it was put back
@@ -9907,9 +9993,15 @@ def _suspend_user_access(username, udata):
         step('openvpn', openvpn)
 
     def units():
+        failed_units = []
         for unit in _user_tunnel_units(userid):
-            suspended.setdefault('units', []).append(unit)
-            _stop_service(unit, disable=True)
+            if unit not in suspended.setdefault('units', []):
+                suspended['units'].append(unit)
+            # Observe the stop result before marking this step complete.
+            if _stop_service(unit, disable=True, defer=False) is False:
+                failed_units.append(unit)
+        if failed_units:
+            raise RuntimeError('Tunnel stop failed: ' + ', '.join(failed_units))
     step('tunnels', units, 'units')
 
     def softether():
@@ -9917,6 +10009,9 @@ def _suspend_user_access(username, udata):
         remove_softether_user(username)
     if _softether_password(udata) and os.path.isfile('/var/lib/softether/vpn_server.config'):
         step('softether', softether)
+    if pending:
+        suspended['_partial'] = True
+        suspended['_pending'] = sorted(pending)
     return suspended
 
 def _resume_user_access(username, udata, suspended):
@@ -9993,6 +10088,9 @@ def _suspend_disabled_users():
         for username, udata in list(users.items()):
             if username == 'admin' or not isinstance(udata, dict):
                 continue
+            # A prior wg sync can have failed after its desired file was
+            # saved, even when every other suspension step completed.
+            wireguard = wireguard or (_user_disabled(udata) and bool(udata.get('wireguard_peers')))
             if _user_disabled(udata) and _suspension_incomplete(udata):
                 # One user failing left every disabled user after it with
                 # its access
@@ -10002,7 +10100,6 @@ def _suspend_disabled_users():
                 except Exception:
                     LOG.exception("Suspending disabled user %s failed", log_safe(username))
                     continue
-                wireguard = wireguard or bool(udata.get('wireguard_peers'))
                 LOG.info("Access of disabled user %s suspended: %s", log_safe(username),
                          ', '.join(sorted(suspended)) or 'API only')
         # Its peers stayed in wg0 until another user's /wireguard call
@@ -10064,6 +10161,9 @@ def modify_user(*, params: ModifyUser, current_user: User = Depends(get_current_
     if params.disabled is not None and udata.get('wireguard_peers'):
         _write_wireguard_conf(read_omr_config())
     LOG.info("User admin (IP: " + request.client.host + ") modified user " + log_safe(params.username))
+    if (changes.get('access_suspended') or {}).get('_partial'):
+        return {'result': 'error', 'reason': 'User disabled but access suspension is incomplete; retry disabling the user',
+                'route': 'modify_user'}
     return {'result': 'done', 'reason': 'user modified', 'route': 'modify_user'}
 
 class ClienttoClient(BaseModel):

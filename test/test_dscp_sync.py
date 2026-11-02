@@ -31,7 +31,7 @@ classification):
 
 import io
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -256,7 +256,7 @@ class TestMptcpWeightEndpoint:
         with (
             patch("os.path.exists", side_effect=_exists_only(_WEIGHT_SCRIPT)),
             patch("builtins.open", side_effect=env),
-            patch("subprocess.run") as run,
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
         ):
             r = user_client.post(
                 "/mptcp_weight",
@@ -281,7 +281,7 @@ class TestMptcpWeightEndpoint:
         with (
             patch("os.path.exists", side_effect=_exists_only(_WEIGHT_SCRIPT)),
             patch("builtins.open", side_effect=env),
-            patch("subprocess.run") as run,
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
         ):
             r = user_client.post(
                 "/mptcp_weight",
@@ -305,7 +305,7 @@ class TestMptcpWeightEndpoint:
                 side_effect=_exists_only(_WEIGHT_SCRIPT, _WEIGHT_STATE_FILE),
             ),
             patch("builtins.open", side_effect=env),
-            patch("subprocess.run") as run,
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
         ):
             r = user_client.post(
                 "/mptcp_weight", json={"weights": [{"remote_id": 1, "weight": 50}]}
@@ -325,7 +325,7 @@ class TestMptcpWeightEndpoint:
                 side_effect=_exists_only(_WEIGHT_SCRIPT, _WEIGHT_STATE_FILE),
             ),
             patch("builtins.open", side_effect=env),
-            patch("subprocess.run") as run,
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
         ):
             r = user_client.post("/mptcp_weight", json={"weights": []})
         assert r.json()["result"] == "done"
@@ -338,7 +338,7 @@ class TestMptcpWeightEndpoint:
         with (
             patch("os.path.exists", side_effect=_exists_only(_WEIGHT_SCRIPT)),
             patch("builtins.open", side_effect=env),
-            patch("subprocess.run") as run,
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
         ):
             r = user_client.post("/mptcp_weight", json={})
         assert r.json()["result"] == "done"

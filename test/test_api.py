@@ -1773,6 +1773,14 @@ class TestMPTCPListenerRestarts:
                     "v2ray", "xray", "glorytun-tcp@tun0", "openvpn@tun0"):
             assert any("restart " + svc in c for c in calls), (svc, calls)
 
+    def test_iperf3_restarted_only_if_running(self, user_client):
+        calls = self._post_and_collect(user_client, {"/etc/iperf3/users.csv"})
+        assert "systemctl -q try-restart iperf3" in calls, calls
+
+    def test_iperf3_not_restarted_when_absent(self, user_client):
+        calls = self._post_and_collect(user_client, set())
+        assert not any("iperf3" in c for c in calls), calls
+
     def test_every_users_glorytun_tcp_restarted(self, user_client):
         calls = self._post_and_collect(user_client, {"/etc/glorytun-tcp/tun0", "/etc/glorytun-tcp/tun0.key",
                                                      "/etc/glorytun-tcp/tun3"})
@@ -2954,7 +2962,25 @@ class TestMqvpn:
         assert r.json()["result"] == "done"
         capture.seek(0)
         written = json.loads(capture.read())
-        assert written["reorder"] == {"enabled": "on", "max_wait_ms": 50, "cap_packets": 512}
+        # mqvpn 0.19.0 takes a JSON boolean only
+        assert written["reorder"] == {"enabled": True, "max_wait_ms": 50, "cap_packets": 512}
+
+    @pytest.mark.parametrize("sent, enabled", [("on", True), ("off", False), ("auto", True),
+                                               (True, True), (False, False)])
+    def test_reorder_enabled_written_as_bool(self, user_client, sent, enabled):
+        payload = {**self._PAYLOAD, "reorder": {"enabled": sent, "max_wait_ms": 30, "cap_packets": 1024}}
+        r, written = self._post_capture(user_client, payload)
+        assert r.json()["result"] == "done"
+        assert written["reorder"]["enabled"] is enabled
+
+    @pytest.mark.parametrize("legacy, enabled", [("on", True), ("off", False), ("auto", True)])
+    def test_legacy_reorder_enabled_rewritten_when_not_sent(self, user_client, legacy, enabled):
+        """A release wrote "on", "off" or "auto": mqvpn 0.19.0 refuses its
+        config on it, for every user."""
+        config = dict(MQVPN_CONFIG, reorder=dict(MQVPN_CONFIG["reorder"], enabled=legacy))
+        r, written = self._post_capture(user_client, self._PAYLOAD, json.dumps(config))
+        assert r.json()["result"] == "done"
+        assert written["reorder"] == dict(MQVPN_CONFIG["reorder"], enabled=enabled)
 
     def test_reorder_rules_written_to_config(self, user_client):
         """POST /mqvpn with reorder_rules must persist the rules list."""
@@ -3011,7 +3037,25 @@ class TestMqvpn:
             r = user_client.get("/config")
         assert r.status_code == 200
         mqvpn = r.json().get("mqvpn", {})
-        assert mqvpn.get("reorder") == MQVPN_CONFIG["reorder"]
+        # "on" or "off", as the router compares its own
+        assert mqvpn.get("reorder") == dict(MQVPN_CONFIG["reorder"], enabled="off")
+
+    @pytest.mark.parametrize("stored, reported", [(True, "on"), (False, "off"), ("on", "on"),
+                                                  ("off", "off"), ("auto", "on")])
+    def test_config_reports_reorder_enabled_on_off(self, user_client, stored, reported):
+        config = json.dumps(dict(MQVPN_CONFIG, reorder=dict(MQVPN_CONFIG["reorder"], enabled=stored)))
+
+        def _open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json":
+                return io.StringIO(config)
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("builtins.open", side_effect=_open),
+        ):
+            r = user_client.get("/config")
+        assert r.json()["mqvpn"]["reorder"]["enabled"] == reported
 
     def test_config_returns_reorder_rules(self, user_client):
         """GET /config must include the reorder_rules list from server.json."""
@@ -3042,6 +3086,61 @@ class TestMqvpn:
         assert reorder.get("max_wait_ms") == 30
         assert reorder.get("cap_packets") == 1024
         assert mqvpn.get("reorder_rules") == []
+
+
+class TestMqvpnReorderEnabledAtStartup:
+    """mqvpn 0.19.0 stops at startup on the "on", "off" or "auto" a release
+    wrote as the reorder "enabled" of server.json."""
+
+    def _run(self, config, enabled=True, active=False):
+        written = {}
+        calls = []
+
+        def _run(cmd, *args, **kwargs):
+            calls.append(cmd[1:])
+            failed = (cmd[2] == "is-enabled" and not enabled) or (cmd[2] == "is-active" and not active)
+            return MagicMock(returncode=1 if failed else 0, stderr="")
+
+        def _open(path, mode="r", *args, **kwargs):
+            if str(path) == "/etc/mqvpn/server.json":
+                return io.StringIO(json.dumps(config))
+            return _mock_open(path, mode, *args, **kwargs)
+
+        with (
+            patch("os.path.isfile", _isfile_for("/etc/mqvpn/server.json")),
+            patch("builtins.open", side_effect=_open),
+            patch("omr_admin._omr_config_lock", side_effect=lambda *a, **k: contextlib.nullcontext()),
+            patch("omr_admin._atomic_write_json", side_effect=lambda p, d, **k: written.update(data=d)),
+            patch("omr_admin.subprocess.run", side_effect=_run),
+        ):
+            omr_admin.mqvpn_reorder_enabled_bool()
+        return written.get("data"), calls
+
+    @pytest.mark.parametrize("legacy, enabled", [("on", True), ("off", False), ("auto", True)])
+    def test_legacy_rewritten_and_stopped_mqvpn_started(self, legacy, enabled):
+        config = dict(MQVPN_CONFIG, reorder=dict(MQVPN_CONFIG["reorder"], enabled=legacy))
+        written, calls = self._run(config)
+        assert written == dict(config, reorder=dict(MQVPN_CONFIG["reorder"], enabled=enabled))
+        assert ["-q", "reset-failed", "mqvpn"] in calls
+        assert ["-q", "restart", "mqvpn"] in calls
+
+    def test_running_mqvpn_keeps_its_sessions(self):
+        config = dict(MQVPN_CONFIG, reorder=dict(MQVPN_CONFIG["reorder"], enabled="on"))
+        written, calls = self._run(config, active=True)
+        assert written["reorder"]["enabled"] is True
+        assert ["-q", "restart", "mqvpn"] not in calls
+
+    def test_disabled_mqvpn_not_started(self):
+        config = dict(MQVPN_CONFIG, reorder=dict(MQVPN_CONFIG["reorder"], enabled="off"))
+        written, calls = self._run(config, enabled=False)
+        assert written["reorder"]["enabled"] is False
+        assert ["-q", "restart", "mqvpn"] not in calls
+
+    @pytest.mark.parametrize("reorder", [{"enabled": True}, {"enabled": "maybe"}, {}, "on"])
+    def test_nothing_written_otherwise(self, reorder):
+        written, calls = self._run(dict(MQVPN_CONFIG, reorder=reorder))
+        assert written is None
+        assert calls == []
 
 
 def _open_with_mqvpn_config(cfg):
@@ -3445,7 +3544,7 @@ class TestWireGuard:
             patch("builtins.open", side_effect=_open),
             patch("omr_admin.file_as_bytes", side_effect=[b"old", b"new"]),
             patch("omr_admin._atomic_write", side_effect=_fake_atomic_write) as write,
-            patch("subprocess.run") as run,
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
         ):
             assert omr_admin._write_wireguard_conf(config)
         out = tmp.getvalue()

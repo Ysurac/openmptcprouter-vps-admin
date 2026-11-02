@@ -2095,7 +2095,7 @@ class TestDisabledUserAccess:
             patch("omr_admin._openvpn_revoke") as revoke,
             patch("omr_admin._openvpn_kill"),
             patch("omr_admin.modif_config_user") as modif,
-            patch("subprocess.run"),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
         ):
             suspended = omr_admin._suspend_user_access("readonly", udata)
         assert not ccd.called and not retire.called and not revoke.called
@@ -2114,7 +2114,7 @@ class TestDisabledUserAccess:
             patch("omr_admin._pki_retire_user_certs", return_value=["02"]) as retire,
             patch("omr_admin._pki_restore_user_certs", return_value="02") as restore,
             patch("omr_admin._openvpn_drop_cert_files") as drop,
-            patch("subprocess.run") as run,
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
             patch("omr_admin._restart_service") as restart,
         ):
             suspended = omr_admin._suspend_user_access("readonly", {"userid": 2})
@@ -2987,3 +2987,157 @@ class TestReview20261023:
         assert r.json()["result"] == "done"
         apply.assert_called_once()
         assert "fd12::/48" in apply.call_args.args[1]
+
+
+class TestAccessReconciliationRetries:
+    def test_failed_suspension_retries_and_keeps_recovery_data(self):
+        config = _config()
+        entry = config['users'][0]['readonly']
+        entry['disabled'] = True
+        recovery = {'user': {'name': 'readonly', 'key': 'secret'}, 'path_policy': []}
+        files = {'/etc/mqvpn/server.json': json.dumps({'users': [recovery['user']]})}
+        def persist(username, changes):
+            config['users'][0][username].update(json.loads(json.dumps(changes)))
+        with (
+            patch('os.path.isfile', side_effect=lambda p: p == '/etc/mqvpn/server.json'),
+            patch('builtins.open', side_effect=_open_with(files)),
+            patch('omr_admin.read_omr_config', side_effect=lambda: config),
+            patch('omr_admin.modif_config_user', side_effect=persist),
+            patch('omr_admin.PROXY_REDIRECT_CONFIGS', {}),
+            patch('omr_admin._ss_suspend'),
+            patch('omr_admin.remove_mqvpn', side_effect=[False, True]) as remove,
+        ):
+            omr_admin._suspend_disabled_users()
+            assert omr_admin._suspension_incomplete(entry)
+            assert entry['access_suspended']['_pending'] == ['mqvpn']
+            assert entry['access_suspended']['mqvpn'] == recovery
+            # The config removal may have succeeded while the live removal failed.
+            files['/etc/mqvpn/server.json'] = '{"users": []}'
+            omr_admin._suspend_disabled_users()
+            assert not omr_admin._suspension_incomplete(entry)
+            assert entry['access_suspended']['mqvpn'] == recovery
+            omr_admin._suspend_disabled_users()
+            assert remove.call_count == 2
+
+    def test_failed_tunnel_stop_retries_without_duplicate_units(self):
+        with (
+            patch('os.path.isfile', return_value=False),
+            patch('omr_admin.PROXY_REDIRECT_CONFIGS', {}),
+            patch('omr_admin._ss_suspend'),
+            patch('omr_admin._user_tunnel_units', return_value=['glorytun-tcp@tun2']),
+            patch('omr_admin._stop_service', side_effect=[False, True]) as stop,
+            patch('omr_admin.modif_config_user'),
+        ):
+            first = omr_admin._suspend_user_access('readonly', {'userid': 2})
+            assert first['_partial'] and first['_pending'] == ['units']
+            second = omr_admin._suspend_user_access('readonly', {'userid': 2, 'access_suspended': first})
+            assert second == {'units': ['glorytun-tcp@tun2']}
+            assert stop.call_count == 2
+
+    def test_wireguard_retries_identical_file_after_failed_sync(self):
+        files = {'/etc/wireguard/wg0.conf': '[Interface]\nPrivateKey = secret\nAddress = 10.255.247.1/24\n'}
+        def write(path, text, **kwargs):
+            files[path] = text
+        with (
+            patch('os.path.isfile', return_value=True),
+            patch('builtins.open', side_effect=_open_with(files)),
+            patch('omr_admin._atomic_write_text', side_effect=write),
+            patch('omr_admin._wg_syncconf', side_effect=[False, True]) as sync,
+        ):
+            config = {'users': [{'readonly': {'wireguard_peers': []}}]}
+            assert omr_admin._write_wireguard_conf(config) is False
+            desired = files['/etc/wireguard/wg0.conf']
+            assert omr_admin._write_wireguard_conf(config) is True
+            assert files['/etc/wireguard/wg0.conf'] == desired
+            assert sync.call_count == 2
+            assert sync.call_args_list[0] == sync.call_args_list[1]
+
+    @pytest.mark.parametrize('outcome', [MagicMock(returncode=1, stderr='failed'), OSError('missing wg')])
+    def test_wireguard_sync_reports_failure(self, outcome):
+        with patch('subprocess.run') as run:
+            if isinstance(outcome, Exception):
+                run.side_effect = outcome
+            else:
+                run.return_value = outcome
+            assert omr_admin._wg_syncconf('[Interface]\n') is False
+
+    def test_weight_failed_delete_is_tracked_until_success(self):
+        files = {omr_admin.MPTCP_WEIGHT_STATE_FILE: '7 8'}
+        def run(argv, **kwargs):
+            return MagicMock(returncode=1 if argv[-1] == '7' else 0)
+        with (
+            patch('os.path.exists', return_value=True),
+            patch('builtins.open', side_effect=_open_with(files)),
+            patch('omr_admin._atomic_write_text', side_effect=lambda p, t, **k: files.update({p: t})),
+            patch('subprocess.run', side_effect=run) as command,
+        ):
+            params = omr_admin.MPTCPWeightParams(weights=[])
+            assert omr_admin.mptcp_weight(params=params, current_user=PRIMARY)['result'] == 'error'
+            assert files[omr_admin.MPTCP_WEIGHT_STATE_FILE] == '7'
+            command.side_effect = None
+            command.return_value = MagicMock(returncode=0)
+            command.reset_mock()
+            assert omr_admin.mptcp_weight(params=params, current_user=PRIMARY)['result'] == 'done'
+            assert files[omr_admin.MPTCP_WEIGHT_STATE_FILE] == ''
+            command.assert_called_once_with(['/usr/sbin/mptcp-scheduler-weight.sh', 'del', 'id', '7'], check=False)
+
+    def test_weight_failed_set_returns_error_and_stays_tracked(self):
+        written = {}
+        with (
+            patch('os.path.exists', side_effect=lambda p: p != omr_admin.MPTCP_WEIGHT_STATE_FILE),
+            patch('omr_admin._atomic_write_text', side_effect=lambda p, t, **k: written.update({p: t})),
+            patch('subprocess.run', return_value=MagicMock(returncode=1)),
+        ):
+            params = omr_admin.MPTCPWeightParams(weights=[omr_admin.WeightPin(remote_id=3, weight=50)])
+            assert omr_admin.mptcp_weight(params=params, current_user=PRIMARY)['result'] == 'error'
+            assert written[omr_admin.MPTCP_WEIGHT_STATE_FILE] == '3'
+
+    def test_completed_suspension_still_reconciles_wireguard_at_startup(self):
+        config = _config()
+        config['users'][0]['readonly'].update(disabled=True, access_suspended={}, wireguard_peers=[{'key': 'old'}])
+        with (
+            patch('omr_admin.read_omr_config', return_value=config),
+            patch('omr_admin._suspend_user_access') as suspend,
+            patch('omr_admin._write_wireguard_conf', side_effect=[False, True]) as write,
+        ):
+            omr_admin._suspend_disabled_users()
+            omr_admin._suspend_disabled_users()
+            assert write.call_count == 2
+            suspend.assert_not_called()
+
+    def test_wireguard_endpoint_reports_failed_live_sync(self, other_client):
+        config = _config()
+        with (
+            patch('os.path.isfile', return_value=True),
+            patch('omr_admin.read_omr_config', return_value=config),
+            patch('omr_admin.modif_config_user'),
+            patch('omr_admin._write_wireguard_conf', return_value=False),
+        ):
+            result = other_client.post('/wireguard', json={'peers': []})
+            assert result.json()['result'] == 'error'
+
+    def test_mqvpn_failed_fallback_restart_reports_failure(self):
+        with (
+            patch('builtins.open', side_effect=_open_with({'/etc/mqvpn/server.json': '{"users": []}'})),
+            patch('omr_admin._atomic_write_json'),
+            patch('omr_admin.mqvpn_api', return_value={'ok': False}),
+            patch('omr_admin._systemctl_now', return_value=False) as restart,
+        ):
+            assert omr_admin.remove_mqvpn('readonly') is False
+            restart.assert_called_once_with('try-restart', 'mqvpn')
+
+    def test_modify_user_reports_pending_suspension_and_keeps_disabled_flag(self, admin_client):
+        config = _config()
+        record = {'_partial': True, '_pending': ['mqvpn'], 'mqvpn': {'user': {'key': 'secret'}}}
+        def persist(mutator, **kwargs):
+            mutator(config)
+        with (
+            patch('omr_admin.read_omr_config', return_value=config),
+            patch('omr_admin._suspend_user_access', return_value=record),
+            patch('omr_admin._mutate_omr_config', side_effect=persist),
+        ):
+            response = admin_client.post('/modify_user', json={'username': 'readonly', 'disabled': True})
+            assert response.json()['result'] == 'error'
+            entry = config['users'][0]['readonly']
+            assert entry['disabled'] == 'true'
+            assert entry['access_suspended'] == record
