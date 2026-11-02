@@ -1,3 +1,10 @@
+omr-vps-admin (0.18+20261102) unstable; urgency=medium
+
+  * /mqvpn: the reorder "enabled" is written to server.json as a JSON boolean: mqvpn 0.19.0 refuses its config, for every user, on the "on", "off" or "auto" (run as on) written before. The router's "on", "off" and "auto" are still taken, and true or false too; a server.json one of before has is rewritten by any /mqvpn, the reorder sent or not. /config still reports it as "on" or "off", what the router compares its own with
+  * At startup, a server.json with "on", "off" or "auto" as the reorder "enabled" is rewritten with the boolean, and mqvpn, enabled and stopped on it at its upgrade to 0.19.0, is started again. One still running (before 0.19.0) keeps its sessions
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Mon, 02 Nov 2026 00:00:00 +0100
+
 omr-vps-admin (0.18+20261026) unstable; urgency=medium
 
   * /mqvpn: mqvpn 0.18.0's PathMTU (path_mtu, 0 or 1280-9000: mqvpn refused its config on any other, for every user) and PMTUD (pmtud), which have to match the router's, and its TUN batching (tun_offload, tun_gro, in server.json's advanced object). Each one not sent is left as it is: a router of before sends none. /config gives them to the router, with mqvpn's defaults (0, off, on, on)
