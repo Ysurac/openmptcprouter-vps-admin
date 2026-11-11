@@ -72,7 +72,8 @@ _WAN = {
     },
     "congestion": {"score": 5, "level": "none"},
     "bandwidth": {"rx_bytes": 1_000_000, "tx_bytes": 500_000, "rx_bps": 1024, "tx_bps": 2048},
-    "timestamp": 1_700_000_000,
+    # current: an older snapshot is no longer routable (_is_unroutable)
+    "timestamp": int(time.time()),
 }
 
 _WAN2 = {**_WAN, "interface": "wan2", "device": "eth1", "device_ip": "5.6.7.8"}
@@ -192,6 +193,28 @@ class TestApplyEma:
         omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
         result = omr_metrics._apply_ema("alice", {"wan": 0.8, "wan2": 0.2})
         assert result == pytest.approx({"wan": 0.59, "wan2": 0.41})
+
+    def test_blend_not_kept_when_not_saved(self):
+        omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
+        assert omr_metrics._apply_ema("alice", {"wan": 0.8, "wan2": 0.2}, save=False) == \
+            pytest.approx({"wan": 0.59, "wan2": 0.41})
+        # the next one blends with the kept 0.5/0.5, not with 0.59/0.41
+        assert omr_metrics._apply_ema("alice", {"wan": 0.8, "wan2": 0.2}) == \
+            pytest.approx({"wan": 0.59, "wan2": 0.41})
+
+    @pytest.mark.parametrize("client,query,saved", [("user_client", "", True),
+                                                    ("user_client", "?predict=true", False),
+                                                    ("admin_client", "?username=openmptcprouter", False)])
+    def test_kept_only_from_the_routers_own_plain_polls(self, request, client, query, saved):
+        # an admin polling ?username=X wiped the smoothing out, and the
+        # predict=true weights were mixed into the plain ones
+        with (
+            patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
+            patch.object(omr_metrics, "_read_history", return_value=[]),
+            patch.object(omr_metrics, "_apply_ema", return_value={"wan": 1.0}) as ema,
+        ):
+            request.getfixturevalue(client).get("/metrics/decision" + query)
+        assert ema.call_args.args[2] is saved
 
     def test_interface_removal_renormalises_remaining_probabilities(self):
         omr_metrics._apply_ema("alice", {"wan": 0.5, "wan2": 0.5})
@@ -1655,6 +1678,14 @@ class TestGetDecision:
             r = user_client.get("/metrics/decision")
         assert "rising_loss" in r.json()["anomalies"]["wan"]
 
+    def test_gateway_changed_flagged(self):
+        # the history ends with the snapshot itself: its last gateway was
+        # always the current one, and the flag never came up
+        now = {**_WAN, "gateway": "192.168.1.1", "timestamp": _T0 + 60}
+        hist = [{**_WAN, "gateway": "10.0.0.1", "timestamp": _T0 + 30}, now]
+        assert "gateway_changed" in omr_metrics._interface_anomalies(now, hist)
+        assert "gateway_changed" not in omr_metrics._interface_anomalies(now, [{**hist[0], "gateway": "192.168.1.1"}, now])
+
     def test_explain_flag_forwarded(self, user_client):
         captured = {}
 
@@ -2559,6 +2590,14 @@ class TestComputeWeightsHeuristic:
     def test_offline_interface_gets_zero_prob(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_OFFLINE})
         assert result["probs"]["wan2"] == 0.0
+
+    def test_stale_snapshot_treated_as_offline(self):
+        # the latest query reaches back a day: a WAN whose tracker stopped
+        # posting kept its weight that long
+        stale = {**_H_CONG0, "timestamp": int(time.time()) - omr_metrics._STALE_S - 60}
+        result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": stale})
+        assert result["probs"]["wan2"] == 0.0 and result["probs"]["wan"] > 0.0
+        assert omr_metrics._decision_confidence(stale) == "none"
 
     def test_no_latency_treated_as_offline(self):
         result = omr_metrics._compute_weights_heuristic({"wan": _H_CONG0, "wan2": _H_NO_LAT})
@@ -3553,7 +3592,7 @@ class TestForecastMetric:
         # Only the two timestamped entries should feed the regression
         hist = [
             {**_WAN, "loss": 1.0, "timestamp": _FM_T0},
-            {**_WAN, "loss": 2.0},                      # no timestamp → skipped
+            _no_ts({**_WAN, "loss": 2.0}),              # no timestamp → skipped
             {**_WAN, "loss": 3.0, "timestamp": _FM_T0 + 60},
         ]
         result = omr_metrics._forecast_metric(
@@ -3802,6 +3841,21 @@ def _tp_history(values, step=30):
     """Return (timestamps, values) lists spaced *step* seconds apart."""
     ts = [float(_TP_T0 + i * step) for i in range(len(values))]
     return ts, list(values)
+
+
+class TestMakeModel:
+    @_TORCH_SKIP
+    def test_a_new_model_prefers_the_better_wan(self):
+        # zero-mean deeper layers made the ranking a coin flip per model
+        import torch
+        good = dict(_WAN, latency=20.0, loss=0.0, jitter=1.0)
+        bad = dict(_WAN, latency=400.0, loss=20.0, jitter=80.0)
+        x = torch.tensor([omr_metrics._extract_features(good), omr_metrics._extract_features(bad)])
+        for seed in range(50):
+            torch.manual_seed(seed)
+            with torch.no_grad():
+                scores = omr_metrics._make_model()(x)
+            assert scores[0] > scores[1], seed
 
 
 class TestTorchPredictAt:

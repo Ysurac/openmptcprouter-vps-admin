@@ -397,6 +397,18 @@ def _fake_atomic_write(path, fill, new_mode=0o600):
 
 
 @pytest.fixture(autouse=True)
+def no_public_lookup():
+    """_public_lookup's IPv4-only session, never out to the internet: in
+    its own fixture, patch_env's `with` is at Python's nesting limit."""
+    with (
+        patch("omr_admin.requests.Session.get", side_effect=_requests_get_factory),
+        # a lookup failed in one test is no reason to skip it in the next
+        patch.dict(omr_admin._public_lookup_failed, clear=True),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def patch_env(request):
     """Prevent actual filesystem writes and subprocess calls in every test.
 

@@ -3388,6 +3388,19 @@ class TestOpenVpn:
             r = user_client.post("/openvpn", json=self._PAYLOAD)
         assert r.json()["result"] == "done"
 
+    def test_new_port_opened_in_both_families(self, user_client):
+        # tun0.conf is tcp6-server: an IPv4-only rule cut the IPv6 clients
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.file_as_bytes", side_effect=[b"old", b"new"]),
+            patch("omr_admin._restart_service"),
+            patch("omr_admin.shorewall_add_port") as add4,
+            patch("omr_admin.shorewall6_add_port") as add6,
+        ):
+            r = user_client.post("/openvpn", json={**self._PAYLOAD, "port": 1194})
+        assert r.json()["result"] == "done"
+        assert add4.call_args.args[1:3] == ("1194", "tcp") and add6.call_args.args[1:3] == ("1194", "tcp")
+
     def test_cipher_injection_refused(self, user_client):
         # tun0.conf is one directive per line, script hooks run as root
         for cipher in ("AES-256-GCM\nup /tmp/x", "AES-256-GCM up", "", "AES#x", "A" * 65):
@@ -3738,8 +3751,6 @@ class TestVpnIps:
             ("localip6", "fd00::a00:1/126\nX=$(id)"),
             ("remoteip6", "fd00::a00:2/126;id"),
             ("remoteip6", "10.255.255.2"),
-            ("ula", "fd12:3456:789a::/48 $(id)"),
-            ("ula", "fe80::1%eth0"),
         ):
             with (
                 patch("os.path.isfile", return_value=True),
@@ -3749,6 +3760,18 @@ class TestVpnIps:
                 r = user_client.post("/vpnips", json={**self._PAYLOAD, field: value})
             assert r.json() == {"result": "error", "reason": f"Invalid {field}", "route": "vpnips"}, field
             assert not modif.called and not run.called, field
+        # A refused ULA leaves out only itself: the tunnel addresses are taken
+        for value in ("fd12:3456:789a::/48 $(id)", "fe80::1%eth0"):
+            with (
+                patch("os.path.isfile", return_value=True),
+                patch("omr_admin.modif_config_user") as modif,
+                patch("omr_admin._apply_6in4_conf") as apply,
+                patch("subprocess.run"),
+            ):
+                r = user_client.post("/vpnips", json={**self._PAYLOAD, "ula": value})
+            assert r.json() == {"result": "error", "reason": "Invalid ula", "route": "vpnips"}, value
+            assert not any("ula" in c.args[1] for c in modif.call_args_list), value
+            assert all("ULA=" not in (c.args[1] or "") for c in apply.call_args_list), value
 
     def test_ula_prefix_and_auto_accepted(self, user_client):
         for ula in ("fd12:3456:789a::/48", "auto"):
@@ -5317,6 +5340,13 @@ class TestModifyUser:
     def test_ro_denied(self, ro_client):
         r = ro_client.post("/modify_user", json={"username": "readonly", "disabled": True})
         assert r.json()["result"] == "permission"
+
+    def test_own_account_not_disabled(self, admin_client):
+        # every later call refused, the one re-enabling it too
+        with patch("omr_admin._mutate_omr_config") as mutate:
+            r = admin_client.post("/modify_user", json={"username": "admin", "disabled": True})
+        assert r.json() == {"result": "error", "reason": "Can not disable your own account", "route": "modify_user"}
+        assert not mutate.called
 
     def test_nonexistent_user_returns_error(self, admin_client):
         r = admin_client.post("/modify_user", json={"username": "ghost", "disabled": True})

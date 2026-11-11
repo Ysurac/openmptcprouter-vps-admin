@@ -207,11 +207,21 @@ def _serialise_config_write(func):
     return wrapped
 
 
+def _json_loads(content):
+    """json.loads, and if that fails, again without the trailing commas of a
+    hand edit ({"a": 1,}). Only then: the fix-up applied to every read also
+    rewrote the stored strings holding ",}" (a forward named "web,}" read
+    back as "web}", never matched again by the router's re-posts)."""
+    try:
+        return json.loads(content)
+    except ValueError:
+        return json.loads(re.sub(r",\s*}", "}", content))  # pylint: disable=W1401
+
+
 def _read_omr_config_unlocked():
     with open(OMR_CONFIG_FILE) as f:
         content = f.read()
-    content = re.sub(r",\s*}", "}", content)  # pylint: disable=W1401
-    return json.loads(content)
+    return _json_loads(content)
 
 
 def _owner_only_opener(file, flags):
@@ -410,7 +420,7 @@ def _config_if_usable(path):
     try:
         with open(path) as f:
             content = f.read()
-        data = json.loads(re.sub(r",\s*}", "}", content))  # pylint: disable=W1401
+        data = _json_loads(content)
     except (OSError, ValueError):
         return None
     users = data.get('users') if isinstance(data, dict) else None
@@ -1206,8 +1216,7 @@ def _add_ss_user_locked(port, key, userid, ip):
         return port
     with f_ss as f:
         content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    data = json.loads(content)
+    data = _json_loads(content)
     if ip == '' and 'port_key' in data:
         if port is None or port == '' or port == 0 or port == 'None':
             port = _ss_free_port(data['port_key'])
@@ -1252,8 +1261,7 @@ def _remove_ss_user_locked(port):
         return
     with f_ss as f:
         content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    data = json.loads(content)
+    data = _json_loads(content)
     if 'port_key' in data:
         data['port_key'].pop(str(port), None)
     else:
@@ -1670,6 +1678,21 @@ def _vps_ipv4_addresses():
     addrs.discard('')
     return addrs
 
+def _vps_ipv6_addresses():
+    """Every IPv6 address of the VPS's interfaces, as ipaddress objects."""
+    addrs = set()
+    for intf in netifaces.interfaces():
+        try:
+            infos = netifaces.ifaddresses(intf).get(netifaces.AF_INET6, [])
+        except (ValueError, OSError):
+            continue  # an interface gone while listed
+        for info in infos:
+            try:
+                addrs.add(ipaddress.IPv6Address(info.get('addr', '').split('%')[0]))
+            except ValueError:
+                continue
+    return addrs
+
 def _vps_public_ipv4s():
     """(interface, address, netmask) of each public IPv4 address of the VPS.
     With the stdlib: netaddr 1.x has no IPAddress.is_private(), every address
@@ -1733,7 +1756,7 @@ def _gre_ss_port(addr, userid, udata):
     one of another user on it as well."""
     try:
         with open('/etc/shadowsocks-libev/manager.json') as f:
-            data = json.loads(re.sub(r",\s*}", "}", f.read()))
+            data = _json_loads(f.read())
     except (OSError, ValueError):
         return None, False
     port_conf = data.get('port_conf') or {}
@@ -2528,6 +2551,19 @@ def _proxy_add_port(service, user, port, proto, destip, destport):
             LOG.warning("refusing the %s redirect of %s/%s for user %s: in use by %s",
                         service, proto, port, log_safe(user.username), log_safe(elsewhere))
             return 'Port already in use on the server'
+        # Nor one another user's DNAT, or the main router's bulk redirect,
+        # takes on the shared IPs before the proxy sees it ("done", and no
+        # connection ever came), nor an enabled VXLAN port: the omr-vxlan@
+        # socket or the proxy failed to bind it.
+        omr_config_data = read_omr_config()
+        if set(_port_redirected_by(omr_config_data, first, proto, last)) - {user.username} or \
+           (not _is_primary_userid(_router_userid(user)) and _bulk_redirect_takes(omr_config_data, first)):
+            return 'Port already redirected by another user'
+        if proto == 'udp' and any(port is not None and first <= port <= last
+                                  for port in (_vxlan_enabled_port(udata.get('vxlan'))
+                                               for udata in ((omr_config_data.get('users') or [{}])[0]).values()
+                                               if isinstance(udata, dict))):
+            return 'Port already in use on the server'
         # Nor a port another daemon of the VPS listens on (pihole's 53, a
         # web server's 80...): the delayed restart couldn't bind it and the
         # proxy went down for every user. The proxies' own sockets are left
@@ -2542,33 +2578,28 @@ def _proxy_add_port(service, user, port, proto, destip, destport):
         # Two listeners on one port stop the daemon, for every user: refuse a
         # port another user, or the server itself (the proxies, VLESS Reality
         # on 443, the API inbound), already listens on. The same user's
-        # redirect of that port to another destination is replaced: that is
-        # how the router moves a forward, it removes the old one afterwards.
-        replaced = set()
+        # redirect of that port to another destination too: replaced, two
+        # forwards the router keeps (one port to two hosts, a range and a
+        # port in it) replaced each other at every sync, the proxy restarted
+        # each time. A moved forward is taken at the next sync, the router
+        # removing the old one at the end of each.
         for inbound in data['inbounds']:
             inbound_tag = inbound.get('tag', '')
             if proto not in _proxy_inbound_networks(inbound) or \
                not any(a <= last and first <= b for a, b in _proxy_inbound_ports(inbound)):
                 continue
             owner = _proxy_redirect_owner(inbound_tag)
+            LOG.warning("refusing the %s redirect of %s/%s for user %s: in use by %s",
+                        service, proto, port, log_safe(user.username), log_safe(owner or inbound_tag))
             if owner != user.username:
-                LOG.warning("refusing the %s redirect of %s/%s for user %s: in use by %s",
-                            service, proto, port, log_safe(user.username), log_safe(owner or inbound_tag))
                 return 'Port already in use on the server'
-            replaced.add(inbound_tag.split('#')[0])
-        def is_replaced(inbound_tag):
-            return any(_proxy_tag_matches(inbound_tag, old) for old in replaced)
+            return 'Port already redirected by this user'
         user_ports = last - first + 1
         for inbound in data['inbounds']:
-            inbound_tag = inbound.get('tag', '')
-            if _proxy_redirect_owner(inbound_tag) == user.username and not is_replaced(inbound_tag):
+            if _proxy_redirect_owner(inbound.get('tag', '')) == user.username:
                 user_ports += sum(b - a + 1 for a, b in _proxy_inbound_ports(inbound))
         if user_ports > PROXY_REDIRECT_MAX_USER_PORTS:
             return "No more than {} ports can be redirected with V2Ray/XRay".format(PROXY_REDIRECT_MAX_USER_PORTS)
-        if replaced:
-            data['inbounds'] = [inbound for inbound in data['inbounds'] if not is_replaced(inbound.get('tag', ''))]
-            data['routing']['rules'] = [rule for rule in data['routing']['rules']
-                                        if not is_replaced((rule.get('inboundTag') or [''])[0])]
         reverse_tag = _proxy_ensure_reverse(service, data, user.username, _router_userid(user))[0]
         inbounds = _proxy_redirect_inbounds(service, tag, port, proto, destip, destport)
         data['inbounds'].extend(inbounds)
@@ -4520,20 +4551,34 @@ def _is_ipv4_address(value):
 def _is_hostname(value):
     return isinstance(value, str) and bool(_HOSTNAME_RE.fullmatch(value))
 
+class _IPv4Adapter(requests.adapters.HTTPAdapter):
+    """Connections from 0.0.0.0, so over IPv4 only, as the `wget -4` of
+    before: over IPv6, hostname.openmptcprouter.com answered the VPS's IPv6
+    address, refused as a name, and ifconfig.me the IPv6 one for the IPv4."""
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['source_address'] = ('0.0.0.0', 0)
+        super().init_poolmanager(*args, **kwargs)
+
 def _public_lookup(urls, valid):
     """The first answer of *urls* that *valid* accepts, '' if none: an
     error page (5xx, a captive portal's HTML) was kept as the address."""
-    for url in urls:
-        try:
-            response = requests.get(url, timeout=2)
-        except requests.RequestException:
-            continue  # try the next service
-        if not response.ok:
-            continue
-        value = response.text.strip()
-        if len(value) <= 253 and valid(value):
-            return value
+    with requests.Session() as session:
+        session.mount('https://', _IPv4Adapter())
+        for url in urls:
+            try:
+                response = session.get(url, timeout=2)
+            except requests.RequestException:
+                continue  # try the next service
+            if not response.ok:
+                continue
+            value = response.text.strip()
+            if len(value) <= 253 and valid(value):
+                return value
     return ''
+
+# key -> when its lookup last failed, in this worker: retried hourly, it was
+# redone at each /config of each router (up to 2 s each)
+_public_lookup_failed = {}
 
 def _vps_public_param(omr_config_data, key, valid, urls, offline):
     """omr_config_data[key] if it is set and *valid* (or set empty), else
@@ -4544,9 +4589,15 @@ def _vps_public_param(omr_config_data, key, valid, urls, offline):
         return value
     if 'internet' in omr_config_data and not omr_config_data['internet']:
         return offline()
+    failed = _public_lookup_failed.get(key)
+    if failed is not None and time.monotonic() - failed < 3600:
+        return ''
     value = _public_lookup(urls, valid)
     if value:
+        _public_lookup_failed.pop(key, None)
         set_global_param(key, value)
+    else:
+        _public_lookup_failed[key] = time.monotonic()
     return value
 
 def _vps_ipv4(omr_config_data):
@@ -4588,9 +4639,8 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
     if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
         with open('/etc/shadowsocks-libev/manager.json') as f:
             content = f.read()
-        content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
         try:
-            data = json.loads(content)
+            data = _json_loads(content)
         except ValueError as e:
             data = {'server_port': 65101, 'method': 'chacha20'}
     else:
@@ -5182,7 +5232,11 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
         for users in omr_config_data['users'][0]:
             # [0] of an empty list was a 500 for every other router
             other_lanips = omr_config_data['users'][0][users].get('lanips') or []
-            if other_lanips and users != username and other_lanips[0] not in alllanips:
+            # Only a LAN /lan takes with client2client on: one stored while
+            # it was off (0.0.0.0/0, 10.0.0.0/8) became a route on every router
+            lan = _lan_network(other_lanips[0]) if other_lanips else None
+            if lan is not None and not _lan_too_wide(lan) and users != username \
+               and other_lanips[0] not in alllanips:
                 alllanips.append(other_lanips[0])
 
     shorewall_redirect = "enable" if omr_config_data.get('bulk_redirect_v4') else "disable"
@@ -5287,9 +5341,8 @@ def _shadowsocks_locked(params, current_user):
     initial_md5 = hashlib.md5(file_as_bytes('/etc/shadowsocks-libev/manager.json')).hexdigest()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
-        data = json.loads(content)
+        data = _json_loads(content)
     except ValueError as e:
         data = {'timeout': 600, 'verbose': 0, 'prefer_ipv6': False}
     #key = data["key"]
@@ -5478,9 +5531,8 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     initial_md5 = hashlib.md5(file_as_bytes('/etc/shadowsocks-go/server.json')).hexdigest()
     with open('/etc/shadowsocks-go/server.json') as f:
         content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
     try:
-        data = json.loads(content)
+        data = _json_loads(content)
     except ValueError as e:
         return {'result': 'error', 'reason': 'Config file not readable', 'route': 'shadowsocks-go'}
     port = params.port
@@ -5793,6 +5845,8 @@ def _fw_dnat_error(omr_config_data, username, port, proto, families, source_dip)
         # Within a dedicated IP, not just overlapping one: a network
         # around it (0.0.0.0/0) is on the shared IPs as well.
         return bool(address) and bool(_public_ip_owners(omr_config_data, address, contained=True))
+    if not dedicated(source_dip) and _bulk_redirect_takes(omr_config_data, first, families):
+        return 'Port already redirected by another user'
     for _other, entry in _dnat_entries(omr_config_data, proto, first, last, families, exclude=username):
         other_dip = entry.get('source_dip', '')
         if source_dip and other_dip:
@@ -5809,14 +5863,21 @@ def _fw_dnat_error(omr_config_data, username, port, proto, families, source_dip)
             return 'Port used by the server'
     return None
 
-def _port_redirected_by(omr_config_data, port, proto):
-    """Users whose DNAT takes *port*/*proto* on the shared IPs of the VPS
+def _bulk_redirect_takes(omr_config_data, first, families=(4, 6)):
+    """True if the main router's bulk redirect (/firewall redirect_ports),
+    loaded before every user's DNAT, takes ports from *first* on the shared
+    IPs in one of *families*: another user's DNAT or proxy redirect there
+    answered "done" and never got a connection."""
+    return first <= 64999 and any(omr_config_data.get('bulk_redirect_v%d' % family) for family in families)
+
+def _port_redirected_by(omr_config_data, port, proto, last=None):
+    """Users whose DNAT takes *port* (to *last*)/*proto* on the shared IPs of the VPS
     (their dedicated IPs are theirs): user_dnat rewrites it before the VPS
     sees it, so a service of the server moved or turned on there was
     unreachable for every user, with nothing to tell. The reverse of the
     'Port used by the server' check of _fw_dnat_error, every family: the
     server's services listen on both."""
-    return sorted({username for username, entry in _dnat_entries(omr_config_data, proto, port, port)
+    return sorted({username for username, entry in _dnat_entries(omr_config_data, proto, port, port if last is None else last)
                    if not (entry.get('source_dip') and
                            _public_ip_owners(omr_config_data, entry['source_dip'], contained=True))})
 
@@ -8158,7 +8219,9 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
 
     if initial_md5 != final_md5:
         _restart_service("openvpn@tun0")
+        # Both families: tun0.conf is tcp6-server, and the old port is closed in both
         shorewall_add_port(current_user, str(params.port), 'tcp', 'openvpn')
+        shorewall6_add_port(current_user, str(params.port), 'tcp', 'openvpn')
         if old_port is not None and old_port != str(params.port):
             _fw_service_port_del(old_port, 'tcp', 'openvpn')
         #set_lastchange()
@@ -8468,9 +8531,8 @@ def bypass(*, bypassconfig: ByPass, current_user: User = Depends(get_current_use
     if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-bypass.json'):
         with open('/etc/openmptcprouter-vps-admin/omr-bypass.json') as f:
             content = f.read()
-        content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
         try:
-            data = json.loads(content)
+            data = _json_loads(content)
         except ValueError as e:
             return {'error': 'Config file not readable', 'route': 'bypass'}
     else:
@@ -8480,6 +8542,388 @@ def bypass(*, bypassconfig: ByPass, current_user: User = Depends(get_current_use
     data[bypassconfig.intf]["ipv6"] = bypassipv6s
     _atomic_write_json('/etc/openmptcprouter-vps-admin/omr-bypass.json', data)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'bypass'}
+
+# omr-geoban (openmptcprouter-vps): filter the new connections from the
+# internet by the country or network (ASN) of their source. The script does
+# the work and owns the checks (a list refused when it would block a peer
+# connected now, a router WAN or an SSH session); omr-admin only edits the
+# keys it has no command to replace, and puts them back when the script refuses.
+GEOBAN_BIN = '/usr/local/bin/omr-geoban'
+GEOBAN_CONF = '/etc/openmptcprouter-vps-admin/omr-geoban.conf'
+GEOBAN_APPLIED = '/var/lib/omr-geoban/applied'
+GEOBAN_LOCK = '/run/omr-geoban.lock'
+GEOBAN_API_LOCK = '/run/omr-geoban-api.lock'
+# omr-geoban's OPEN_PORTS without a line for it: SSH open to every country
+GEOBAN_DEFAULT_OPEN_PORTS = 'tcp/65222'
+GEOBAN_GROUPS = ('eu', 'europe', 'africa', 'asia', 'north-america', 'south-america', 'oceania', 'antarctica')
+# The first download of a list (up to curl's --max-time 600) then the apply
+GEOBAN_TIMEOUT = 900
+GEOBAN_MAX_WORDS = 300
+GEOBAN_MAX_EXEMPT = 256
+GEOBAN_MAX_CHECK = 64
+_GEOBAN_WORD_RE = re.compile(r'[-!]?[A-Za-z][A-Za-z0-9-]{1,30}')
+_GEOBAN_PORT_RE = re.compile(r'(tcp|udp)/(\d{1,5})(?:-(\d{1,5}))?')
+_GEOBAN_CHECK_RE = re.compile(r'(\S+) (\S+) AS(\S*)(?: \((.*)\))? ((?:allowed|blocked|not filtered).*)')
+# \s*: a network with no organisation name ends at "IPv4" once stripped
+_GEOBAN_ASN_RE = re.compile(r'AS(\d+)\s+(\S+)\s+(\d+) IPv4\s*(.*)')
+# One change at a time from the API: a refused one puts back the file it read
+_geoban_api_thread_lock = threading.Lock()
+
+@contextlib.contextmanager
+def _geoban_api_lock():
+    """One API change at a time, across threads and uvicorn workers: held
+    from reading the file to putting it back. Not GEOBAN_LOCK, which the
+    script takes itself while it runs."""
+    with _geoban_api_thread_lock, open(GEOBAN_API_LOCK, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+@contextlib.contextmanager
+def _geoban_file_lock():
+    """The lock omr-geoban takes (flock on GEOBAN_LOCK) around its own
+    configuration writes and applies. Held only while omr-admin reads or
+    writes the file, never while it runs the script, which would wait on it."""
+    with open(GEOBAN_LOCK, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+def _geoban_conf_text():
+    try:
+        with open(GEOBAN_CONF) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+def _geoban_conf_get(text, key, default=''):
+    """The value of KEY="value" as omr-geoban's get_conf reads it: the last
+    line, one pair of quotes off."""
+    value = None
+    for line in (text or '').splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(key + '='):
+            value = stripped[len(key) + 1:]
+    if value is None:
+        return default
+    if value.startswith('"'):
+        value = value[1:]
+    if value.endswith('"'):
+        value = value[:-1]
+    return value or default
+
+def _geoban_conf_has(text, key):
+    return any(line.lstrip().startswith(key + '=') for line in (text or '').splitlines())
+
+def _geoban_conf_set(text, values):
+    """*text* with the line of each key of *values* replaced (the first one,
+    the others dropped) or appended, comments kept, as omr-geoban's set_conf."""
+    lines = (text or '').splitlines()
+    for key, value in values.items():
+        new_line = key + '="' + value + '"'
+        out = []
+        done = False
+        for line in lines:
+            if line.lstrip().startswith(key + '='):
+                if not done:
+                    out.append(new_line)
+                    done = True
+                continue
+            out.append(line)
+        if not done:
+            out.append(new_line)
+        lines = out
+    return '\n'.join(lines) + '\n'
+
+def _geoban_write_conf(text):
+    """0600 even over a file made by hand: it may hold a MaxMind license key.
+    Before the write, which keeps the mode of the file it replaces: after it,
+    the key was readable until the chmod."""
+    with contextlib.suppress(FileNotFoundError):
+        os.chmod(GEOBAN_CONF, 0o600)
+    _atomic_write_text(GEOBAN_CONF, text, new_mode=0o600)
+
+def _geoban_restore_conf(text):
+    with _geoban_file_lock():
+        if text is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(GEOBAN_CONF)
+        else:
+            _geoban_write_conf(text)
+
+def _geoban_update_conf(values):
+    """Write *values* into omr-geoban.conf; returns the text it had (None:
+    no file), for _geoban_restore_conf."""
+    with _geoban_file_lock():
+        old = _geoban_conf_text()
+        if values:
+            _geoban_write_conf(_geoban_conf_set(old, values))
+        return old
+
+def _geoban_run(*args):
+    """(returncode, stdout, the 'omr-geoban: ' log lines of stderr)."""
+    try:
+        result = subprocess.run([GEOBAN_BIN, *args], capture_output=True, text=True,
+                                timeout=GEOBAN_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return 1, '', ['timed out']
+    except OSError as e:
+        return 1, '', [str(e)]
+    stderr = result.stderr if isinstance(result.stderr, str) else ''
+    log = [line[len('omr-geoban: '):] if line.startswith('omr-geoban: ') else line
+           for line in stderr.splitlines() if line.strip()]
+    return result.returncode, result.stdout if isinstance(result.stdout, str) else '', log
+
+def _geoban_refusal(route, log):
+    """The answer to a command omr-geoban refused: 'conflict' with the peers
+    connected now that it would have blocked, 'error' otherwise."""
+    if any('would be blocked' in line for line in log):
+        return {'result': 'conflict',
+                'reason': 'These peers, connected now, would be blocked: add them to exempt, or pass force=true',
+                'blocked': [line.strip() for line in log if line.startswith('  ')],
+                'route': route}
+    return {'result': 'error', 'reason': log[-1] if log else 'omr-geoban failed', 'route': route}
+
+def _geoban_words(values):
+    """The COUNTRIES words of *values* (each may hold several, split on
+    spaces and commas), or None if one is not a code, group or AS number.
+    omr-geoban checks they exist; this keeps out what is no word at all."""
+    words = [w for v in values for w in re.split(r'[\s,]+', v) if w]
+    if len(words) > GEOBAN_MAX_WORDS or not all(_GEOBAN_WORD_RE.fullmatch(w) for w in words):
+        return None
+    return words
+
+def _geoban_address(value):
+    """The address *value* is, or None: a plain literal only, as
+    _ip_network (no scope ID, whose text would reach the file or the
+    script's command line)."""
+    value = value.strip()
+    if '/' in value or _ip_network(value) is None:
+        return None
+    return ip_address(value)
+
+def _geoban_exempt_entry(entry):
+    """*entry* (an address, a prefix or a range "a-b") written the way nft
+    takes it, or None."""
+    if '-' in entry:
+        first, last = (_geoban_address(a) for a in entry.split('-', 1))
+        if first is None or last is None or first.version != last.version or first > last:
+            return None
+        return str(first) + '-' + str(last)
+    if '/' in entry:
+        net = _ip_network(entry.strip())
+        return str(net) if net else None
+    address = _geoban_address(entry)
+    return str(address) if address else None
+
+def _geoban_open_port(entry):
+    match = _GEOBAN_PORT_RE.fullmatch(entry.strip().lower())
+    if not match:
+        return None
+    low = int(match.group(2))
+    high = int(match.group(3)) if match.group(3) else low
+    if not 1 <= low <= high <= 65535:
+        return None
+    return match.group(1) + '/' + (str(low) if low == high else str(low) + '-' + str(high))
+
+def _geoban_dropped():
+    """The packets dropped by the omr_geoban table, None if it is not loaded."""
+    try:
+        result = subprocess.run([NFT_BIN, 'list', 'chain', 'inet', 'omr_geoban', 'prerouting'],
+                                capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not isinstance(result.stdout, str):
+        return None
+    return sum(int(n) for n in re.findall(r'counter packets (\d+)', result.stdout))
+
+def _geoban_status():
+    text = _geoban_conf_text()
+    applied = {}
+    try:
+        with open(GEOBAN_APPLIED) as f:
+            for line in f:
+                key, sep, value = line.rstrip('\n').partition('=')
+                if sep:
+                    applied[key] = value
+    except FileNotFoundError:
+        pass
+    dropped = _geoban_dropped()
+    return {
+        'mode': _geoban_conf_get(text, 'MODE', 'off'),
+        'countries': _geoban_conf_get(text, 'COUNTRIES').split(),
+        'exempt': _geoban_conf_get(text, 'EXEMPT').replace(',', ' ').split(),
+        'open_ports': _geoban_conf_get(text, 'OPEN_PORTS', '' if _geoban_conf_has(text, 'OPEN_PORTS')
+                                       else GEOBAN_DEFAULT_OPEN_PORTS).replace(',', ' ').split(),
+        'source': _geoban_conf_get(text, 'SOURCE', 'dbip'),
+        'maxmind_account_id': _geoban_conf_get(text, 'MAXMIND_ACCOUNT_ID'),
+        # never the key itself
+        'maxmind_license_key_set': bool(_geoban_conf_get(text, 'MAXMIND_LICENSE_KEY')),
+        'active': dropped is not None,
+        'dropped': dropped or 0,
+        'applied': applied if dropped is not None else {},
+        'groups': list(GEOBAN_GROUPS),
+    }
+
+@app.get('/geoban', summary="Get the filter of new connections by source country or network (omr-geoban)")
+def geoban_get(current_user: User = Depends(get_current_user)):
+    if not _is_server_admin(current_user):
+        return _server_wide_refusal('geoban')
+    if not os.path.isfile(GEOBAN_BIN):
+        return {'result': 'warning', 'reason': 'omr-geoban not installed', 'route': 'geoban'}
+    return {'result': 'done', 'geoban': _geoban_status(), 'route': 'geoban'}
+
+class GEOBANMODE(str, Enum):
+    off = "off"
+    allow = "allow"
+    deny = "deny"
+
+class Geoban(BaseModel):
+    mode: Optional[GEOBANMODE] = Query(None, title="off, allow (only the countries/networks) or deny (all but them)")
+    countries: Optional[List[str]] = Query(None, title="ISO 3166 codes, groups and AS numbers (fr, europe, -ru, as3215, -as16276)")
+    exempt: Optional[List[str]] = Query(None, title="Addresses, prefixes or ranges never filtered (replaces the list)")
+    open_ports: Optional[List[str]] = Query(None, title="Ports open to every country, tcp/<port> or udp/<first>-<last>, tcp/65222 (SSH) by default; [] filters it too (replaces the list)")
+    force: bool = Query(False, title="Apply even when a peer connected now would be blocked")
+
+@app.post('/geoban', summary="Set the filter of new connections by source country or network (omr-geoban)")
+def geoban_set(*, params: Geoban, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'geoban'}
+    if not _is_server_admin(current_user):
+        return _server_wide_refusal('geoban')
+    if not os.path.isfile(GEOBAN_BIN):
+        return {'result': 'warning', 'reason': 'omr-geoban not installed', 'route': 'geoban'}
+    values = {}
+    words = None
+    if params.countries is not None:
+        words = _geoban_words(params.countries)
+        if words is None:
+            return {'result': 'error', 'reason': 'Invalid countries', 'route': 'geoban'}
+    if params.exempt is not None:
+        exempt = [_geoban_exempt_entry(e) for e in params.exempt]
+        if len(exempt) > GEOBAN_MAX_EXEMPT or None in exempt:
+            return {'result': 'error', 'reason': 'Invalid exempt address', 'route': 'geoban'}
+        values['EXEMPT'] = ' '.join(dict.fromkeys(exempt))
+    if params.open_ports is not None:
+        ports = [_geoban_open_port(p) for p in params.open_ports]
+        if len(ports) > GEOBAN_MAX_EXEMPT or None in ports:
+            return {'result': 'error', 'reason': 'Invalid open port (tcp/<port> or udp/<first>-<last>)', 'route': 'geoban'}
+        values['OPEN_PORTS'] = ' '.join(dict.fromkeys(ports))
+    with _geoban_api_lock():
+        text = _geoban_conf_text()
+        mode = params.mode.value if params.mode is not None else _geoban_conf_get(text, 'MODE', 'off')
+        if words is None:
+            words = _geoban_conf_get(text, 'COUNTRIES').split()
+        if mode == 'off':
+            # omr-geoban only saves COUNTRIES when it applies them
+            if params.countries is not None:
+                values['COUNTRIES'] = ' '.join(words)
+            old = _geoban_update_conf(values)
+            if params.mode is not None:
+                code, _out, log = _geoban_run('off')
+                if code != 0:
+                    if values:
+                        _geoban_restore_conf(old)
+                    return _geoban_refusal('geoban', log)
+        elif params.mode is not None or values or params.countries is not None:
+            if not words:
+                return {'result': 'error', 'reason': 'No country or network to ' + mode, 'route': 'geoban'}
+            # EXEMPT and OPEN_PORTS first: the check of the connected peers
+            # reads them, and a new exempt is what lets a refused list through
+            old = _geoban_update_conf(values)
+            code, _out, log = _geoban_run(mode, *words, *(['--force'] if params.force else []))
+            if code != 0:
+                if values:
+                    _geoban_restore_conf(old)
+                return _geoban_refusal('geoban', log)
+        LOG.info("omr-geoban set by %s: %s %s", log_safe(current_user.username), mode, log_safe(' '.join(words)))
+        return {'result': 'done', 'reason': 'changes applied', 'geoban': _geoban_status(), 'route': 'geoban'}
+
+class GEOBANSOURCE(str, Enum):
+    dbip = "dbip"
+    maxmind = "maxmind"
+
+class GeobanSource(BaseModel):
+    source: GEOBANSOURCE
+    maxmind_account_id: Optional[str] = Query(None, pattern=r'^[0-9]{1,20}$', title="MaxMind account ID")
+    maxmind_license_key: Optional[str] = Query(None, pattern=r'^[A-Za-z0-9_]{1,128}$', title="MaxMind license key")
+    force: bool = Query(False, title="Switch even when a peer connected now would be blocked")
+
+@app.post('/geoban_source', summary="Set where omr-geoban takes countries and networks from: DB-IP or MaxMind GeoLite2")
+def geoban_source(*, params: GeobanSource, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'geoban_source'}
+    if not _is_server_admin(current_user):
+        return _server_wide_refusal('geoban_source')
+    if not os.path.isfile(GEOBAN_BIN):
+        return {'result': 'warning', 'reason': 'omr-geoban not installed', 'route': 'geoban_source'}
+    if (params.maxmind_account_id is None) != (params.maxmind_license_key is None):
+        return {'result': 'error', 'reason': 'MaxMind needs both the account ID and the license key', 'route': 'geoban_source'}
+    # Through the file, which omr-geoban reads them from: on its command line
+    # they would show in every user's ps
+    values = {}
+    if params.maxmind_account_id is not None:
+        values = {'MAXMIND_ACCOUNT_ID': params.maxmind_account_id,
+                  'MAXMIND_LICENSE_KEY': params.maxmind_license_key}
+    with _geoban_api_lock():
+        old = _geoban_update_conf(values)
+        code, _out, log = _geoban_run('source', params.source.value, *(['--force'] if params.force else []))
+        if code != 0:
+            if values:
+                _geoban_restore_conf(old)
+            return _geoban_refusal('geoban_source', log)
+        return {'result': 'done', 'reason': 'changes applied', 'geoban': _geoban_status(), 'route': 'geoban_source'}
+
+class GeobanCheck(BaseModel):
+    addresses: List[str]
+
+@app.post('/geoban_check', summary="Get the country and network of addresses, and whether omr-geoban lets them in")
+def geoban_check(*, params: GeobanCheck, current_user: User = Depends(get_current_user)):
+    if not _is_server_admin(current_user):
+        return _server_wide_refusal('geoban_check')
+    if not os.path.isfile(GEOBAN_BIN):
+        return {'result': 'warning', 'reason': 'omr-geoban not installed', 'route': 'geoban_check'}
+    addresses = []
+    for address in params.addresses:
+        address = _geoban_address(address)
+        if address is None:
+            return {'result': 'error', 'reason': 'Invalid address', 'route': 'geoban_check'}
+        addresses.append(str(address))
+    if not addresses or len(addresses) > GEOBAN_MAX_CHECK:
+        return {'result': 'error', 'reason': 'Between 1 and ' + str(GEOBAN_MAX_CHECK) + ' addresses', 'route': 'geoban_check'}
+    code, out, log = _geoban_run('check', *addresses)
+    if code != 0:
+        return _geoban_refusal('geoban_check', log)
+    results = []
+    for line in out.splitlines():
+        match = _GEOBAN_CHECK_RE.fullmatch(line.strip())
+        if match:
+            results.append({'address': match.group(1), 'country': match.group(2),
+                            'asn': match.group(3), 'organisation': match.group(4) or '',
+                            'verdict': match.group(5)})
+    return {'result': 'done', 'addresses': results, 'route': 'geoban_check'}
+
+@app.get('/geoban_asn', summary="Find networks (AS numbers) by name or number for omr-geoban, the largest first")
+def geoban_asn(name: str = Query(..., pattern=r'^[A-Za-z0-9 ._&-]{2,64}$', title="Name or AS number"),
+               current_user: User = Depends(get_current_user)):
+    if not _is_server_admin(current_user):
+        return _server_wide_refusal('geoban_asn')
+    if not os.path.isfile(GEOBAN_BIN):
+        return {'result': 'warning', 'reason': 'omr-geoban not installed', 'route': 'geoban_asn'}
+    # One argument, matched whole ("bouygues telecom"); never an option
+    name = name.strip().lstrip('-').strip()
+    if not name:
+        return {'result': 'error', 'reason': 'Invalid name', 'route': 'geoban_asn'}
+    code, out, log = _geoban_run('asn', name)
+    if code != 0:
+        if any('no network matches' in line for line in log):
+            return {'result': 'done', 'networks': [], 'route': 'geoban_asn'}
+        return _geoban_refusal('geoban_asn', log)
+    networks = []
+    for line in out.splitlines():
+        match = _GEOBAN_ASN_RE.fullmatch(line.strip())
+        if match:
+            networks.append({'asn': int(match.group(1)), 'country': match.group(2),
+                             'ipv4_addresses': int(match.group(3)), 'organisation': match.group(4)})
+    return {'result': 'done', 'networks': networks, 'route': 'geoban_asn'}
 
 
 
@@ -8678,16 +9122,24 @@ _USER_TUNNEL_POOLS4 = tuple(ipaddress.ip_network(net) for net in
 _MLVPN_NET4 = ipaddress.ip_network('10.255.253.0/24')
 OMR_6IN4_DIR = '/etc/openmptcprouter-vps-admin/omr-6in4'
 
-def _valid_ula(value):
+def _valid_ula(value, main=False):
     """The network of a ULA prefix a router may route over its 6in4 tunnel,
     None if it can't be one: a /48 to /64 of fc00::/7 out of the VPS's own
     fd00::/64. omr-6in4-run routes it via the router as root (`ip route
-    replace ${ULA} via ...`, so ::/0 took the VPS's IPv6 default route)."""
+    replace ${ULA} via ...`, so ::/0 took the VPS's IPv6 default route).
+    The *main* router's may also be a public prefix the provider routes to
+    the VPS, what the wizard's "IPv6 Prefix" was made for: refused, its LAN
+    lost its public IPv6 (#4418). Not another user's, which would draw to
+    its tunnel what the others send there, nor one with an address of the
+    VPS in it."""
     net = _ip_network(value or '')
-    if net is None or net.version != 6 or not net.subnet_of(_ULA_NET) \
-       or not 48 <= net.prefixlen <= 64 or net.overlaps(_VPS_TUNNEL_NET6):
+    if net is None or net.version != 6 or not 48 <= net.prefixlen <= 64:
         return None
-    return net
+    if net.subnet_of(_ULA_NET):
+        return None if net.overlaps(_VPS_TUNNEL_NET6) else net
+    if main and net.is_global and not any(addr in net for addr in _vps_ipv6_addresses()):
+        return net
+    return None
 
 def _userid_names(users, userid):
     """The users acting as *userid*: those that have it, and for 0, the main
@@ -8810,14 +9262,48 @@ def _remoteip_owner_error(users, userid, remoteip, leases=None):
         return taken
     return None
 
-def _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, ula, leases=None):
-    """API error if the addresses of a /vpnips request aren't this router's
-    to claim, else None. omr-6in4-run routes ULA via the router as root,
-    and remoteip is the address every DNAT of this user goes to. An address
-    another user stored is the caller's all the same when OpenVPN has leased
-    it to the caller (*leases*): the other one's is stale."""
-    if ula and ula != 'auto' and _valid_ula(ula) is None:
+def _vpnips_ula_error(omr_config_data, current_user, ula):
+    """API error if the ULA of a /vpnips request isn't this router's to
+    claim, else None. omr-6in4-run routes it via the router as root."""
+    if not ula or ula == 'auto':
+        return None
+    userid = 0 if current_user.userid is None else int(current_user.userid)
+    net = _valid_ula(ula, userid == 0)
+    if net is None:
         return {'result': 'error', 'reason': 'Invalid ula', 'route': 'vpnips'}
+    users = omr_config_data['users'][0]
+    own = _userid_names(users, userid) | {current_user.username}
+    for other, ucfg in users.items():
+        # Only a valid one: a ::/0 stored by an older release blocked every
+        # other user's ULA.
+        other_ula = _valid_ula(ucfg.get('ula'), True)
+        if other not in own and other_ula is not None and net.overlaps(other_ula):
+            return {'result': 'error', 'reason': 'ula already used by another user', 'route': 'vpnips'}
+    return None
+
+# (user, reason) -> when a refused /vpnips was last logged: a router posts
+# the same addresses again every minute until they are taken
+_vpnips_refusals_logged = {}
+
+def _log_vpnips_refusal(username, error, detail):
+    """Log why a /vpnips was refused, once an hour per user and reason. It
+    used to be answered to the router only, which doesn't log it: with no
+    router address stored, every port forward of the user was left out of
+    user_dnat with nothing in any log (#4418)."""
+    key = (username, error.get('reason'))
+    now = time.monotonic()
+    last = _vpnips_refusals_logged.get(key)
+    if last is not None and now - last < 3600:
+        return
+    _vpnips_refusals_logged[key] = now
+    LOG.warning("/vpnips of user %s: %s (%s)", log_safe(username), error.get('reason'), log_safe(detail))
+
+def _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, leases=None):
+    """API error if the addresses of a /vpnips request aren't this router's
+    to claim, else None. remoteip is the address every DNAT of this user goes
+    to. An address another user stored is the caller's all the same when
+    OpenVPN has leased it to the caller (*leases*): the other one's is stale.
+    The ULA is checked on its own (_vpnips_ula_error)."""
     userid = current_user.userid
     if userid is None:
         userid = 0   # an admin: a router logged in as admin is the main one
@@ -8850,11 +9336,6 @@ def _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, re
             return {'result': 'error', 'reason': 'remoteip already used by another user', 'route': 'vpnips'}
         if localip == ucfg.get('vpnremoteip'):
             return {'result': 'error', 'reason': 'localip already used by another user', 'route': 'vpnips'}
-        # Only a valid one: a ::/0 stored by an older release blocked every
-        # other user's ULA.
-        other_ula = _valid_ula(ucfg.get('ula'))
-        if ula and ula != 'auto' and other_ula is not None and _valid_ula(ula).overlaps(other_ula):
-            return {'result': 'error', 'reason': 'ula already used by another user', 'route': 'vpnips'}
     return None
 
 def _6in4_conf_text(userid, localip, remoteip, ula):
@@ -8869,14 +9350,14 @@ def _6in4_conf_text(userid, localip, remoteip, ula):
              'LOCALIP6=' + localip6 + '/126', 'REMOTEIP6=' + remoteip6 + '/126']
     if ula == 'auto':
         lines.append('ULA=auto')
-    elif _valid_ula(ula) is not None:
+    elif _valid_ula(ula, userid == 0) is not None:
         # As the router sent it (/config reports it back, and the router
         # compares it with its own), unless it has host bits, which `ip
         # route` refuses.
         try:
             ipaddress.ip_network(ula)
         except ValueError:
-            ula = str(_valid_ula(ula))
+            ula = str(_valid_ula(ula, userid == 0))
         lines.append('ULA=' + ula)
     return ''.join(line + '\n' for line in lines)
 
@@ -8946,16 +9427,27 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     # Written into omr-6in4/user<id>, which omr-6in4-run reads as root. The
     # router sends its ULA prefix (network.globals.ula_prefix), possibly
     # 'auto'; localip6/remoteip6 default to the fd00::a0<id>:1|2/126 pair.
-    error = _ip_field_error((('localip6', localip6, 6), ('remoteip6', remoteip6, 6),
-                             ('ula', '' if ula == 'auto' else ula, 6)), 'vpnips')
+    error = _ip_field_error((('localip6', localip6, 6), ('remoteip6', remoteip6, 6)), 'vpnips')
     if error:
+        _log_vpnips_refusal(current_user.username, error, f'localip6 {localip6}, remoteip6 {remoteip6}')
         return error
     omr_config_data = read_omr_config()
     # OpenVPN hands its addresses out by DHCP: who has one right now.
     leases = _openvpn_leases() if os.path.isfile('/etc/openvpn/tun0.conf') else {}
-    error = _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, ula, leases)
+    error = _vpnips_error(omr_config_data, current_user, remoteip, localip, localip6, remoteip6, leases)
     if error:
+        _log_vpnips_refusal(current_user.username, error, f'remoteip {remoteip}, localip {localip}')
         return error
+    # The ULA comes with the tunnel addresses but is only routed over the
+    # 6in4 tunnel: refused, it is left out as if the router had sent none.
+    # Refusing the whole request left the user with no router address, so
+    # none of its port forwards was rendered (a public prefix in the wizard's
+    # "IPv6 Prefix", #4418).
+    ula_error = _vpnips_ula_error(omr_config_data, current_user, ula)
+    if ula_error:
+        _log_vpnips_refusal(current_user.username, ula_error,
+                            f'{ula}, the tunnel addresses {remoteip} and {localip} are taken without it')
+        ula = None
     users = omr_config_data['users'][0]
     # The same addresses again go on: what follows only writes what differs.
     # Refused, an omr-6in4 file that had lost its ULA (a post without it)
@@ -9003,7 +9495,8 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         if stale:
             _flush_conntrack_reply_src(remoteip)
 
-    return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
+    # The addresses are applied: the router still learns its ULA wasn't
+    return ula_error or {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
 
 def _flush_conntrack_reply_src(addr):
     """Delete the conntrack entries answered from *addr*, the router's old
@@ -9098,10 +9591,11 @@ def _check_6in4_confs():
                     drop.setdefault(name, set()).add('vpnremoteip')
                 ula = ucfg.get('ula')
                 if ula and ula != 'auto':
-                    net = _valid_ula(ula)
+                    net = _valid_ula(ula, group_of[name] == 0)
                     if net is None or any(
-                            group_of.get(other, -1) != group_of[name] and _valid_ula(o.get('ula')) is not None
-                            and _valid_ula(o.get('ula')).overlaps(net)
+                            group_of.get(other, -1) != group_of[name] and
+                            _valid_ula(o.get('ula'), group_of.get(other) == 0) is not None and
+                            _valid_ula(o.get('ula'), group_of.get(other) == 0).overlaps(net)
                             for other, o in users.items()):
                         drop.setdefault(name, set()).add('ula')
             # Then, among the router addresses left, one that two userids
@@ -9141,7 +9635,8 @@ def _check_6in4_confs():
                     # it sends none, but stores only a new one.
                     ula = current.get('ULA')
                     if not (ula == 'auto' == ucfg.get('ula') or
-                            (_valid_ula(ula) is not None and _valid_ula(ula) == _valid_ula(ucfg.get('ula')))):
+                            (_valid_ula(ula, userid == 0) is not None and
+                             _valid_ula(ula, userid == 0) == _valid_ula(ucfg.get('ula'), userid == 0))):
                         ula = None
                     text = _6in4_conf_text(userid, ucfg['vpnlocalip'], ucfg['vpnremoteip'],
                                            ucfg.get('ula') if ula else None)
@@ -9318,7 +9813,7 @@ def _ss_configured_ports(users):
         ports |= set((udata.get('access_suspended') or {}).get('shadowsocks') or {})
     try:
         with open('/etc/shadowsocks-libev/manager.json') as f:
-            data = json.loads(re.sub(r",\s*}", "}", f.read()))
+            data = _json_loads(f.read())
         ports |= set(data.get('port_key') or {}) | set(data.get('port_conf') or {})
     except (OSError, ValueError, AttributeError):
         pass  # the users' ports only
@@ -9349,14 +9844,19 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     # An existing user (admin, openmptcprouter included) was overwritten:
     # new password and userid, its keys and ports left behind. /modify_user
     # changes a user.
-    if params.username in users:
+    # Xray's VLESS and Trojan clients, of email <username>, compare it
+    # lowercased and refuse a duplicate: bob and Bob, or a user named as the
+    # main router's reverse client, and xray-server refused its whole config
+    # at the next restart, for every router.
+    if params.username.lower() in {name.lower() for name in users} | {'omr-reverse'}:
         return {'result': 'error', 'reason': 'User already exists', 'route': 'add_user'}
     # DEFAULT is the ccd OpenVPN uses for every client without its own,
     # ipp_*.txt its address pools in the same directory. 'server' is the CN
     # of OpenVPN's own certificate: a user of that name had it revoked and
-    # replaced by a client one, OpenVPN down for every router. A leading '-'
-    # made the name an option of the xray and easyrsa commands it is given to.
-    if len(params.username) > USERNAME_MAX_LEN or params.username in ('DEFAULT', 'ipp_tcp.txt', 'ipp_udp.txt', 'server') \
+    # replaced by a client one, OpenVPN down for every router. 'ca': its
+    # pki/private/ca.key is the CA's own key, deleted before easyrsa ran. A
+    # leading '-' made the name an option of the xray and easyrsa commands.
+    if len(params.username) > USERNAME_MAX_LEN or params.username in ('DEFAULT', 'ipp_tcp.txt', 'ipp_udp.txt', 'server', 'ca') \
             or params.username.startswith('-'):
         return {'result': 'error', 'reason': 'Invalid username', 'route': 'add_user'}
     used_userids = set()
@@ -9541,7 +10041,7 @@ def _remove_user_ss_ports(udata, userid):
               if isinstance(tunnel, dict) and tunnel.get('shadowsocks_port') is not None}
     try:
         with open('/etc/shadowsocks-libev/manager.json') as f:
-            data = json.loads(re.sub(r",\s*}", "}", f.read()))
+            data = _json_loads(f.read())
         ports |= {port for port, conf in (data.get('port_conf') or {}).items()
                   if isinstance(conf, dict) and str(conf.get('userid')) == str(userid)}
     except (OSError, ValueError, AttributeError):
@@ -9813,7 +10313,7 @@ def _ss_suspend(udata, userid, taken=None):
     with _omr_config_lock(exclusive=True):
         try:
             with open('/etc/shadowsocks-libev/manager.json') as f:
-                data = json.loads(re.sub(r",\s*}", "}", f.read()))
+                data = _json_loads(f.read())
         except (OSError, ValueError):
             return taken
         table = data.get('port_conf') if 'port_conf' in data else data.get('port_key')
@@ -9831,7 +10331,7 @@ def _ss_resume(taken, userid=None):
         return
     with _omr_config_lock(exclusive=True):
         with open('/etc/shadowsocks-libev/manager.json') as f:
-            data = json.loads(re.sub(r",\s*}", "}", f.read()))
+            data = _json_loads(f.read())
         conf = 'port_conf' in data or 'port_key' not in data
         table = data.setdefault('port_conf' if conf else 'port_key', {})
         readd = {}
@@ -10128,6 +10628,9 @@ def modify_user(*, params: ModifyUser, current_user: User = Depends(get_current_
             return {'result': 'error', 'reason': error, 'route': 'modify_user'}
         changes['user_password'] = params.user_password
     if params.disabled is not None:
+        # Its own account: every later call refused, the one re-enabling it too
+        if params.disabled and params.username == current_user.username:
+            return {'result': 'error', 'reason': 'Can not disable your own account', 'route': 'modify_user'}
         changes['disabled'] = "true" if params.disabled else "false"
     if params.vpn is not None:
         changes['vpn'] = params.vpn

@@ -167,8 +167,13 @@ _config_thread_lock = threading.RLock()
 
 def _parse_admin_config(f) -> dict:
     """omr-admin-config.json as omr-admin reads it, a trailing comma
-    included: json.load refused it, and the metrics lost their settings."""
-    return json.loads(re.sub(r",\s*}", "}", f.read()))
+    included: json.load refused it, and the metrics lost their settings.
+    Only on a parse error: always, it also rewrote strings holding ",}"."""
+    content = f.read()
+    try:
+        return json.loads(content)
+    except ValueError:
+        return json.loads(re.sub(r",\s*}", "}", content))
 
 
 @contextlib.contextmanager
@@ -239,13 +244,14 @@ def _write_ema_state(state: dict) -> None:
         LOG.debug("omr_metrics: EMA state %s not written (%s)", EMA_STATE_FILE, exc)
 
 
-def _apply_ema(username: str, probs: dict) -> dict:
+def _apply_ema(username: str, probs: dict, save: bool = True) -> dict:
     """Blend float probabilities *probs* {iface: [0,1]} with the per-user EMA history.
 
     Operates on raw probabilities before integer conversion so that rounding
     noise does not accumulate across iterations.  Returns a dict of floats.
     First call initialises the EMA at the current probabilities (no cold-start
     jump).  Interfaces that disappear are evicted automatically.
+    With *save* false the blend is returned but not kept.
     """
     if not probs:
         return probs
@@ -273,6 +279,8 @@ def _apply_ema(username: str, probs: dict) -> dict:
         total = sum(new_ema.values())
         if total > 0.0:
             new_ema = {iface: value / total for iface, value in new_ema.items()}
+        if not save:
+            return new_ema
         _weight_ema[username] = new_ema
         if state is not None:
             state[username] = new_ema
@@ -2277,6 +2285,20 @@ def _snapshot_age_s(payload: dict) -> Optional[float]:
         return None
 
 
+# A snapshot older than this is no longer the interface's state.
+_STALE_S = 900
+
+
+def _is_unroutable(payload: dict) -> bool:
+    """Down (_is_interface_down), or its latest snapshot older than
+    _STALE_S: the latest-snapshot query reaches back a day, and a WAN whose
+    tracker stopped posting kept its routing weight that long, while
+    _decision_confidence already said "none" for it. A snapshot without a
+    timestamp is taken as current."""
+    age_s = _snapshot_age_s(payload)
+    return _is_interface_down(payload) or (age_s is not None and age_s > _STALE_S)
+
+
 def _decision_confidence(payload: dict, history: Optional[list] = None) -> str:
     """Confidence in a routing decision for one interface.
 
@@ -2287,7 +2309,7 @@ def _decision_confidence(payload: dict, history: Optional[list] = None) -> str:
     if _is_interface_down(payload):
         return "none"
     age_s = _snapshot_age_s(payload)
-    if age_s is None or age_s > 900:
+    if age_s is None or age_s > _STALE_S:
         return "none"
 
     hist = _valid_history(history)
@@ -2373,10 +2395,14 @@ def _interface_anomalies(payload: dict, history: Optional[list] = None) -> list:
         if changes >= 2:
             flags.append("flapping")
 
+        # The rows before this snapshot: the history ends with the snapshot
+        # itself, and its last gateway was always the current one.
+        current_ts = _as_float(payload.get("timestamp"))
         gateways = [
             (p.get("gateway"), p.get("gateway6"))
             for p in hist
-            if p.get("gateway") or p.get("gateway6")
+            if (p.get("gateway") or p.get("gateway6"))
+            and (current_ts is None or (_as_float(p.get("timestamp")) or 0.0) < current_ts)
         ]
         current_gw = (payload.get("gateway"), payload.get("gateway6"))
         if gateways and current_gw != gateways[-1] and (current_gw[0] or current_gw[1]):
@@ -2497,8 +2523,7 @@ def _dscp_class_weights(user_data: dict, history_data: dict, model_probs: dict) 
         raw: list = []
         for iface in interfaces:
             p = user_data[iface]
-            status, latency = p.get("status"), p.get("latency")
-            if (status and status != "online") or latency is None:
+            if _is_unroutable(p):
                 raw.append(0.0)
                 continue
             hist = history_data.get(iface) or []
@@ -2591,9 +2616,13 @@ def _make_model():
             model.net[0].weight.data[i] = row / row.norm().clamp(min=1e-6)
         model.net[0].bias.data.zero_()
         # net[1]=ReLU net[2]=Dropout net[3]=Linear(32,16) net[4]=ReLU net[5]=Dropout net[6]=Linear(16,1)
+        # Non-negative: with zero-mean weights here, whether better features
+        # raised or lowered the score was a coin flip for each new model
         nn.init.xavier_uniform_(model.net[3].weight)
+        model.net[3].weight.data.abs_()
         model.net[3].bias.data.zero_()
         nn.init.xavier_uniform_(model.net[6].weight)
+        model.net[6].weight.data.abs_()
         model.net[6].bias.data.zero_()
     model.eval()
     return model
@@ -2735,7 +2764,7 @@ def _apply_cost(raw: list, interfaces: list, user_data: dict) -> list:
         # Equal shares between the online ones: an idle link scores 0 on a
         # bandwidth-only DSCP class (cs1), and the offline interfaces got
         # their share of it too. Every interface when none is online.
-        online = [not _is_interface_down(user_data[iface]) for iface in interfaces]
+        online = [not _is_unroutable(user_data[iface]) for iface in interfaces]
         if not any(online):
             online = [True] * len(interfaces)
         eq = 1.0 / sum(online) if interfaces else 1.0
@@ -2761,13 +2790,11 @@ def _compute_weights_heuristic(user_data: dict,
     raw: list = []
     for iface in interfaces:
         p = user_data[iface]
-        status  = p.get("status")
-        latency = p.get("latency")
-        if (status and status != "online") or latency is None:
+        if _is_unroutable(p):
             raw.append(0.0)
             continue
 
-        lat   = float(latency)
+        lat   = float(p["latency"])
         loss  = p.get("loss")
         jitter = p.get("jitter")
         sig_q = (p.get("signal") or {}).get("quality")
@@ -2837,12 +2864,7 @@ def _compute_weights(user_data: dict, explain: bool = False,
         with torch.no_grad():
             scores = model(feat_tensor)
             for idx, iface in enumerate(interfaces):
-                p      = user_data[iface]
-                status  = p.get("status")
-                latency = p.get("latency")
-                # Treat as down when: status is not "online", status is "ERROR",
-                # or latency is null (check failed / interface unreachable).
-                if (status and status != "online") or latency is None:
+                if _is_unroutable(user_data[iface]):
                     scores[idx] = float("-inf")
             weights = torch.softmax(scores, dim=0)
         raw_weights = [float(weights[i]) for i in range(len(interfaces))]
@@ -3975,7 +3997,11 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
         # Exploration (when auto-learning is on) perturbs after EMA so the
         # deviation is actually expressed, without polluting the EMA state.
         # In a thread: the EMA state's flock and file I/O held up the loop.
-        ema_probs = await asyncio.to_thread(_apply_ema, target, result.get("probs", {}))
+        # Kept only from the router's own plain polls: an admin's
+        # ?username=X every few seconds wiped the smoothing out, and the
+        # predict=true weights were mixed into the plain ones.
+        ema_probs = await asyncio.to_thread(_apply_ema, target, result.get("probs", {}),
+                                            target == current_user.username and not predict)
         smoothed_probs = _maybe_explore(ema_probs)
         int_weights = {iface: max(1, round(p * 255)) for iface, p in smoothed_probs.items()}
         output = {k: v for k, v in result.items() if k != "probs"}

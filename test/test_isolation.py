@@ -8,6 +8,7 @@ password, the /backuppost size limit, the /mptcpsupport cache...).
 
 import base64
 import io
+import ipaddress
 import json
 import os
 from datetime import datetime, timedelta
@@ -265,6 +266,28 @@ class TestProxyRedirectIsolation:
         assert add(OTHER, "8080", "udp", "x", "192.168.2.2", "80") is None
 
     @pytest.mark.real_env
+    @pytest.mark.parametrize("service", ["v2ray", "xray"])
+    def test_port_another_user_redirects_or_vxlan_refused(self, configs, service):
+        # another user's DNAT, or the main router's bulk redirect, took the
+        # port before the proxy ("done", never a connection); a VXLAN port
+        # failed the bind of omr-vxlan@ or of the proxy
+        paths, _ = configs
+        add = getattr(omr_admin, f"{service}_add_port")
+        config = _config()
+        config["users"][0]["openmptcprouter"]["fw_ports"] = [{"fwtype": "DNAT", "proto": "tcp", "port": "8080"}]
+        config["users"][0]["openmptcprouter"]["vxlan"] = {"enabled": True, "port": 4789}
+        before = open(paths[service]).read()
+        with patch("omr_admin.read_omr_config", return_value=config):
+            assert add(OTHER, "8000-8100", "tcp", "x", "192.168.2.2", "") == "Port already redirected by another user"
+            assert add(OTHER, "4789", "udp", "x", "192.168.2.2", "") == "Port already in use on the server"
+            config["bulk_redirect_v4"] = True
+            assert add(OTHER, "9000", "tcp", "x", "192.168.2.2", "") == "Port already redirected by another user"
+            assert open(paths[service]).read() == before
+            # its own DNAT and bulk redirect are the main router's business
+            assert add(PRIMARY, "8080", "tcp", "x", "192.168.1.2", "") is None
+            assert add(OTHER, "65100", "tcp", "x", "192.168.2.2", "") is None
+
+    @pytest.mark.real_env
     @pytest.mark.parametrize("port", ["443", "10086"])
     def test_server_listener_refused(self, configs, port):
         # VLESS Reality on 443, the API inbound: the daemon could not start.
@@ -330,10 +353,19 @@ class TestProxyRedirectIsolation:
 
     @pytest.mark.real_env
     @pytest.mark.parametrize("service", ["v2ray", "xray"])
-    def test_same_user_new_destination_replaces_the_redirect(self, configs, service):
+    def test_same_user_new_destination_taken_once_the_old_is_removed(self, configs, service):
+        # Replaced at once, two forwards the router keeps (a range and a port
+        # in it) replaced each other at every sync, the proxy restarted each time
         paths, _ = configs
         add = getattr(omr_admin, f"{service}_add_port")
         add(PRIMARY, "1000-1002", "tcp", "x", "192.168.1.2", "2000-2002")
+        with patch("omr_admin._schedule_proxy_restart") as restart:
+            for _sync in range(3):
+                assert add(PRIMARY, "1001", "tcp", "x", "192.168.1.3", "80") == "Port already redirected by this user"
+                assert add(PRIMARY, "1000-1002", "tcp", "x", "192.168.1.2", "2000-2002") is None
+        assert not restart.called
+        # the router moves a forward: the old one removed at the end of its sync
+        getattr(omr_admin, f"{service}_del_port")(PRIMARY, "1000-1002", "tcp", "x", "192.168.1.2", "2000-2002")
         assert add(PRIMARY, "1001", "tcp", "x", "192.168.1.3", "80") is None
         data = self._load(paths[service])
         redirects = [i for i in data["inbounds"] if "_redir_" in i["tag"]]
@@ -599,13 +631,43 @@ class TestVpnIpsOwnership:
     @pytest.mark.parametrize("ula", ["::/0", "2000::/3", "fd00::/48", "fd00::/8", "fd12:3456:789a::/32",
                                      "fd12:3456:789a::/96", "2001:db8::/48"])
     def test_ula_refused(self, user_client, ula):
+        # The tunnel addresses are taken all the same: refused with the ULA,
+        # none of the user's port forwards was rendered (#4418)
         body, modif = self._post(user_client, ula=ula)
         assert body == {"result": "error", "reason": "Invalid ula", "route": "vpnips"}
-        assert not modif.called
+        changes = [c.args[1] for c in modif.call_args_list]
+        assert {"vpnremoteip": "10.255.255.2"} in changes
+        assert not any("ula" in change for change in changes)
 
     def test_router_ula_accepted(self, user_client):
         body, _ = self._post(user_client, ula="fd12:3456:789a::/48")
         assert body["result"] == "done"
+
+    _PUBLIC = "2a01:e0a:1234::/48"
+
+    def test_public_prefix_of_the_main_router_accepted(self, user_client):
+        # what the wizard's "IPv6 Prefix" is for (#4418)
+        with patch("omr_admin._vps_ipv6_addresses", return_value={ipaddress.IPv6Address("2a01:e0a:ffff::1")}):
+            body, modif = self._post(user_client, ula=self._PUBLIC)
+        assert body["result"] == "done"
+        assert {"ula": self._PUBLIC} in [c.args[1] for c in modif.call_args_list]
+
+    def test_public_prefix_of_another_router_refused(self, other_client):
+        # it would draw to its tunnel what the other users send there
+        with patch("omr_admin._vps_ipv6_addresses", return_value=set()):
+            body, modif = self._post(other_client, remoteip="10.255.255.10", localip="10.255.255.9",
+                                     ula=self._PUBLIC)
+        assert body == {"result": "error", "reason": "Invalid ula", "route": "vpnips"}
+        changes = [c.args[1] for c in modif.call_args_list]
+        assert {"vpnremoteip": "10.255.255.10"} in changes
+        assert not any("ula" in change for change in changes)
+
+    def test_public_prefix_with_an_address_of_the_vps_refused(self, user_client):
+        # routed to the router, the VPS's own on-link prefix went with it
+        with patch("omr_admin._vps_ipv6_addresses", return_value={ipaddress.IPv6Address("2a01:e0a:1234::1")}):
+            body, modif = self._post(user_client, ula=self._PUBLIC)
+        assert body == {"result": "error", "reason": "Invalid ula", "route": "vpnips"}
+        assert not any("ula" in c.args[1] for c in modif.call_args_list)
 
     @pytest.mark.parametrize("field,value", [("localip6", "fd00::a02:1/126"), ("remoteip6", "fd00::a00:1/126"),
                                              ("remoteip6", "2001:db8::2/126")])
@@ -864,6 +926,12 @@ class TestSixInFourConf:
         text = omr_admin._6in4_conf_text(0, "10.255.255.1", "10.255.255.2", ula)
         assert [l for l in text.splitlines() if l.startswith("ULA=")] == ([line] if line else [])
 
+    @pytest.mark.parametrize("userid,line", [(0, "ULA=2a01:e0a:1234::/48"), (2, None)])
+    def test_public_prefix_of_the_main_router_only(self, userid, line):
+        with patch("omr_admin._vps_ipv6_addresses", return_value=set()):
+            text = omr_admin._6in4_conf_text(userid, "10.255.255.1", "10.255.255.2", "2a01:e0a:1234::/48")
+        assert [l for l in text.splitlines() if l.startswith("ULA=")] == ([line] if line else [])
+
 
 class TestCheck6in4Confs:
     """At startup, the files an older release wrote from unchecked values."""
@@ -916,6 +984,20 @@ class TestCheck6in4Confs:
         applied, users = self._run(config, files)
         assert applied[2].endswith("ULA=fd12:3456:789a::/48\n")
         assert users["readonly"]["ula"] == "fd12:3456:789a::/48"
+
+    def test_public_prefix_kept_for_the_main_router_only(self):
+        # 0.1086 dropped the main router's too, and its LAN lost IPv6 (#4418)
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnlocalip="10.255.255.1", vpnremoteip="10.255.255.2",
+                                                    ula="2a01:e0a:1234::/48")
+        config["users"][0]["readonly"].update(vpnlocalip="10.255.255.9", vpnremoteip="10.255.255.10",
+                                             ula="2a01:e0a:5678::/48")
+        files = {"user0": {"LOCALIP": "10.255.255.1", "REMOTEIP": "10.255.255.2", "ULA": "2a01:e0a:1234::/48"},
+                 "user2": {"LOCALIP": "10.255.255.9", "REMOTEIP": "10.255.255.10", "ULA": "2a01:e0a:5678::/48"}}
+        with patch("omr_admin._vps_ipv6_addresses", return_value=set()):
+            applied, users = self._run(config, files)
+        assert applied[0].endswith("ULA=2a01:e0a:1234::/48\n") and "ULA=" not in applied[2]
+        assert users["openmptcprouter"]["ula"] == "2a01:e0a:1234::/48" and "ula" not in users["readonly"]
 
     def test_address_of_another_router_dropped(self):
         # userid 2 had claimed the main router's glorytun address

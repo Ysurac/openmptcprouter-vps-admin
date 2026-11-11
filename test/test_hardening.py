@@ -106,6 +106,22 @@ class TestWildcardDnat:
         assert r.json()["reason"] == "Port already redirected by another user"
         assert not add.called
 
+    @pytest.mark.parametrize("ipproto,bulk,refused", [("ipv4", "bulk_redirect_v4", True),
+                                                      ("ipv6", "bulk_redirect_v4", False),
+                                                      ("ipv6", "bulk_redirect_v6", True)])
+    def test_port_the_bulk_redirect_takes_refused(self, other_client, ipproto, bulk, refused):
+        # loaded before every user's DNAT: "done", and never a connection
+        config = _config()
+        config[bulk] = True
+        with (
+            patch("builtins.open", side_effect=_open_with({CONFIG_PATH: json.dumps(config)})),
+            patch("omr_admin.shorewall_add_port", return_value=None),
+            patch("omr_admin.shorewall6_add_port", return_value=None),
+        ):
+            r = other_client.post("/firewallopen", json={"name": "x", "port": "8080", "proto": "tcp",
+                                                         "fwtype": "DNAT", "ipproto": ipproto})
+        assert (r.json().get("reason") == "Port already redirected by another user") == refused, r.json()
+
     def test_port_on_another_users_dedicated_ip_does_not_conflict(self, other_client):
         config = _config()
         config["users"][0]["openmptcprouter"]["public_ips"] = ["203.0.113.5"]
@@ -348,8 +364,13 @@ class TestAddUserChecks:
     @pytest.mark.parametrize("payload,reason", [
         ({"username": "readonly"}, "User already exists"),
         ({"username": "admin"}, "User already exists"),
+        # xray compares its clients' emails lowercased: its whole config refused
+        ({"username": "ReadOnly"}, "User already exists"),
+        ({"username": "omr-reverse"}, "User already exists"),
         ({"username": "DEFAULT"}, "Invalid username"),
         ({"username": "ipp_tcp.txt"}, "Invalid username"),
+        # pki/private/ca.key: the CA's own key
+        ({"username": "ca"}, "Invalid username"),
         ({"username": "-help"}, "Invalid username"),
         ({"username": "u" * 65}, "Invalid username"),
         ({"username": "new", "userid": 2}, "Userid already used"),
@@ -1135,7 +1156,7 @@ class TestShadowsocksUnescaped:
                 return MagicMock(ok=True, text='x","plugin":"/bin/sh')
             return MagicMock(ok=True, text=" vps.example.com\n")
 
-        with patch("omr_admin.requests.get", side_effect=_get):
+        with patch("omr_admin.requests.Session.get", side_effect=_get):
             assert omr_admin._public_lookup(("https://a", "https://b", "https://c"), omr_admin._is_hostname) == "vps.example.com"
             assert omr_admin._public_lookup(("https://a", "https://b"), omr_admin._is_hostname) == ""
         assert omr_admin._is_ipv4_address("192.0.2.1")
@@ -1154,6 +1175,28 @@ class TestShadowsocksUnescaped:
             set_param.assert_called_once_with("hostname", "vps.example.com")
             assert omr_admin._vps_hostname({"internet": False}) == ""
             assert lookup.call_count == 1
+
+    def test_failed_lookup_retried_hourly(self):
+        # it was redone at each /config of each router, up to 2 s each
+        with (
+            patch.dict(omr_admin._public_lookup_failed, clear=True),
+            patch("omr_admin._public_lookup", return_value="") as lookup,
+            patch("omr_admin.set_global_param") as set_param,
+            # failed at 1000, not asked again at 2000, asked again at 4700
+            patch("omr_admin.time.monotonic", side_effect=[1000.0, 2000.0, 4700.0]),
+        ):
+            assert omr_admin._vps_hostname({}) == ""
+            assert omr_admin._vps_hostname({}) == ""
+            assert lookup.call_count == 1
+            lookup.return_value = "vps.example.com"
+            assert omr_admin._vps_hostname({}) == "vps.example.com"
+            set_param.assert_called_once_with("hostname", "vps.example.com")
+            assert "hostname" not in omr_admin._public_lookup_failed
+
+    def test_lookups_over_ipv4(self):
+        with omr_admin.requests.Session() as session:
+            session.mount("https://", omr_admin._IPv4Adapter())
+            assert session.get_adapter("https://x").poolmanager.connection_pool_kw["source_address"] == ("0.0.0.0", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1286,6 +1329,13 @@ class TestConfigTrailingComma:
     def test_vxlan_reads_it(self):
         with patch("builtins.open", side_effect=_open_with({CONFIG_PATH: self.TEXT})):
             assert omr_admin.get_vxlan_config("openmptcprouter", 0)["mode"] == "l3"
+
+    def test_a_stored_string_with_a_comma_brace_kept(self):
+        # the fix-up ran on every read: a forward named "web,}" came back as
+        # "web}", never matched again by the router's re-posts nor its delete
+        assert omr_admin._json_loads('{"name": "web,}", "c": "x, }"}') == {"name": "web,}", "c": "x, }"}
+        assert omr_admin._json_loads('{"a": 1,}') == {"a": 1}
+        assert omr_admin._json_loads('{"name": "web,}", "a": 1,}') == {"name": "web}", "a": 1}
 
     def test_main_does_not_parse_the_file_again(self):
         # load_startup_config read it at import, a trailing comma included:
@@ -1495,6 +1545,22 @@ class TestConfigMissingKeys:
         assert body["shadowsocks"]["key"] == "" and body["shadowsocks"]["method"] == "chacha20"
         assert body["mqvpn"]["key"] == ""
         assert body["client2client"]["lanips"] == []
+
+    @pytest.mark.parametrize("lan,relayed", [("192.168.100.0/24", True), ("0.0.0.0/0", False),
+                                             ("10.0.0.0/8", False), ("8.8.8.0/24", False)])
+    def test_only_a_routable_lan_relayed(self, other_client, lan, relayed):
+        # stored while client2client was off, it became a route on every router
+        config = _config()
+        config["client2client"] = True
+        config["users"][0]["openmptcprouter"]["lanips"] = [lan]
+        files = {CONFIG_PATH: json.dumps(config)}
+        real_isfile = os.path.isfile
+        with (
+            patch("builtins.open", side_effect=_open_with(files)),
+            patch("os.path.isfile", side_effect=lambda p: p in files or real_isfile(p)),
+        ):
+            r = other_client.get("/config")
+        assert r.json()["client2client"]["lanips"] == ([lan] if relayed else [])
 
     def test_openvpn_certificate_made_under_the_lock(self, other_client):
         lock = _TrackLock()
