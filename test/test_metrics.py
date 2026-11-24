@@ -111,6 +111,12 @@ _BBR_WAN = {
 }
 
 
+
+def _hist_all(hist, ifaces=("wan", "wan2")):
+    """_read_history answering *hist* for each interface: every interface
+    is read in one query (interface None)."""
+    return lambda username, iface, since, limit: dict.fromkeys(ifaces, hist) if iface is None else hist
+
 def _no_ts(payload: dict) -> dict:
     return {k: v for k, v in payload.items() if k != "timestamp"}
 
@@ -548,6 +554,13 @@ class TestToPrometheusText:
     def test_error_status_emits_0(self):
         text = omr_metrics._to_prometheus_text(
             self._make_store(status="ERROR"))
+        line = next(l for l in text.splitlines()
+                    if "omr_interface_online" in l and not l.startswith("#"))
+        assert line.endswith(" 0")
+
+    def test_online_without_latency_emits_0(self):
+        # weight 0 for the decision engine: the gauge said 1, no alert fired
+        text = omr_metrics._to_prometheus_text(self._make_store(status="online", latency=None))
         line = next(l for l in text.splitlines()
                     if "omr_interface_online" in l and not l.startswith("#"))
         assert line.endswith(" 0")
@@ -1262,11 +1275,13 @@ class TestPredictDecisionEndpoint:
         hist = _history_at(_WAN, [{"latency": 25.0}] * 3)
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
-            patch.object(omr_metrics, "_read_history", return_value=hist) as mock_hist,
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)) as mock_hist,
         ):
             r = user_client.get("/metrics/decision?predict=true")
         assert r.status_code == 200
-        assert mock_hist.call_count == 2  # once per interface
+        # every interface in one query: one per interface was 1 + N per poll
+        assert mock_hist.call_count == 1
+        assert mock_hist.call_args.args[1] is None
 
     def test_predict_falls_back_to_current_when_no_history(self, user_client):
         with (
@@ -1282,7 +1297,7 @@ class TestPredictDecisionEndpoint:
 
         def fake_read_history(username, iface, since_seconds, limit):
             captured["since_seconds"] = since_seconds
-            return hist
+            return {"wan": hist}
 
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
@@ -1656,7 +1671,7 @@ class TestGetDecision:
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_get_backend", return_value=MagicMock()),
             patch.object(omr_metrics, "_read_user", return_value={"wan": fresh}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
             patch.object(omr_metrics, "_compute_weights", return_value={"probs": {"wan": 1.0}, "scores": {"wan": 100.0}}),
         ):
             r = user_client.get("/metrics/decision")
@@ -1672,7 +1687,7 @@ class TestGetDecision:
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_get_backend", return_value=MagicMock()),
             patch.object(omr_metrics, "_read_user", return_value={"wan": fresh}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
             patch.object(omr_metrics, "_compute_weights", return_value={"probs": {"wan": 1.0}, "scores": {"wan": 100.0}}),
         ):
             r = user_client.get("/metrics/decision")
@@ -1685,6 +1700,14 @@ class TestGetDecision:
         hist = [{**_WAN, "gateway": "10.0.0.1", "timestamp": _T0 + 30}, now]
         assert "gateway_changed" in omr_metrics._interface_anomalies(now, hist)
         assert "gateway_changed" not in omr_metrics._interface_anomalies(now, [{**hist[0], "gateway": "192.168.1.1"}, now])
+
+    def test_flapping_flagged_without_status(self):
+        # no status and no latency is down, as /metrics/report counts it:
+        # those samples were dropped, and the flaps never showed
+        hist = [{"latency": lat, "timestamp": _T0 + 30 * i} for i, lat in enumerate([20, None, 20, None, 20])]
+        assert "flapping" in omr_metrics._interface_anomalies(hist[-1], hist)
+        steady = [{"latency": 20, "timestamp": _T0 + 30 * i} for i in range(5)]
+        assert "flapping" not in omr_metrics._interface_anomalies(steady[-1], steady)
 
     def test_explain_flag_forwarded(self, user_client):
         captured = {}
@@ -1824,7 +1847,7 @@ class TestTrainDecision:
         with (
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
-            patch.object(omr_metrics, "_read_history", return_value=hist) as mock_hist,
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)) as mock_hist,
             patch.object(omr_metrics, "_get_backend",
                          return_value=MagicMock(spec=omr_metrics.InfluxBackend)),
             patch.object(omr_metrics, "_train_step", side_effect=fake_train),
@@ -1834,7 +1857,7 @@ class TestTrainDecision:
             r = self._post(admin_client, {"best_interface": "wan"})
 
         assert r.status_code == 200
-        assert mock_hist.call_count == 2
+        assert mock_hist.call_count == 1
         assert captured["history_data"] == {"wan": hist, "wan2": hist}
 
     def test_negative_free_form_weight_returns_422(self, admin_client):
@@ -2484,7 +2507,7 @@ class TestSaveModel:
             patch.dict(omr_metrics.__dict__, {"torch": broken_torch}),
             patch.object(omr_metrics, "DECISION_MODEL_FILE", "/fake/model.pt"),
         ):
-            omr_metrics._save_model(model)  # must not raise
+            assert omr_metrics._save_model(model) is False  # must not raise
 
 
 # ===========================================================================
@@ -3319,11 +3342,21 @@ class TestBlockingCallsOffLoop:
         with (
             patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
             patch.object(omr_metrics, "_make_model", return_value=MagicMock()),
-            patch.object(omr_metrics, "_save_model", side_effect=self._spy(threads)),
+            patch.object(omr_metrics, "_save_model", side_effect=self._spy(threads, True)),
         ):
             r = admin_client.post("/metrics/decision/reset")
         assert r.status_code == 200
         assert threads and threads[0] != threading.get_ident()
+
+    def test_reset_not_saved_is_an_error(self, admin_client):
+        # answered ok, and every other worker kept its own model
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_make_model", return_value=MagicMock()),
+            patch.object(omr_metrics, "_save_model", return_value=False),
+        ):
+            r = admin_client.post("/metrics/decision/reset")
+        assert r.status_code == 503
 
 
 # ===========================================================================
@@ -3563,6 +3596,18 @@ class TestForecastMetric:
         )
         assert result["eta_severe_s"] == 0
 
+    def test_eta_zero_when_above_threshold_and_steady_or_falling(self):
+        # null was what a healthy link got: the router saw no severe link
+        for values in ([25.0, 25.0, 25.0], [25.0, 20.0, 18.0]):
+            result = omr_metrics._forecast_metric(
+                _loss_history(values), ("loss",), omr_metrics._LOSS_THRESHOLDS, hi_clamp=100.0,
+            )
+            assert result["current_level"] == "severe"
+            assert result["eta_severe_s"] == 0
+        hist = [{**_WAN, "timestamp": _FM_T0 + i * 30, "congestion": {"score": s, "level": "severe"}}
+                for i, s in enumerate([98.0, 95.0, 92.0])]
+        assert omr_metrics._predict_congestion(hist)["eta_severe_s"] == 0
+
     def test_eta_moderate_finite_for_rising_loss(self):
         # Rising from 0.5 % to 1 % in 90 s → must reach moderate (1 %) soon
         hist = _loss_history([0.1, 0.3, 0.5, 0.8])
@@ -3646,7 +3691,7 @@ class TestGetQualityForecast:
         hist = self._make_hist()
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN, "wan2": _WAN2}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
         ):
             r = self._get(user_client)
         assert r.status_code == 200
@@ -3657,7 +3702,7 @@ class TestGetQualityForecast:
         hist = self._make_hist()
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
         ):
             r = self._get(user_client)
         entry = r.json()["wan"]
@@ -3674,7 +3719,7 @@ class TestGetQualityForecast:
         }
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
         ):
             r = self._get(user_client)
         entry = r.json()["wan"]
@@ -3714,15 +3759,15 @@ class TestGetQualityForecast:
         captured = {}
 
         def fake_read_history(username, iface, since_seconds, limit):
-            captured.setdefault(iface, [])
-            return hist
+            captured["iface"] = iface
+            return {"wan": hist}
 
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
             patch.object(omr_metrics, "_read_history", side_effect=fake_read_history),
         ):
             r = self._get(user_client)
-        assert "wan" in captured
+        assert captured["iface"] is None   # every interface in one query
         assert r.json()["wan"]["loss"]["confidence"] == "high"
 
     # --- query params ---
@@ -3732,7 +3777,7 @@ class TestGetQualityForecast:
         hist = self._make_hist(n=5)
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
         ):
             r_short = self._get(user_client, horizon=60)
             r_long  = self._get(user_client, horizon=1800)
@@ -3745,7 +3790,7 @@ class TestGetQualityForecast:
 
         def fake_read_history(username, iface, since_seconds, limit):
             captured["since"] = since_seconds
-            return self._make_hist()
+            return {"wan": self._make_hist()}
 
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
@@ -3759,7 +3804,7 @@ class TestGetQualityForecast:
 
         def fake_read_history(username, iface, since_seconds, limit):
             captured["limit"] = limit
-            return self._make_hist()
+            return {"wan": self._make_hist()}
 
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
@@ -3779,7 +3824,7 @@ class TestGetQualityForecast:
 
         with (
             patch.object(omr_metrics, "_read_user", side_effect=fake_read_user),
-            patch.object(omr_metrics, "_read_history", return_value=self._make_hist()),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(self._make_hist())),
         ):
             self._get(admin_client, username="openmptcprouter")
         assert captured["username"] == "openmptcprouter"
@@ -3795,7 +3840,7 @@ class TestGetQualityForecast:
         last_loss = hist[-1]["loss"]
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
         ):
             r = self._get(user_client)
         assert r.json()["wan"]["loss"]["current"] == pytest.approx(last_loss)
@@ -3808,7 +3853,7 @@ class TestGetQualityForecast:
         ]
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
         ):
             r = self._get(user_client)
         assert r.json()["wan"]["loss"]["trend"] == "rising"
@@ -3817,7 +3862,7 @@ class TestGetQualityForecast:
         hist = self._make_hist()
         with (
             patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
-            patch.object(omr_metrics, "_read_history", return_value=hist),
+            patch.object(omr_metrics, "_read_history", side_effect=_hist_all(hist)),
         ):
             r = self._get(user_client)
         level = r.json()["wan"]["congestion"]["current_level"]
@@ -4040,6 +4085,36 @@ class TestForecastDispatch:
         with patch.object(omr_metrics, "_predict_at", wraps=omr_metrics._predict_at) as mock_pa:
             omr_metrics._predict_payload(hist, horizon_seconds=60)
         mock_pa.assert_called()
+
+    def test_read_histories_one_query_capped_per_interface(self):
+        rows = {"wan": list(range(10)), "wan2": [1], "gone": [2]}
+        with patch.object(omr_metrics, "_read_history", return_value=rows) as read:
+            assert omr_metrics._read_histories("u", ["wan", "wan2", "new"], 3600, 3) == \
+                {"wan": [7, 8, 9], "wan2": [1]}
+        read.assert_called_once_with("u", None, 3600, 9)
+        assert omr_metrics._read_histories("u", [], 3600, 3) == {}
+
+    def test_torch_trained_once_per_history_in_a_request(self):
+        # the 6 horizons of ?dscp=true each trained the same MLP again,
+        # from another random start: 5 of 6 trainings wasted, and forecasts
+        # that disagreed between horizons
+        hist = _history_at(_WAN, [{"latency": float(i * 5)} for i in range(6)])
+        with (
+            patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
+            patch.object(omr_metrics, "_torch_fit", side_effect=lambda pairs, hl: (None, pairs[-1][0], 1.0)) as fit,
+            patch.object(omr_metrics, "_torch_eval", side_effect=lambda model, t: t),
+        ):
+            with omr_metrics._forecast_request():
+                for horizon in (20, 30, 120, 180, 300, 600):
+                    omr_metrics._predict_payload(hist, horizon_seconds=horizon)
+            per_request = fit.call_count
+            fit.reset_mock()
+            # outside a request, nothing is kept
+            omr_metrics._predict_payload(hist, horizon_seconds=20)
+            omr_metrics._predict_payload(hist, horizon_seconds=30)
+        assert per_request >= 1
+        assert fit.call_count == 2 * per_request
+        assert getattr(omr_metrics._forecast_ctx, "models", None) is None
 
     def test_forecast_metric_torch_result_used_as_predicted(self):
         hist = self._rising_loss_hist()
@@ -4287,7 +4362,7 @@ class TestAutoLearnRound:
             patch.object(omr_metrics, "_read_all",
                          return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
             patch.object(omr_metrics, "_read_history",
-                         side_effect=lambda u, i, s, l: hists[i]),
+                         side_effect=lambda u, i, s, l: hists),
             patch.object(omr_metrics, "_train_step", return_value=0.05) as ts,
             patch.object(omr_metrics, "_get_model", return_value=_FakeModel()),
             patch.object(omr_metrics, "_save_model") as sm,
@@ -4322,7 +4397,7 @@ class TestAutoLearnRound:
             patch.object(omr_metrics, "_read_all",
                          return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
             patch.object(omr_metrics, "_read_history",
-                         side_effect=lambda u, i, s, l: hists[i]),
+                         side_effect=lambda u, i, s, l: hists),
             patch.object(omr_metrics, "_train_step") as ts,
         ):
             summary = omr_metrics._auto_learn_round(self._CFG)
@@ -4339,7 +4414,7 @@ class TestAutoLearnRound:
             patch.object(omr_metrics, "_read_all",
                          return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
             patch.object(omr_metrics, "_read_history",
-                         side_effect=lambda u, i, s, l: hists[i]),
+                         side_effect=lambda u, i, s, l: hists),
             patch.object(omr_metrics, "_train_step", side_effect=RuntimeError("boom")),
         ):
             summary = omr_metrics._auto_learn_round(self._CFG)
@@ -4858,7 +4933,7 @@ class TestForecastBounds:
         try:
             with (
                 patch.object(omr_metrics, "_read_user", return_value={"wan": _WAN}),
-                patch.object(omr_metrics, "_read_history", return_value=self._hist(6)),
+                patch.object(omr_metrics, "_read_history", side_effect=_hist_all(self._hist(6))),
                 patch.object(omr_metrics, "_TORCH_AVAILABLE", True),
                 patch.object(omr_metrics, "_torch_predict_at") as tp,
             ):
@@ -4900,7 +4975,7 @@ class TestTrustedTraining:
 
         def fake_history(user, iface, since, limit):
             read_users.append(user)
-            return hists[iface]
+            return hists
 
         with (
             patch.object(omr_metrics, "_read_all", return_value={

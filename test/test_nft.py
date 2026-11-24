@@ -484,6 +484,18 @@ class TestRenderBulkRedirect:
         config["bulk_redirect_v4"] = True
         assert omr_admin._render_bulk_redirect(config) == []
 
+    def test_server_ports_left_out(self):
+        # MQVPN's udp/443 and Reality's tcp/443 went to the main router:
+        # down for every user
+        config = _config({"openmptcprouter": {"userid": 0, "vpnremoteip": "10.255.220.6"}})
+        config["bulk_redirect_v4"] = config["bulk_redirect_v6"] = True
+        ports = {"tcp": [(443, 443), (65228, 65228)], "udp": [(443, 443), (8000, 8010)]}
+        with patch("omr_admin._configured_server_ports", side_effect=lambda proto: ports[proto]):
+            lines = omr_admin._render_bulk_redirect(config)
+        assert len(lines) == 4
+        assert all("tcp dport 1-64999 tcp dport != { 443 } dnat" in l for l in lines if "redirect tcp" in l)
+        assert all("udp dport 1-64999 udp dport != { 443, 8000-8010 } dnat" in l for l in lines if "redirect udp" in l)
+
     def test_v6_enabled_synthesizes_ula(self):
         config = _config({"openmptcprouter": {"userid": 0}})
         config["bulk_redirect_v6"] = True

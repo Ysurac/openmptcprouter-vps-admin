@@ -1459,6 +1459,19 @@ def _read_history(username: str, interface: Optional[str], since_seconds: int, l
     return _get_backend().read_history(username, interface, since_seconds, limit)
 
 
+def _read_histories(username: str, interfaces, since_seconds: int, limit: int) -> dict:
+    """{interface: history} of *interfaces* that have one, *limit* newest
+    points each, oldest first, in one query: one per interface made each
+    /metrics/decision poll 1 + N queries."""
+    interfaces = list(interfaces)
+    if not interfaces:
+        return {}
+    rows = _read_history(username, None, since_seconds, limit * len(interfaces))
+    if not isinstance(rows, dict):
+        return {}
+    return {iface: rows[iface][-limit:] for iface in interfaces if rows.get(iface)}
+
+
 def _user_stats(username: str) -> dict:
     return _get_backend().user_stats(username)
 
@@ -1663,10 +1676,12 @@ def _predict_congestion(history: list, horizon_s: int = 300,
         trend = "falling"
 
     def _eta(threshold: float) -> Optional[int]:
-        if not slope or slope <= 0 or current_score is None:
+        if current_score is None:
             return None
         if current_score >= threshold:
             return 0
+        if not slope or slope <= 0:
+            return None
         secs = (threshold - current_score) / slope
         return round(secs) if secs <= 86400 else None
 
@@ -1760,11 +1775,33 @@ def _torch_predict_at(timestamps: list, values: list, target_ts: float,
     if len(pairs) < _FORECAST_TORCH_MIN_POINTS:
         return None
 
+    hl = halflife_s if halflife_s > 0 else 1.0
+    # Trained once per history in a request, evaluated at each target: the
+    # training doesn't depend on it, and the 6 horizons of ?dscp=true each
+    # trained their own (from another random start, so they disagreed)
+    models = getattr(_forecast_ctx, "models", None)
+    key = (tuple(pairs), hl)
+    if models is not None and key in models:
+        model, t_ref, v_scale = models[key]
+    else:
+        model, t_ref, v_scale = _torch_fit(pairs, hl)
+        if models is not None:
+            models[key] = (model, t_ref, v_scale)
+    return _torch_eval(model, (target_ts - t_ref) / hl) * v_scale
+
+
+def _torch_eval(model, t_norm: float) -> float:
+    with torch.no_grad():
+        return model(torch.tensor([[t_norm]], dtype=torch.float32)).item()
+
+
+def _torch_fit(pairs: list, hl: float) -> tuple:
+    """(model, t_ref, v_scale) of the MLP of _torch_predict_at trained on
+    *pairs* (timestamp, value)."""
     ts_arr = [p[0] for p in pairs]
     vs_arr = [p[1] for p in pairs]
 
     t_ref = ts_arr[-1]
-    hl = halflife_s if halflife_s > 0 else 1.0
     v_scale = max(abs(sum(vs_arr) / len(vs_arr)), 1e-9)
 
     decay = math.log(2) / hl
@@ -1790,15 +1827,11 @@ def _torch_predict_at(timestamps: list, values: list, target_ts: float,
         loss = (weights * (pred - v_norm).pow(2)).mean() + l2
         loss.backward()
         optimizer.step()
-
-    t_target = torch.tensor([[(target_ts - t_ref) / hl]], dtype=torch.float32)
-    with torch.no_grad():
-        result = model(t_target).item() * v_scale
-    return result
+    return model, t_ref, v_scale
 
 
-# Each torch forecast trains a small MLP per metric, interface and horizon
-# (/metrics/decision?dscp=true runs ~60 per interface), so a client could keep
+# Each torch forecast trains a small MLP per metric and interface (once per
+# request for all its horizons, ~10 per interface), so a client could keep
 # every worker's CPU busy. Bound it: only the first interfaces of a request
 # get torch forecasts, and only a few requests per process at a time; past
 # these bounds the cheap linear estimator is used instead.
@@ -1823,10 +1856,13 @@ def _forecast_request():
     """Take a forecast slot for one request without waiting: a request that
     finds none falls back to linear forecasts rather than queueing torch work."""
     acquired = _forecast_slots.acquire(blocking=False)
+    prev_models = getattr(_forecast_ctx, "models", None)
+    _forecast_ctx.models = {} if prev_models is None else prev_models
     try:
         with _torch_forecasts(acquired):
             yield
     finally:
+        _forecast_ctx.models = prev_models
         if acquired:
             _forecast_slots.release()
 
@@ -1929,13 +1965,17 @@ def _forecast_metric(history: list, path: tuple, thresholds: list,
     eta_levels = [(t, n) for t, n in thresholds if n in ("severe", "high", "moderate")]
 
     def _eta(threshold: float) -> Optional[int]:
-        if len(timestamps) < 2 or current is None:
+        if current is None:
+            return None
+        # Before the slope: a link already past it but steady or falling
+        # got null, as a healthy one does
+        if current >= threshold:
+            return 0
+        if len(timestamps) < 2:
             return None
         slope = _weighted_slope(timestamps, values, halflife_s=hl)
         if not slope or slope <= 0:
             return None
-        if current >= threshold:
-            return 0
         secs = (threshold - current) / slope
         return round(secs) if secs <= 86400 else None
 
@@ -2386,11 +2426,10 @@ def _interface_anomalies(payload: dict, history: Optional[list] = None) -> list:
 
     hist = _valid_history(history)
     if hist:
-        states = [
-            not _is_interface_down(p)
-            for p in hist
-            if p.get("status") is not None or p.get("latency") is not None
-        ]
+        # Every sample, as /metrics/report counts them: no status and no
+        # latency is down, and dropping those hid the flaps of a router
+        # that sends no status.
+        states = [not _is_interface_down(p) for p in hist]
         changes = sum(1 for prev, cur in zip(states, states[1:]) if prev != cur)
         if changes >= 2:
             flags.append("flapping")
@@ -2712,6 +2751,9 @@ def ensure_decision_model() -> bool:
 
 
 def _save_model(model):
+    """True once *model* is in DECISION_MODEL_FILE, which every worker
+    loads. A failure logged in debug only: /metrics/decision/train answered
+    ok, and the workers went on with a model each."""
     global _decision_model_mtime
     tmp = None
     try:
@@ -2730,8 +2772,10 @@ def _save_model(model):
             if model is _decision_model:
                 # Our own save must not look like another worker's update.
                 _decision_model_mtime = _model_file_mtime()
+        return True
     except Exception as exc:
-        LOG.debug("omr_decision: save error: %s", exc)
+        LOG.warning("omr_decision: model not saved, the other workers keep theirs: %s", exc)
+        return False
     finally:
         if tmp is not None:
             with contextlib.suppress(OSError):
@@ -3211,8 +3255,9 @@ def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
 
         rewards: dict = {}
         history_data: dict = {}
+        histories = _read_histories(username, user_data, cfg["window"], _AUTO_HISTORY_LIMIT)
         for iface in user_data:
-            hist = _read_history(username, iface, cfg["window"], _AUTO_HISTORY_LIMIT)
+            hist = histories.get(iface, [])
             reward = _auto_reward(hist, min_points=cfg["min_points"])
             if reward is not None:
                 rewards[iface] = reward
@@ -3759,8 +3804,9 @@ def _to_prometheus_text(all_data: dict) -> str:
     for username, ifaces in all_data.items():
         for iface, p in ifaces.items():
             lbl = f'username="{_prom_label(username)}",interface="{_prom_label(iface)}"'
-            status = p.get("status")
-            online_s.append((lbl, 0 if (status and status != "online") else 1))
+            # the decision engine's rule: online with no latency is down
+            # (weight 0), and the gauge said 1, no alert ever fired
+            online_s.append((lbl, 0 if _is_interface_down(p) else 1))
             ts = _as_float(p.get("timestamp"))
             if ts is not None and math.isfinite(ts):
                 age_s.append((lbl, round(now - ts, 1)))
@@ -3963,9 +4009,10 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             def _fetch_predicted():
                 predicted = {}
                 hist_by_iface = {}
+                histories = _read_histories(target, user_data, max(horizon * 10, 3600), 50)
                 with _forecast_request():
                     for iface in user_data:
-                        hist = _read_history(target, iface, max(horizon * 10, 3600), 50)
+                        hist = histories.get(iface, [])
                         if len(hist) >= 2:
                             with _torch_forecasts(len(hist_by_iface) < _FORECAST_MAX_TORCH_INTERFACES):
                                 predicted[iface] = _predict_payload(hist, horizon_seconds=horizon)
@@ -3975,14 +4022,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
                 return predicted, hist_by_iface
             user_data, history_data = await asyncio.to_thread(_fetch_predicted)
         elif preemptive and has_history_backend:
-            def _fetch_preemptive():
-                hist_by_iface = {}
-                for iface in user_data:
-                    hist = _read_history(target, iface, 3600, 60)
-                    if hist:
-                        hist_by_iface[iface] = hist
-                return hist_by_iface
-            history_data = await asyncio.to_thread(_fetch_preemptive)
+            history_data = await asyncio.to_thread(_read_histories, target, user_data, 3600, 60)
 
         if not _TORCH_AVAILABLE:
             result = await asyncio.to_thread(
@@ -4049,18 +4089,15 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
         since_seconds = _parse_since(since)
 
-        def _qfetch(iface):
-            h = _read_history(target, iface, since_seconds, limit)
-            if not h:
-                snap = user_data[iface]
-                h = [snap] if snap.get("timestamp") is not None else []
-            return iface, h
-
         def _build_forecasts():
             result: dict = {}
+            histories = _read_histories(target, user_data, since_seconds, limit)
             with _forecast_request():
                 for index, iface in enumerate(user_data):
-                    _, hist = _qfetch(iface)
+                    hist = histories.get(iface)
+                    if not hist:
+                        snap = user_data[iface]
+                        hist = [snap] if snap.get("timestamp") is not None else []
                     with _torch_forecasts(index < _FORECAST_MAX_TORCH_INTERFACES):
                         result[iface] = _iface_forecast(hist)
             return result
@@ -4127,14 +4164,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
 
         history_data: dict = {}
         if not isinstance(_get_backend(), JSONBackend):
-            def _fetch_history():
-                hd = {}
-                for iface in user_data:
-                    hist = _read_history(target, iface, 3600, 60)
-                    if hist:
-                        hd[iface] = hist
-                return hd
-            history_data = await asyncio.to_thread(_fetch_history)
+            history_data = await asyncio.to_thread(_read_histories, target, user_data, 3600, 60)
 
         def _train_and_save():
             loss_value = _train_step(
@@ -4147,10 +4177,12 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             # reset or a round meanwhile had its model written over, or
             # saved this one half trained.
             with _model_lock:
-                _save_model(_get_model())
-            return loss_value
+                saved = _save_model(_get_model())
+            return loss_value, saved
 
-        loss = await asyncio.to_thread(_train_and_save)
+        loss, saved = await asyncio.to_thread(_train_and_save)
+        if not saved:
+            raise HTTPException(status_code=503, detail="Model trained but not saved: the other workers keep theirs")
         return {"result": "ok", "loss": round(loss, 6)}
 
     @router.post('/metrics/decision/reset',
@@ -4165,14 +4197,16 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             with _model_lock:
                 _decision_model = _make_model()
                 _optimizer = None   # force a fresh Adam for the new model
-                _save_model(_decision_model)
+                return _save_model(_decision_model)
 
         # _model_lock waits on a training round, and the save fsyncs: in a
         # thread, the loop answered nothing meanwhile.
-        await asyncio.to_thread(_reset)
+        saved = await asyncio.to_thread(_reset)
         with _stats_lock:
             _engine_stats["model_resets"] += 1
             _engine_stats["model_loaded_at"] = time.time()
+        if not saved:
+            raise HTTPException(status_code=503, detail="Model reset but not saved: the other workers keep theirs")
         return {"result": "ok"}
 
     @router.get('/metrics/decision/auto',

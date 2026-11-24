@@ -123,6 +123,7 @@ class TestMptcpDscpEndpoint:
             patch("os.path.exists", side_effect=_exists_only(_DSCP_SCRIPT)),
             patch("subprocess.run") as run,
         ):
+            run.return_value.returncode = 0
             r = user_client.post(
                 "/mptcp_dscp", json={"pins": [{"dscp": "cs4", "remote_id": 5}]}
             )
@@ -199,6 +200,24 @@ class TestMptcpDscpEndpoint:
         calls = [c.args[0] for c in run.call_args_list]
         assert [_DSCP_SCRIPT, "set", "ef", "id", "4", "132"] in calls
         assert [_DSCP_SCRIPT, "set", "ef", "id", "4"] in calls
+
+    def test_set_failure_reported(self, user_client):
+        # the map not loaded: the router took its pins for applied
+        def _run(cmd, check=False):
+            from unittest.mock import MagicMock
+            res = MagicMock()
+            res.returncode = 1   # a del of a class without pin fails too
+            return res
+
+        with (
+            patch("os.path.exists", side_effect=_exists_only(_DSCP_SCRIPT)),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            r = user_client.post("/mptcp_dscp", json={"pins": [{"dscp": "cs4", "remote_id": 5}]})
+            assert r.json() == {"result": "error", "reason": "DSCP pin update failed for: cs4",
+                                "route": "mptcp_dscp"}
+            # a failed del alone is not an error
+            assert user_client.post("/mptcp_dscp", json={"pins": []}).json()["result"] == "done"
 
     def test_empty_pins_deletes_every_class(self, user_client):
         with (
@@ -409,7 +428,7 @@ class TestDscpClassifyEndpoint:
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
             patch("omr_admin._nft_ensure_dscp_sets") as ensure_sets,
-            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_refresh_dscp_sets") as refresh,
             patch("omr_admin._nft_sync_dscp_mark") as sync_mark,
         ):
             r = user_client.post(
@@ -423,8 +442,8 @@ class TestDscpClassifyEndpoint:
             )
         assert r.json()["result"] == "done"
         ensure_sets.assert_called_once()
-        assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
-        cs4_calls = {c.args[1]: c.args[2] for c in refresh.call_args_list if c.args[0] == "cs4"}
+        assert len(refresh.call_args.args[0]) == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
+        cs4_calls = {f: c for (d, f), c in refresh.call_args.args[0].items() if d == "cs4"}
         assert cs4_calls[4] == ["10.0.0.0/24"]
         assert cs4_calls[6] == ["2001:db8::/32"]
         sync_mark.assert_called_once()
@@ -433,27 +452,27 @@ class TestDscpClassifyEndpoint:
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
             patch("omr_admin._nft_ensure_dscp_sets"),
-            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_refresh_dscp_sets") as refresh,
             patch("omr_admin._nft_sync_dscp_mark"),
         ):
             user_client.post(
                 "/dscp_classify",
                 json={"entries": [{"dscp": "cs4", "cidr": "10.0.0.0/24"}]},
             )
-        ef_calls = [c for c in refresh.call_args_list if c.args[0] == "ef"]
-        assert ef_calls and all(c.args[2] == [] for c in ef_calls)
+        ef_calls = [c for (d, f), c in refresh.call_args.args[0].items() if d == "ef"]
+        assert ef_calls and all(c == [] for c in ef_calls)
 
     def test_entries_field_defaults_when_omitted(self, user_client):
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
             patch("omr_admin._nft_ensure_dscp_sets"),
-            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_refresh_dscp_sets") as refresh,
             patch("omr_admin._nft_sync_dscp_mark"),
         ):
             r = user_client.post("/dscp_classify", json={})
         assert r.json()["result"] == "done"
-        assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
-        assert all(c.args[2] == [] for c in refresh.call_args_list)
+        assert len(refresh.call_args.args[0]) == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
+        assert refresh.call_args is None or all(c == [] for c in refresh.call_args.args[0].values())
 
     def test_success_persists_entries_for_resync(self, user_client):
         """The router's push must survive an omr-admin restart (e.g. the
@@ -462,7 +481,7 @@ class TestDscpClassifyEndpoint:
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
             patch("omr_admin._nft_ensure_dscp_sets"),
-            patch("omr_admin._nft_refresh_dscp_set"),
+            patch("omr_admin._nft_refresh_dscp_sets"),
             patch("omr_admin._nft_sync_dscp_mark"),
             patch("omr_admin.set_global_param") as set_param,
         ):
@@ -502,13 +521,13 @@ class TestNftResyncDscpClassify:
         with (
             patch("omr_admin.read_omr_config", return_value=config),
             patch("omr_admin._nft_ensure_dscp_sets") as ensure_sets,
-            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_refresh_dscp_sets") as refresh,
             patch("omr_admin._nft_sync_dscp_mark") as sync_mark,
         ):
             omr_admin._nft_resync_dscp_classify()
         ensure_sets.assert_called_once()
-        assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
-        cs4_calls = {c.args[1]: c.args[2] for c in refresh.call_args_list if c.args[0] == "cs4"}
+        assert len(refresh.call_args.args[0]) == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
+        cs4_calls = {f: c for (d, f), c in refresh.call_args.args[0].items() if d == "cs4"}
         assert cs4_calls[4] == ["10.0.0.0/24"]
         assert cs4_calls[6] == ["2001:db8::/32"]
         sync_mark.assert_called_once()
@@ -517,22 +536,22 @@ class TestNftResyncDscpClassify:
         with (
             patch("omr_admin.read_omr_config", return_value={}),
             patch("omr_admin._nft_ensure_dscp_sets"),
-            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_refresh_dscp_sets") as refresh,
             patch("omr_admin._nft_sync_dscp_mark"),
         ):
             omr_admin._nft_resync_dscp_classify()
-        assert refresh.call_count == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
-        assert all(c.args[2] == [] for c in refresh.call_args_list)
+        assert len(refresh.call_args.args[0]) == len(omr_admin.DSCP_CLASSIFY_CLASSES) * 2
+        assert refresh.call_args is None or all(c == [] for c in refresh.call_args.args[0].values())
 
     def test_unreadable_config_is_a_noop_not_a_crash(self):
         with (
             patch("omr_admin.read_omr_config", return_value=None),
             patch("omr_admin._nft_ensure_dscp_sets"),
-            patch("omr_admin._nft_refresh_dscp_set") as refresh,
+            patch("omr_admin._nft_refresh_dscp_sets") as refresh,
             patch("omr_admin._nft_sync_dscp_mark"),
         ):
             omr_admin._nft_resync_dscp_classify()
-        assert all(c.args[2] == [] for c in refresh.call_args_list)
+        assert refresh.call_args is None or all(c == [] for c in refresh.call_args.args[0].values())
 
     def test_by_class_skips_invalid_entries_silently(self):
         entries = [
@@ -556,7 +575,7 @@ class TestNftDscpSetName:
 
 
 # ===========================================================================
-# Helper: _nft_refresh_dscp_set / _nft_ensure_dscp_sets
+# Helper: _nft_refresh_dscp_sets / _nft_ensure_dscp_sets
 # (these, plus every other _nft_sync_*/_nft_ensure_* helper, apply their
 # script via one `nft -f -` call -- subprocess.run's `input` kwarg is the
 # exact transaction that would be committed, so that's what these assert on
@@ -573,16 +592,18 @@ class TestNftRefreshDscpSet:
     def test_flush_and_add_element_are_one_atomic_call(self):
         with patch("subprocess.run") as run:
             run.return_value.returncode = 0
-            omr_admin._nft_refresh_dscp_set("cs4", 4, ["10.0.0.0/24", "10.0.1.0/24"])
+            omr_admin._nft_refresh_dscp_sets({("cs4", 4): ["10.0.0.0/24", "10.0.1.0/24"], ("ef", 6): []})
         run.assert_called_once()
         script = _applied_script(run)
         assert "flush set inet omr omr_dscp_classify_cs4_4" in script
         assert "add element inet omr omr_dscp_classify_cs4_4 { 10.0.0.0/24, 10.0.1.0/24 }" in script
+        # every set in the same transaction
+        assert "flush set inet omr omr_dscp_classify_ef_6" in script
 
     def test_empty_cidrs_only_flushes(self):
         with patch("subprocess.run") as run:
             run.return_value.returncode = 0
-            omr_admin._nft_refresh_dscp_set("ef", 6, [])
+            omr_admin._nft_refresh_dscp_sets({("ef", 6): []})
         script = _applied_script(run)
         assert "flush set inet omr omr_dscp_classify_ef_6" in script
         assert "add element" not in script
@@ -968,7 +989,7 @@ class TestDscpClassifyOverlaps:
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
             patch("omr_admin._nft_ensure_dscp_sets", return_value=True),
-            patch("omr_admin._nft_refresh_dscp_set", return_value=True) as refresh,
+            patch("omr_admin._nft_refresh_dscp_sets", return_value=True) as refresh,
             patch("omr_admin._nft_sync_dscp_mark", return_value=True),
             patch("omr_admin.set_global_param"),
         ):
@@ -982,7 +1003,7 @@ class TestDscpClassifyOverlaps:
                 {"dscp": "ef", "cidr": "10.1.0.0/16"},   # another set
             ]})
         assert r.json()["result"] == "done"
-        calls = {(c.args[0], c.args[1]): c.args[2] for c in refresh.call_args_list}
+        calls = refresh.call_args.args[0]
         assert calls[("cs4", 4)] == ["10.0.0.0/8", "192.0.2.1/32"]
         assert calls[("cs4", 6)] == ["2001:db8::/32"]
         assert calls[("ef", 4)] == ["10.1.0.0/16"]
@@ -991,7 +1012,7 @@ class TestDscpClassifyOverlaps:
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
             patch("omr_admin._nft_ensure_dscp_sets", return_value=True),
-            patch("omr_admin._nft_refresh_dscp_set", side_effect=lambda d, f, c: d != "cs4"),
+            patch("omr_admin._nft_refresh_dscp_sets", return_value=False),
             patch("omr_admin._nft_sync_dscp_mark", return_value=True),
             patch("omr_admin._nft_base_table_exists", return_value=True),
             patch("omr_admin.set_global_param") as set_param,
@@ -1005,7 +1026,7 @@ class TestDscpClassifyOverlaps:
         with (
             patch("os.path.exists", side_effect=_exists_only(omr_admin.NFT_BIN)),
             patch("omr_admin._nft_ensure_dscp_sets", return_value=False),
-            patch("omr_admin._nft_refresh_dscp_set", return_value=False),
+            patch("omr_admin._nft_refresh_dscp_sets", return_value=False),
             patch("omr_admin._nft_sync_dscp_mark", return_value=False),
             patch("omr_admin._nft_base_table_exists", return_value=False),
             patch("omr_admin.set_global_param") as set_param,

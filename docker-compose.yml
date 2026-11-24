@@ -34,11 +34,19 @@ x-app-base: &app-base
           # auto_learning block set by POST /metrics/decision/auto was lost.
           try:
               with open(path) as f:
-                  # a trailing comma, as omr-admin reads it
-                  cfg = json.loads(re.sub(r',\s*}', '}', f.read()))
-              if not isinstance(cfg, dict):
+                  content = f.read()
+          except OSError:
+              content = '{}'
+          try:
+              cfg = json.loads(content)
+          except ValueError:
+              # a trailing comma, as omr-admin reads it: only then, a string
+              # holding ,} (a forward named web,}) was saved as web}
+              try:
+                  cfg = json.loads(re.sub(r',\s*}', '}', content))
+              except ValueError:
                   cfg = {}
-          except (OSError, ValueError):
+          if not isinstance(cfg, dict):
               cfg = {}
           cfg['influxdb'] = {
               'url':    url,

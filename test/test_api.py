@@ -305,6 +305,25 @@ class TestStatus:
         for key in ("loadavg", "uptime", "memory_total", "cpu_count"):
             assert key in vps
 
+    def test_user_without_userid_is_an_error_not_a_500(self, admin_client):
+        # the admin has none: int(KeyError) answered 500
+        for route in ("/status", "/config"):
+            r = admin_client.get(route + "?username=admin")
+            assert r.status_code == 200 and r.json()["error"] in ("User has no userid", "Unknown user")
+
+    def test_vpn_traffic_default_is_the_one_config_reports(self):
+        # /status counted gt-tun bytes, /config said openvpn
+        assert omr_admin._user_vpn({}) == "openvpn"
+        with patch("omr_admin.get_bytes_openvpn", return_value={"uplinkBytes": 5, "downlinkBytes": 7}):
+            assert omr_admin._user_vpn_traffic("u", 3, "openvpn") == (5, 7)
+        with patch("omr_admin.get_bytes", side_effect=lambda t, iface: f"{t}:{iface}"):
+            assert omr_admin._user_vpn_traffic("u", 3, "glorytun_udp") == ("rx:gt-udp-tun3", "tx:gt-udp-tun3")
+        assert omr_admin._user_vpn_traffic("u", 3, "none") == (0, 0)
+
+    def test_note_of_an_unknown_user_is_an_error_not_a_500(self, admin_client):
+        r = admin_client.post("/add_user_note", json={"username": "nobody", "note": ["x"]})
+        assert r.status_code == 200 and r.json()["result"] == "error"
+
 
 # ===========================================================================
 # Config
@@ -407,6 +426,18 @@ class TestConfigWritePermissions:
         backups = list(tmp_path.glob("omr-admin-config.json.[0-9]*"))
         assert len(backups) == 1
         assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+
+    @pytest.mark.real_env
+    def test_two_backups_in_one_second_both_kept(self, tmp_path, monkeypatch):
+        # named to the second, the writes of one /add_user replaced the copy
+        # from before it with one from halfway through
+        cfg = tmp_path / "omr-admin-config.json"
+        monkeypatch.setattr(omr_admin, "OMR_CONFIG_FILE", str(cfg))
+        for step in ("before", "halfway"):
+            cfg.write_text(json.dumps({"users": [{}], "step": step}))
+            omr_admin.backup_config()
+        steps = sorted(json.loads(p.read_text())["step"] for p in tmp_path.glob("omr-admin-config.json.[0-9]*"))
+        assert steps == ["before", "halfway"]
 
     @pytest.mark.real_env
     def test_temp_copy_is_created_0600_not_just_chmod_ed(self, tmp_path, monkeypatch):
@@ -1270,6 +1301,15 @@ class TestTunnelFilesWrittenAtomically:
             omr_admin.add_dsvpn(1)
         assert writes["/etc/dsvpn/dsvpn1"][0] == 'PORT=65401\nDEV=dsvpn1\nLOCALTUNIP=10.255.251.5\nREMOTETUNIP=10.255.251.6\n'
         assert writes["/etc/dsvpn/dsvpn1.key"][1] == 0o600
+
+    def test_no_glorytun_nor_dsvpn_past_userid_63(self):
+        # no /30 of the /24 left, and 650<64> is no port
+        with self._env({"/etc/glorytun-tcp/tun0": self._GT_TCP, "/etc/glorytun-udp/tun0": self._GT_UDP,
+                        "/etc/dsvpn/dsvpn0": self._DSVPN}) as writes:
+            omr_admin.add_glorytun_tcp(64)
+            omr_admin.add_glorytun_udp(64)
+            omr_admin.add_dsvpn(253)
+        assert writes == {}
 
     def test_glorytun_update(self, user_client):
         with self._env({"/etc/glorytun-tcp/tun0": self._GT_TCP, "/etc/glorytun-udp/tun0": self._GT_UDP}) as writes:
@@ -2166,6 +2206,15 @@ class TestLogStartupEnvironment:
         assert "x86_64" in message
         assert "0.1057" in message
 
+    def test_version_not_found_looked_for_once(self, monkeypatch):
+        # a motd of the administrator's own: each /status and /config read
+        # every file of /etc
+        monkeypatch.setattr(omr_admin, "_OMR_VERSION_CACHE", None)
+        with patch("glob.glob", return_value=[]) as listed, patch("os.path.isfile", return_value=False):
+            assert omr_admin.get_omr_version() == ""
+            assert omr_admin.get_omr_version() == ""
+        assert listed.call_count == 1
+
     def test_unknown_vps_version_still_logs_the_kernel(self):
         with (
             patch("platform.uname", return_value=self._uname()),
@@ -2739,6 +2788,19 @@ class TestMqvpn:
         assert add4.call_args[0][1:] == ("65443", "udp", "mqvpn")
         # closed for whoever opened it (v4 and v6), not just the caller
         close.assert_called_once_with("443", "udp", "mqvpn")
+
+    def test_old_port_kept_when_the_new_one_is_refused(self, user_client):
+        # 443 was closed whatever the answer: MQVPN unreachable for every
+        # router, and the route answered done
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port", return_value="Firewall rule refused"),
+            patch("omr_admin.shorewall6_add_port", return_value=None),
+            patch("omr_admin._fw_service_port_del") as close,
+        ):
+            r = user_client.post("/mqvpn", json={**self._PAYLOAD, "port": 65443})
+        assert r.json() == {"result": "error", "reason": "Port not opened: Firewall rule refused", "route": "mqvpn"}
+        assert not close.called
 
     def test_same_port_does_not_touch_firewall(self, user_client):
         """No firewall changes when the port stays the same."""
@@ -3394,8 +3456,8 @@ class TestOpenVpn:
             patch("os.path.isfile", return_value=True),
             patch("omr_admin.file_as_bytes", side_effect=[b"old", b"new"]),
             patch("omr_admin._restart_service"),
-            patch("omr_admin.shorewall_add_port") as add4,
-            patch("omr_admin.shorewall6_add_port") as add6,
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
+            patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
         ):
             r = user_client.post("/openvpn", json={**self._PAYLOAD, "port": 1194})
         assert r.json()["result"] == "done"
@@ -5662,3 +5724,87 @@ class TestMqvpnServerPin:
 
     def test_missing_certificate(self, tmp_path):
         assert omr_admin.mqvpn_server_pin(str(tmp_path / "absent.crt")) == ""
+
+
+class TestMPTCPBbrLossThresh:
+    """tcp_bbr.loss_thresh (BBRv3 loss threshold, OMR kernel patch): a module
+    parameter set from the router's /mptcp sync, kept by systemd-tmpfiles
+    and never in sysctl.d (#4432)."""
+
+    _PAYLOAD = {**TestMPTCPV1Scheduler._PAYLOAD, "bbr_loss_thresh": 26}
+
+    def _exists(self, with_param=True):
+        v1 = TestMPTCPV1Scheduler()._v1_exists
+        return lambda p: v1(p) or (with_param and str(p) == omr_admin._BBR_LOSS_THRESH)
+
+    def _post(self, client, payload, with_param=True, ok=True):
+        with (
+            patch("os.path.exists", side_effect=self._exists(with_param)),
+            patch("omr_admin._bbr_loss_thresh_set", return_value=ok) as setter,
+        ):
+            r = client.post("/mptcp", json=payload)
+        return r.json(), setter
+
+    def test_applied_when_the_kernel_has_it(self, user_client):
+        res, setter = self._post(user_client, self._PAYLOAD)
+        assert res["result"] == "done"
+        setter.assert_called_once_with(26)
+
+    def test_blank_or_missing_keeps_the_value(self, user_client):
+        for payload in ({**self._PAYLOAD, "bbr_loss_thresh": ""}, TestMPTCPV1Scheduler._PAYLOAD):
+            res, setter = self._post(user_client, payload)
+            assert res["result"] == "done"
+            setter.assert_not_called()
+
+    def test_kernel_without_the_parameter(self, user_client):
+        res, setter = self._post(user_client, self._PAYLOAD, with_param=False)
+        assert res["result"] == "done"
+        setter.assert_not_called()
+
+    def test_out_of_range_refused(self, user_client):
+        # bbr_inflight_hi_from_lost_skb() divides by 256 - loss_thresh
+        for value in (0, 256, -1):
+            res, setter = self._post(user_client, {**self._PAYLOAD, "bbr_loss_thresh": value})
+            assert res == {"result": "error", "reason": "Invalid bbr_loss_thresh", "route": "mptcp"}
+            setter.assert_not_called()
+
+    def test_refusal_reported(self, user_client):
+        res, _ = self._post(user_client, self._PAYLOAD, ok=False)
+        assert res["result"] == "error"
+        assert "tcp_bbr.loss_thresh" in res["reason"]
+
+    def test_not_written_to_sysctl_d(self, user_client):
+        written = {}
+
+        def _open(p, mode="r", *a, **kw):
+            if "w" in str(mode):
+                buf = io.StringIO()
+                buf.close = lambda: written.__setitem__(str(p), buf.getvalue())
+                return buf
+            return _mock_open(p, mode, *a, **kw)
+
+        with (
+            patch("os.path.exists", side_effect=self._exists()),
+            patch("builtins.open", side_effect=_open),
+        ):
+            r = user_client.post("/mptcp", json=self._PAYLOAD)
+        assert r.json()["result"] == "done"
+        assert written[omr_admin._BBR_LOSS_THRESH] == "26"
+        assert written[omr_admin._BBR_LOSS_THRESH_TMPFILES] == \
+            "w /sys/module/tcp_bbr/parameters/loss_thresh - - - - 26\n"
+        assert "loss_thresh" not in written.get("/etc/sysctl.d/90-shadowsocks.conf", "")
+
+    def test_config_reports_it(self, user_client):
+        v1 = TestMPTCPV1ConfigRead()
+
+        def _open(p, mode="r", *a, **kw):
+            if str(p) == omr_admin._BBR_LOSS_THRESH:
+                return io.StringIO("26\n")
+            return v1._proc_open(p, mode, *a, **kw)
+
+        with (
+            patch("os.path.exists", side_effect=self._exists()),
+            patch("builtins.open", side_effect=_open),
+        ):
+            r = user_client.get("/config")
+        assert r.json()["mptcp"]["bbr_loss_thresh"] == "26"

@@ -404,6 +404,8 @@ def no_public_lookup():
         patch("omr_admin.requests.Session.get", side_effect=_requests_get_factory),
         # a lookup failed in one test is no reason to skip it in the next
         patch.dict(omr_admin._public_lookup_failed, clear=True),
+        # /remove_user purged the BGP config of the machine running the tests
+        patch("omr_admin._omr_bgp_router", None),
     ):
         yield
 

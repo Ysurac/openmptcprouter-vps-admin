@@ -181,6 +181,18 @@ class TestShadowsocksPorts:
             assert omr_admin._shadowsocks_port_error(data, PRIMARY, 65300) == "Port already used by another user"
             assert omr_admin._shadowsocks_port_error(data, PRIMARY, 65301) is None
 
+    def test_server_port_refused(self):
+        """sshd's port (listening) or a proxy's (configured): ss-server could
+        not bind it, the main router's shadowsocks went down."""
+        with patch("omr_admin.read_omr_config", return_value=_config()), \
+                patch("omr_admin._listening_ports", return_value=[(65222, 65222)]), \
+                patch("omr_admin._configured_server_ports", return_value=[(443, 443)]):
+            assert omr_admin._shadowsocks_port_error({"port_key": {}}, PRIMARY, 65222) == "Port already used on the server"
+            assert omr_admin._shadowsocks_port_error({"port_key": {}}, PRIMARY, 443) == "Port already used on the server"
+            assert omr_admin._shadowsocks_port_error({"port_key": {}}, PRIMARY, 65301) is None
+            # one manager.json gives ss-server already
+            assert omr_admin._shadowsocks_port_error({"port_key": {"65222": "k"}}, PRIMARY, 65222) is None
+
     def test_manager_command_is_json(self):
         manager = json.dumps({"port_key": {"65101": "k"}})
         sent = []

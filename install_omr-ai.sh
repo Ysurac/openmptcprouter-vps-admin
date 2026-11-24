@@ -364,8 +364,13 @@ lock_file = open(lock_path, "a+")
 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 try:
     with open(config_file) as f:
-        # a trailing comma, as omr-admin reads it
-        cfg = json.loads(re.sub(r",\s*}", "}", f.read()))
+        content = f.read()
+    try:
+        cfg = json.loads(content)
+    except ValueError:
+        # a trailing comma, as omr-admin reads it: only then, a string
+        # holding ",}" (a forward named "web,}") was saved as "web}"
+        cfg = json.loads(re.sub(r",\s*}", "}", content))
 except FileNotFoundError:
     cfg = {}
 except ValueError as e:

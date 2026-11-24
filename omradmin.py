@@ -39,7 +39,7 @@ import types
 import io
 #from pprint import pprint
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Literal, Optional
 from shutil import move
 from enum import Enum
 from os import path
@@ -47,6 +47,7 @@ from ipaddress import ip_address, IPv4Address, IPv6Address
 import logging
 import asyncio
 import contextlib
+import itertools
 import fcntl
 import threading
 import uvicorn
@@ -65,7 +66,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 from fastapi.openapi.models import SecurityBase as SecurityBaseModel
-from pydantic import BaseModel, field_validator # pylint: disable=E0611
+from pydantic import BaseModel, ConfigDict, Field, field_validator # pylint: disable=E0611
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.responses import RedirectResponse, Response, JSONResponse, StreamingResponse
 #from starlette.requests import Request
@@ -94,9 +95,15 @@ ALGORITHM = "HS256"
 # Usernames end up in file names (OpenVPN ccd/PKI, backups), so a leading dot
 # is refused: it would allow '.' and '..' as usernames.
 USERNAME_PATTERN = r'^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,255}$'
-# For a new user: the name is in file names (backups, keys, NAME_MAX 255).
-USERNAME_MAX_LEN = 64
-USERID_MAX = 63
+# For a new user: the name is in file names (backups, keys, NAME_MAX 255),
+# and mqvpn takes 63 bytes at most (name[64]): a longer one in server.json
+# and mqvpn refused its whole config at its next start, for every router.
+USERNAME_MAX_LEN = 63
+# Userid 0 (the main router) and 2..253: 253 users, admin has none.
+USERID_MAX = 253
+# Glorytun and DSVPN give a userid a /30 of a /24 and its port 650NN/654NN:
+# past 63 there is none, these users go without.
+GLORYTUN_USERID_MAX = 63
 
 def safe_path_join(base_dir, *parts):
     """Join parts onto base_dir, refusing any result that escapes base_dir."""
@@ -396,7 +403,9 @@ def delete_oldest_files(path, keep = 10, match=None):
             os.remove(sorted_files[x][0])
 
 def backup_config():
-    backup = OMR_CONFIG_FILE + '.' + str(int(time.time()))
+    # Not to the second: the writes of one /add_user, within a second,
+    # replaced the copy from before it with one from halfway through
+    backup = OMR_CONFIG_FILE + '.' + str(time.time_ns())
     # Created 0600: copy2() created it with the umask, readable until the
     # chmod below.
     with open(OMR_CONFIG_FILE, 'rb') as src, open(backup, 'wb', opener=_owner_only_opener) as dst:
@@ -452,6 +461,25 @@ def _sysctl_set(key, value):
         LOG.warning("sysctl %s=%s refused: %s", key, log_safe(str(value)),
                     (result.stderr or '').strip()[:300] if isinstance(result.stderr, str) else '')
         return False
+    return True
+
+# BBRv3 loss threshold, in 1/256: a module parameter added by an OMR kernel
+# patch, absent from other kernels. Not a sysctl, so it is kept across boots
+# by systemd-tmpfiles rather than in sysctl.d.
+_BBR_LOSS_THRESH = '/sys/module/tcp_bbr/parameters/loss_thresh'
+_BBR_LOSS_THRESH_TMPFILES = '/etc/tmpfiles.d/omr-bbr-loss-thresh.conf'
+
+def _bbr_loss_thresh_set(value):
+    """Apply and persist tcp_bbr.loss_thresh; True if the kernel took it."""
+    try:
+        with open(_BBR_LOSS_THRESH, 'w') as f:
+            f.write(str(value))
+    except OSError as exc:
+        LOG.warning("tcp_bbr loss_thresh=%s refused: %s", log_safe(str(value)), exc)
+        return False
+    line = f'w {_BBR_LOSS_THRESH} - - - - {value}\n'
+    if read_proc(_BBR_LOSS_THRESH_TMPFILES) != line.strip():
+        _atomic_write_text(_BBR_LOSS_THRESH_TMPFILES, line)
     return True
 
 def _restart_service(unit):
@@ -576,7 +604,8 @@ PKI_DIR = '/etc/openvpn/ca/pki'
 def _pki_retire_user_certs(username):
     """Mark the still valid certificates of *username* revoked in easyrsa's
     index.txt, so build-client-full can issue a new one (openssl refuses a
-    second valid certificate for a subject), then regenerate the CRL.
+    second valid certificate for a subject). The caller regenerates the CRL
+    (_openvpn_gen_crl), and decides what its failure means.
     The lines used to be deleted instead: a revoked certificate then left
     the next CRL and worked again, and a valid one could never be revoked.
     The serials of the certificates revoked, empty if none was."""
@@ -597,7 +626,6 @@ def _pki_retire_user_certs(username):
     if serials:
         LOG.debug("Revoking the previous certificate of %s", log_safe(username))
         _atomic_write_text(index_file, ''.join(lines))
-        _openvpn_gen_crl()
     return serials
 
 def _pki_user_has_valid_cert(username):
@@ -635,10 +663,22 @@ def _pki_restore_user_certs(username, serials):
     return None
 
 def _openvpn_gen_crl():
+    """True if the CRL was regenerated. A failure was silent: crl.pem kept
+    the old list, and the UDP instance, kept out by the CRL only, let a
+    suspended or removed router in."""
     env = os.environ.copy()
     env['EASYRSA_CRL_DAYS'] = '3650'
-    subprocess.run(["./easyrsa", "gen-crl"], cwd="/etc/openvpn/ca", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    try:
+        result = subprocess.run(["./easyrsa", "gen-crl"], cwd="/etc/openvpn/ca", env=env, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, check=False, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        LOG.error("OpenVPN CRL not regenerated: %s", e)
+        return False
+    if result.returncode != 0:
+        LOG.error("OpenVPN CRL not regenerated: %s", log_safe(result.stderr.decode(errors='replace')[-300:]))
+        return False
     subprocess.run(["chmod", "644", os.path.join(PKI_DIR, 'crl.pem')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return True
 
 def _openvpn_status():
     """The lines of OpenVPN's management `status` (format 1), None if it
@@ -888,8 +928,11 @@ _OMR_VERSION_CACHE: Optional[str] = None
 _OMR_VERSION_RE = re.compile(r'OpenMPTCProuter VPS\s+(\d[^\s>]*)')
 
 def get_omr_version():
+    """The release in the motd, '' if none says it. Found or not, looked for
+    once: not found (a motd of the administrator's own), each /status and
+    /config of each router read every file of /etc."""
     global _OMR_VERSION_CACHE
-    if _OMR_VERSION_CACHE:
+    if _OMR_VERSION_CACHE is not None:
         return _OMR_VERSION_CACHE
     seen = set()
     for filepath in ['/etc/motd.head', '/etc/motd'] + sorted(glob.glob('/etc/*')):
@@ -907,6 +950,7 @@ def get_omr_version():
                         return _OMR_VERSION_CACHE
         except OSError:
             pass  # version file unreadable, try the next one
+    _OMR_VERSION_CACHE = ''
     return ''
 
 def get_username_from_userid(userid):
@@ -926,9 +970,14 @@ def get_userid_from_username(username):
     data = read_omr_config()
     if not data:
         return {'error': 'Config file not readable', 'route': 'get_username'}
-    if username not in data['users'][0]:
+    users = (data.get('users') or [{}])[0]
+    if username not in users:
         return {'error': 'Unknown user', 'route': 'get_username'}
-    return int(data['users'][0][username]['userid'])
+    try:
+        return int(users[username]['userid'])
+    except (KeyError, TypeError, ValueError):
+        # the admin: /status?username=admin answered 500
+        return {'error': 'User has no userid', 'route': 'get_username'}
 
 # The tokens a router showed its serial with, per user: with serial_enforce,
 # the other routes take only those. Credentials from another device, or
@@ -1285,6 +1334,7 @@ def _ss_go_users_request(call, suffix='', **kwargs):
     """*call* (requests.post, requests.delete) on the users API, the older
     path when the current one answers 404: that answer raises nothing, so
     the older path, tried on an exception only, never was."""
+    not_found = None
     for url in SS_GO_USERS_URLS:
         try:
             r = call(url=url + suffix, timeout=5, **kwargs)
@@ -1295,11 +1345,13 @@ def _ss_go_users_request(call, suffix='', **kwargs):
             LOG.debug("Shadowsocks go API error (" + str(err) + ")")
             continue
         if r.status_code == 404:
+            not_found = r
             continue
         if not r.ok:
             LOG.debug("Shadowsocks go API answered %s", r.status_code)
         return r
-    return None
+    # 404 on every path: no such route, or no such user
+    return not_found
 
 def add_ss_go_user(user, key=''):
     if not os.path.exists('/etc/shadowsocks-go/server.json'):
@@ -1308,49 +1360,51 @@ def add_ss_go_user(user, key=''):
     return key
 
 def remove_ss_go_user(user):
+    """True once shadowsocks-go has no such user (removed now, or never
+    had it). Its answer was dropped: a timeout left a suspended or removed
+    router its uPSK, and the suspension was saved as complete."""
     if not os.path.exists('/etc/shadowsocks-go/server.json'):
-        return
+        return True
     if not re.fullmatch(USERNAME_PATTERN, user):
         LOG.debug("Shadowsocks go remove: invalid username")
-        return
-    _ss_go_users_request(requests.delete, '/' + urllib.parse.quote(user, safe=''))
+        return True
+    r = _ss_go_users_request(requests.delete, '/' + urllib.parse.quote(user, safe=''))
+    if r is not None and (r.ok or r.status_code == 404):
+        return True
+    LOG.warning("Shadowsocks go: user %s not removed", log_safe(user))
+    return False
+
+def _softether_rpc(method, params, timeout=5, ok_codes=()):
+    """SoftEther's JSON-RPC *method*; True if it did it, or answered an
+    error code of *ok_codes*. Its answer was not read: a password it refused
+    (no such user in the hub, a wrong admin password) was saved all the
+    same, and given to the router by /config."""
+    payload = {"jsonrpc": "2.0", "id": "rpc_call_id", "method": method, "params": params}
+    try:
+        r = requests.post(url="http://127.0.0.1:65390/api", json=payload, headers=softethervpnPassword, timeout=timeout)
+        answer = r.json() if r.ok else {}
+        error = answer.get('error') if isinstance(answer, dict) else None
+        if r.ok and (error is None or (isinstance(error, dict) and error.get('code') in ok_codes)):
+            return True
+        LOG.warning("SoftEther VPN %s refused: %s", method, log_safe(r.text[:300]))
+    except (requests.exceptions.RequestException, ValueError) as err:
+        LOG.warning("SoftEther VPN %s failed (%s)", method, err)
+    return False
 
 def add_softether_user(user, password):
-    createUserPayload = {
-        "jsonrpc": "2.0",
-        "id": "rpc_call_id",
-        "method": "CreateUser",
-        "params": {
-            "HubName_str": "OMRVPN",
-            "Name_str": user,
-            "AuthType_u32": 1,
-            "Auth_Password_str": password,
-        },
-    }
-    try:
-        requests.post(url="http://127.0.0.1:65390/api", json=createUserPayload, headers=softethervpnPassword, timeout=5)
-    except requests.exceptions.Timeout:
-        LOG.debug("SoftEther VPN add timeout")
-    except requests.exceptions.RequestException as err:
-        LOG.debug("SoftEther VPN add error (" + str(err) + ")")
+    _softether_rpc("CreateUser", {"HubName_str": "OMRVPN", "Name_str": user,
+                                  "AuthType_u32": 1, "Auth_Password_str": password})
     return password
 
+# SoftEther's ERR_OBJECT_NOT_FOUND
+SOFTETHER_ERR_NOT_FOUND = 29
+
 def remove_softether_user(user):
-    removeUserPayload = {
-        "jsonrpc": "2.0",
-        "id": "rpc_call_id",
-        "method": "DeleteUser",
-        "params": {
-            "HubName_str": "OMRVPN",
-            "Name_str": user,
-        },
-    }
-    try:
-        requests.post(url="http://127.0.0.1:65390/api", json=removeUserPayload, headers=softethervpnPassword, timeout=5)
-    except requests.exceptions.Timeout:
-        LOG.debug("SoftEther VPN remove timeout")
-    except requests.exceptions.RequestException as err:
-        LOG.debug("SoftEther VPN remove error (" + str(err) + ")")
+    """True once the hub has no such user. Its answer was dropped: SoftEther
+    down or slow left a suspended or removed router its account, and the
+    suspension was saved as complete."""
+    return _softether_rpc("DeleteUser", {"HubName_str": "OMRVPN", "Name_str": user},
+                          ok_codes=(SOFTETHER_ERR_NOT_FOUND,))
 
 def _v2ray_api_adi(config):
     """v2ray api adi of *config* (a dict), passed in a private temporary
@@ -2017,21 +2071,21 @@ def add_gre_tunnels(only_user=None):
             _restart_service("shadowsocks-libev-manager@manager")
     set_global_param('allips', allips)
 
-def add_glorytun_tcp(userid):
+def _add_glorytun(kind, userid, net, port_key):
+    """Glorytun-<kind>'s tun<userid>, from its tun0 template: port
+    650<userid>, the /30 <userid> of *net*, and its key."""
     userid = int(userid)
-    if not os.path.isfile('/etc/glorytun-tcp/tun0'):
+    base = f'/etc/glorytun-{kind}/tun'
+    if userid > GLORYTUN_USERID_MAX or not os.path.isfile(base + '0'):
         return
-    port = '650{:02d}'.format(userid)
-    ip = IPNetwork('10.255.255.0/24')
-    subnets = ip.subnet(30)
-    network = list(subnets)[userid]
+    network = list(IPNetwork(net).subnet(30))[userid]
     lines = []
-    with open('/etc/glorytun-tcp/tun0', 'r') as f:
+    with open(base + '0', 'r') as f:
         for line in f:
-            if 'PORT' in line:
-                lines.append('PORT=' + port + "\n")
+            if port_key in line:
+                lines.append(f'{port_key}=650{userid:02d}\n')
             elif 'DEV' in line:
-                lines.append('DEV=tun' + str(userid) + "\n")
+                lines.append(f'DEV=tun{userid}\n')
             elif (not 'LOCALIP' in line
                   and not 'REMOTEIP' in line
                   and not 'BROADCASTIP' in line
@@ -2040,78 +2094,53 @@ def add_glorytun_tcp(userid):
     lines.append("\n" + 'LOCALIP=' + str(list(network)[1]) + "\n")
     lines.append('REMOTEIP=' + str(list(network)[2]) + "\n")
     lines.append('BROADCASTIP=' + str(network.broadcast) + "\n")
-    _atomic_write_text('/etc/glorytun-tcp/tun' + str(userid), ''.join(lines))
-    glorytun_tcp_key = secrets.token_hex(32)
-    _atomic_write_text('/etc/glorytun-tcp/tun' + str(userid) + '.key', glorytun_tcp_key.upper(), new_mode=0o600)
-    subprocess.run(["systemctl", "-q", "enable", f"glorytun-tcp@tun{userid}"], check=False)
-    _restart_service(f"glorytun-tcp@tun{userid}")
-
-def remove_glorytun_tcp(userid):
-    userid = int(userid)
-    # tun0 is the template every user's config is built from.
-    if userid == 0 or not os.path.isfile('/etc/glorytun-tcp/tun' + str(userid) + '.key'):
-        return
-    # Now: its files (and gt-udp link) are removed below, Restart=always
-    _stop_service(f"glorytun-tcp@tun{userid}", disable=True, defer=False)
-    os.remove('/etc/glorytun-tcp/tun' + str(userid) + '.key')
-    # The config was left behind, and /config kept reading the removed
-    # user's tunnel addresses from it.
-    if os.path.isfile('/etc/glorytun-tcp/tun' + str(userid)):
-        os.remove('/etc/glorytun-tcp/tun' + str(userid))
-
-def add_glorytun_udp(userid):
-    userid = int(userid)
-    if not os.path.isfile('/etc/glorytun-udp/tun0'):
-        return
-    port = '650{:02d}'.format(userid)
-    ip = IPNetwork('10.255.254.0/24')
-    subnets = ip.subnet(30)
-    network = list(subnets)[userid]
-    lines = []
-    with open('/etc/glorytun-udp/tun0', 'r') as f:
-        for line in f:
-            if 'BIND_PORT' in line:
-                lines.append('BIND_PORT=' + port + "\n")
-            elif 'DEV' in line:
-                lines.append('DEV=tun' + str(userid) + "\n")
-            elif (not 'LOCALIP' in line
-                  and not 'REMOTEIP' in line
-                  and not 'BROADCASTIP' in line
-                  and not line == "\n"):
-                lines.append(line)
-    lines.append("\n" + 'LOCALIP=' + str(list(network)[1]) + "\n")
-    lines.append('REMOTEIP=' + str(list(network)[2]) + "\n")
-    lines.append('BROADCASTIP=' + str(network.broadcast) + "\n")
-    _atomic_write_text('/etc/glorytun-udp/tun' + str(userid), ''.join(lines))
-    # Same key as glorytun-tcp (/config sends one): on a VPS without
-    # glorytun-tcp there is none to copy, and every /add_user failed.
-    if os.path.isfile('/etc/glorytun-tcp/tun' + str(userid) + '.key'):
-        with open('/etc/glorytun-tcp/tun' + str(userid) + '.key', 'r') as f:
-            glorytun_udp_key = f.read()
+    _atomic_write_text(base + str(userid), ''.join(lines))
+    # UDP: the same key as glorytun-tcp (/config sends one); on a VPS
+    # without glorytun-tcp there is none to copy, and every /add_user failed.
+    tcp_key = f'/etc/glorytun-tcp/tun{userid}.key'
+    if kind == 'udp' and os.path.isfile(tcp_key):
+        with open(tcp_key, 'r') as f:
+            key = f.read()
     else:
-        glorytun_udp_key = secrets.token_hex(32).upper()
-    _atomic_write_text('/etc/glorytun-udp/tun' + str(userid) + '.key', glorytun_udp_key, new_mode=0o600)
-    subprocess.run(["systemctl", "-q", "enable", f"glorytun-udp@tun{userid}"], check=False)
-    _restart_service(f"glorytun-udp@tun{userid}")
+        key = secrets.token_hex(32).upper()
+    _atomic_write_text(base + str(userid) + '.key', key, new_mode=0o600)
+    subprocess.run(["systemctl", "-q", "enable", f"glorytun-{kind}@tun{userid}"], check=False)
+    _restart_service(f"glorytun-{kind}@tun{userid}")
 
-def remove_glorytun_udp(userid):
+def _remove_glorytun(kind, userid):
     userid = int(userid)
+    base = f'/etc/glorytun-{kind}/tun{userid}'
     # tun0 is the template every user's config is built from.
-    if userid == 0 or not os.path.isfile('/etc/glorytun-udp/tun' + str(userid) + '.key'):
+    if userid == 0 or not os.path.isfile(base + '.key'):
         return
     # Now: its files (and gt-udp link) are removed below, Restart=always
-    _stop_service(f"glorytun-udp@tun{userid}", disable=True, defer=False)
-    # glorytun-udp runs with OPTIONS="persist", so its interface outlives the
-    # service (glorytun-udp-run names it gt-udp-<config name>).
-    subprocess.run(["ip", "link", "del", f"gt-udp-tun{userid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    for name in ('/etc/glorytun-udp/tun' + str(userid) + '.key', '/etc/glorytun-udp/tun' + str(userid)):
+    _stop_service(f"glorytun-{kind}@tun{userid}", disable=True, defer=False)
+    if kind == 'udp':
+        # glorytun-udp runs with OPTIONS="persist", so its interface outlives the
+        # service (glorytun-udp-run names it gt-udp-<config name>).
+        subprocess.run(["ip", "link", "del", f"gt-udp-tun{userid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    # The config too: /config kept reading the removed user's tunnel
+    # addresses from it.
+    for name in (base + '.key', base):
         if os.path.isfile(name):
             os.remove(name)
+
+def add_glorytun_tcp(userid):
+    _add_glorytun('tcp', userid, '10.255.255.0/24', 'PORT')
+
+def remove_glorytun_tcp(userid):
+    _remove_glorytun('tcp', userid)
+
+def add_glorytun_udp(userid):
+    _add_glorytun('udp', userid, '10.255.254.0/24', 'BIND_PORT')
+
+def remove_glorytun_udp(userid):
+    _remove_glorytun('udp', userid)
 
 
 def add_dsvpn(userid):
     userid = int(userid)
-    if not os.path.isfile('/etc/dsvpn/dsvpn0'):
+    if userid > GLORYTUN_USERID_MAX or not os.path.isfile('/etc/dsvpn/dsvpn0'):
         return
     port = '654{:02d}'.format(userid)
     ip = IPNetwork('10.255.251.0/24')
@@ -2192,7 +2221,19 @@ def _add_mqvpn_locked(username, fixed_ip):
         users = mqvpn_config.get('users', [])
         if not any(u.get('name') == username for u in users):
             mqvpn_user_key = secrets.token_urlsafe(32)
-            api_result = mqvpn_api({'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key})
+            if fixed_ip is None and _mqvpn_auto_fixed_ip_enabled():
+                fixed_ip = _mqvpn_pick_fixed_ip(mqvpn_config, username)
+            add_cmd = {'cmd': 'add_user', 'name': username, 'key': mqvpn_user_key}
+            if fixed_ip:
+                add_cmd['fixed_ip'] = fixed_ip
+            api_result = mqvpn_api(add_cmd)
+            if fixed_ip and api_result.get('error') == 'fixed_ip invalid or unavailable':
+                # Live for a client that reported no address: added without
+                # one, as before mqvpn_auto_fixed_ip
+                LOG.warning("MQVPN refused fixed IP %s for %s, added without one", fixed_ip, log_safe(username))
+                fixed_ip = None
+                del add_cmd['fixed_ip']
+                api_result = mqvpn_api(add_cmd)
             if not api_result.get('ok'):
                 # the user is still persisted below, but the running daemon
                 # will reject this client until it learns the key via the
@@ -2207,6 +2248,98 @@ def _add_mqvpn_locked(username, fixed_ip):
             _atomic_write_json('/etc/mqvpn/server.json', mqvpn_config, indent=2)
     except Exception as e:
         LOG.debug("MQVPN add user json error (" + str(e) + ")")
+
+def _mqvpn_auto_fixed_ip_enabled():
+    """mqvpn_auto_fixed_ip of omr-admin-config.json: off unless true."""
+    return read_omr_config().get('mqvpn_auto_fixed_ip') is True
+
+def _mqvpn_pick_fixed_ip(mqvpn_config, username):
+    """A free address of MQVPN's subnet for *username*, None if there is
+    none: the one its router reports using now (vpnremoteip, so a connected
+    router keeps it), else subnet + userid + 2 (the same on every VPS with
+    the same users), else the first free one. Free: no other user's fixed IP
+    (a suspended one's too) nor reported address, the dynamic ones mqvpn
+    handed out."""
+    try:
+        subnet = ipaddress.ip_network(mqvpn_config.get('subnet', '10.255.220.0/24'), strict=False)
+    except (TypeError, ValueError):
+        return None
+    if subnet.version != 4:
+        return None
+    users = (read_omr_config().get('users') or [{}])[0]
+    taken = {u.get('fixed_ip') for u in mqvpn_config.get('users', [])
+             if isinstance(u, dict) and u.get('name') != username}
+    taken |= {addr for addr, name in _mqvpn_suspended_fixed_ips().items() if name != username}
+    taken |= {u.get('vpnremoteip') for name, u in users.items() if name != username and isinstance(u, dict)}
+    own = users.get(username) if isinstance(users.get(username), dict) else {}
+    hosts = subnet.hosts()
+    reserved = (subnet.network_address, subnet.broadcast_address, next(hosts, None))   # the first: mqvpn's own
+    candidates = [own.get('vpnremoteip')]
+    with contextlib.suppress(TypeError, ValueError):
+        candidates.append(subnet.network_address + int(own.get('userid')) + 2)
+    for candidate in itertools.chain(candidates, hosts):
+        try:
+            addr = ipaddress.IPv4Address(str(candidate))
+        except ValueError:
+            continue
+        if addr in subnet and addr not in reserved and str(addr) not in taken:
+            return str(addr)
+    return None
+
+def mqvpn_auto_fixed_ips():
+    """At startup, with mqvpn_auto_fixed_ip: a fixed IP (_mqvpn_pick_fixed_ip)
+    for each MQVPN user without one, set live when mqvpn can. It can't for
+    an address in use by a session. The router's own (it keeps its
+    address): pinned from mqvpn's next start. Another router's (a dynamic
+    one it has not reported yet): not saved, or that router's /vpnips was
+    refused as using another user's address; tried again at the next start.
+    Picked under the config lock, set live once it is released: held, a
+    wedged mqvpn stopped every request for 5 s per user."""
+    if not os.path.isfile('/etc/mqvpn/server.json') or not _mqvpn_auto_fixed_ip_enabled():
+        return
+    picks = []
+    with _omr_config_lock():
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_config = json.load(f)
+        users = (read_omr_config().get('users') or [{}])[0]
+        for entry in mqvpn_config.get('users', []):
+            if not isinstance(entry, dict) or not isinstance(entry.get('name'), str) or entry.get('fixed_ip'):
+                continue
+            addr = _mqvpn_pick_fixed_ip(mqvpn_config, entry['name'])
+            if addr is None:
+                LOG.warning("No free MQVPN address for %s's fixed IP", log_safe(entry['name']))
+                continue
+            entry['fixed_ip'] = addr   # taken for the next ones
+            own = users.get(entry['name']) if isinstance(users.get(entry['name']), dict) else {}
+            picks.append((entry['name'], addr, own.get('vpnremoteip') == addr))
+    keep = {}
+    deadline = time.monotonic() + MQVPN_PUSH_DEADLINE
+    for name, addr, own_session in picks:
+        live = mqvpn_api({'cmd': 'set_user_fixed_ip', 'name': name, 'fixed_ip': addr}) \
+            if time.monotonic() <= deadline else {}
+        if live.get('ok') or own_session:
+            keep[name] = addr
+            LOG.info("MQVPN fixed IP %s given to %s%s", addr, log_safe(name),
+                     '' if live.get('ok') else ', from mqvpn\'s next start')
+        else:
+            LOG.warning("MQVPN fixed IP %s for %s not set (%s), tried again at the next start",
+                        addr, log_safe(name), log_safe(live.get('error', 'control API too slow')))
+    if not keep:
+        return
+    with _omr_config_lock():
+        # Read again: changed meanwhile by another route
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_config = json.load(f)
+        taken = {u.get('fixed_ip') for u in mqvpn_config.get('users', []) if isinstance(u, dict)}
+        changed = False
+        for entry in mqvpn_config.get('users', []):
+            addr = keep.get(entry.get('name')) if isinstance(entry, dict) else None
+            if addr and not entry.get('fixed_ip') and addr not in taken:
+                entry['fixed_ip'] = addr
+                taken.add(addr)
+                changed = True
+        if changed:
+            _atomic_write_json('/etc/mqvpn/server.json', mqvpn_config, indent=2)
 
 def _mqvpn_drop_user_auth_key(mqvpn_config, keys=None):
     """Remove the server-wide auth_key of *mqvpn_config* when it is one of
@@ -2280,7 +2413,10 @@ def remove_mqvpn(username):
     except Exception as e:
         LOG.debug("MQVPN remove user json error (" + str(e) + ")")
         return False
-    if not api_result.get('ok'):
+    # "user not found": the running mqvpn has no such user (one suspended
+    # before, an /add_user rollback), and the restart dropped every router's
+    # session for nothing.
+    if not api_result.get('ok') and api_result.get('error') != 'user not found':
         # The running mqvpn still had its key: a removed or suspended user
         # kept its session, and could reconnect, until mqvpn restarted for
         # another reason. It reloads server.json; not started if stopped.
@@ -2993,15 +3129,18 @@ def _render_bulk_redirect(config_data):
     # Not on the public IPs the other users have to themselves.
     others = [net for username, nets in _dedicated_ips(config_data).items()
               if username != 'openmptcprouter' for net in nets]
-    if config_data.get('bulk_redirect_v4'):
-        target = default_user.get('vpnremoteip', '')
+    target = default_user.get('vpnremoteip', '') if config_data.get('bulk_redirect_v4') else ''
+    target6 = _user_tunnel_ip6(default_user.get('userid'), 2) if config_data.get('bulk_redirect_v6') else ''
+    for proto in ('tcp', 'udp') if target or target6 else ():
+        # Nor the ports the proxies and MQVPN listen on (MQVPN's udp/443,
+        # Reality's tcp/443): sent to the main router, they were down for
+        # every user
+        spans = sorted({span for span in _configured_server_ports(proto) if span[0] <= 64999})
+        keep = f' {proto} dport != {{ {", ".join(str(a) if a == b else f"{a}-{b}" for a, b in spans)} }}' if spans else ''
         if target:
-            for proto in ('tcp', 'udp'):
-                lines.append(f'{_NFT_FROM_NET} meta nfproto ipv4{_nft_daddr_exclusion(others, 4)} {proto} dport 1-64999 dnat ip to {target} comment "OMR bulk redirect {proto}"')
-    target6 = _user_tunnel_ip6(default_user.get('userid'), 2)
-    if config_data.get('bulk_redirect_v6') and target6:
-        for proto in ('tcp', 'udp'):
-            lines.append(f'{_NFT_FROM_NET} meta nfproto ipv6{_nft_daddr_exclusion(others, 6)} {proto} dport 1-64999 dnat ip6 to {target6} comment "OMR bulk redirect {proto}6"')
+            lines.append(f'{_NFT_FROM_NET} meta nfproto ipv4{_nft_daddr_exclusion(others, 4)} {proto} dport 1-64999{keep} dnat ip to {target} comment "OMR bulk redirect {proto}"')
+        if target6:
+            lines.append(f'{_NFT_FROM_NET} meta nfproto ipv6{_nft_daddr_exclusion(others, 6)} {proto} dport 1-64999{keep} dnat ip6 to {target6} comment "OMR bulk redirect {proto}6"')
     return lines
 
 # The _nft_sync_* functions read the config and load its rules under the
@@ -3260,7 +3399,7 @@ def _vxlan_service_ports(config_data, listening=None):
         if not conf.endswith('.key'):
             spans += [(port, port) for port in _tunnel_file_ports(conf)]
     glorytun_base = TUNNEL_DEFAULT_PORT_BASES[0]
-    spans.append((glorytun_base, glorytun_base + USERID_MAX))
+    spans.append((glorytun_base, glorytun_base + GLORYTUN_USERID_MAX))
     return spans
 
 def _nft_sync_vxlan_input():
@@ -3334,15 +3473,18 @@ def _nft_ensure_dscp_sets():
         script += f'add set {NFT_FAMILY} {NFT_TABLE} {_nft_dscp_set_name(dscp, 6)} {{ type ipv6_addr; flags interval; }}\n'
     return _nft_run(script)
 
-def _nft_refresh_dscp_set(dscp, family, cidrs):
-    """Atomically replace one set's contents. flush+add-element in the same
-    transaction means (unlike the old ipset create-tmp+swap dance, which
-    only existed to work around ipset lacking a single-command atomic
-    replace) there's no window where it's empty/partial."""
-    name = _nft_dscp_set_name(dscp, family)
-    script = f'flush set {NFT_FAMILY} {NFT_TABLE} {name}\n'
-    if cidrs:
-        script += f'add element {NFT_FAMILY} {NFT_TABLE} {name} {{ {", ".join(cidrs)} }}\n'
+def _nft_refresh_dscp_sets(sets):
+    """Atomically replace the contents of the sets of *sets* ({(dscp,
+    family): cidrs}): flush+add-element of every set in one transaction,
+    so no set is ever empty/partial, and one set nft refused no longer
+    left the sets before it new and the ones after it old (while the
+    config kept the old list)."""
+    script = ''
+    for (dscp, family), cidrs in sets.items():
+        name = _nft_dscp_set_name(dscp, family)
+        script += f'flush set {NFT_FAMILY} {NFT_TABLE} {name}\n'
+        if cidrs:
+            script += f'add element {NFT_FAMILY} {NFT_TABLE} {name} {{ {", ".join(cidrs)} }}\n'
     return _nft_run(script)
 
 def _render_dscp_mark():
@@ -3380,11 +3522,10 @@ def _nft_apply_dscp_classify(by_class):
     10.1.0.0/16, or one network twice), and the whole update of that set
     with them."""
     ok = bool(_nft_ensure_dscp_sets())
-    for dscp in DSCP_CLASSIFY_CLASSES:
-        for family in (4, 6):
-            cidrs = [str(net) for net in ipaddress.collapse_addresses(
+    sets = {(dscp, family): [str(net) for net in ipaddress.collapse_addresses(
                 ipaddress.ip_network(cidr) for cidr in by_class[dscp][family])]
-            ok = bool(_nft_refresh_dscp_set(dscp, family, cidrs)) and ok
+            for dscp in DSCP_CLASSIFY_CLASSES for family in (4, 6)}
+    ok = bool(_nft_refresh_dscp_sets(sets)) and ok
     return bool(_nft_sync_dscp_mark()) and ok
 
 def _nft_resync_dscp_classify():
@@ -3512,6 +3653,17 @@ def _fw_service_port_del(port, proto, name):
                for entry in udata.get('fw_ports') or []):
             shorewall_del_port(username, str(port), proto, name)
             shorewall6_del_port(username, str(port), proto, name)
+
+def _fw_open_service_port(user, port, name, opens):
+    """Open *port* of a service for each (proto, family) of *opens*. The
+    first refusal ('Port not opened: ...'), None once open in all: its old
+    port was closed whatever the answer, the service unreachable from then
+    on while the route answered done."""
+    for proto, family in opens:
+        error = (shorewall_add_port if family == 4 else shorewall6_add_port)(user, str(port), proto, name)
+        if error:
+            return 'Port not opened: ' + error
+    return None
 
 def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
     return _fw_port_add(user.username, str(port), proto, name, fwtype, 4, source_dip, dest_ip, vpn, gencomment)
@@ -4009,7 +4161,7 @@ async def _lifespan(app):
     # into the same failure. The API is how what broke it gets fixed.
     for step in (load_mptcp_bpf_schedulers, normalize_persisted_mptcp_path_manager, sync_ss_go_users,
                  resume_proxy_restarts, proxy_isolate_reverse_tunnels, _tighten_tunnel_keys,
-                 _tighten_router_backups, mqvpn_reorder_enabled_bool):
+                 _tighten_router_backups, mqvpn_reorder_enabled_bool, mqvpn_auto_fixed_ips):
         try:
             step()
         except Exception:
@@ -4024,9 +4176,13 @@ async def _lifespan(app):
     except Exception as e:
         LOG.warning("omr_metrics auto-learning start failed: " + str(e))
         _omr_metrics = None
+    if _omr_bgp_router is not None:
+        _omr_bgp_router.start()
     yield
     if _omr_metrics is not None:
         _omr_metrics.stop_auto_learning()
+    if _omr_bgp_router is not None:
+        _omr_bgp_router.stop()
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, title="OpenMPTCProuter Server API", lifespan=_lifespan)
@@ -4258,6 +4414,19 @@ except Exception:  # pylint: disable=broad-except
     # a crash loop systemd gives up on.
     LOG.exception("omr_metrics module not loaded")
 
+_omr_bgp_router = None
+try:
+    import omr_bgp
+    # _mqvpn_status is defined further down: looked up at call time
+    app.include_router(omr_bgp.create_router(get_current_active_user, User, lambda: _mqvpn_status(),
+                                             lambda: _vps_ipv4_addresses() | {str(a) for a in _vps_ipv6_addresses()}))
+    _omr_bgp_router = omr_bgp
+    LOG.info("omr_bgp module loaded")
+except ImportError:
+    pass  # BGP module is optional
+except Exception:  # pylint: disable=broad-except
+    LOG.exception("omr_bgp module not loaded")
+
 # Show something at homepage
 @app.get("/")
 async def homepage():
@@ -4416,6 +4585,25 @@ def mptcpsupport(request: Request):
         return {"mptcp": "working" if _mptcp_peer_present(ip) else "not working"}
     return {"mptcp": "check only support IPv4"}
 
+def _user_vpn(udata):
+    """The VPN of a user, as /config tells its router (vpn.current): /status
+    defaulted to glorytun_tcp, and counted another VPN's bytes."""
+    return udata.get('vpn', 'openvpn')
+
+def _user_vpn_traffic(username, userid, vpn):
+    """(rx, tx) bytes of *vpn* for the user, for /status and /config."""
+    iface = {'glorytun_tcp': 'gt-tun', 'glorytun_udp': 'gt-udp-tun', 'mlvpn': 'mlvpn', 'dsvpn': 'dsvpn'}.get(vpn)
+    if iface:
+        return get_bytes('rx', iface + str(userid)), get_bytes('tx', iface + str(userid))
+    if vpn == 'mqvpn':
+        return _mqvpn_user_bytes(username)
+    if vpn == 'openvpn_bonding':
+        return get_bytes('rx', 'omr-bonding'), get_bytes('tx', 'omr-bonding')
+    if vpn in ('openvpn', 'softether'):
+        txrx = get_bytes_openvpn(username) if vpn == 'openvpn' else get_bytes_softether(username)
+        return txrx['uplinkBytes'], txrx['downlinkBytes']
+    return 0, 0
+
 # Get VPS status
 @app.get('/status', summary="Get current server load average, uptime and release")
 def status(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user), token: Optional[str] = Depends(oauth2_scheme_optional)):
@@ -4497,38 +4685,8 @@ def status(userid: Optional[int] = Query(None), username: Optional[str] = Query(
     if os.path.isfile('/etc/xray/xray-server.json') and 'xray' in proxy and checkIfProcessRunning('xray'):
         xray_tx = get_bytes_xray('tx',username)
         xray_rx = get_bytes_xray('rx',username)
-    vpn = 'glorytun_tcp'
-    if 'vpn' in omr_config_data['users'][0][username]:
-        vpn = omr_config_data['users'][0][username]['vpn']
-    vpn_traffic_rx = 0
-    vpn_traffic_tx = 0
-    if vpn == 'glorytun_tcp':
-        vpn_traffic_rx = get_bytes('rx', 'gt-tun' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'gt-tun' + str(userid))
-    elif vpn == 'glorytun_udp':
-        vpn_traffic_rx = get_bytes('rx', 'gt-udp-tun' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'gt-udp-tun' + str(userid))
-    elif vpn == 'mlvpn':
-        vpn_traffic_rx = get_bytes('rx', 'mlvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'mlvpn' + str(userid))
-    elif vpn == 'mqvpn':
-        vpn_traffic_rx, vpn_traffic_tx = _mqvpn_user_bytes(username)
-    elif vpn == 'dsvpn':
-        vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
-    elif vpn == 'openvpn':
-        # vpn_traffic_rx = get_bytes('rx', 'tun0')
-        # vpn_traffic_tx = get_bytes('tx', 'tun0')
-        vpn_txrx = get_bytes_openvpn(username)
-        vpn_traffic_rx = vpn_txrx['uplinkBytes']
-        vpn_traffic_tx = vpn_txrx['downlinkBytes']
-    elif vpn == 'openvpn_bonding':
-        vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
-        vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
-    elif vpn == 'softether':
-        vpn_txrx = get_bytes_softether(username)
-        vpn_traffic_rx = vpn_txrx['uplinkBytes']
-        vpn_traffic_tx = vpn_txrx['downlinkBytes']
+    vpn = _user_vpn(omr_config_data['users'][0][username])
+    vpn_traffic_rx, vpn_traffic_tx = _user_vpn_traffic(username, userid, vpn)
 
     LOG.debug('Get status: done')
     if IFACE:
@@ -4579,6 +4737,10 @@ def _public_lookup(urls, valid):
 # key -> when its lookup last failed, in this worker: retried hourly, it was
 # redone at each /config of each router (up to 2 s each)
 _public_lookup_failed = {}
+# username -> when /config last failed to issue its OpenVPN certificate, in
+# this worker
+_openvpn_issue_failed = {}
+OPENVPN_ISSUE_RETRY_S = 600
 
 def _vps_public_param(omr_config_data, key, valid, urls, offline):
     """omr_config_data[key] if it is set and *valid* (or set empty), else
@@ -4624,7 +4786,8 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
         userid = 0
     userid = int(userid)
     username = get_username_from_userid(userid)
-    if not username:
+    # An error dict when the config can't be read: a KeyError further on
+    if not isinstance(username, str) or not username:
         return {'error': 'Unknown user', 'route': 'config'}
     if not current_user.permissions == "admin":
         if not check_username_serial(username, serial, token, current_user.username):
@@ -4751,7 +4914,7 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
         else:
             glorytun_udp_host_ip = '10.255.254.1'
             glorytun_udp_client_ip = '10.255.254.2'
-    available_vpn = ["glorytun_tcp", "glorytun_udp"]
+    available_vpn = ["glorytun_tcp", "glorytun_udp"] if userid <= GLORYTUN_USERID_MAX else []
     LOG.debug('Get config... dsvpn')
     if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid) + '.key'):
         dsvpn_key = read_first_line('/etc/dsvpn/dsvpn' + str(userid) + '.key')
@@ -4798,8 +4961,13 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
             not os.path.isfile('/etc/openvpn/ca/pki/issued/' + username + '.crt')
     # Not to a suspended user: revoked at its suspension, a new certificate
     # let its router back into tun1, that has no ccd and only the CRL.
+    # Nor again within OPENVPN_ISSUE_RETRY_S of a failure: with a broken CA,
+    # each /config of the router reran easyrsa under the exclusive lock,
+    # every other request of every worker waiting.
+    issue_failed = _openvpn_issue_failed.get(username)
     if openvpn_cert_missing() and os.path.isfile('/etc/openvpn/tun0.conf') and \
-       not _user_access_cut(user_config):
+       not _user_access_cut(user_config) and \
+       (issue_failed is None or time.monotonic() - issue_failed >= OPENVPN_ISSUE_RETRY_S):
         # Under the lock, as /add_user and /remove_user: easyrsa's
         # index.txt and serial are read and rewritten by each run, two at
         # once (two workers, a router syncing while a user is added) lost
@@ -4815,13 +4983,22 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
             # made meanwhile by another worker's /config
             if latest is not None and not _user_access_cut(latest) and openvpn_cert_missing():
                 LOG.debug("OpenVPN cert missing for %s, creating it", username)
-                _pki_retire_user_certs(username)
+                if _pki_retire_user_certs(username):
+                    _openvpn_gen_crl()
                 _openvpn_drop_cert_files(username)
                 env = os.environ.copy()
                 env['EASYRSA_CERT_EXPIRE'] = '3650'
-                result = subprocess.run(["./easyrsa", "--batch", "build-client-full", username, "nopass"], cwd="/etc/openvpn/ca", env=env, capture_output=True, check=False)
-                if result.returncode != 0:
-                    LOG.error("easyrsa failed for %s: %s", username, result.stderr.decode())
+                try:
+                    result = subprocess.run(["./easyrsa", "--batch", "build-client-full", username, "nopass"], cwd="/etc/openvpn/ca",
+                                            env=env, capture_output=True, check=False, timeout=60)
+                    error = result.stderr.decode(errors='replace') if result.returncode != 0 else None
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    error = str(e)
+                if error is None:
+                    _openvpn_issue_failed.pop(username, None)
+                else:
+                    _openvpn_issue_failed[username] = time.monotonic()
+                    LOG.error("easyrsa failed for %s: %s", log_safe(username), log_safe(error[-300:]))
     if os.path.isfile('/etc/openvpn/ca/pki/private/' + username + '.key'):
         with open('/etc/openvpn/ca/pki/private/' + username + '.key', "rb") as ovpnkey_file:
             openvpn_keyb = base64.b64encode(ovpnkey_file.read())
@@ -5168,39 +5345,8 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
                 if 'ULA=' in line:
                     ula = line.replace(line[:4], '').rstrip()
 
-    vpn = 'openvpn'
-    if 'vpn' in omr_config_data['users'][0][username]:
-        vpn = omr_config_data['users'][0][username]['vpn']
-
-    vpn_traffic_rx = 0
-    vpn_traffic_tx = 0
-    if vpn == 'glorytun_tcp':
-        vpn_traffic_rx = get_bytes('rx', 'gt-tun' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'gt-tun' + str(userid))
-    elif vpn == 'glorytun_udp':
-        vpn_traffic_rx = get_bytes('rx', 'gt-udp-tun' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'gt-udp-tun' + str(userid))
-    elif vpn == 'mlvpn':
-        vpn_traffic_rx = get_bytes('rx', 'mlvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'mlvpn' + str(userid))
-    elif vpn == 'mqvpn':
-        vpn_traffic_rx, vpn_traffic_tx = _mqvpn_user_bytes(username)
-    elif vpn == 'dsvpn':
-        vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
-    elif vpn == 'openvpn':
-        #vpn_traffic_rx = get_bytes('rx', 'tun0')
-        #vpn_traffic_tx = get_bytes('tx', 'tun0')
-        vpn_txrx = get_bytes_openvpn(username)
-        vpn_traffic_rx = vpn_txrx['uplinkBytes']
-        vpn_traffic_tx = vpn_txrx['downlinkBytes']
-    elif vpn == 'openvpn_bonding':
-        vpn_traffic_rx = get_bytes('rx', 'omr-bonding')
-        vpn_traffic_tx = get_bytes('tx', 'omr-bonding')
-    elif vpn == 'softether':
-        vpn_txrx = get_bytes_softether(username)
-        vpn_traffic_rx = vpn_txrx['uplinkBytes']
-        vpn_traffic_tx = vpn_txrx['downlinkBytes']
+    vpn = _user_vpn(omr_config_data['users'][0][username])
+    vpn_traffic_rx, vpn_traffic_tx = _user_vpn_traffic(username, userid, vpn)
 
     #vpn = current_user.vpn
     # Same list as /proxy_list: the router picks a name from here and posts it
@@ -5241,7 +5387,7 @@ def config(userid: Optional[int] = Query(None), username: Optional[str] = Query(
 
     shorewall_redirect = "enable" if omr_config_data.get('bulk_redirect_v4') else "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'path_mtu': mqvpn_path_mtu, 'pmtud': mqvpn_pmtud, 'tun_offload': mqvpn_tun_offload, 'tun_gro': mqvpn_tun_gro, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules, 'pinned_pubkey': mqvpn_pinned_pubkey}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'vxlan': get_vxlan_config(username, userid), 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'fixed_ip': mqvpn_fixed_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'fec_enable': mqvpn_fec_enable, 'fec_scheme': mqvpn_fec_scheme, 'reinjection_control': mqvpn_reinjection_control, 'reinjection_mode': mqvpn_reinjection_mode, 'cc': mqvpn_cc, 'path_mtu': mqvpn_path_mtu, 'pmtud': mqvpn_pmtud, 'tun_offload': mqvpn_tun_offload, 'tun_gro': mqvpn_tun_gro, 'reorder': mqvpn_reorder, 'reorder_rules': mqvpn_reorder_rules, 'pinned_pubkey': mqvpn_pinned_pubkey}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'close_timeout': mptcp_close_timeout, 'pm_type': mptcp_pm_type, 'stale_loss_cnt': mptcp_stale_loss_cnt, 'syn_retrans_before_tcp_fallback': mptcp_syn_retrans_before_tcp_fallback, 'bbr_loss_thresh': read_proc(_BBR_LOSS_THRESH)}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'vxlan': get_vxlan_config(username, userid), 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -5281,6 +5427,19 @@ def _shadowsocks_port_error(data, user, port):
         vxlan_users = _vxlan_port_users(port, omr_config_data) if str(port).isdigit() else []
         if vxlan_users:
             return 'Port used by the VXLAN of: ' + ', '.join(vxlan_users)
+        # As /add_user checks it: sshd's, this API's, a proxy's or MQVPN's
+        # port, or a suspended user's, and ss-server could not bind it (the
+        # main router's shadowsocks down). Not the ports manager.json gives
+        # ss-server already (port_key's, its own port_conf ones).
+        mine = set(data.get('port_key') or {}) | {
+            p for p, c in (data.get('port_conf') or {}).items()
+            if isinstance(c, dict) and str(c.get('userid')) == str(user.userid)}
+        if str(port).isdigit() and str(port) not in mine:
+            busy = _ss_ports_in_use(users)
+            for proto in ('tcp', 'udp'):
+                busy |= {p for first, last in _configured_server_ports(proto) for p in range(first, last + 1)}
+            if int(port) in busy:
+                return 'Port already used on the server'
     conf = (data.get('port_conf') or {}).get(str(port))
     if isinstance(conf, dict) and conf.get('userid') is not None and str(conf['userid']) != str(user.userid):
         return 'Port already used by another user'
@@ -5500,11 +5659,12 @@ def _shadowsocks_locked(params, current_user):
     final_md5 = hashlib.md5(file_as_bytes('/etc/shadowsocks-libev/manager.json')).hexdigest()
     if initial_md5 != final_md5:
         _restart_service("shadowsocks-libev-manager@manager.service")
-        if old_port is not None:
+        error = _fw_open_service_port(current_user, port, 'shadowsocks', (('tcp', 4), ('udp', 4)))
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'shadowsocks'}
+        if old_port is not None and str(old_port) != str(port):
             shorewall_del_port(current_user.username, str(old_port), 'tcp', 'shadowsocks')
             shorewall_del_port(current_user.username, str(old_port), 'udp', 'shadowsocks')
-        shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks')
-        shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks')
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks'}
     else:
@@ -5517,6 +5677,12 @@ class ShadowsocksGoConfigparams(BaseModel):
     reuse_port: bool
     mptcp: bool = Query(True, title="Enable/Disable MPTCP support")
     #key: str
+
+# The 2022 methods shadowsocks-go has, for the 32-byte keys of the installer
+SS_GO_METHODS = {
+    '2022-blake3-aes-256-gcm': '2022-blake3-aes-256-gcm',
+    '2022-blake3-aes-128-gcm': '2022-blake3-aes-256-gcm',
+}
 
 @app.post('/shadowsocks-go', summary="Modify Shadowsocks-Go configuration")
 def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = Depends(get_current_user)):
@@ -5536,10 +5702,31 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     except ValueError as e:
         return {'result': 'error', 'reason': 'Config file not readable', 'route': 'shadowsocks-go'}
     port = params.port
-    # If method is aes 128 then key need to be length 16 instead of 32, so force aes-256-gcm for now
-    method = params.method
-    if method == "2022-blake3-aes-128-gcm":
-        method = "2022-blake3-aes-256-gcm"
+    # If method is aes 128 then key need to be length 16 instead of 32, so force aes-256-gcm for now.
+    # Any other written as is: shadowsocks-go refused its config, down for every router
+    method = SS_GO_METHODS.get(params.method)
+    if method is None:
+        return {'result': 'error', 'reason': 'Invalid method', 'route': 'shadowsocks-go'}
+    try:
+        old_port = str(data["servers"][0]["tcpListeners"][0].get("address", ":")).rsplit(':', 1)[-1]
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return {'result': 'error', 'reason': 'Config file not readable', 'route': 'shadowsocks-go'}
+    if str(port) != old_port:
+        # Moved onto a port ss-server, a proxy, MQVPN or a VXLAN has, or a
+        # router redirects: it could not bind it, or never got a connection
+        omr_config_data = read_omr_config()
+        users = (omr_config_data.get('users') or [{}])[0]
+        for proto in ('tcp', 'udp'):
+            redirected = _port_redirected_by(omr_config_data, port, proto)
+            if redirected:
+                return {'result': 'error', 'reason': 'Port redirected by: ' + ', '.join(redirected), 'route': 'shadowsocks-go'}
+        vxlan_users = _vxlan_port_users(port, omr_config_data)
+        if vxlan_users:
+            return {'result': 'error', 'reason': 'Port used by the VXLAN of: ' + ', '.join(vxlan_users), 'route': 'shadowsocks-go'}
+        if port in _ss_configured_ports(users) or any(
+                a <= port <= b for proto in ('tcp', 'udp')
+                for a, b in _listening_ports(proto, ('shadowsocks-go',)) + _configured_server_ports(proto)):
+            return {'result': 'error', 'reason': 'Port used by the server', 'route': 'shadowsocks-go'}
     fast_open = params.fast_open
     reuse_port = params.reuse_port
     mptcp = params.mptcp
@@ -5553,7 +5740,6 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
             shadowsocks_go_upsk = json.load(_f).get(current_user.username, '')
     shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': port, 'protocol': method }
     modif_config_user(current_user.username, {'shadowsocks-go': shadowsocks_go_conf})
-    old_port = str(data["servers"][0]["tcpListeners"][0].get("address", ":")).rsplit(':', 1)[-1]
     data["servers"][0]["tcpListeners"][0]["address"] = ":" + str(port)
     data["servers"][0]["tcpListeners"][0]["fastOpen"] = fast_open
     data["servers"][0]["listenerTFO"] = fast_open
@@ -5565,8 +5751,9 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     final_md5 = hashlib.md5(file_as_bytes('/etc/shadowsocks-go/server.json')).hexdigest()
     if initial_md5 != final_md5:
         _restart_service("shadowsocks-go.service")
-        shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks-go')
-        shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks-go')
+        error = _fw_open_service_port(current_user, port, 'shadowsocks-go', (('tcp', 4), ('udp', 4)))
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'shadowsocks-go'}
         if old_port.isdigit() and old_port != str(port):
             _fw_service_port_del(old_port, 'tcp', 'shadowsocks-go')
             _fw_service_port_del(old_port, 'udp', 'shadowsocks-go')
@@ -6006,14 +6193,15 @@ def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_use
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'sipalg'}
     if not _is_server_admin(current_user):
         return _server_wide_refusal('sipalg')
-    enable = params.enable
     # The flag and the helpers as one step, as _nft_resync_all reads them
     with _omr_config_lock(exclusive=True):
-        set_global_param('sipalg', enable)
-        applied = _nft_sync_sipalg(enable)
+        set_global_param('sipalg', params.enable)
+        applied = _nft_sync_sipalg(params.enable)
     if not applied:
-        return {'result': 'error', 'reason': 'SIP conntrack helpers not applied (nf_conntrack_sip kernel module unavailable?)', 'route': 'sipalg'}
+        return {'result': 'error', 'reason': _SIPALG_NOT_APPLIED, 'route': 'sipalg'}
     return {'result': 'done', 'reason': 'changes applied', 'route': 'sipalg'}
+
+_SIPALG_NOT_APPLIED = 'SIP conntrack helpers not applied (nf_conntrack_sip kernel module unavailable?)'
 
 class V2rayconfig(BaseModel):
     userid: str
@@ -6406,13 +6594,16 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
     LOG.debug("modif_config_user for xray conf")
     modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
+        error = None
         if reality_added:
-            shorewall_add_port(current_user, '443', 'tcp', 'xray vless-reality')
+            error = _fw_open_service_port(current_user, 443, 'xray vless-reality', (('tcp', 4),))
         elif not params.vless_reality and chk_vless_reality:
             # Whoever opened it: the admin account and the main router
             # both may switch it
             _fw_service_port_del('443', 'tcp', 'xray vless-reality')
         _restart_service("xray")
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'xray'}
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'xray'}
     else:
@@ -6528,6 +6719,9 @@ def _mptcp_params_error(params):
     for field in ('path_manager', 'scheduler', 'congestion_control'):
         if not _KERNEL_NAME_RE.fullmatch(getattr(params, field)):
             return f'Invalid {field}'
+    # the kernel divides by 256 - loss_thresh
+    if params.bbr_loss_thresh is not None and not 1 <= params.bbr_loss_thresh <= 255:
+        return 'Invalid bbr_loss_thresh'
     return None
 
 # The sysctls /mptcp sets on an out-of-tree (v0) kernel, and on a mainline
@@ -6555,6 +6749,7 @@ class MPTCPparams(BaseModel):
     close_timeout: Optional[int] = None
     stale_loss_cnt: Optional[int] = None
     syn_retrans_before_tcp_fallback: Optional[int] = None
+    bbr_loss_thresh: Optional[int] = None
 
     # The router (openmptcprouter-vps's _set_mptcp_vps) builds this JSON body
     # from `uci -q get network.globals.mptcp_*`, quoting every value as a
@@ -6575,7 +6770,7 @@ class MPTCPparams(BaseModel):
         return v
 
     @field_validator('pm_type', 'close_timeout', 'stale_loss_cnt',
-                     'syn_retrans_before_tcp_fallback', mode='before')
+                     'syn_retrans_before_tcp_fallback', 'bbr_loss_thresh', mode='before')
     @classmethod
     def _blank_str_to_none(cls, v):
         if isinstance(v, str) and v.strip() == '':
@@ -6609,6 +6804,9 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     error = _mptcp_params_error(params)
     if error:
         return {'result': 'error', 'reason': error, 'route': 'mptcp'}
+    # Read by BBR at every ACK: unlike the sysctls below, it needs no restart
+    bbr_refused = (params.bbr_loss_thresh is not None and path.exists(_BBR_LOSS_THRESH)
+                   and not _bbr_loss_thresh_set(params.bbr_loss_thresh))
     settings = []
     if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
         settings += [('net.mptcp.mptcp_checksum', checksum), ('net.mptcp.mptcp_path_manager', path_manager),
@@ -6626,7 +6824,9 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
             settings.append(('net.mptcp.pm_type', pm_type))
         for key, value in (('close_timeout', close_timeout), ('stale_loss_cnt', stale_loss_cnt),
                            ('syn_retrans_before_tcp_fallback', syn_retrans_before_tcp_fallback)):
-            if value is not None:
+            # Guarded as above and in /config: a kernel without one (6.1)
+            # had every sync answer "Refused by the kernel"
+            if value is not None and path.exists('/proc/sys/net/mptcp/' + key):
                 settings.append(('net.mptcp.' + key, value))
     settings.append(('net.ipv4.tcp_congestion_control', congestion_control))
     # Saved only once the kernel took it: a value it refused (a scheduler
@@ -6687,6 +6887,8 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
         if os.path.isfile('/etc/iperf3/users.csv'):
             _systemctl_after_lock('try-restart', 'iperf3')
     #set_lastchange()
+    if bbr_refused:
+        refused.append('tcp_bbr.loss_thresh')
     if refused:
         return {'result': 'error', 'reason': 'Refused by the kernel: ' + ', '.join(refused), 'route': 'mptcp'}
     return {'result': 'done', 'reason': 'changes applied'}
@@ -6737,6 +6939,7 @@ def mptcp_dscp(*, params: MPTCPDscpParams, current_user: User = Depends(get_curr
     # than tracking previous state server-side: cheap (bpftool map
     # update/delete are near-instant) and self-healing if a previous push
     # was ever interrupted partway through.
+    failed = []
     for dscp in DSCP_CLASSES:
         if dscp in desired:
             ids = desired[dscp]
@@ -6744,9 +6947,16 @@ def mptcp_dscp(*, params: MPTCPDscpParams, current_user: User = Depends(get_curr
             # An mptcp-dscp-manager older than the id sets takes one id:
             # keep the first, the WAN's IPv4 one
             if len(ids) > 1 and result.returncode != 0:
-                subprocess.run([script, 'set', dscp, 'id', ids[0]], check=False)
+                result = subprocess.run([script, 'set', dscp, 'id', ids[0]], check=False)
+            if result.returncode != 0:
+                failed.append(dscp)
         else:
+            # Not checked: a class that has no pin fails to be deleted
             subprocess.run([script, 'del', dscp], check=False)
+    if failed:
+        # The map not loaded: the router took its pins for applied
+        return {'result': 'error', 'reason': 'DSCP pin update failed for: ' + ', '.join(failed),
+                'route': 'mptcp_dscp'}
     return {'result': 'done', 'reason': 'changes applied'}
 
 # Set bpf_weight/bpf_weight_rr per-WAN weights (server/VPS side:
@@ -6822,7 +7032,7 @@ def mptcp_weight(*, params: MPTCPWeightParams, current_user: User = Depends(get_
 # (replacing the old per-class/family ipset), marked via a native `ip[6]
 # dscp set <class>` rule in the dscp_mark chain (replacing Shorewall's
 # DSCP(CLASS) mangle-row contortion documented in the git history of this
-# file) -- see _nft_refresh_dscp_set/_render_dscp_mark in the nftables
+# file) -- see _nft_refresh_dscp_sets/_render_dscp_mark in the nftables
 # engine block above shorewall_add_port. Both the set contents and the
 # marking rule are applied as single atomic `nft -f -` transactions, so
 # there's never a window where a set is empty/partial the way the old
@@ -7361,12 +7571,18 @@ def _tunnel_port_error(user, port, protos, own_files):
     # with no check, and the new user's daemon fought this one for the port
     userid = _router_userid(user)
     for base in TUNNEL_DEFAULT_PORT_BASES:
-        if base <= port <= base + USERID_MAX and port - base != userid:
+        if base <= port <= base + GLORYTUN_USERID_MAX and port - base != userid:
             return 'Port reserved for another user'
     api_port = read_omr_config().get('port', 65500)
     if port == api_port or any(a <= port <= b for proto in protos for a, b in _server_ports(proto)):
         return 'Port used by the server'
     return None
+
+def _tunnel_key_valid(key):
+    """/glorytun's and /dsvpn's key, written as the key file the daemon
+    reads: an empty one broke the tunnel, a newline or a space made it
+    another key than the router's."""
+    return bool(key) and len(key) <= 256 and key.isprintable() and not any(c.isspace() for c in key)
 
 class GlorytunConfig(BaseModel):
     key: str
@@ -7393,8 +7609,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     key = glorytunconfig.key
     port = glorytunconfig.port
     chacha = glorytunconfig.chacha
-    if not key or any(c.isspace() for c in key):
-        # an empty key file broke the tunnel
+    if not _tunnel_key_valid(key):
         return {'result': 'error', 'reason': 'Invalid key', 'route': 'glorytun'}
     own_files = [conf for conf in ('/etc/glorytun-tcp/tun' + str(userid), '/etc/glorytun-udp/tun' + str(userid))
                  if os.path.isfile(conf)]
@@ -7459,8 +7674,9 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
         _atomic_write_text(udp_conf, ''.join(lines))
         if _snapshot(udp_conf, udp_conf + '.key') != before:
             _restart_service(f"glorytun-udp@tun{userid}")
-    shorewall_add_port(current_user, str(port), 'tcp', 'glorytun')
-    shorewall_add_port(current_user, str(port), 'udp', 'glorytun')
+    error = _fw_open_service_port(current_user, port, 'glorytun', (('tcp', 4), ('udp', 4)))
+    if error:
+        return {'result': 'error', 'reason': error, 'route': 'glorytun'}
     for old_port in old_ports - {port}:
         # the old port stayed open
         shorewall_del_port(current_user.username, str(old_port), 'tcp', 'glorytun')
@@ -7497,9 +7713,7 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     port = params.port
     if not key or port is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'dsvpn'}
-    # As /glorytun: written as the key file dsvpn reads, a newline or a
-    # space made it another key than the router's.
-    if len(key) > 256 or not key.isprintable() or any(c.isspace() for c in key):
+    if not _tunnel_key_valid(key):
         return {'result': 'error', 'reason': 'Invalid key', 'route': 'dsvpn'}
     dsvpn_conf = '/etc/dsvpn/dsvpn' + str(userid)
     error = _tunnel_port_error(current_user, port, ('tcp',), [dsvpn_conf])
@@ -7524,7 +7738,9 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     after = [hashlib.md5(file_as_bytes(conf)).hexdigest() for conf in (dsvpn_conf, dsvpn_key_file)]
     if before != after:
         _restart_service(f"dsvpn-server@dsvpn{userid}")
-    shorewall_add_port(current_user, str(port), 'tcp', 'dsvpn')
+    error = _fw_open_service_port(current_user, port, 'dsvpn', (('tcp', 4),))
+    if error:
+        return {'result': 'error', 'reason': error, 'route': 'dsvpn'}
     for old_port in old_ports - {port}:
         shorewall_del_port(current_user.username, str(old_port), 'tcp', 'dsvpn')
     #set_lastchange()
@@ -7857,8 +8073,9 @@ def _mqvpn_set_config_locked(params, current_user):
     if changed:
         _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg, indent=2)
     if str(params.port) != old_port:
-        shorewall_add_port(current_user, str(params.port), 'udp', 'mqvpn')
-        shorewall6_add_port(current_user, str(params.port), 'udp', 'mqvpn')
+        error = _fw_open_service_port(current_user, params.port, 'mqvpn', (('udp', 4), ('udp', 6)))
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'mqvpn'}, changed
         _fw_service_port_del(old_port, 'udp', 'mqvpn')
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn'}, changed
 
@@ -8079,6 +8296,34 @@ def _mqvpn_push(pushes):
             warnings.append(f'{iface}: {error}')
     return warnings
 
+def _mqvpn_path_policy_sync(username, desired, field, cmd, route):
+    """/mqvpn_dscp's and /mqvpn_weight's: set *field* of *username*'s
+    path_policy to *desired* ({iface: value}), the ifaces no longer in it
+    reset to 0 (for a weight, the scheduler's default, 1: mqvpn's
+    src/path_entry_internal.h path_entry_t.weight), in server.json under
+    the config lock, then live with *cmd* once it is released."""
+    with _omr_config_lock():
+        with open('/etc/mqvpn/server.json') as f:
+            mqvpn_cfg = json.load(f)
+        policy = mqvpn_cfg.setdefault('path_policy', [])
+        initial_policy = json.dumps(policy, sort_keys=True)
+        pushes = []
+        for iface in _mqvpn_path_policy_ifaces_with(policy, username, field) - set(desired):
+            pushes.append((iface, {'cmd': cmd, 'user': username, 'iface': iface, field: 0}))
+            _mqvpn_path_policy_clear(policy, username, iface, field)
+        for iface, value in desired.items():
+            pushes.append((iface, {'cmd': cmd, 'user': username, 'iface': iface, field: value}))
+            _mqvpn_path_policy_set(policy, username, iface, field, value)
+        error = _mqvpn_path_policy_error(policy, username, json.loads(initial_policy))
+        if error:
+            return {'result': 'error', 'reason': error, 'route': route}
+        if json.dumps(policy, sort_keys=True) != initial_policy:
+            _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg, indent=2)
+    warnings = _mqvpn_push(pushes)
+    if warnings:
+        return {'result': 'warning', 'reason': '; '.join(warnings), 'route': route}
+    return {'result': 'done', 'reason': 'changes applied', 'route': route}
+
 class MQVPNDscpPin(BaseModel):
     iface: str
     dscp: List[str] = []
@@ -8104,29 +8349,7 @@ def mqvpn_dscp(*, params: MQVPNDscpParams, current_user: User = Depends(get_curr
                 return {'result': 'error', 'reason': f'Invalid dscp class {dscp!r}', 'route': 'mqvpn_dscp'}
             mask |= 1 << DSCP_CODEPOINTS[dscp]
         desired[pin.iface] = mask
-    username = current_user.username
-    with _omr_config_lock():
-        with open('/etc/mqvpn/server.json') as f:
-            mqvpn_cfg = json.load(f)
-        policy = mqvpn_cfg.setdefault('path_policy', [])
-        initial_policy = json.dumps(policy, sort_keys=True)
-        previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'dscp_mask')
-        pushes = []
-        for iface in previous_ifaces - set(desired.keys()):
-            pushes.append((iface, {'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': 0}))
-            _mqvpn_path_policy_clear(policy, username, iface, 'dscp_mask')
-        for iface, mask in desired.items():
-            pushes.append((iface, {'cmd': 'set_path_dscp_mask', 'user': username, 'iface': iface, 'dscp_mask': mask}))
-            _mqvpn_path_policy_set(policy, username, iface, 'dscp_mask', mask)
-        error = _mqvpn_path_policy_error(policy, username, json.loads(initial_policy))
-        if error:
-            return {'result': 'error', 'reason': error, 'route': 'mqvpn_dscp'}
-        if json.dumps(policy, sort_keys=True) != initial_policy:
-            _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg, indent=2)
-    warnings = _mqvpn_push(pushes)
-    if warnings:
-        return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_dscp'}
-    return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_dscp'}
+    return _mqvpn_path_policy_sync(current_user.username, desired, 'dscp_mask', 'set_path_dscp_mask', 'mqvpn_dscp')
 
 class MQVPNWeightPin(BaseModel):
     iface: str
@@ -8150,31 +8373,7 @@ def mqvpn_weight(*, params: MQVPNWeightParams, current_user: User = Depends(get_
         if not (0 <= pin.weight <= 65535):
             return {'result': 'error', 'reason': f'Invalid weight {pin.weight!r}', 'route': 'mqvpn_weight'}
         desired[pin.iface] = pin.weight
-    username = current_user.username
-    with _omr_config_lock():
-        with open('/etc/mqvpn/server.json') as f:
-            mqvpn_cfg = json.load(f)
-        policy = mqvpn_cfg.setdefault('path_policy', [])
-        initial_policy = json.dumps(policy, sort_keys=True)
-        previous_ifaces = _mqvpn_path_policy_ifaces_with(policy, username, 'weight')
-        pushes = []
-        for iface in previous_ifaces - set(desired.keys()):
-            # 0 resets to the scheduler's default weight (1) -- see mqvpn's
-            # src/path_entry_internal.h path_entry_t.weight doc comment.
-            pushes.append((iface, {'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': 0}))
-            _mqvpn_path_policy_clear(policy, username, iface, 'weight')
-        for iface, weight in desired.items():
-            pushes.append((iface, {'cmd': 'set_path_weight', 'user': username, 'iface': iface, 'weight': weight}))
-            _mqvpn_path_policy_set(policy, username, iface, 'weight', weight)
-        error = _mqvpn_path_policy_error(policy, username, json.loads(initial_policy))
-        if error:
-            return {'result': 'error', 'reason': error, 'route': 'mqvpn_weight'}
-        if json.dumps(policy, sort_keys=True) != initial_policy:
-            _atomic_write_json('/etc/mqvpn/server.json', mqvpn_cfg, indent=2)
-    warnings = _mqvpn_push(pushes)
-    if warnings:
-        return {'result': 'warning', 'reason': '; '.join(warnings), 'route': 'mqvpn_weight'}
-    return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn_weight'}
+    return _mqvpn_path_policy_sync(current_user.username, desired, 'weight', 'set_path_weight', 'mqvpn_weight')
 
 
 # Set OpenVPN config
@@ -8220,8 +8419,9 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
     if initial_md5 != final_md5:
         _restart_service("openvpn@tun0")
         # Both families: tun0.conf is tcp6-server, and the old port is closed in both
-        shorewall_add_port(current_user, str(params.port), 'tcp', 'openvpn')
-        shorewall6_add_port(current_user, str(params.port), 'tcp', 'openvpn')
+        error = _fw_open_service_port(current_user, params.port, 'openvpn', (('tcp', 4), ('tcp', 6)))
+        if error:
+            return {'result': 'error', 'reason': error, 'route': 'openvpn'}
         if old_port is not None and old_port != str(params.port):
             _fw_service_port_del(old_port, 'tcp', 'openvpn')
         #set_lastchange()
@@ -8239,46 +8439,16 @@ def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_curre
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'softethervpn'}
     if not os.path.isfile('/var/lib/softether/vpn_server.config'):
         return {'result': 'warning', 'reason': 'SoftEther VPN is not installed', 'route': 'softethervpn'}
-    cipherPayload = {
-        "jsonrpc": "2.0",
-        "id": "rpc_call_id",
-        "method": "SetServerCipher",
-        "params": {
-            "String_str": params.cipher
-        }
-    }
     # The cipher is the server's, for every user; the password is the caller's.
-    if _is_server_admin(current_user):
-        try:
-            requests.post(url="http://127.0.0.1:65390/api", json=cipherPayload, headers=softethervpnPassword, timeout=10)
-        except requests.exceptions.Timeout:
-            LOG.debug("SoftEther VPN change cipher timeout")
-            return {'result': 'error'}
-        except requests.exceptions.RequestException as err:
-            LOG.debug("SoftEther VPN change cipher error (" + str(err) + ")")
-            return {'result': 'error'}
+    if _is_server_admin(current_user) and \
+            not _softether_rpc("SetServerCipher", {"String_str": params.cipher}, timeout=10):
+        return {'result': 'error', 'reason': 'SoftEther VPN refused the cipher', 'route': 'softethervpn'}
     if params.password != "":
-        passwordPayload = {
-            "jsonrpc": "2.0",
-            "id": "rpc_call_id",
-            "method": "SetUser",
-            "params": {
-                "HubName_str": "OMRVPN",
-                "Name_str": current_user.username,
-                # SetUser replaces the whole user: without it the AuthType
-                # read as 0, anonymous, as add_softether_user's 1 is password.
-                "AuthType_u32": 1,
-                "Auth_Password_str": params.password
-            }
-        }
-        try:
-            requests.post(url="http://127.0.0.1:65390/api", json=passwordPayload, headers=softethervpnPassword, timeout=10)
-        except requests.exceptions.Timeout:
-            LOG.debug("SoftEther VPN change password timeout")
-            return {'result': 'error'}
-        except requests.exceptions.RequestException as err:
-            LOG.debug("SoftEther VPN change password error (" + str(err) + ")")
-            return {'result': 'error'}
+        # SetUser replaces the whole user: without it the AuthType read as
+        # 0, anonymous, as add_softether_user's 1 is password.
+        if not _softether_rpc("SetUser", {"HubName_str": "OMRVPN", "Name_str": current_user.username,
+                                          "AuthType_u32": 1, "Auth_Password_str": params.password}, timeout=10):
+            return {'result': 'error', 'reason': 'SoftEther VPN refused the password', 'route': 'softethervpn'}
         # In the form it had: the installer reads the main router's as a
         # string (jq -r .softethervpn), and set it to the object's text.
         previous = (read_omr_config().get('users') or [{}])[0].get(current_user.username, {}).get('softethervpn')
@@ -9368,6 +9538,11 @@ def _apply_6in4_conf(userid, text):
     if text is None:
         _remove_tunnel_unit(f"omr6in4@user{int(userid)}", conf)
         return
+    if not os.path.isdir(OMR_6IN4_DIR):
+        # 6in4 not installed (docker-compose): the write raised, /vpnips
+        # answered 500 with the address saved and the DNATs left on the old
+        # one, never resynced as it no longer changed
+        return
     if os.path.isfile(conf):
         with open(conf) as f:
             if f.read() == text:
@@ -9875,8 +10050,6 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
                 return {'result': 'error', 'reason': 'No userid left', 'route': 'add_user'}
             userid = free[0]
     elif not 2 <= userid <= USERID_MAX:
-        # The tunnels of a userid are a /30 of a /24 (glorytun, dsvpn...)
-        # and its port 650<userid>: past 63, the user was saved but got none.
         # Userid 1's ports, 65001 and 65401, are those of userid 0's tun0
         # and dsvpn0: the main router lost its tunnels.
         return {'result': 'error', 'reason': 'Invalid userid, 2 to {}'.format(USERID_MAX), 'route': 'add_user'}
@@ -9926,7 +10099,8 @@ def add_user(*, params: NewUser, current_user: User = Depends(get_current_user),
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         LOG.debug("Create user " + log_safe(params.username) + " in OpenVPN")
         # A certificate left valid for this CN would make easyrsa refuse to reissue
-        _pki_retire_user_certs(params.username)
+        if _pki_retire_user_certs(params.username):
+            _openvpn_gen_crl()
         _openvpn_drop_cert_files(params.username)
         env = os.environ.copy()
         env['EASYRSA_CERT_EXPIRE'] = '3650'
@@ -10024,8 +10198,10 @@ class ExistingUser(BaseModel):
 def add_user_note(*, params: ExistingUser, current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
-    modif_config_user(params.username,{"note": params.note})
-    #set_lastchange(30)
+    try:
+        modif_config_user(params.username, {"note": params.note})
+    except (KeyError, IndexError, ValueError, OSError):
+        return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'add_user_note'}
     return {'result': 'done', 'reason': 'Note added', 'route': 'add_user_note'}
 
 
@@ -10167,6 +10343,8 @@ def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_
     # the EMA's flock, held every config request meanwhile.
     if _omr_metrics_router is not None and hasattr(_omr_metrics_router, 'purge_user'):
         _omr_metrics_router.purge_user(params.username)
+    if _omr_bgp_router is not None:
+        _omr_bgp_router.purge_user(params.username)
     LOG.info("User admin (IP: " + request.client.host + ") removed user " + log_safe(params.username))
     return result
 
@@ -10192,14 +10370,16 @@ def _remove_user(params, current_user):
 
 def _openvpn_revoke(username):
     """Revoke *username*'s OpenVPN client certificate, and drop its files:
-    /config issues a new one the next time it is asked for one."""
+    /config issues a new one the next time it is asked for one. True if the
+    CRL was regenerated."""
     with _omr_config_lock(exclusive=True):
         subprocess.run(["./easyrsa", "--batch", "revoke", username], cwd="/etc/openvpn/ca", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         # Whatever easyrsa could not revoke (no issued file left) is revoked
-        # in the index, which also regenerates the CRL.
-        if not _pki_retire_user_certs(username):
-            _openvpn_gen_crl()
+        # in the index
+        _pki_retire_user_certs(username)
+        crl = _openvpn_gen_crl()
         _openvpn_drop_cert_files(username)
+    return crl
 
 def _openvpn_drop_cert_files(username):
     """Delete *username*'s certificate, key and request: /config issues a
@@ -10451,7 +10631,8 @@ def _suspend_user_access(username, udata):
             upsk = None
         if upsk:
             suspended.setdefault('shadowsocks_go', upsk)
-            remove_ss_go_user(username)
+            if not remove_ss_go_user(username):
+                raise RuntimeError('Shadowsocks go removal failed')
     if os.path.isfile('/etc/shadowsocks-go/upsks.json'):
         step('shadowsocks-go', shadowsocks_go, 'shadowsocks_go')
 
@@ -10480,6 +10661,8 @@ def _suspend_user_access(username, udata):
         # a revoked certificate until it fetched /config again.
         with _omr_config_lock(exclusive=True):
             serials = _pki_retire_user_certs(username)
+            # again on a retry (previous): the CRL of the pass before failed
+            crl = _openvpn_gen_crl() if serials or isinstance(previous, dict) else True
         if serials:
             old_serials = previous.get('serials', []) if isinstance(previous, dict) else []
             suspended['openvpn'] = {'serials': list(dict.fromkeys(old_serials + serials))}
@@ -10487,8 +10670,11 @@ def _suspend_user_access(username, udata):
             # No valid line in the index (revoked already, index rebuilt):
             # revoked by easyrsa and its files dropped, as before; kept,
             # they were handed out by /config, revoked, after it was put back
-            _openvpn_revoke(username)
+            crl = _openvpn_revoke(username)
         _openvpn_kill(username)
+        if not crl:
+            # kept pending: retried until the CRL keeps it out of tun1
+            raise RuntimeError('OpenVPN CRL not regenerated')
     if os.path.isfile('/etc/openvpn/tun0.conf'):
         step('openvpn', openvpn)
 
@@ -10506,7 +10692,8 @@ def _suspend_user_access(username, udata):
 
     def softether():
         suspended['softether'] = True
-        remove_softether_user(username)
+        if not remove_softether_user(username):
+            raise RuntimeError('SoftEther removal failed')
     if _softether_password(udata) and os.path.isfile('/var/lib/softether/vpn_server.config'):
         step('softether', softether)
     if pending:
@@ -10619,7 +10806,7 @@ def modify_user(*, params: ModifyUser, current_user: User = Depends(get_current_
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'modify_user'}
     content = read_omr_config()
-    if params.username not in content['users'][0]:
+    if params.username not in (content.get('users') or [{}])[0]:
         return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'modify_user'}
     changes = {}
     if params.user_password is not None:
@@ -10694,6 +10881,70 @@ def serialenforce(*, params: SerialEnforce, current_user: User = Depends(get_cur
     set_global_param('serial_enforce', params.enable)
     return {'result': 'done'}
 
+# Server-wide options of omr-admin-config.json, with the value each has
+# while it is not set. The ones a dedicated route sets with more than the
+# flag (/shorewall's bulk redirect, /dscp_classify's list) stay there.
+GLOBAL_OPTIONS = {
+    'mqvpn_auto_fixed_ip': False,  # fixed IPs picked for MQVPN users
+    'gre_tunnels': True,           # GRE tunnels for users with public IPs
+    '6in4': True,                  # the routers' 6in4 tunnels (/vpnips)
+    'internet': True,              # the VPS can reach the internet (public IP lookups)
+    'serial_enforce': False,       # /serialenforce
+    'sipalg': False,               # /sipalg
+    'client2client': False,        # /client2client
+    'debug': False,                # debug logs
+    'glorytun_tcp_type': 'static', # the main router's Glorytun addresses: static or dhcp
+    'glorytun_udp_type': 'static',
+}
+
+class GlobalOptions(BaseModel):
+    """Only the options sent are changed."""
+    model_config = ConfigDict(extra='forbid', populate_by_name=True)
+    mqvpn_auto_fixed_ip: Optional[bool] = None
+    gre_tunnels: Optional[bool] = None
+    sixin4: Optional[bool] = Field(None, alias='6in4')
+    internet: Optional[bool] = None
+    serial_enforce: Optional[bool] = None
+    sipalg: Optional[bool] = None
+    client2client: Optional[bool] = None
+    debug: Optional[bool] = None
+    glorytun_tcp_type: Optional[Literal['static', 'dhcp']] = None
+    glorytun_udp_type: Optional[Literal['static', 'dhcp']] = None
+
+@app.get('/global_options', summary="Server-wide options")
+def global_options(current_user: User = Depends(get_current_user)):
+    if current_user.permissions != "admin":
+        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'global_options'}
+    config = read_omr_config()
+    return {'result': 'done', 'route': 'global_options',
+            'options': {key: config.get(key, default) for key, default in GLOBAL_OPTIONS.items()}}
+
+@app.post('/global_options', summary="Set server-wide options")
+def set_global_options(*, params: GlobalOptions, current_user: User = Depends(get_current_user)):
+    if current_user.permissions != "admin":
+        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'global_options'}
+    changes = params.model_dump(by_alias=True, exclude_none=True)
+    sip_applied = True
+    # The flags and what follows them as one step, as /sipalg and /client2client
+    with _omr_config_lock(exclusive=True):
+        try:
+            _mutate_omr_config(lambda data: data.update(changes))
+        except (OSError, ValueError):
+            return {'result': 'error', 'reason': 'Config file not readable', 'route': 'global_options'}
+        if 'sipalg' in changes:
+            sip_applied = _nft_sync_sipalg(changes['sipalg'])
+        if 'client2client' in changes:
+            _sync_openvpn_client2client(changes['client2client'])
+            _nft_sync_client2client()
+    if 'debug' in changes:
+        # this worker's: the others' at omr-admin's next start. Off: uvicorn's level
+        LOG.setLevel(logging.DEBUG if changes['debug'] else logging.NOTSET)
+    if changes.get('mqvpn_auto_fixed_ip'):
+        mqvpn_auto_fixed_ips()   # the users without one, as at startup
+    if not sip_applied:
+        return {'result': 'error', 'reason': _SIPALG_NOT_APPLIED, 'route': 'global_options'}
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'global_options', 'changed': sorted(changes)}
+
 @app.get('/list_users', summary="List all users")
 def list_users(current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
@@ -10705,7 +10956,7 @@ def get_number_of_users(current_user: User = Depends(get_current_user)):
     if not current_user.permissions == "admin":
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'get-number-of-users'}
     content = read_omr_config()
-    users = len(content['users'][0]) - 1
+    users = max(len((content.get('users') or [{}])[0]) - 1, 0)
     return {'users': users}
 
 # Speedtests running in this worker, per user: each holds a connection and

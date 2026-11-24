@@ -564,6 +564,12 @@ class TestConfigUpdate:
         assert len(calls) == 1 and calls[0].startswith("systemctl restart omr-admin")
         assert '"influxdb"' in calls[0]
 
+    def test_comma_brace_inside_a_string_kept(self, tmp_path):
+        # the fix-up applied to every read saved a forward "web,}" as "web}"
+        r, config, _ = self._run(tmp_path, '{"users": [{"r": {"fw_ports": [{"name": "web,}"}]}}]}')
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert json.loads(config.read_text())["users"][0]["r"]["fw_ports"][0]["name"] == "web,}"
+
     def test_unreadable_config_left_as_it_is(self, tmp_path):
         broken = '{"users": [{"openmptcprouter": {"userid": 0'
         r, config, calls = self._run(tmp_path, broken)
@@ -934,6 +940,10 @@ class TestCompose:
                                     "org": "omr", "bucket": "omr_metrics", "retention_days": 30}
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert sorted(p.name for p in tmp_path.iterdir()) == ["omr-admin-config.json"]
+
+    def test_comma_brace_inside_a_string_kept(self, compose, tmp_path):
+        path = self._run(compose, tmp_path, '{"users": [{"r": {"fw_ports": [{"name": "web,}"}]}}]}')
+        assert json.loads(path.read_text())["users"][0]["r"]["fw_ports"][0]["name"] == "web,}"
 
     @pytest.mark.parametrize("content", [None, "", "{not json", "[1, 2]"],
                              ids=["missing", "empty", "invalid", "not-a-dict"])

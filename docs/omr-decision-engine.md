@@ -1,8 +1,24 @@
 # OpenMPTCProuter — Decision Engine
 
-`omr_metrics.py` exposes a PyTorch-based decision engine that assigns a routing
-weight to each WAN interface for use with `ip route … nexthop … weight N`.
-Higher weight = more traffic sent through that gateway.
+`omr_metrics.py` exposes a PyTorch-based decision engine that assigns a
+multipath weight to each WAN interface: the share of the traffic towards the
+VPS that each path carries. Higher weight = more traffic sent through that WAN.
+
+The router (`omr-weight-sync`, omr-metrics package) polls `GET /metrics/decision`
+and puts the weights in runtime state (`/var/state`), never in the config. From
+there they go to:
+
+- the `endpoint_weights` BPF map read by the MPTCP weight schedulers
+  (`bpf_weight`, `bpf_burstweight`, `bpf_weight_rr`, `bpf_overflow`);
+- the mqvpn path weights (`006-mqvpn-weight`), used by the weighted mqvpn
+  schedulers;
+- the VPS, for the download direction (`openmptcprouter-vps`).
+
+With another scheduler (MPTCP `default`, mqvpn `minrtt`) the weights have no
+effect. They are not applied to the router's balanced default route
+(`network.<iface>.weight`, `ip route … nexthop … weight N`): that option is
+saved to flash, and weights that change every few seconds would rewrite it on
+every poll. The route keeps the weights the user set.
 
 ---
 
@@ -34,7 +50,7 @@ Interface metrics (JSON)
         │                     (offline interfaces bypass EMA — immediate reaction)
         ├─► score  = softmax_scaled × 100   (quality %, 0–100, higher = better)
         │
-        └─► weight = max(1, round(ema_smoothed × 255))   (ip route weight, 1–255)
+        └─► weight = max(1, round(ema_smoothed × 255))   (multipath weight, 1–255)
 ```
 
 In addition to this base per-interface weight, `?dscp=true` scores every
@@ -151,15 +167,16 @@ file is discarded and the model is reinitialised with a warning log.
 5. **Score** — `score = round(scaled_weight × 100, 2)`.  A quality percentage
    in [0, 100]; always non-negative.  Offline interface → score ≈ 0.
 6. **Weight** — `weight = max(1, round(scaled_weight × 255))`.  An integer in
-   [1, 255] ready to pass directly to `ip route … nexthop … weight N`.
-   The minimum of 1 ensures no interface is completely removed from routing.
+   [1, 255], the per-path weight of the MPTCP and mqvpn weight schedulers.
+   The minimum of 1 ensures no interface is completely removed from the
+   multipath scheduling.
 
 ### Example
 
 Two interfaces, one with a good connection and one poor:
 
-| Interface | Softmax | Score (%) | ip route weight |
-|-----------|---------|-----------|-----------------|
+| Interface | Softmax | Score (%) | Multipath weight |
+|-----------|---------|-----------|------------------|
 | eth0 | 0.82 | 82.0 | 209 |
 | wwan0 | 0.18 | 18.0 | 46 |
 
@@ -493,7 +510,7 @@ Exposed metrics (all gauges, labelled `username` and `interface`):
 
 | Metric | Description |
 |--------|-------------|
-| `omr_interface_online` | 1 = online, 0 = offline/error |
+| `omr_interface_online` | 1 = online, 0 = offline/error, or online without a latency (the decision engine gives it weight 0) |
 | `omr_latency_ms` | Latency in ms |
 | `omr_loss_percent` | Packet loss in % |
 | `omr_jitter_ms` | Jitter in ms |
@@ -632,8 +649,8 @@ configuration and `task_running` flag in `auto_learning`.
 | `GET` | `/metrics/quality/forecast?horizon=600&since=6h` | user | Longer window / horizon |
 | `GET` | `/metrics/user` | user | Metrics DB stats: entry count, first/last seen, interfaces |
 | `GET` | `/metrics/user?username=X` | admin | Stats for another user |
-| `POST` | `/metrics/decision/train` | user | Submit quality feedback |
-| `POST` | `/metrics/decision/reset` | admin | Reset model to heuristic init |
+| `POST` | `/metrics/decision/train` | user | Submit quality feedback (503 when the model could not be saved for the other workers) |
+| `POST` | `/metrics/decision/reset` | admin | Reset model to heuristic init (503 when it could not be saved) |
 | `GET` | `/metrics/decision/auto` | admin | Online auto-learning status |
 | `POST` | `/metrics/decision/auto` | admin | Enable/disable auto-learning (`{"enabled": bool}`) |
 
@@ -648,7 +665,10 @@ configuration and `task_running` flag in `auto_learning`.
 }
 ```
 
-`weights` are passed directly to `ip route … nexthop dev eth0 weight 209 nexthop dev wwan0 weight 46`.
+`weights` are the per-path multipath weights (1–255) the router applies to the
+MPTCP weight schedulers and to mqvpn: here eth0 carries about 82% of the
+traffic towards the VPS and wwan0 about 18%. They are not applied to the
+balanced default route (see the introduction).
 
 `scores` are quality percentages in [0, 100]; an offline interface scores ≈ 0.
 
@@ -658,8 +678,9 @@ configuration and `task_running` flag in `auto_learning`.
 `anomalies` is a per-interface list of compact flags. Current-snapshot flags can
 include `offline`, `unreachable`, `stale_metrics`, `high_loss`, `high_jitter`,
 and `high_congestion`. When InfluxDB history is available, decision responses
-can also include `flapping`, `gateway_changed`, `rising_loss`, `rising_jitter`,
-and `rising_congestion`.
+can also include `flapping` (up/down changed twice or more, a sample with no
+status and no latency counting as down), `gateway_changed`, `rising_loss`,
+`rising_jitter`, and `rising_congestion`.
 
 ### GET /metrics/decision?explain=true
 

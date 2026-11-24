@@ -300,7 +300,8 @@ class TestPkiRetire:
         assert lines[0] == self._INDEX.splitlines()[0]          # still revoked, still in the CRL
         assert lines[1].startswith("R\t360101000000Z\t") and lines[1].split("\t")[2]
         assert lines[2].startswith("V\t")                        # bobby untouched
-        gen_crl.assert_called_once()
+        # the caller regenerates the CRL, and decides what a failure means
+        assert not gen_crl.called
 
     def test_nothing_valid_nothing_written(self):
         with (
@@ -372,12 +373,13 @@ class TestAddUserChecks:
         # pki/private/ca.key: the CA's own key
         ({"username": "ca"}, "Invalid username"),
         ({"username": "-help"}, "Invalid username"),
-        ({"username": "u" * 65}, "Invalid username"),
+        # mqvpn's name[64]: its whole config refused
+        ({"username": "u" * 64}, "Invalid username"),
         ({"username": "new", "userid": 2}, "Userid already used"),
-        ({"username": "new", "userid": 64}, "Invalid userid, 2 to 63"),
-        ({"username": "new", "userid": -1}, "Invalid userid, 2 to 63"),
+        ({"username": "new", "userid": 254}, "Invalid userid, 2 to 253"),
+        ({"username": "new", "userid": -1}, "Invalid userid, 2 to 253"),
         # 65001 and 65401: userid 0's glorytun and dsvpn ports
-        ({"username": "new", "userid": 1}, "Invalid userid, 2 to 63"),
+        ({"username": "new", "userid": 1}, "Invalid userid, 2 to 253"),
         ({"username": "new", "ips": ["0.0.0.0/0"]}, "Invalid IP"),
         ({"username": "new", "ips": ["not an ip"]}, "Invalid IP"),
         ({"username": "new", "shadowsocks_port": 65101}, "Shadowsocks port already used"),
@@ -575,6 +577,11 @@ class TestRemoveMqvpn:
 
     def test_not_restarted_when_removed_live(self):
         assert self._remove({"ok": True}) == []
+
+    def test_not_restarted_when_mqvpn_has_no_such_user(self):
+        # a suspended user is already out of the running mqvpn: the restart
+        # of its /remove_user dropped every router's session
+        assert self._remove({"ok": False, "error": "user not found"}) == []
 
 
 class TestRemoveUserTeardown:
@@ -1581,6 +1588,33 @@ class TestConfigMissingKeys:
             other_client.get("/config")
         assert made == [1]
 
+    def test_failed_openvpn_certificate_not_retried_at_each_config(self, other_client, monkeypatch):
+        # a broken CA: each /config of the router reran easyrsa under the
+        # exclusive lock, and a hung one held it for good
+        monkeypatch.setattr(omr_admin, "_openvpn_issue_failed", {})
+        made = []
+
+        def run(cmd, **kwargs):
+            if cmd[:2] == ["./easyrsa", "--batch"]:
+                made.append(kwargs.get("timeout"))
+                raise omr_admin.subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+        real_isfile = os.path.isfile
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/openvpn/tun0.conf" or real_isfile(p)),
+            patch("omr_admin._pki_retire_user_certs", return_value=[]),
+            patch("subprocess.run", side_effect=run),
+        ):
+            assert other_client.get("/config").status_code == 200
+            assert other_client.get("/config").status_code == 200
+            assert made == [60]
+            # tried again once the delay is over
+            monkeypatch.setattr(omr_admin, "_openvpn_issue_failed",
+                                {k: v - omr_admin.OPENVPN_ISSUE_RETRY_S for k, v in omr_admin._openvpn_issue_failed.items()})
+            other_client.get("/config")
+        assert made == [60, 60]
+
     def test_no_openvpn_certificate_for_a_user_removed_meanwhile(self, other_client):
         # /remove_user ran (certificate revoked and dropped) between the
         # read of the config and the lock: a new one let the router back in
@@ -1673,6 +1707,44 @@ class TestDocsCookieToken:
 # shadowsocks-go: the older API path
 # ---------------------------------------------------------------------------
 
+class TestShadowsocksGoChecks:
+    _SERVER = json.dumps({"servers": [{"name": "ss-2022", "protocol": "2022-blake3-aes-256-gcm", "psk": "p",
+                                       "tcpListeners": [{"address": ":65280"}]}]})
+
+    def _post(self, client, **payload):
+        body = {"port": 65280, "method": "2022-blake3-aes-256-gcm", "fast_open": False,
+                "reuse_port": False, "mptcp": True, **payload}
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/shadowsocks-go/server.json"),
+            patch("builtins.open", side_effect=_open_with({"/etc/shadowsocks-go/server.json": self._SERVER})),
+            patch("omr_admin._listening_ports", return_value=[]),
+            patch("omr_admin._configured_server_ports", side_effect=lambda proto: [(443, 443)] if proto == "udp" else []),
+            patch("omr_admin._ss_configured_ports", return_value={65101}),
+            patch("omr_admin._atomic_write_json") as write,
+            patch("omr_admin._restart_service"),
+        ):
+            r = client.post("/shadowsocks-go", json=body)
+        return r.json(), write
+
+    @pytest.mark.parametrize("payload,reason", [
+        # written as is, shadowsocks-go refused its config: down for every router
+        ({"method": "aes-256-gcm\n"}, "Invalid method"),
+        ({"method": "2022-blake3-chacha20-poly1305"}, "Invalid method"),
+        # ss-libev's default port, MQVPN's: it could not bind it
+        ({"port": 65101}, "Port used by the server"),
+        ({"port": 443}, "Port used by the server"),
+    ])
+    def test_refused_before_the_config_is_written(self, user_client, payload, reason):
+        body, write = self._post(user_client, **payload)
+        assert body["reason"] == reason
+        assert not write.called
+
+    def test_its_own_port_and_aes_128_accepted(self, user_client):
+        body, write = self._post(user_client, method="2022-blake3-aes-128-gcm")
+        assert body["result"] == "done"
+        assert write.call_args.args[1]["servers"][0]["protocol"] == "2022-blake3-aes-256-gcm"
+
+
 class TestSsGoApiFallback:
     @staticmethod
     def _answers(*codes):
@@ -1704,6 +1776,19 @@ class TestSsGoApiFallback:
         with patch("os.path.exists", return_value=True), patch("omr_admin.requests.post", side_effect=call):
             omr_admin.add_ss_go_user("alice", "k")
         assert len(calls) == 1
+
+    @pytest.mark.parametrize("answers,removed", [
+        ((200,), True),
+        # no such user on either path: nothing left to remove
+        ((404, 404), True),
+        # down or slow: the suspension has to stay pending
+        ((omr_admin.requests.exceptions.Timeout(),), False),
+        ((500,), False),
+    ])
+    def test_remove_reports_whether_the_user_is_gone(self, answers, removed):
+        call, _ = self._answers(*answers)
+        with patch("os.path.exists", return_value=True), patch("omr_admin.requests.delete", side_effect=call):
+            assert omr_admin.remove_ss_go_user("alice") is removed
 
 
 # ---------------------------------------------------------------------------
@@ -2178,6 +2263,7 @@ class TestDisabledUserAccess:
             patch("omr_admin._openvpn_kill") as kill,
             patch("omr_admin._openvpn_revoke") as revoke,
             patch("omr_admin._pki_retire_user_certs", return_value=["02"]) as retire,
+            patch("omr_admin._openvpn_gen_crl", return_value=True) as gen_crl,
             patch("omr_admin._pki_restore_user_certs", return_value="02") as restore,
             patch("omr_admin._openvpn_drop_cert_files") as drop,
             patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
@@ -2189,6 +2275,7 @@ class TestDisabledUserAccess:
             # tun1 (UDP) has no ccd: only the CRL keeps it out there; the
             # files are kept, for the router's certificate to be put back
             retire.assert_called_once_with("readonly")
+            gen_crl.assert_called_once()
             assert not revoke.called
             assert suspended["openvpn"] == {"serials": ["02"]}
             assert [c.args[0] for c in run.call_args_list] == [
@@ -2341,6 +2428,76 @@ class TestDisabledUserAccess:
             suspended = omr_admin._suspend_user_access("readonly", {"userid": 2})
         assert suspended["shadowsocks_go"] == "upsk"
 
+    def test_suspension_pending_while_the_crl_fails(self):
+        # tun1 (UDP) checks only the CRL: a failed gen-crl let the router in
+        # while the suspension was saved as complete
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/openvpn/tun0.conf"),
+            patch("omr_admin._ccd_disable"),
+            patch("omr_admin._pki_retire_user_certs", return_value=["02"]),
+            patch("omr_admin._openvpn_gen_crl", return_value=False),
+            patch("omr_admin._openvpn_kill") as kill,
+            patch("omr_admin._mutate_omr_config"),
+            patch("subprocess.run"),
+        ):
+            suspended = omr_admin._suspend_user_access("readonly", {"userid": 2})
+        kill.assert_called_once_with("readonly")
+        assert suspended["openvpn"] == {"serials": ["02"]}
+        assert suspended["_pending"] == ["openvpn"]
+        # the retry finds nothing valid left in the index, and regenerates it
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/openvpn/tun0.conf"),
+            patch("omr_admin._ccd_disable"),
+            patch("omr_admin._pki_retire_user_certs", return_value=[]),
+            patch("omr_admin._openvpn_gen_crl", return_value=True) as gen_crl,
+            patch("omr_admin._openvpn_revoke") as revoke,
+            patch("omr_admin._openvpn_kill"),
+            patch("omr_admin._mutate_omr_config"),
+            patch("subprocess.run"),
+        ):
+            suspended = omr_admin._suspend_user_access("readonly", {"userid": 2, "access_suspended": suspended})
+        gen_crl.assert_called_once()
+        assert not revoke.called
+        assert suspended == {"openvpn": {"serials": ["02"]}}
+
+    def test_gen_crl_failure_reported(self):
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr=b"index broken")) as run:
+            assert omr_admin._openvpn_gen_crl() is False
+        assert run.call_count == 1      # no chmod of a crl.pem not written
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            assert omr_admin._openvpn_gen_crl() is True
+
+    @pytest.mark.parametrize("failing", ["shadowsocks_go", "softether"])
+    def test_suspension_pending_when_a_removal_fails(self, failing):
+        # the failure was dropped: the suspension saved as complete, never
+        # retried, and the disabled router kept that access
+        files = ("/etc/shadowsocks-go/upsks.json", "/var/lib/softether/vpn_server.config")
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in files),
+            patch("builtins.open", side_effect=_open_with({"/etc/shadowsocks-go/upsks.json": json.dumps({"readonly": "upsk"})})),
+            patch("omr_admin.remove_ss_go_user", return_value=failing != "shadowsocks_go"),
+            patch("omr_admin.remove_softether_user", return_value=failing != "softether"),
+            patch("omr_admin._mutate_omr_config"),
+            patch("subprocess.run"),
+        ):
+            suspended = omr_admin._suspend_user_access("readonly", {"userid": 2, "softethervpn": "pw"})
+        assert suspended["_partial"] is True
+        assert suspended["_pending"] == [failing]
+
+    @pytest.mark.parametrize("answer,removed", [
+        ({"result": {}}, True),
+        # ERR_OBJECT_NOT_FOUND: no such user, nothing left to remove
+        ({"error": {"code": 29, "message": "Object not found"}}, True),
+        ({"error": {"code": 9, "message": "Access denied"}}, False),
+    ])
+    def test_softether_removal_result(self, answer, removed):
+        reply = MagicMock(ok=True)
+        reply.json.return_value = answer
+        with patch("omr_admin.requests.post", return_value=reply):
+            assert omr_admin.remove_softether_user("readonly") is removed
+        with patch("omr_admin.requests.post", side_effect=omr_admin.requests.exceptions.ConnectTimeout()):
+            assert omr_admin.remove_softether_user("readonly") is False
+
     def test_softether_password_of_both_forms(self):
         assert omr_admin._softether_password({"softethervpn": "pw"}) == "pw"
         assert omr_admin._softether_password({"softethervpn": {"password": "pw"}}) == "pw"
@@ -2470,7 +2627,8 @@ class TestReviewFixes20261014:
             calls.append(" ".join(cmd) if cmd else "")
             return MagicMock(returncode=0)
         v1_files = {"/proc/sys/net/mptcp/enabled", "/proc/sys/net/mptcp/pm_type", "/proc/sys/net/mptcp/scheduler",
-                    "/proc/sys/net/mptcp/path_manager", "/proc/sys/net/mptcp/syn_retries"}
+                    "/proc/sys/net/mptcp/path_manager", "/proc/sys/net/mptcp/syn_retries",
+                    "/proc/sys/net/mptcp/close_timeout", "/proc/sys/net/mptcp/stale_loss_cnt"}
         with (
             patch("os.path.exists", side_effect=lambda p: str(p) in v1_files if v1 else str(p) == "/proc/sys/net/mptcp/mptcp_enabled"),
             patch("os.path.isfile", return_value=False),
@@ -2499,6 +2657,12 @@ class TestReviewFixes20261014:
         assert "sysctl -qw net.mptcp.close_timeout=0" in calls
         assert "net.mptcp.close_timeout=0" in text and "close_timeout=120" not in text
         assert "net.mptcp.stale_loss_cnt=8" in text     # unset: kept
+
+    def test_mptcp_v1_knob_missing_from_the_kernel_not_written(self, primary_client):
+        # 6.1 has no syn_retrans_before_tcp_fallback: every sync was refused
+        text, calls = self._mptcp(primary_client, {**self._MPTCP, "syn_retrans_before_tcp_fallback": 2})
+        assert not any("syn_retrans_before_tcp_fallback" in c for c in calls)
+        assert "syn_retrans_before_tcp_fallback" not in text
 
     def test_mptcp_keeps_the_installer_sysctls(self, primary_client):
         installer = ("net.mptcp.enabled=1\nnet.mptcp.blackhole_timeout = 0\nnet.mptcp.close_timeout=60\n"
@@ -2640,6 +2804,22 @@ class TestReviewFixes20261014:
             r = primary_client.post("/softethervpn", json={"password": "newpassword"})
         assert r.json()["result"] == "done", r.json()
         assert changes == {"softethervpn": "newpassword"}
+
+    def test_softethervpn_password_refused_not_saved(self, primary_client):
+        # saved anyway, /config gave the router a password SoftEther didn't have
+        refused = MagicMock(ok=True, text='{"error": {"code": 29}}')
+        refused.json.side_effect = lambda: {"error": {"code": 29, "message": "Object not found"}}
+        ok = MagicMock(ok=True, text='{"result": {}}')
+        ok.json.side_effect = lambda: {"result": {}}
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.read_omr_config", side_effect=_config),
+            patch("omr_admin.modif_config_user") as modif,
+            patch("requests.post", side_effect=lambda url, json, **kw: refused if json["method"] == "SetUser" else ok),
+        ):
+            r = primary_client.post("/softethervpn", json={"password": "newpassword"})
+        assert r.json() == {"result": "error", "reason": "SoftEther VPN refused the password", "route": "softethervpn"}
+        modif.assert_not_called()
 
     def test_reality_port_closed_whoever_opened_it(self, primary_client):
         xray = {"inbounds": [{"tag": "omrin-vless-reality", "port": 443}, {"tag": "omrin-tunnel", "port": 65228}]}
@@ -2974,7 +3154,7 @@ class TestReview20261023:
              patch("builtins.open", side_effect=_open_with(files)), \
              patch("omr_admin._configured_server_ports", return_value=[]):
             spans = omr_admin._vxlan_service_ports(config, listening=[])
-            for port in (65311, 65102, 65150, 65302, 65201, 65000 + 5, 65000 + omr_admin.USERID_MAX):
+            for port in (65311, 65102, 65150, 65302, 65201, 65000 + 5, 65000 + omr_admin.GLORYTUN_USERID_MAX):
                 assert any(a <= port <= b for a, b in spans), port
             for port in (4789, 65301):   # OpenVPN TCP's is not a UDP port
                 assert not any(a <= port <= b for a, b in spans), port
@@ -3053,6 +3233,23 @@ class TestReview20261023:
         assert r.json()["result"] == "done"
         apply.assert_called_once()
         assert "fd12::/48" in apply.call_args.args[1]
+
+    def test_vpnips_without_6in4_still_resyncs_the_dnats(self, user_client, monkeypatch, tmp_path):
+        # no omr-6in4 directory (docker-compose): the write raised, 500, the
+        # new address saved and the DNATs left on the old one for good
+        monkeypatch.setattr(omr_admin, "OMR_6IN4_DIR", str(tmp_path / "missing"))
+        config = _config()
+        config["users"][0]["openmptcprouter"].update(vpnremoteip="10.255.255.2", vpnlocalip="10.255.255.1")
+        with patch("omr_admin.read_omr_config", return_value=config), \
+             patch("omr_admin._vpnips_error", return_value=None), \
+             patch("omr_admin._openvpn_leases", return_value={}), \
+             patch("omr_admin.modif_config_user"), \
+             patch("omr_admin._atomic_write_text") as write, \
+             patch("omr_admin._nft_sync_ports") as sync:
+            r = user_client.post("/vpnips", json={"remoteip": "10.255.255.6", "localip": "10.255.255.5"})
+        assert r.json()["result"] == "done"
+        assert not write.called
+        sync.assert_called_once()
 
 
 class TestAccessReconciliationRetries:
@@ -3207,3 +3404,10 @@ class TestAccessReconciliationRetries:
             entry = config['users'][0]['readonly']
             assert entry['disabled'] == 'true'
             assert entry['access_suspended'] == record
+
+
+def test_tunnel_key_check_same_for_glorytun_and_dsvpn():
+    # /glorytun had no length nor printable check, /dsvpn had both
+    assert omr_admin._tunnel_key_valid("A" * 64)
+    for key in ("", "a b", "a\nb", "a\x00b", "A" * 257):
+        assert not omr_admin._tunnel_key_valid(key), repr(key)
