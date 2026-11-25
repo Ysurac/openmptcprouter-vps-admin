@@ -82,7 +82,7 @@ Configuration endpoints return a JSON object of the form:
 
 `warning` is typically returned when the target software is not installed on the VPS.
 
-A route that moves a service to a new port (`/shadowsocks`, `/shadowsocks-go`, `/glorytun`, `/dsvpn`, `/mqvpn`, `/openvpn`, `/xray` turning Reality on) answers `error` / `Port not opened: <why>` when the firewall refuses the new port (`No more than 1024 firewall entries per user`, `Firewall rule refused`); the old port then stays open.
+A route that moves a service to a new port (`/shadowsocks`, `/shadowsocks-go`, `/glorytun`, `/dsvpn`, `/mqvpn`, `/openvpn`, `/xray` turning Reality on) answers `error` / `Port not opened: <why>` when the firewall refuses the new port (`No more than 1024 firewall entries per user`, `Firewall rule refused`); the old port then stays open. The next call opens it again, even with nothing else changed. `/openvpn` refuses a new port another user's DNAT takes (`Port redirected by: ...`) or the server uses (`Port used by the server`), as `/mqvpn` and `/shadowsocks-go` do.
 
 ## Endpoints
 
@@ -241,8 +241,8 @@ learning engine.
 | POST | `/metrics` | Store metrics for one WAN interface; one sample per interface every 2 s at most (429) |
 | GET | `/metrics/all` | Metrics of all users (admin only) |
 | GET | `/metrics/user` | Current user profile and metrics DB statistics |
-| GET | `/metrics/history` | Historical metrics (requires InfluxDB) |
-| GET | `/metrics/report` | Availability report per WAN interface (requires InfluxDB); 503 when the query fails |
+| GET | `/metrics/history` | Historical metrics (requires InfluxDB); 429 when two history or report reads already run on that worker |
+| GET | `/metrics/report` | Availability report per WAN interface (requires InfluxDB); 503 when the query fails, 429 as `/metrics/history` |
 | GET | `/metrics/decision` | Model-assigned weight for each WAN interface |
 | GET | `/metrics/quality/forecast` | Link-quality forecast |
 | POST | `/metrics/decision/train` | Train the decision model |

@@ -284,7 +284,9 @@ def sync_once():
     connected = _connected_users()
     if connected is None:
         _mqvpn_failures += 1
-        if _mqvpn_failures < MQVPN_FAILURES_MAX and _applied is not None:
+        # At startup too: omr-admin up before mqvpn's control socket withdrew
+        # every route BIRD announced from its last config, at each boot
+        if _mqvpn_failures < MQVPN_FAILURES_MAX:
             return
         connected = set()
     else:

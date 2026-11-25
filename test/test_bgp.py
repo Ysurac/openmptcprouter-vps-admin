@@ -143,6 +143,21 @@ def test_sync(bgp, monkeypatch):
         assert "203.0.113.1" not in (bgp / "omr-bgp.conf").read_text()
 
 
+def test_startup_waits_for_mqvpn(bgp, monkeypatch):
+    # omr-admin up before mqvpn's control socket: every route BIRD announced
+    # from its last config was withdrawn at once, at each boot
+    (bgp / "omr-bgp.json").write_text(json.dumps(dict(_BGP, routers={"r1": {"ipv4": "203.0.113.1"}})))
+    monkeypatch.setattr(omr_bgp, "_mqvpn_failures", 0)
+    monkeypatch.setattr(omr_bgp, "_mqvpn_status", lambda: None)
+    run = MagicMock(return_value=MagicMock(returncode=0, stdout="Reconfigured\n", stderr=""))
+    with patch("omr_bgp.subprocess.run", run), patch("omr_bgp.shutil.which", return_value="/usr/sbin/birdc"):
+        for _ in range(omr_bgp.MQVPN_FAILURES_MAX - 1):
+            omr_bgp.sync_once()
+        assert run.call_count == 0
+        omr_bgp.sync_once()
+        assert run.call_count == 2
+
+
 def test_password_newline_refused(bgp, admin_client):
     # match() took a trailing newline into BIRD's config, which then refused it
     bad = dict(_BGP, neighbors=[dict(_BGP["neighbors"][0], password="s3cret\n")])

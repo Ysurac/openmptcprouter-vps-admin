@@ -285,7 +285,8 @@ names `omr_routers`, `omr_routers6` and `omr_<neighbor>` there.
   table is loaded all the same. The next round tries again.
 - **MQVPN unreachable:** the announcements are kept for up to 2 failed
   status requests in a row, and withdrawn at the third. A short control socket
-  hiccup doesn't make every route flap.
+  hiccup doesn't make every route flap, nor does omr-admin starting before
+  mqvpn at boot (BIRD keeps announcing from its last config meanwhile).
 - **Firewall reload:** reloading nftables flushes the `omr_bgp` table and
   restarts omr-admin, which loads it again once it is back up (about 30
   seconds). Announcements are not affected meanwhile.

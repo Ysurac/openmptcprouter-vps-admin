@@ -220,6 +220,13 @@ _ema_lock = threading.Lock()
 EMA_STATE_FILE = '/run/omr-admin-weight-ema.json'
 
 
+# The auto-learning counters of the leader (the only worker training), for
+# /metrics/engine answered by another worker: it showed no round at all.
+AUTO_STATE_FILE = '/run/omr-admin-auto-learning.json'
+_AUTO_STATE_KEYS = ("auto_rounds", "auto_train_count", "auto_skipped",
+                    "last_auto_round_at", "last_auto_loss", "auto_resets")
+
+
 def _read_ema_state() -> Optional[dict]:
     """The EMAs every worker shares, {} without the file, None if unreadable."""
     try:
@@ -1599,7 +1606,7 @@ _PREDICTABLE: list = [
     (("signal",     "quality"),0.0,  100.0,  600.0),   # very slow
 ]
 
-# Public name kept for backward compatibility (used in tests and the doc).
+# Public name kept for backward compatibility.
 PREDICTABLE_FIELDS: list = [path for path, _, _, _ in _PREDICTABLE]
 
 
@@ -1838,6 +1845,23 @@ def _torch_fit(pairs: list, hl: float) -> tuple:
 _FORECAST_MAX_TORCH_INTERFACES: int = 8
 _forecast_slots = threading.BoundedSemaphore(2)
 _forecast_ctx = threading.local()
+
+
+# /metrics/history and /metrics/report read up to days of rows (30 s each
+# query at most): a few at once took every thread asyncio.to_thread has
+# (min(32, cpu + 4)), every router's POST /metrics waiting behind them.
+_history_slots = threading.BoundedSemaphore(2)
+
+
+def _history_slot(func, *args):
+    """func(*args) in one of _history_slots, taken without waiting; raises
+    HTTPException 429 when none is free."""
+    if not _history_slots.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Too many history requests at once, try again later")
+    try:
+        return func(*args)
+    finally:
+        _history_slots.release()
 
 
 @contextlib.contextmanager
@@ -3244,11 +3268,12 @@ def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
     if not _TORCH_AVAILABLE or isinstance(_get_backend(), JSONBackend):
         return summary
 
-    trusted = _trusted_training_users()
-    all_data = _read_all()
-    for username, user_data in all_data.items():
-        if username not in trusted:
-            continue   # other tenants' data never trains the shared model
+    # Other tenants' data never trains the shared model, nor is it read: every
+    # router's latest rows, each round, to train on one or two users
+    for username in sorted(_trusted_training_users()):
+        user_data = _read_user(username)
+        if not user_data:
+            continue   # no metrics posted
         if not isinstance(user_data, dict) or len(user_data) < 2:
             summary["skipped"] += 1
             continue
@@ -3289,6 +3314,14 @@ def _auto_learn_round(cfg: Optional[dict] = None) -> dict:
         _engine_stats["auto_rounds"] += 1
         _engine_stats["auto_skipped"] += summary["skipped"]
         _engine_stats["last_auto_round_at"] = time.time()
+        auto_state = {k: _engine_stats[k] for k in _AUTO_STATE_KEYS}
+    tmp = AUTO_STATE_FILE + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(auto_state, f)
+        os.replace(tmp, AUTO_STATE_FILE)
+    except OSError as exc:
+        LOG.debug("omr_auto: %s not written (%s)", AUTO_STATE_FILE, exc)
     LOG.debug("omr_auto: round done — trained=%d skipped=%d",
               summary["trained"], summary["skipped"])
     return summary
@@ -3711,6 +3744,14 @@ def _engine_diagnostics() -> dict:
     """Assemble the full engine diagnostics snapshot."""
     with _stats_lock:
         stats = dict(_engine_stats)
+    if _auto_leader_fd is None:
+        # Not the worker that trains: the leader's counters
+        try:
+            with open(AUTO_STATE_FILE) as f:
+                leader_stats = json.load(f)
+            stats.update({k: leader_stats[k] for k in _AUTO_STATE_KEYS if k in leader_stats})
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
 
     # Derived averages (avoid ZeroDivision)
     ic = stats["inference_count"]
@@ -3964,7 +4005,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             return _501_history
         target = username if current_user.permissions == "admin" and username else current_user.username
         since_seconds = _parse_since(since)
-        return await asyncio.to_thread(_read_history, target, interface, since_seconds, limit)
+        return await asyncio.to_thread(_history_slot, _read_history, target, interface, since_seconds, limit)
 
     @router.get('/metrics/report',
                 summary="Availability report: uptime, outages and latency/loss/jitter per WAN interface (InfluxDB only)")
@@ -3978,7 +4019,7 @@ def create_router(get_current_user, get_current_active_user, User) -> APIRouter:
             return _501_history
         target = username if current_user.permissions == "admin" and username else current_user.username
         since_seconds = _parse_since(since)
-        return await asyncio.to_thread(_build_report, target, interface, since_seconds)
+        return await asyncio.to_thread(_history_slot, _build_report, target, interface, since_seconds)
 
     # ---- decision endpoints -----------------------------------------------
 

@@ -130,6 +130,7 @@ def reset_backend(tmp_path, monkeypatch):
     """Reset backend, decision-model, EMA and auto-learning state between tests."""
     # the EMAs the workers share: not the machine's /run
     monkeypatch.setattr(omr_metrics, "EMA_STATE_FILE", str(tmp_path / "weight-ema.json"))
+    monkeypatch.setattr(omr_metrics, "AUTO_STATE_FILE", str(tmp_path / "auto-learning.json"))
     # nor its removed users' cutoffs
     monkeypatch.setattr(omr_metrics, "PURGED_USERS_FILE", str(tmp_path / "purged.json"))
     # nor its JSON snapshot: run as root on a VPS, a test wrote the real one
@@ -4359,8 +4360,8 @@ class TestAutoLearnRound:
             "wan2": _auto_hist(_WAN2, n=10, loss=15.0),
         }
         with (
-            patch.object(omr_metrics, "_read_all",
-                         return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
+            patch.object(omr_metrics, "_read_user",
+                         side_effect=lambda u, _d={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}: _d.get(u, {})),
             patch.object(omr_metrics, "_read_history",
                          side_effect=lambda u, i, s, l: hists),
             patch.object(omr_metrics, "_train_step", return_value=0.05) as ts,
@@ -4379,8 +4380,8 @@ class TestAutoLearnRound:
     def test_skips_user_with_single_interface(self, torch_env):
         self._influx_env()
         with (
-            patch.object(omr_metrics, "_read_all",
-                         return_value={"openmptcprouter": {"wan": _WAN}}),
+            patch.object(omr_metrics, "_read_user",
+                         side_effect=lambda u, _d={"openmptcprouter": {"wan": _WAN}}: _d.get(u, {})),
             patch.object(omr_metrics, "_train_step") as ts,
         ):
             summary = omr_metrics._auto_learn_round(self._CFG)
@@ -4394,8 +4395,8 @@ class TestAutoLearnRound:
             "wan2": [],   # no history yet → cannot be labelled
         }
         with (
-            patch.object(omr_metrics, "_read_all",
-                         return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
+            patch.object(omr_metrics, "_read_user",
+                         side_effect=lambda u, _d={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}: _d.get(u, {})),
             patch.object(omr_metrics, "_read_history",
                          side_effect=lambda u, i, s, l: hists),
             patch.object(omr_metrics, "_train_step") as ts,
@@ -4411,8 +4412,8 @@ class TestAutoLearnRound:
             "wan2": _auto_hist(_WAN2, n=10),
         }
         with (
-            patch.object(omr_metrics, "_read_all",
-                         return_value={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}),
+            patch.object(omr_metrics, "_read_user",
+                         side_effect=lambda u, _d={"openmptcprouter": {"wan": _WAN, "wan2": _WAN2}}: _d.get(u, {})),
             patch.object(omr_metrics, "_read_history",
                          side_effect=lambda u, i, s, l: hists),
             patch.object(omr_metrics, "_train_step", side_effect=RuntimeError("boom")),
@@ -4423,10 +4424,37 @@ class TestAutoLearnRound:
     def test_round_updates_stats(self, torch_env):
         self._influx_env()
         before = omr_metrics._engine_stats["auto_rounds"]
-        with patch.object(omr_metrics, "_read_all", return_value={}):
+        with patch.object(omr_metrics, "_trusted_training_users", return_value=set()), \
+             patch("builtins.open", new=_REAL_OPEN):
             omr_metrics._auto_learn_round(self._CFG)
         assert omr_metrics._engine_stats["auto_rounds"] == before + 1
         assert omr_metrics._engine_stats["last_auto_round_at"] is not None
+        # for the workers that do not train
+        with _REAL_OPEN(omr_metrics.AUTO_STATE_FILE) as f:
+            assert json.load(f)["auto_rounds"] == before + 1
+
+    def test_engine_shows_the_leader_counters(self):
+        # Answered by a worker that does not train: no round at all, half
+        # of the /metrics/engine calls
+        with _REAL_OPEN(omr_metrics.AUTO_STATE_FILE, "w") as f:
+            json.dump({"auto_rounds": 7, "last_auto_loss": 0.1}, f)
+        with patch.object(omr_metrics, "_auto_leader_fd", None):
+            runtime = omr_metrics._engine_diagnostics()["runtime"]
+        assert runtime["auto_rounds"] == 7 and runtime["last_auto_loss"] == 0.1
+
+    def test_history_requests_bounded(self):
+        # A few 30-day reports at once took every to_thread thread, every
+        # router's POST /metrics waiting
+        held = [omr_metrics._history_slots.acquire(blocking=False) for _ in range(2)]
+        try:
+            assert all(held)
+            with pytest.raises(omr_metrics.HTTPException) as exc:
+                omr_metrics._history_slot(lambda: "rows")
+            assert exc.value.status_code == 429
+        finally:
+            for _ in held:
+                omr_metrics._history_slots.release()
+        assert omr_metrics._history_slot(lambda: "rows") == "rows"
 
 
 class TestMaybeExplore:
@@ -4978,10 +5006,10 @@ class TestTrustedTraining:
             return hists
 
         with (
-            patch.object(omr_metrics, "_read_all", return_value={
+            patch.object(omr_metrics, "_read_user", side_effect=lambda u: {
                 "tenant": {"wan": _WAN, "wan2": _WAN2},
                 "openmptcprouter": {"wan": _WAN, "wan2": _WAN2},
-            }),
+            }.get(u, {})) as read_user,
             patch.object(omr_metrics, "_read_history", side_effect=fake_history),
             patch.object(omr_metrics, "_train_step", return_value=0.05) as ts,
             patch.object(omr_metrics, "_get_model", return_value=_FakeModel()),
@@ -4991,6 +5019,8 @@ class TestTrustedTraining:
         assert summary["trained"] == 1
         ts.assert_called_once()
         assert set(read_users) == {"openmptcprouter"}
+        # a tenant's metrics are not even read
+        assert "tenant" not in [c.args[0] for c in read_user.call_args_list]
 
 
 class TestDisabledUserRefused:

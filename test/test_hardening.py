@@ -1773,9 +1773,27 @@ class TestSsGoApiFallback:
 
     def test_timeout_not_retried(self):
         call, calls = self._answers(omr_admin.requests.exceptions.Timeout())
-        with patch("os.path.exists", return_value=True), patch("omr_admin.requests.post", side_effect=call):
+        # shadowsocks-go enabled (subprocess.run mocked to succeed): raised,
+        # /add_user undoes the user instead of answering done
+        with patch("os.path.exists", return_value=True), patch("omr_admin.requests.post", side_effect=call), \
+             pytest.raises(RuntimeError):
             omr_admin.add_ss_go_user("alice", "k")
         assert len(calls) == 1
+
+    def test_softether_refusal_raised(self):
+        # The password was saved and given to the router by /config, the
+        # hub without the user
+        with patch("omr_admin._softether_rpc", return_value=False), pytest.raises(RuntimeError):
+            omr_admin.add_softether_user("alice", "pw")
+
+    def test_failure_ignored_when_disabled(self):
+        # The installer run again with SHADOWSOCKS_GO=no: disabled, its
+        # server.json left in place, /add_user must not fail over it
+        call, _ = self._answers(omr_admin.requests.exceptions.ConnectionError(),
+                                omr_admin.requests.exceptions.ConnectionError())
+        with patch("os.path.exists", return_value=True), patch("omr_admin.requests.post", side_effect=call), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1)):
+            assert omr_admin.add_ss_go_user("alice", "k") == "k"
 
     @pytest.mark.parametrize("answers,removed", [
         ((200,), True),

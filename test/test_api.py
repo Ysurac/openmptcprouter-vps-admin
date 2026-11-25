@@ -2802,10 +2802,16 @@ class TestMqvpn:
         assert r.json() == {"result": "error", "reason": "Port not opened: Firewall rule refused", "route": "mqvpn"}
         assert not close.called
 
-    def test_same_port_does_not_touch_firewall(self, user_client):
-        """No firewall changes when the port stays the same."""
+    def test_same_port_open_does_not_touch_firewall(self, user_client):
+        """No firewall changes when the port stays the same and is open,
+        whoever opened it (the installer did as the main router)."""
+        config = copy.deepcopy(MOCK_CONFIG)
+        config["users"][0]["admin"]["fw_ports"] = [
+            {"name": "mqvpn", "port": "443", "proto": "udp", "fwtype": "ACCEPT", "family": family,
+             "source_dip": "", "dest_ip": ""} for family in (4, 6)]
         with (
             patch("os.path.isfile", return_value=True),
+            patch("omr_admin.read_omr_config", return_value=config),
             patch("omr_admin.shorewall_add_port", return_value=None) as add4,
             patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
             patch("omr_admin.shorewall_del_port") as del4,
@@ -2818,6 +2824,21 @@ class TestMqvpn:
         add6.assert_not_called()
         del4.assert_not_called()
         del6.assert_not_called()
+
+    def test_same_port_not_open_is_opened(self, user_client):
+        # A port refused before: the config written, the next call saw no
+        # change and answered done, the port never opened
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin.shorewall_add_port", return_value=None) as add4,
+            patch("omr_admin.shorewall6_add_port", return_value=None) as add6,
+            patch("omr_admin._fw_service_port_del") as close,
+        ):
+            r = user_client.post("/mqvpn", json=self._PAYLOAD)
+        assert r.json()["result"] == "done"
+        assert add4.call_args[0][1:] == ("443", "udp", "mqvpn")
+        assert add6.call_args[0][1:] == ("443", "udp", "mqvpn")
+        assert not close.called
 
     def _post_capture(self, user_client, payload, server_json=None):
         capture = io.StringIO()
@@ -3462,6 +3483,18 @@ class TestOpenVpn:
             r = user_client.post("/openvpn", json={**self._PAYLOAD, "port": 1194})
         assert r.json()["result"] == "done"
         assert add4.call_args.args[1:3] == ("1194", "tcp") and add6.call_args.args[1:3] == ("1194", "tcp")
+
+    def test_port_redirected_by_a_router_refused(self, user_client):
+        # Bob's DNAT took the port on the shared IPs: OpenVPN unreachable
+        # for every router, answered done
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("omr_admin._port_redirected_by", return_value=["bob"]),
+            patch("omr_admin._atomic_write_text") as write,
+        ):
+            r = user_client.post("/openvpn", json={**self._PAYLOAD, "port": 1194})
+        assert r.json() == {"result": "error", "reason": "Port redirected by: bob", "route": "openvpn"}
+        assert not write.called
 
     def test_cipher_injection_refused(self, user_client):
         # tun0.conf is one directive per line, script hooks run as root

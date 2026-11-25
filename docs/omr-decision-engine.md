@@ -629,7 +629,9 @@ enable is instant.  Tuning (`omr-admin-config.json`, changes picked up within
 Progress is reported by `GET /metrics/engine`: `auto_rounds`,
 `auto_train_count`, `auto_skipped`, `last_auto_round_at`, `last_auto_loss`,
 `auto_resets`, `exploration_count` in `runtime`, plus the resolved
-configuration and `task_running` flag in `auto_learning`.
+configuration and `task_running` flag in `auto_learning`. Only one worker
+trains (`leader`); the others report its `auto_*` counters, which it writes
+to `/run/omr-admin-auto-learning.json` after each round.
 
 ---
 
@@ -649,7 +651,7 @@ configuration and `task_running` flag in `auto_learning`.
 | `GET` | `/metrics/quality/forecast?horizon=600&since=6h` | user | Longer window / horizon |
 | `GET` | `/metrics/user` | user | Metrics DB stats: entry count, first/last seen, interfaces |
 | `GET` | `/metrics/user?username=X` | admin | Stats for another user |
-| `POST` | `/metrics/decision/train` | user | Submit quality feedback (503 when the model could not be saved for the other workers) |
+| `POST` | `/metrics/decision/train` | admin | Submit quality feedback (503 when the model could not be saved for the other workers) |
 | `POST` | `/metrics/decision/reset` | admin | Reset model to heuristic init (503 when it could not be saved) |
 | `GET` | `/metrics/decision/auto` | admin | Online auto-learning status |
 | `POST` | `/metrics/decision/auto` | admin | Enable/disable auto-learning (`{"enabled": bool}`) |

@@ -502,6 +502,16 @@ class TestRenderBulkRedirect:
         lines = omr_admin._render_bulk_redirect(config)
         assert any("dnat ip6 to fd00::a00:2" in l for l in lines)
 
+    def test_v6_leaves_the_6in4_tunnel_out(self):
+        # 6in4-user* (omr-6in4-user* before VPS 0.1102) carries the router's
+        # own IPv6: DNATed as from the internet, it went back to the router
+        config = _config({"openmptcprouter": {"userid": 0}})
+        config["bulk_redirect_v6"] = True
+        (line,) = [l for l in omr_admin._render_bulk_redirect(config) if "nfproto ipv6 tcp" in l]
+        excluded = line.split("}", 1)[0]
+        assert excluded.startswith("iifname != { ")
+        assert '"6in4-user*"' in excluded and '"omr-6in4-user*"' in excluded
+
 
 # ===========================================================================
 # _render_gre_snat
@@ -639,6 +649,12 @@ class TestRenderClient2Client:
         assert "oifname { " in lines[0]
         for pattern in omr_admin.NFT_VPN_IFACES:
             assert f'"{pattern}"' in lines[0]
+
+    def test_6in4_tunnel_is_a_vpn_iface(self):
+        # the loop above passes whatever the set holds: pin the 6in4 names
+        line = omr_admin._render_client2client(True)[0]
+        for name in ("6in4-user*", "omr-6in4-user*"):
+            assert line.count(f'"{name}"') == 2
 
 
 class TestRenderVxlanInput:

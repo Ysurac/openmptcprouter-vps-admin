@@ -273,9 +273,9 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        out=$$(influxdb3 create database "$$INFLUXDB_BUCKET" \
+        # The token in the environment, not on the command line (ps)
+        out=$$(INFLUXDB3_AUTH_TOKEN="$$INFLUXDB_TOKEN" influxdb3 create database "$$INFLUXDB_BUCKET" \
           --host "http://influxdb:8181" \
-          --token "$$INFLUXDB_TOKEN" \
           --retention-period "$$INFLUXDB_RETENTION" 2>&1) || {
             echo "$$out" | grep -qi "already exists" || { echo "$$out" >&2; exit 1; }
           }
