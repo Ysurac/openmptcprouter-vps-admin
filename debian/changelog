@@ -1,3 +1,21 @@
+omr-vps-admin (0.19+20261125) unstable; urgency=medium
+
+  * nftables: the 6in4 tunnel (6in4-user*, omr-6in4-user* before VPS 0.1102) is a VPN interface again. What came in through it was taken as from the internet: an IPv6 redirect (the bulk one too) DNATed the router's own IPv6 traffic, a VXLAN port reached that way was dropped, and client2client left it out
+  * /shadowsocks, /shadowsocks-go, /mqvpn, /openvpn and /xray (Reality): a service port the firewall refused is opened again at the next call. Only a config change opened it: the next identical call answered done, the service listening on a closed port for every router. A port already open, by whoever, is left as it is
+  * /openvpn: a new port another user's DNAT takes, or the server uses (shadowsocks, a proxy, anything listening), is refused as /mqvpn and /shadowsocks-go do: OpenVPN unreachable, answered done
+  * /add_user: a shadowsocks-go or SoftEther VPN that is enabled and did not take the user, or an MQVPN server.json that could not be read or written, undoes the user ('User creation failed'). Answered done, the router got an empty uPSK or a password SoftEther did not have, never added again. A service disabled (the installer run again with its option off, its config left) is skipped as before
+  * /shadowsocks-go holds the config lock across its port checks and write: a router's DNAT of the same port on the other worker passed too, ss-go unreachable for every router
+  * /vpnips asks OpenVPN for its leases before taking the config lock (a slow management socket held every request of every worker). /config writes ipv6_network and ipv6_addr only when missing (twice the exclusive lock at each router sync)
+  * With debug on, /config no longer logs the user's whole entry (its password, proxy uuids, SoftEther password and serial tokens)
+  * Removing a GRE tunnel restarts xray once (restart=0 was not read, a second restart 5 s later cut every connection again)
+  * omr_bgp: omr-admin starting before mqvpn's control socket withdrew every route at once, at each boot; startup now waits the 3 failed rounds as any other time
+  * omr_metrics: /metrics/history and /metrics/report run two at a time per worker, 429 past it: a few 30-day reports took every thread, every router's POST /metrics waiting. /metrics/engine shows the training worker's auto_* counters on every worker (half the calls showed no round). Auto-learning reads the trusted users' metrics only, not every router's latest day of rows each round
+  * docker-compose.yml: the InfluxDB token goes through INFLUXDB3_AUTH_TOKEN, not --token (readable in ps), as install_omr-ai.sh does
+  * install_omr-ai.sh: the banner shows the real model (21->32->16->1) and /metrics/decision/train as admin; docs/omr-decision-engine.md too
+  * Add tests for the above (test/test_api.py, test/test_hardening.py, test/test_metrics.py, test/test_bgp.py)
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Wed, 25 Nov 2026 00:00:00 +0100
+
 omr-vps-admin (0.19+20261124) unstable; urgency=medium
 
   * /add_user: userids up to 253, 253 users with the main router's 0, plus admin (63 before). Glorytun TCP/UDP and DSVPN give a userid a /30 of a /24 and its port 650NN/654NN: only userids up to 63 get them, /config leaves glorytun out of vpn.available past it. Their default ports of a userid not given yet stay reserved for 0-63 only (65000-65063, 65400-65463)
